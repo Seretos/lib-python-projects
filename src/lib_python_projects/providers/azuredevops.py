@@ -1639,6 +1639,21 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         assignees: list[str],
         status: Status | None = None,
     ) -> Ticket:
+        """Create an ADO work item.
+
+        When ``status`` is given, this runs a two-step flow: the work item
+        is first POSTed without a ``System.State`` patch (so ADO picks its
+        template-default initial state, e.g. ``"New"`` / ``"To Do"`` /
+        ``"Proposed"``), then — if the requested status differs from that
+        initial state — a follow-up ``update_ticket`` PATCH transitions
+        the item via the state machine. This is necessary because ADO
+        rejects terminal states (``"Done"`` / ``"Closed"`` / ``"Resolved"``)
+        on creation with 400 even though ``list_ticket_statuses`` lists
+        them. If the transition fails the work item is **not** rolled
+        back; the caller can delete it explicitly if needed.
+
+        When ``status`` is ``None``, behavior is unchanged: a single POST.
+        """
         wi_type = self._default_work_item_type(project, token)
         body_with_marker = ensure_body_prefix(body or "")
         merged_labels = sorted(set([*labels, AI_GENERATED_LABEL]))
@@ -1659,12 +1674,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                 "path": "/fields/System.AssignedTo",
                 "value": assignees[0],
             })
-        if status:
-            patch.append({
-                "op": "add",
-                "path": "/fields/System.State",
-                "value": status,
-            })
+        # Note: System.State is intentionally NOT added here. ADO only
+        # accepts initial-states on create; terminal states must be reached
+        # through the state machine via a follow-up update_ticket below.
 
         path = f"{_project_scope(project)}/_apis/wit/workitems/${quote(wi_type, safe='')}"
         with _client(project, token) as c:
@@ -1675,7 +1687,22 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                 json=patch,
             )
         _check(resp)
-        return _map_work_item(resp.json(), project)
+        created = _map_work_item(resp.json(), project)
+
+        # Step 2: if a status was requested and differs from the
+        # work-item's resulting initial state, transition via update.
+        if status is not None and status != created.status:
+            try:
+                return self.update_ticket(
+                    project, token, str(created.id), status=status
+                )
+            except Exception as exc:  # AzureDevOpsError or httpx errors
+                raise AzureDevOpsError(
+                    getattr(exc, "status", 400),
+                    f"work item #{created.id} created but state "
+                    f"transition to '{status}' failed: {exc}",
+                ) from exc
+        return created
 
     def update_ticket(
         self,

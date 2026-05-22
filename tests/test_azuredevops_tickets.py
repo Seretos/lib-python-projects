@@ -457,6 +457,144 @@ def test_create_ticket_uses_configured_default_type(
     # (No assertion needed; the mock would have failed.)
 
 
+def test_azuredevops_create_ticket_without_status_single_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """status=None must not trigger the follow-up PATCH (single POST)."""
+    posts: list[httpx.Request] = []
+    patches: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/$" in path and req.method == "POST":
+            posts.append(req)
+            return _json(_work_item_payload(7))
+        if req.method == "PATCH":
+            patches.append(req)
+            return _json(_work_item_payload(7))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = AzureDevOpsProvider().create_ticket(
+        _project(default_type="Issue"),
+        token="t",
+        title="hi",
+        body="b",
+        labels=[],
+        assignees=[],
+        status=None,
+    )
+    assert ticket.id == "7"
+    assert len(posts) == 1
+    assert len(patches) == 0
+
+
+def test_azuredevops_create_ticket_with_terminal_status_does_two_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """status='Done' must POST without System.State, then PATCH it to 'Done'."""
+    post_bodies: list[list[dict]] = []
+    patch_bodies: list[list[dict]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/$" in path and req.method == "POST":
+            post_bodies.append(json.loads(req.content.decode("utf-8")))
+            # Server returns initial-state "To Do".
+            return _json(_work_item_payload(42, **{"System.State": "To Do"}))
+        if req.method == "GET" and "/_apis/wit/workitems/42" in path:
+            # update_ticket reads current before PATCH.
+            return _json(_work_item_payload(42, **{"System.State": "To Do"}))
+        if req.method == "PATCH" and "/_apis/wit/workitems/42" in path:
+            patch_bodies.append(json.loads(req.content.decode("utf-8")))
+            return _json(_work_item_payload(42, **{"System.State": "Done"}))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = AzureDevOpsProvider().create_ticket(
+        _project(default_type="Issue"),
+        token="t",
+        title="hi",
+        body="b",
+        labels=[],
+        assignees=[],
+        status="Done",
+    )
+    # Exactly one create + one transition.
+    assert len(post_bodies) == 1
+    assert len(patch_bodies) == 1
+    # The create payload must NOT carry System.State; that field is the
+    # whole point of the two-step flow.
+    create_paths = {op["path"] for op in post_bodies[0]}
+    assert "/fields/System.State" not in create_paths
+    # The transition PATCH must set System.State to the requested value.
+    transition_ops = {op["path"]: op for op in patch_bodies[0]}
+    assert transition_ops["/fields/System.State"]["value"] == "Done"
+    # The returned Ticket reflects the post-transition state.
+    assert ticket.status == "Done"
+
+
+def test_azuredevops_create_ticket_terminal_status_upstream_failure_raises_with_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the PATCH transition fails, the error mentions the work-item id
+    and the upstream message — and the work item is left in place
+    (no rollback DELETE)."""
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    deletes: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/$" in path and req.method == "POST":
+            return _json(_work_item_payload(99, **{"System.State": "To Do"}))
+        if req.method == "GET" and "/_apis/wit/workitems/99" in path:
+            return _json(_work_item_payload(99, **{"System.State": "To Do"}))
+        if req.method == "PATCH" and "/_apis/wit/workitems/99" in path:
+            return _json(
+                {
+                    "message": "transition not allowed: To Do -> Done",
+                    "typeKey": "RuleValidationException",
+                },
+                status_code=400,
+            )
+        if req.method == "DELETE":
+            deletes.append(req)
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    requests = _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_ticket(
+            _project(default_type="Issue"),
+            token="t",
+            title="hi",
+            body="b",
+            labels=[],
+            assignees=[],
+            status="Done",
+        )
+    msg = str(exc.value)
+    assert "#99" in msg
+    assert "Done" in msg
+    # The wrapper must signal that this was the post-create transition
+    # that failed (not the create itself) and include the upstream error
+    # text so the agent can act on it. update_ticket already wraps the
+    # raw ADO 400 into a curated "state '<x>' rejected" ValueError; that
+    # rewrap is the upstream signal we surface here.
+    assert "state transition" in msg
+    assert "rejected" in msg
+    # And the chained __cause__ carries the upstream exception so the
+    # agent can introspect if needed.
+    assert exc.value.__cause__ is not None
+    # No rollback DELETE issued — the agent owns cleanup.
+    assert deletes == []
+    # And the requests log shows we did hit the create + patch path.
+    methods = [r.method for r in requests]
+    assert "POST" in methods
+    assert "PATCH" in methods
+
+
 # ---------- update_ticket ---------------------------------------------------
 
 
