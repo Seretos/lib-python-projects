@@ -311,7 +311,11 @@ def _map_mergeable(raw: dict) -> bool | None:
     return None
 
 
-def _map_mr(raw: dict, project: ProjectConfig | None = None) -> PullRequest:
+def _map_mr(
+    raw: dict,
+    project: ProjectConfig | None = None,
+    approvals: dict | None = None,
+) -> PullRequest:
     """Translate a GitLab merge-request payload into a `PullRequest`.
 
     Status mapping:
@@ -324,6 +328,16 @@ def _map_mr(raw: dict, project: ProjectConfig | None = None) -> PullRequest:
     SHA comes from `sha` on the MR root. `repo_full_name` is the
     target project path; cross-fork sources are not resolved into a
     full name here (would require an extra round-trip — defer).
+
+    Approval state: GitLab's `/projects/:id/merge_requests/:iid` root
+    payload does NOT include approval data — that lives behind a
+    separate `/approvals` endpoint. When the caller has already fetched
+    that payload, it can pass it via `approvals=...` and we derive
+    `review_decision` + `approvals_received` + `approvals_required`
+    from it. When `approvals` is `None` (the cheaper `list_prs` path),
+    we fall back to whatever (usually `None`) the MR root happened to
+    carry and leave `review_decision` at the dataclass default of
+    `None`.
     """
     state = raw.get("state", "opened")
     if state in ("opened", "reopened"):
@@ -358,6 +372,42 @@ def _map_mr(raw: dict, project: ProjectConfig | None = None) -> PullRequest:
     mr_url = raw.get("web_url") or ""
     if project is not None:
         mr_url = _canonical_url(mr_url, project)
+
+    # Approval state. Two paths:
+    #   (a) caller passed an `/approvals` payload → derive
+    #       review_decision + approvals_received from it.
+    #   (b) caller passed nothing → preserve historical behavior
+    #       (read whatever the MR root carries; review_decision stays
+    #       at the dataclass default of None).
+    if approvals is not None:
+        approvals_required: int | None = int(
+            approvals.get("approvals_required") or 0
+        )
+        approved_by = approvals.get("approved_by") or []
+        approvals_received: int | None = len(approved_by)
+        if "approved" in approvals:
+            approved = bool(approvals.get("approved"))
+        else:
+            # Older GitLab editions don't surface `approved` directly;
+            # derive from approvals_left when the gate is configured.
+            approved = (
+                approvals_required > 0
+                and int(approvals.get("approvals_left") or 0) == 0
+            )
+        if approvals_required == 0:
+            # No gate configured → no decision to report. Matches
+            # GitHub's `review_decision = None` on PRs without
+            # required-review rules.
+            review_decision: str | None = None
+        elif approved:
+            review_decision = "APPROVED"
+        else:
+            review_decision = "REVIEW_REQUIRED"
+    else:
+        approvals_required = raw.get("approvals_required")
+        approvals_received = raw.get("approvals_received")
+        review_decision = None
+
     return PullRequest(
         id=str(raw["iid"]),
         number=int(raw["iid"]),
@@ -382,8 +432,9 @@ def _map_mr(raw: dict, project: ProjectConfig | None = None) -> PullRequest:
         merge_commit_sha=raw.get("merge_commit_sha"),
         detailed_merge_status=raw.get("detailed_merge_status"),
         pipeline_status=pipeline_status,
-        approvals_required=raw.get("approvals_required"),
-        approvals_received=raw.get("approvals_received"),
+        approvals_required=approvals_required,
+        approvals_received=approvals_received,
+        review_decision=review_decision,
     )
 
 
@@ -1668,12 +1719,43 @@ class GitLabProvider(TokenCapabilityProvider):
         token: str | None,
         pr_id: str,
     ) -> tuple[PullRequest, list[Comment]]:
-        """Fetch a single MR plus its non-system notes."""
+        """Fetch a single MR plus its non-system notes.
+
+        Performs three round-trips against GitLab:
+
+          1. `GET /projects/:id/merge_requests/:iid` — the MR root.
+          2. `GET /projects/:id/merge_requests/:iid/approvals` — the
+             approval state (Premium / self-hosted editions). GitLab's
+             MR root does not include approval data, so this is a
+             dedicated endpoint. Used to derive `review_decision` and
+             `approvals_received`. If the endpoint returns 403
+             (restricted scope) or 404 (self-hosted edition without
+             the approvals API), we fall back to the historical
+             behavior: `_map_mr` is called without the approvals
+             payload and `review_decision`/`approvals_received` stay
+             `None` rather than raising.
+          3. `GET /projects/:id/merge_requests/:iid/notes` — the
+             discussion notes.
+
+        `list_prs` deliberately skips step (2) to avoid an N+1 round
+        trip across the listing. Callers that need accurate approval
+        state on a single MR should always use `get_pr`.
+        """
         path = _project_path(project)
         with _client(project, token) as client:
             r = client.get(f"/projects/{path}/merge_requests/{pr_id}")
             _check(r)
-            pr = _map_mr(r.json(), project)
+            raw_mr = r.json()
+            ar = client.get(
+                f"/projects/{path}/merge_requests/{pr_id}/approvals"
+            )
+            if ar.status_code in (403, 404):
+                # No approvals data accessible on this edition / with
+                # this token's scope — degrade gracefully.
+                pr = _map_mr(raw_mr, project)
+            else:
+                _check(ar)
+                pr = _map_mr(raw_mr, project, approvals=ar.json())
             c = client.get(
                 f"/projects/{path}/merge_requests/{pr_id}/notes",
                 params={"per_page": 100, "sort": "asc", "order_by": "created_at"},

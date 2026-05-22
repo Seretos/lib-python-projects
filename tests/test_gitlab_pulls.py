@@ -154,6 +154,120 @@ def test_get_pr_returns_pr_and_filtered_comments(
     assert comments[0].body == "comment"
 
 
+# ---------- get_pr approval state (ticket #52 F9) ---------------------------
+
+
+def test_gitlab_get_pr_review_decision_approved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Approved MR: /approvals reports approved=True with a non-empty
+    approved_by list — derive review_decision="APPROVED" and
+    approvals_received from len(approved_by)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5/approvals"):
+            return _json({
+                "approved": True,
+                "approvals_required": 1,
+                "approvals_left": 0,
+                "approved_by": [{"user": {"username": "alice"}}],
+            })
+        if url.endswith("merge_requests/5"):
+            return _json(_mr_payload(5))
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    assert pr.review_decision == "APPROVED"
+    assert pr.approvals_received == 1
+    assert pr.approvals_required == 1
+
+
+def test_gitlab_get_pr_review_decision_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate configured but nobody has approved yet — should surface
+    review_decision="REVIEW_REQUIRED" so a Merge-Gate agent can
+    distinguish "not approved" from "no gate"."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5/approvals"):
+            return _json({
+                "approved": False,
+                "approvals_required": 1,
+                "approvals_left": 1,
+                "approved_by": [],
+            })
+        if url.endswith("merge_requests/5"):
+            return _json(_mr_payload(5))
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    assert pr.review_decision == "REVIEW_REQUIRED"
+    assert pr.approvals_received == 0
+    assert pr.approvals_required == 1
+
+
+def test_gitlab_get_pr_no_approval_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No approval rules configured: approvals_required=0 → no gate to
+    report; review_decision stays None to match GitHub's shape on PRs
+    without a required-review rule."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5/approvals"):
+            return _json({
+                "approvals_required": 0,
+                "approvals_left": 0,
+                "approved_by": [],
+            })
+        if url.endswith("merge_requests/5"):
+            return _json(_mr_payload(5))
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    assert pr.review_decision is None
+    assert pr.approvals_received == 0
+    assert pr.approvals_required == 0
+
+
+def test_gitlab_list_prs_does_not_fetch_approvals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """list_prs must NOT issue a per-MR /approvals round-trip. The
+    follow-up request would scale linearly with the listing and is
+    only worth it on the single-MR get_pr path."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        # Any /approvals hit during list_prs is a regression — fail
+        # the test loudly rather than silently returning data.
+        assert "/approvals" not in url, (
+            f"list_prs must not fetch approvals (saw {url})"
+        )
+        if url.endswith("/merge_requests") or "/merge_requests?" in url:
+            return _json([_mr_payload(1), _mr_payload(2)])
+        return _json({}, status_code=404)
+
+    seen = _install_mock(monkeypatch, handler)
+    GitLabProvider().list_prs(_project(), "t", PRFilters())
+    # Belt-and-braces: scan recorded requests as well, in case the
+    # handler's assert was bypassed by an exception.
+    assert all("/approvals" not in str(r.url) for r in seen)
+
+
 # ---------- create_pr --------------------------------------------------------
 
 
