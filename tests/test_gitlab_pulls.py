@@ -312,7 +312,7 @@ def test_merge_pr_merge_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
         return _json({}, status_code=404)
 
     _install_mock(monkeypatch, handler)
-    pr = GitLabProvider().merge_pr(_project(), "t", "5", strategy="merge")
+    pr = GitLabProvider().merge_pr(_project(), "t", "5", merge_method="merge")
     assert pr.status == "merged"
     assert "squash" not in captured["body"]
 
@@ -330,16 +330,16 @@ def test_merge_pr_squash_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
         return _json({}, status_code=404)
 
     _install_mock(monkeypatch, handler)
-    GitLabProvider().merge_pr(_project(), "t", "5", strategy="squash")
+    GitLabProvider().merge_pr(_project(), "t", "5", merge_method="squash")
     assert captured["body"]["squash"] is True
 
 
 def test_merge_pr_rebase_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`strategy='rebase'` must surface a clear error pointing at the
+    """`merge_method='rebase'` must surface a clear error pointing at the
     separate rebase endpoint."""
     _install_mock(monkeypatch, lambda r: _json({}, 200))
     with pytest.raises(ValueError, match="rebase"):
-        GitLabProvider().merge_pr(_project(), "t", "5", strategy="rebase")
+        GitLabProvider().merge_pr(_project(), "t", "5", merge_method="rebase")
 
 
 def test_merge_pr_unknown_strategy_rejected(
@@ -348,7 +348,7 @@ def test_merge_pr_unknown_strategy_rejected(
     _install_mock(monkeypatch, lambda r: _json({}, 200))
     with pytest.raises(ValueError, match="unsupported"):
         GitLabProvider().merge_pr(
-            _project(), "t", "5", strategy="cherry-pick",
+            _project(), "t", "5", merge_method="cherry-pick",
         )
 
 
@@ -369,7 +369,7 @@ def test_merge_pr_refetches_after_merge(
         return _json({}, 404)
 
     _install_mock(monkeypatch, handler)
-    GitLabProvider().merge_pr(_project(), "t", "5", strategy="merge")
+    GitLabProvider().merge_pr(_project(), "t", "5", merge_method="merge")
     # Sequence: PUT /merge then GET /merge_requests/5
     assert seen_methods[0].startswith("PUT")
     assert seen_methods[0].endswith("/merge")
@@ -392,10 +392,59 @@ def test_merge_pr_commit_message_routed_per_strategy(
 
     _install_mock(monkeypatch, handler)
     p = _project()
-    GitLabProvider().merge_pr(p, "t", "5", strategy="merge", commit_message="m1")
-    GitLabProvider().merge_pr(p, "t", "5", strategy="squash", commit_message="m2")
+    GitLabProvider().merge_pr(
+        p, "t", "5", merge_method="merge", commit_message="m1",
+    )
+    GitLabProvider().merge_pr(
+        p, "t", "5", merge_method="squash", commit_message="m2",
+    )
     assert captured["bodies"][0]["merge_commit_message"] == "m1"
     assert captured["bodies"][1]["squash_commit_message"] == "m2"
+
+
+def test_gitlab_merge_pr_default_merge_method(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default `merge_method="merge"` must NOT send `merge_method` in
+    the PUT body (GitLab doesn't accept that field) and must not toggle
+    `squash`. Guards the GitHub-style signature unification (#52 F1).
+    """
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT":
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_mr_payload(5, state="merged"))
+        return _json(_mr_payload(5, state="merged"))
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().merge_pr(_project(), "t", "5", merge_method="merge")
+    assert "merge_method" not in captured["body"]
+    assert "squash" not in captured["body"]
+
+
+def test_gitlab_merge_pr_squash_with_commit_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`commit_title` + `commit_message` join into a single GitLab-side
+    `squash_commit_message` separated by a blank line (#52 F1 parity)."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT":
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_mr_payload(5, state="merged"))
+        return _json(_mr_payload(5, state="merged"))
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().merge_pr(
+        _project(), "t", "5",
+        merge_method="squash",
+        commit_title="T",
+        commit_message="B",
+    )
+    assert captured["body"]["squash"] is True
+    assert captured["body"]["squash_commit_message"] == "T\n\nB"
 
 
 # ---------- inline review comments (ticket #43 D) --------------------------

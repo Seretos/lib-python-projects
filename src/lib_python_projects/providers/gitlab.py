@@ -2142,48 +2142,68 @@ class GitLabProvider(TokenCapabilityProvider):
         project: ProjectConfig,
         token: str | None,
         pr_id: str,
-        strategy: str = "merge",
+        merge_method: str = "merge",
+        commit_title: str | None = None,
         commit_message: str | None = None,
     ) -> PullRequest:
         """Merge a merge request.
 
-        Strategy mapping:
+        `merge_method` mapping (unified with GitHub — see #52 F1):
           - `"merge"` → POST `.../merge` with no `squash` flag (true
             merge commit).
           - `"squash"` → POST `.../merge` with `squash=true`.
           - `"rebase"` → rejected. GitLab's rebase flow is a separate
             `PUT .../rebase` endpoint that doesn't perform the merge
             itself; agents wanting a rebase-first merge should call
-            the rebase endpoint and then `merge_pr(strategy="merge")`.
+            the rebase endpoint and then `merge_pr(merge_method="merge")`.
             We surface a clear error here rather than silently doing
             something different.
+
+        `commit_title` / `commit_message` are joined into the GitLab-side
+        `merge_commit_message` (for `"merge"`) or `squash_commit_message`
+        (for `"squash"`):
+          - both set → `"<title>\\n\\n<message>"`
+          - only `commit_title` set → title used as the whole message
+          - only `commit_message` set → message used unchanged
+          - neither set → no commit message override sent
 
         After the merge call, the MR is re-fetched so the response
         carries `merged_at`, `merge_commit_sha`, and the final
         `state="merged"`.
         """
-        if strategy == "rebase":
+        if merge_method == "rebase":
             raise ValueError(
-                "GitLab does not support 'rebase' as a merge strategy. "
+                "GitLab does not support 'rebase' as a merge_method. "
                 "Use a separate rebase flow (PUT .../rebase) then call "
-                "merge_pr(strategy='merge')."
+                "merge_pr(merge_method='merge')."
             )
-        if strategy not in ("merge", "squash"):
+        if merge_method not in ("merge", "squash"):
             raise ValueError(
-                f"unsupported merge strategy {strategy!r} — accepted: "
+                f"unsupported merge_method {merge_method!r} — accepted: "
                 f"merge, squash"
             )
         path = _project_path(project)
         payload: dict[str, Any] = {}
-        if strategy == "squash":
+        if merge_method == "squash":
             payload["squash"] = True
-        if commit_message:
+        # Join commit_title + commit_message into the appropriate
+        # GitLab-side field. GitLab has no separate title/body split
+        # for merge commits.
+        if commit_title is not None and commit_message is not None:
+            joined_message: str | None = f"{commit_title}\n\n{commit_message}"
+        elif commit_title is not None:
+            joined_message = commit_title
+        elif commit_message is not None:
+            joined_message = commit_message
+        else:
+            joined_message = None
+        if joined_message is not None:
             # GitLab uses `merge_commit_message` for merge, and
             # `squash_commit_message` for squash. Send the appropriate one.
-            if strategy == "squash":
-                payload["squash_commit_message"] = commit_message
+            if merge_method == "squash":
+                payload["squash_commit_message"] = joined_message
             else:
-                payload["merge_commit_message"] = commit_message
+                payload["merge_commit_message"] = joined_message
         with _client(project, token) as client:
             r = client.put(
                 f"/projects/{path}/merge_requests/{pr_id}/merge", json=payload,
