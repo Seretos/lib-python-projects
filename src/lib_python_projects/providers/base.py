@@ -1,0 +1,447 @@
+"""Provider abstraction — common types shared by GitHub/GitLab."""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Literal
+
+
+_TIMESTAMP_FRACTION_RE = re.compile(
+    r"(?P<base>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.\d+"
+    r"(?P<tz>(?:Z|[+-]\d{2}:?\d{2}))?$"
+)
+
+
+def normalize_timestamp(raw: str | None) -> str:
+    """Normalise a provider-returned timestamp to second precision (#49 finding 10).
+
+    GitHub returns `"2026-05-20T23:07:48Z"` (seconds), GitLab returns
+    `"2026-05-20T23:07:59.507Z"` (milliseconds). Both providers feed
+    through this helper so the cross-provider surface looks identical
+    and lexical string comparisons work without surprises.
+
+    Anything not matching `<YYYY-MM-DDTHH:MM:SS><.fraction><tz>` is
+    returned unchanged — we don't want to silently mangle vendor
+    payloads that happen to encode time differently.
+    """
+    if not raw:
+        return raw or ""
+    m = _TIMESTAMP_FRACTION_RE.match(raw)
+    if not m:
+        return raw
+    return f"{m.group('base')}{m.group('tz') or ''}"
+
+# Provider-native status as a free string.
+#
+# Historically a 3-value enum (`open`/`completed`/`not_planned`) was used
+# here, but that model could not represent Azure-DevOps workflows
+# (`Resolved`, `Committed`, custom states, etc.). The string now flows
+# through unchanged; agents discover valid values + semantic hints via
+# `list_ticket_statuses`. GitHub uses a `state:state_reason` suffix
+# encoding to preserve the `closed:completed` vs `closed:not_planned`
+# distinction.
+Status = str
+ListStatus = Literal["open", "closed", "any"]
+
+
+@dataclass
+class Ticket:
+    id: str               # provider-native id (issue.number / iid) as string
+    title: str
+    body: str
+    status: Status
+    author: str
+    assignees: list[str]
+    labels: list[str]
+    url: str
+    created_at: str       # ISO-8601 string
+    updated_at: str
+
+
+@dataclass
+class Comment:
+    id: str
+    author: str
+    body: str
+    url: str
+    created_at: str
+
+
+RelationKind = Literal[
+    "parent",
+    "child",
+    "closes",
+    "closed_by",
+    "duplicate_of",
+    "duplicated_by",
+    "mentions",
+    "mentioned_by",
+    "blocks",
+    "blocked_by",
+    "relates_to",
+]
+
+
+# Kinds that the write-side `add_relation` / `remove_relation` tools
+# accept. Read-only inverse kinds (`closed_by`, `duplicated_by`,
+# `mentioned_by`, `mentions`) are not settable directly — they emerge
+# from the other side of a write or from body content.
+WRITABLE_RELATION_KINDS: tuple[str, ...] = (
+    "parent",
+    "child",
+    "blocks",
+    "blocked_by",
+    "duplicate_of",
+    "relates_to",
+)
+
+
+class RelationKindUnsupported(NotImplementedError):
+    """Raised by a provider when `add_relation` / `remove_relation` is
+    called with a relation kind that provider cannot model natively.
+
+    Carries `kind`, `provider`, and `supported_kinds` so the agent can
+    branch on the failure or surface a precise error to the user.
+    Subclass of `NotImplementedError` so the generic `_safe` wrapper in
+    `tools/_providers.py` translates it to `{"error": "..."}` without
+    further plumbing.
+    """
+
+    def __init__(
+        self,
+        kind: str,
+        provider: str,
+        supported_kinds: tuple[str, ...] | list[str],
+    ) -> None:
+        self.kind = kind
+        self.provider = provider
+        self.supported_kinds = tuple(supported_kinds)
+        super().__init__(
+            f"relation kind {kind!r} is not supported on provider "
+            f"{provider!r}; supported_kinds={list(supported_kinds)}"
+        )
+
+
+@dataclass
+class Relation:
+    """A typed link between this ticket and another ticket / PR.
+
+    `ticket_id` is `"#N"` for references within the same repository and
+    `"owner/repo#N"` for cross-repo references. `state` is `"open"`,
+    `"closed"`, `"merged"`, or `""` when the provider didn't report one.
+    `is_pull_request` is true when the other side is a PR/MR. `title`
+    is best-effort and may be empty if the provider didn't return it.
+    """
+
+    kind: str
+    ticket_id: str
+    title: str
+    url: str
+    state: str
+    is_pull_request: bool
+
+
+SortBy = Literal["created", "updated", "comments"]
+SortOrder = Literal["asc", "desc"]
+
+
+@dataclass
+class TicketFilters:
+    status: ListStatus = "open"
+    labels: list[str] = field(default_factory=list)
+    assignee: str | None = None
+    search: str | None = None
+    limit: int = 30
+    not_labels: list[str] = field(default_factory=list)
+    author: str | None = None
+    created_after: str | None = None
+    created_before: str | None = None
+    updated_after: str | None = None
+    updated_before: str | None = None
+    sort_by: SortBy = "created"
+    sort_order: SortOrder = "desc"
+
+
+PRStatus = Literal["open", "closed", "merged"]
+PRListStatus = Literal["open", "closed", "any"]
+
+
+@dataclass
+class PullRequest:
+    """A pull-request snapshot mirroring `Ticket` but with PR-specific fields.
+
+    `id` is the PR number as a string (mirrors `Ticket.id` style).
+    `mergeable` is `None` when GitHub has not yet computed mergeability.
+
+    Provider-specific fields are nullable on the other provider:
+
+    Shared:
+      - `merge_commit_sha`: the SHA of the merge commit once merged.
+
+    GitHub-only (always `None` on GitLab payloads):
+      - `mergeable_state`: GitHub's qualitative state — `clean`, `dirty`,
+        `behind`, `unstable`, `blocked`, `draft`, `unknown`.
+      - `review_decision`: `APPROVED` / `REVIEW_REQUIRED` /
+        `CHANGES_REQUESTED`. Sourced from GraphQL only; the REST `_map_pr`
+        path leaves it `None`.
+      - `auto_merge`: GitHub's auto-merge configuration block (or `None`
+        when auto-merge is not enabled).
+
+    GitLab-only (always `None` on GitHub payloads):
+      - `detailed_merge_status`: GitLab's qualitative state — `mergeable`,
+        `broken_status`, `ci_must_pass`, `discussions_not_resolved`, etc.
+      - `pipeline_status`: head-pipeline status (`success`, `failed`,
+        `running`, ...). `None` when no pipeline is attached.
+      - `approvals_required` / `approvals_received`: GitLab approval
+        counts (Premium+); both `None` on free tier.
+    """
+
+    id: str
+    number: int
+    title: str
+    body: str
+    status: PRStatus
+    draft: bool
+    author: str
+    assignees: list[str]
+    reviewers: list[str]              # users who actually submitted a review
+    requested_reviewers: list[str]
+    labels: list[str]
+    head: dict                        # {"ref", "sha", "repo_full_name"}
+    base: dict                        # {"ref", "sha"}
+    merged: bool
+    mergeable: bool | None
+    url: str
+    created_at: str
+    updated_at: str
+    mergeable_state: str | None = None
+    merge_commit_sha: str | None = None
+    review_decision: str | None = None
+    auto_merge: dict | None = None
+    detailed_merge_status: str | None = None
+    pipeline_status: str | None = None
+    approvals_required: int | None = None
+    approvals_received: int | None = None
+
+
+@dataclass
+class ReviewComment:
+    """An inline (code-review) comment on a pull-request diff.
+
+    Distinct from `Comment`, which is the issue-style discussion
+    comment. Review comments are anchored to a file path and a line in
+    the diff and are organised into threads (`in_reply_to`).
+
+    Field semantics:
+      - `path`: file path the comment is attached to. `None` only for
+        legacy GitLab notes that lost their position metadata.
+      - `line`: line number on the post-change ("RIGHT") side of the
+        diff. `None` when the position is unresolvable (e.g. outdated
+        comment whose anchor moved out of the latest diff).
+      - `original_line`: the line as of `original_commit_sha`. GitHub
+        only; GitLab leaves it `None`.
+      - `side`: `"LEFT"` for a deletion-side anchor, `"RIGHT"` for the
+        addition side. `None` for GitLab (uses `old_line`/`new_line`
+        directly).
+      - `commit_sha`: the diff base the comment was anchored against.
+      - `in_reply_to`: the id of the comment / discussion this is a
+        reply to, or `None` for new threads. On GitHub this is the
+        parent comment id; on GitLab it is the discussion id (so
+        multiple notes in the same discussion share the same value).
+      - `discussion_id`: the thread anchor — the value to pass as
+        `in_reply_to` when replying. Provider-uniform semantic: every
+        note in the same thread carries the same `discussion_id`,
+        regardless of provider. On GitHub the value is the top-of-thread
+        note id (`in_reply_to_id` for replies, own `id` for the first
+        note); on GitLab it is the actual discussion id from the
+        `/discussions` endpoint.
+    """
+
+    id: str
+    author: str
+    body: str
+    path: str | None
+    line: int | None
+    original_line: int | None = None
+    side: str | None = None
+    commit_sha: str = ""
+    in_reply_to: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+    url: str = ""
+    discussion_id: str | None = None
+
+
+ReviewState = Literal["approve", "request_changes", "comment"]
+
+
+@dataclass
+class Review:
+    """A pull-request review submission.
+
+    `state` is normalized to provider-agnostic lower-case values:
+    `"approve"`, `"request_changes"`, `"comment"`. GitHub's enum maps
+    directly; GitLab's discrete endpoints (`approve` / `unapprove` +
+    note) are synthesised into the same surface.
+
+    `commit_sha` is set only when the provider pins reviews to a
+    specific commit (GitHub). GitLab leaves it `None`.
+    """
+
+    id: str
+    state: ReviewState
+    author: str
+    body: str
+    url: str
+    submitted_at: str
+    commit_sha: str | None = None
+
+
+@dataclass
+class StatusSpec:
+    """Result of `list_ticket_statuses` — discovery payload for the
+    provider-native status state-space.
+
+    `values` lists every accepted status string (including any GitHub
+    `state:state_reason` suffix encodings). `transitions` maps each
+    value to the values that can legally follow it. `hints` exposes
+    semantic anchors so agents can act without provider-specific
+    knowledge:
+
+    - `default_open` — the value to use when reopening a ticket.
+    - `terminal` — every value that ends the workflow.
+    - `terminal_completed` — the terminal value meaning "done as planned".
+    - `terminal_declined` — the terminal value meaning "won't do" /
+      "not planned".
+
+    For providers that don't distinguish completed-vs-declined (GitLab,
+    most ADO templates) `terminal_completed` and `terminal_declined`
+    may be the same value.
+    """
+
+    values: list[str]
+    transitions: dict[str, list[str]]
+    hints: dict[str, str | list[str]]
+
+
+@dataclass
+class PRFilters:
+    status: PRListStatus = "open"
+    labels: list[str] = field(default_factory=list)
+    assignee: str | None = None
+    head: str | None = None           # branch name (`feat/x`) or `owner:branch`
+    base: str | None = None
+    search: str | None = None
+    limit: int = 30
+
+
+# ---------- pipelines / CI runs ---------------------------------------------
+
+
+@dataclass
+class FailingJob:
+    """A single failing job within a pipeline run.
+
+    `failed_step` is the name of the step that flipped the job red, when
+    GitHub reports it. `annotations` is the list of GitHub Check-Run
+    annotations attached to the job (typically the `failure` /
+    `warning` items emitted by build tooling). `log_excerpt` is a small
+    text excerpt around the failure (or `None` when logs were
+    unavailable, e.g. 403/404 on the log endpoint).
+    """
+
+    name: str
+    url: str
+    failed_step: str
+    annotations: list[dict]
+    log_excerpt: str | None
+
+
+@dataclass
+class PipelineFailure:
+    """Aggregated failure context for a single completed-failed run."""
+
+    failing_jobs: list[FailingJob]
+    note: str | None = None  # e.g. "logs unavailable"
+
+
+@dataclass
+class PipelineRun:
+    """A CI/CD pipeline run (GitHub Actions workflow_run / GitLab pipeline).
+
+    `conclusion` is `None` for in-progress runs. `failure` is only
+    populated by `get_pipeline_run` when the caller asks for the
+    failure excerpt AND the run actually concluded as failed.
+    """
+
+    id: str
+    name: str
+    branch: str
+    head_sha: str
+    event: str
+    status: str
+    conclusion: str | None
+    url: str
+    created_at: str
+    updated_at: str
+    run_attempt: int
+    failure: PipelineFailure | None = None
+
+
+# ---------- token capabilities (ticket #32) ---------------------------------
+
+
+@dataclass
+class TokenCapabilities:
+    """Result of `probe_token_capabilities` — what a given token may do
+    against a given project.
+
+    Mirrors the nested `Permissions` model from `config.py` so the result
+    can be substituted in directly for auto-discovered projects:
+
+    - `issues_create` / `issues_modify` — issue write operations.
+    - `pulls_create` / `pulls_modify` / `pulls_merge` — pull-request
+      write operations.
+
+    `reason` is `None` on the happy path. On any failure mode it carries
+    a stable string identifier so the caller (and tests) can branch on
+    it without parsing free-form text:
+
+    - `"bad_credentials"`        — 401 from the provider.
+    - `"repo_invisible_to_token"` — 404 from the provider (the token has
+      no visibility into the repo, which is GitHub's privacy-preserving
+      response for both "doesn't exist" and "exists but you can't see it").
+    - `"network_error"`           — transport-level failure (DNS,
+      connection refused, timeout, ...).
+    - `"permissions_field_missing"` — request succeeded but GitHub
+      didn't populate `permissions` on the response (classic PAT
+      sometimes, or unexpected payload shape). Combined with all-False
+      flags this preserves today's hardcoded-False default behavior.
+
+    When `reason` is not `None`, all boolean flags should be False —
+    the caller must not grant any operation based on a failed probe.
+    """
+
+    issues_create: bool = False
+    issues_modify: bool = False
+    pulls_create: bool = False
+    pulls_modify: bool = False
+    pulls_merge: bool = False
+    reason: str | None = None
+
+
+class TokenCapabilityProvider:
+    """Mixin/interface: providers that can probe a token's effective
+    capabilities against a single project implement this method.
+
+    Implementations MUST NOT raise on expected failure modes (401, 404,
+    network error, missing field) — they must return a `TokenCapabilities`
+    with `reason` set and all flags False so the caller can degrade
+    gracefully. Only programming errors (bad project shape, etc.) should
+    propagate.
+    """
+
+    def probe_token_capabilities(
+        self, project, token: str
+    ) -> TokenCapabilities:
+        raise NotImplementedError

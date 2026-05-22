@@ -1,0 +1,271 @@
+"""Tests for the GitLab provider's pipeline (CI run) surface."""
+from __future__ import annotations
+
+import json
+from typing import Callable
+
+import httpx
+import pytest
+
+from lib_python_projects import ProjectConfig
+from lib_python_projects.providers import gitlab as gitlab_mod
+from lib_python_projects.providers.gitlab import GitLabProvider
+
+
+def _project() -> ProjectConfig:
+    return ProjectConfig(
+        id="acme", provider="gitlab", path="acme/backend",
+        token_env="GITLAB_TOKEN_ACME",
+    )
+
+
+def _install_mock(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> list[httpx.Request]:
+    seen: list[httpx.Request] = []
+
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return handler(request)
+
+    transport = httpx.MockTransport(wrapped)
+
+    def fake_client(project: ProjectConfig, token: str | None) -> httpx.Client:
+        headers = {"Accept": "application/json", "User-Agent": "test"}
+        if token:
+            headers["PRIVATE-TOKEN"] = token
+        return httpx.Client(
+            base_url=gitlab_mod._base_url(project),
+            headers=headers,
+            transport=transport,
+        )
+
+    monkeypatch.setattr(gitlab_mod, "_client", fake_client)
+    return seen
+
+
+def _json(payload, status_code: int = 200) -> httpx.Response:
+    return httpx.Response(
+        status_code=status_code,
+        content=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+
+
+def _pipeline(pid: int, **overrides) -> dict:
+    base = {
+        "id": pid,
+        "ref": "main",
+        "sha": "abc",
+        "source": "push",
+        "status": "success",
+        "web_url": f"https://gitlab.com/acme/backend/-/pipelines/{pid}",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:05:00Z",
+    }
+    base.update(overrides)
+    return base
+
+
+# ---------- list_runs_for_branch / tag / commit ------------------------------
+
+
+def test_list_runs_for_branch_sends_ref(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert "/pipelines" in str(req.url)
+        assert req.url.params.get("ref") == "main"
+        return _json([_pipeline(1), _pipeline(2)])
+
+    _install_mock(monkeypatch, handler)
+    runs = GitLabProvider().list_runs_for_branch(_project(), "t", "main")
+    assert [r.id for r in runs] == ["1", "2"]
+
+
+def test_list_runs_for_tag_uses_ref_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitLab doesn't distinguish branch vs tag — both use `ref`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.params.get("ref") == "v1.0.0"
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    runs, refs = GitLabProvider().list_runs_for_tag(_project(), "t", "v1.0.0")
+    assert refs == ["v1.0.0"]
+    assert runs == []
+
+
+def test_list_runs_for_commit_sends_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.params.get("sha") == "deadbeef"
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().list_runs_for_commit(_project(), "t", "deadbeef")
+
+
+def test_list_runs_limit_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.params.get("per_page") == "100"
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().list_runs_for_branch(_project(), "t", "main", limit=500)
+
+
+# ---------- list_runs_for_ticket ---------------------------------------------
+
+
+def test_list_runs_for_ticket_walks_related_mrs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Walk related_merge_requests → per-MR pipelines → flatten."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/issues/5/related_merge_requests"):
+            return _json([{"iid": 10}, {"iid": 11}])
+        if "/merge_requests/10/pipelines" in url:
+            return _json([_pipeline(100, created_at="2024-01-01T00:00:00Z")])
+        if "/merge_requests/11/pipelines" in url:
+            return _json([
+                _pipeline(101, created_at="2024-01-02T00:00:00Z"),
+                _pipeline(102, created_at="2024-01-03T00:00:00Z"),
+            ])
+        return _json([], status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    runs, refs = GitLabProvider().list_runs_for_ticket(_project(), "t", "5")
+    # All 3 pipelines, sorted by created_at desc.
+    assert [r.id for r in runs] == ["102", "101", "100"]
+    # MR iids prefixed with `!` mirror GitHub's resolved_refs surface.
+    assert refs == ["!10", "!11"]
+
+
+def test_list_runs_for_ticket_no_related_mrs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/related_merge_requests" in str(req.url):
+            return _json([])
+        return _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    runs, refs = GitLabProvider().list_runs_for_ticket(_project(), "t", "5")
+    assert runs == []
+    assert refs == []
+
+
+# ---------- get_run ----------------------------------------------------------
+
+
+def test_get_run_basic(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_pipeline(100))
+
+    _install_mock(monkeypatch, handler)
+    run = GitLabProvider().get_run(_project(), "t", "100")
+    assert run.id == "100"
+    assert run.failure is None  # not requested
+
+
+def test_get_run_succeeds_skips_failure_context_even_if_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """include_failure_excerpt=True on a successful run still returns
+    `failure=None` — only failed runs trigger the jobs/traces walk."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_pipeline(100, status="success"))
+
+    _install_mock(monkeypatch, handler)
+    run = GitLabProvider().get_run(
+        _project(), "t", "100", include_failure_excerpt=True,
+    )
+    assert run.conclusion == "success"
+    assert run.failure is None
+
+
+def test_get_run_failed_with_failure_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed run + flag set → walks jobs, fetches trace for failing
+    ones, builds PipelineFailure."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/pipelines/100/jobs" in url:
+            return _json([
+                {
+                    "id": 1, "name": "build", "status": "success",
+                    "stage": "build", "web_url": "u1",
+                },
+                {
+                    "id": 2, "name": "test", "status": "failed",
+                    "stage": "test", "web_url": "u2",
+                },
+                {
+                    "id": 3, "name": "lint", "status": "failed",
+                    "stage": "test", "web_url": "u3",
+                },
+            ])
+        if "/pipelines/100" in url and "/jobs" not in url:
+            return _json(_pipeline(100, status="failed"))
+        if "/jobs/2/trace" in url:
+            return httpx.Response(
+                200, content=b"build log...\nFAIL: assertion error\n",
+                headers={"Content-Type": "text/plain"},
+            )
+        if "/jobs/3/trace" in url:
+            # Make this trace huge → ensure tail-truncation logic works.
+            return httpx.Response(
+                200, content=b"x" * 10000 + b"\nLAST LINE\n",
+                headers={"Content-Type": "text/plain"},
+            )
+        return _json({}, 404)
+
+    _install_mock(monkeypatch, handler)
+    run = GitLabProvider().get_run(
+        _project(), "t", "100", include_failure_excerpt=True,
+    )
+    assert run.conclusion == "failed"
+    assert run.failure is not None
+    failing = run.failure.failing_jobs
+    assert len(failing) == 2
+    names = sorted(j.name for j in failing)
+    assert names == ["lint", "test"]
+    # Annotations are always [] for GitLab (no structured surface).
+    for j in failing:
+        assert j.annotations == []
+    # Trace excerpt is truncated to a reasonable tail for the big one.
+    big_job = [j for j in failing if j.name == "lint"][0]
+    assert big_job.log_excerpt is not None
+    assert len(big_job.log_excerpt) <= 4096
+    assert "LAST LINE" in big_job.log_excerpt  # tail must include actual failure
+
+
+def test_get_run_failed_handles_jobs_endpoint_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the jobs endpoint 404s/403s, `failure` carries a note rather
+    than blowing up the whole get_run call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/pipelines/100/jobs" in url:
+            return _json({"message": "forbidden"}, 403)
+        if "/pipelines/100" in url:
+            return _json(_pipeline(100, status="failed"))
+        return _json({}, 404)
+
+    _install_mock(monkeypatch, handler)
+    run = GitLabProvider().get_run(
+        _project(), "t", "100", include_failure_excerpt=True,
+    )
+    assert run.failure is not None
+    assert run.failure.failing_jobs == []
+    assert run.failure.note is not None
