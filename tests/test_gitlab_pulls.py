@@ -218,9 +218,8 @@ def test_gitlab_get_pr_review_decision_required(
 def test_gitlab_get_pr_no_approval_rules(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No approval rules configured: approvals_required=0 → no gate to
-    report; review_decision stays None to match GitHub's shape on PRs
-    without a required-review rule."""
+    """No approval rules configured AND nobody approved: review_decision
+    stays None (truly "nothing happened yet")."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         url = str(req.url)
@@ -241,6 +240,64 @@ def test_gitlab_get_pr_no_approval_rules(
     assert pr.review_decision is None
     assert pr.approvals_received == 0
     assert pr.approvals_required == 0
+
+
+def test_gitlab_get_pr_no_rules_but_someone_approved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No approval rules configured, but somebody hit `approve` on the
+    MR: ad-hoc approves still surface as review_decision=APPROVED so
+    consumers can tell "approved" apart from "no review yet" — the
+    exact case #52 F9 sandbox testing flagged."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5/approvals"):
+            return _json({
+                "approvals_required": 0,
+                "approvals_left": 0,
+                "approved_by": [{"user": {"username": "alice"}}],
+            })
+        if url.endswith("merge_requests/5"):
+            return _json(_mr_payload(5))
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    assert pr.review_decision == "APPROVED"
+    assert pr.approvals_received == 1
+    assert pr.approvals_required == 0
+
+
+def test_gitlab_get_pr_gate_partially_approved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate requires 2 approvals, only 1 has signed off: review_decision
+    must be REVIEW_REQUIRED (the gate is not satisfied) even though
+    approved_by is non-empty."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5/approvals"):
+            return _json({
+                "approved": False,
+                "approvals_required": 2,
+                "approvals_left": 1,
+                "approved_by": [{"user": {"username": "alice"}}],
+            })
+        if url.endswith("merge_requests/5"):
+            return _json(_mr_payload(5))
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    assert pr.review_decision == "REVIEW_REQUIRED"
+    assert pr.approvals_received == 1
+    assert pr.approvals_required == 2
 
 
 def test_gitlab_list_prs_does_not_fetch_approvals(

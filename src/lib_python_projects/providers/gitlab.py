@@ -394,15 +394,25 @@ def _map_mr(
                 approvals_required > 0
                 and int(approvals.get("approvals_left") or 0) == 0
             )
-        if approvals_required == 0:
-            # No gate configured → no decision to report. Matches
-            # GitHub's `review_decision = None` on PRs without
-            # required-review rules.
-            review_decision: str | None = None
-        elif approved:
+        # Decision logic (#52 F9):
+        #   - Gate configured (approvals_required > 0): trust the
+        #     `approved` boolean. `approved=True` means the gate is
+        #     satisfied → APPROVED. Anything else (including partial
+        #     approvals like 1-of-2) → REVIEW_REQUIRED.
+        #   - No gate (approvals_required == 0): an ad-hoc approve
+        #     still counts. If `approved_by` is non-empty, surface
+        #     APPROVED so consumers can tell "someone approved" apart
+        #     from "no review yet". Empty list → None (truly nothing
+        #     happened). This is the case the sandbox hit when the
+        #     original F9 partial-fix surfaced approvals_received but
+        #     left review_decision at None.
+        review_decision: str | None
+        if approvals_required > 0:
+            review_decision = "APPROVED" if approved else "REVIEW_REQUIRED"
+        elif approved_by:
             review_decision = "APPROVED"
         else:
-            review_decision = "REVIEW_REQUIRED"
+            review_decision = None
     else:
         approvals_required = raw.get("approvals_required")
         approvals_received = raw.get("approvals_received")
