@@ -1,0 +1,131 @@
+name: release
+
+# Manual lib-release flow. Analogous to the plugin's release.yml but
+# without the binary build (libs ship as Python source distributions
+# pulled by downstream consumers via `git+https://.../@vX.Y.Z` or
+# `@release/Nx`). Topology:
+#
+#   stamp+publish (ubuntu-22.04) -> validates semver, fails on
+#                                   duplicate tag, stamps pyproject.toml
+#                                   with the requested version on a
+#                                   fresh release branch built off main,
+#                                   tags the stamp commit as vX.Y.Z,
+#                                   force-pushes release/Nx (the
+#                                   floating branch downstream consumers
+#                                   pin to), and creates the GitHub
+#                                   Release. `main` is never touched —
+#                                   the bot commit lives only on the
+#                                   release/Nx branch.
+#
+# Release-branch policy:
+#   release/0.x  — all 0.x.y releases.   Force-pushed each release.
+#   release/1.x  — all 1.x.y releases.   Created the first time a 1.x.y
+#                  release is published; force-pushed each release after.
+#   release/Nx   — analogous.
+#
+# Past tags remain reachable via `git+https://.../@vX.Y.Z` even after
+# a force-push because the commit they point to is preserved by git as
+# long as the tag exists.
+#
+# Cross-lib note: this lib pins lib-python-config via @release/0.x
+# (see pyproject.toml). A release here ships with whichever config
+# commit sits on that branch at install time — bump config first if
+# this release needs a specific config-side fix.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (semver, no leading v) e.g. 0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate version is semver
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Version '$V' is not valid semver (expected MAJOR.MINOR.PATCH[-PRERELEASE])."
+            exit 1
+          fi
+
+      - name: Check tag does not yet exist
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ inputs.version }}"
+          if gh api "repos/${{ github.repository }}/git/refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists. Delete it first or pick a new version."
+            exit 1
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Compute release-branch name
+        id: branch
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          MAJOR=$(echo "$V" | cut -d. -f1)
+          BRANCH="release/${MAJOR}.x"
+          echo "name=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "Will publish to ${BRANCH}"
+
+      - name: Stamp pyproject.toml, commit, tag, force-push release branch
+        # Stamp via sed (POSIX, no extra tools), anchored to start of
+        # line to avoid touching nested versions in tool tables. The
+        # stamp commit lives only on the release/Nx branch — main
+        # stays at whatever HEAD it was before this workflow ran.
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          TAG="v${V}"
+          BRANCH="${{ steps.branch.outputs.name }}"
+
+          sed -i -E 's/^(version[[:space:]]*=[[:space:]]*")[^"]*(")/\1'"$V"'\2/' pyproject.toml
+          grep -E "^version[[:space:]]*=[[:space:]]*\"$V\"" pyproject.toml \
+            || { echo "::error::pyproject.toml stamp failed"; exit 1; }
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Build the release branch fresh from main HEAD each time.
+          # Past tags pin past commits — they are independent of where
+          # the release/Nx pointer currently sits.
+          git checkout -B "$BRANCH"
+          git add pyproject.toml
+          git commit -m "release: ${TAG}"
+
+          git tag -a "$TAG" -m "${TAG}"
+
+          git push origin "$BRANCH" --force
+          git push origin "$TAG"
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ inputs.version }}"
+          PRE_FLAG=""
+          if [[ "${{ inputs.version }}" == *-* ]]; then
+            PRE_FLAG="--prerelease"
+          fi
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --generate-notes \
+            $PRE_FLAG
