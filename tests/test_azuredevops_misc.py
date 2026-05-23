@@ -671,3 +671,82 @@ def test_check_invalid_argument_state_still_hints(
     with pytest.raises(AzureDevOpsError) as exc:
         AzureDevOpsProvider().get_ticket(_project(), token="t", ticket_id="5")
     assert "list_ticket_statuses" in str(exc.value)
+
+
+# ---------- add_relation duplicate_of ----------------------------------------
+
+
+def test_add_relation_duplicate_of_appends_body_marker_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation(kind='duplicate_of') must:
+    1. Issue the relation-link PATCH first.
+    2. GET the source work item to read description + type.
+    3. GET workitemtypes/Issue/states for the closed state.
+    4. Issue a second PATCH that sets System.Description (containing
+       'Duplicate of #5') and System.State to 'Closed'.
+    5. Return Relation(kind='duplicate_of', ticket_id='#5').
+    """
+    body_close_captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Relation-link PATCH and body+close PATCH both target /workitems/10.
+        if req.method == "PATCH" and "/workitems/10" in path:
+            body = json.loads(req.content.decode("utf-8"))
+            # Distinguish by patch ops: relation-link patch has path "/relations/-"
+            if any(op.get("path") == "/relations/-" for op in body):
+                return _json({"id": 10})
+            # Body+close patch has fields ops.
+            body_close_captured["patch"] = body
+            return _json({"id": 10})
+        # GET source work item
+        if req.method == "GET" and "/workitems/10" in path and "workitemtypes" not in path:
+            return _json({
+                "id": 10,
+                "fields": {
+                    "System.Description": "<p>Original body</p>",
+                    "System.WorkItemType": "Issue",
+                },
+            })
+        # GET workitemtypes/Issue/states
+        if req.method == "GET" and "workitemtypes/Issue/states" in path:
+            return _json({"value": [
+                {"name": "Active", "category": "InProgress"},
+                {"name": "Closed", "category": "Completed"},
+            ]})
+        # workitemsbatch for target title+state lookup
+        if req.url.path.endswith("/_apis/wit/workitemsbatch"):
+            ids = json.loads(req.content.decode("utf-8"))["ids"]
+            return _json({
+                "value": [
+                    {
+                        "id": wid,
+                        "fields": {
+                            "System.Title": f"target {wid}",
+                            "System.State": "Active",
+                        },
+                    }
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    rel = AzureDevOpsProvider().add_relation(
+        _project(), token="t", ticket_id="10", kind="duplicate_of", target="5"
+    )
+    assert rel.kind == "duplicate_of"
+    assert rel.ticket_id == "#5"
+
+    # Verify the body+close patch was captured.
+    assert body_close_captured, "body+close PATCH was never issued"
+    patch_ops = body_close_captured["patch"]
+    desc_ops = [op for op in patch_ops if op.get("path") == "/fields/System.Description"]
+    state_ops = [op for op in patch_ops if op.get("path") == "/fields/System.State"]
+    assert desc_ops, "System.Description op missing from body+close patch"
+    assert state_ops, "System.State op missing from body+close patch"
+    assert "Duplicate of #5" in (desc_ops[0].get("value") or ""), (
+        "body must contain 'Duplicate of #5'"
+    )
+    assert state_ops[0].get("value") == "Closed"

@@ -370,3 +370,48 @@ def test_include_relations_false_skips_link_fetch(
     assert relations == []
     assert not any("/links" in u for u in seen_urls)
     assert not any("/closed_by" in u for u in seen_urls)
+
+
+# ---------- duplicate_of dedup -----------------------------------------------
+
+
+def test_duplicate_of_suppresses_relates_to_for_same_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After add_relation(kind="duplicate_of") the body contains 'Duplicate of #1'
+    and the issue-links API returns a 'relates_to' link for the same target.
+    get_ticket must return exactly one relation for #1 with kind 'duplicate_of',
+    and NO 'relates_to' entry for the same target.
+    """
+    body = "Duplicate of #1"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("issues/5"):
+            return _json(_issue_with_body(5, body=body))
+        if "/issues/5/links" in url:
+            # The native relates_to link written by _gitlab_mark_duplicate_of.
+            return _json([{
+                "iid": 1,
+                "link_type": "relates_to",
+                "title": "Target issue",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/1",
+                "state": "opened",
+                "references": {"relative": "#1"},
+            }])
+        if "/issues/5/closed_by" in url:
+            return _json([])
+        if "/issues/5/notes" in url:
+            return _json([])
+        return _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    _, _, relations, _ = GitLabProvider().get_ticket(_project(), "t", "5")
+    pairs = _kinds(relations)
+    # Must have exactly one duplicate_of entry for #1.
+    assert ("duplicate_of", "#1") in pairs
+    # The spurious relates_to for the same target must be gone.
+    assert ("relates_to", "#1") not in pairs
+    # Exactly one entry for #1 in total.
+    entries_for_1 = [(k, t) for k, t in pairs if t == "#1"]
+    assert len(entries_for_1) == 1

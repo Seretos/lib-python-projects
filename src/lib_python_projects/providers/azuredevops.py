@@ -2890,6 +2890,69 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                 json=patch,
             )
         _check(resp)
+
+        # For duplicate_of: append body marker + close the source work item,
+        # matching the GitHub and GitLab providers' _mark_duplicate_of helpers.
+        # The relation-link PATCH above fires FIRST (most likely to fail) so
+        # any error surfaces before we mutate the body or state.
+        if kind == "duplicate_of":
+            # Read the current work item to get description + type.
+            src_path = f"{_project_scope(project)}/_apis/wit/workitems/{quote(str(ticket_id), safe='')}"
+            with _client(project, token) as c:
+                src_resp = c.get(src_path, params=_api_version_params())
+            _check(src_resp)
+            src_fields = (src_resp.json() or {}).get("fields") or {}
+            current_html = src_fields.get("System.Description") or ""
+            current_markdown = _html_to_markdown(current_html)
+            wi_type = src_fields.get("System.WorkItemType") or ""
+            already_ai = has_ai_generated_marker(current_markdown)
+
+            # Build the new body with "Duplicate of #N" prepended.
+            dup_line = f"Duplicate of #{target_id}"
+            body_without_marker = strip_leading_ai_marker(current_markdown)
+            if dup_line not in body_without_marker:
+                new_body_core = (
+                    f"{dup_line}\n\n{body_without_marker}"
+                    if body_without_marker
+                    else dup_line
+                )
+            else:
+                new_body_core = body_without_marker
+            new_body = apply_body_marker(new_body_core, will_be_ai_generated=already_ai)
+
+            # Resolve the "Completed"-category closed state for this work item type.
+            closed_state = "Closed"  # safe fallback
+            if wi_type:
+                try:
+                    states = self._states_for_type(project, token, wi_type)
+                    for s in states:
+                        if s.get("category") == "Completed":
+                            closed_state = s.get("name") or "Closed"
+                            break
+                except Exception:  # noqa: BLE001
+                    pass  # fall through to "Closed" fallback
+
+            body_close_patch = [
+                {
+                    "op": "replace",
+                    "path": "/fields/System.Description",
+                    "value": _markdown_to_html(new_body),
+                },
+                {
+                    "op": "replace",
+                    "path": "/fields/System.State",
+                    "value": closed_state,
+                },
+            ]
+            with _client(project, token) as c:
+                bc_resp = c.patch(
+                    src_path,
+                    params=_api_version_params(),
+                    headers={"Content-Type": "application/json-patch+json"},
+                    json=body_close_patch,
+                )
+            _check(bc_resp)
+
         # Surface the target's title + state so the Relation return
         # matches what `get_ticket` reports for the same link — agents
         # often display this immediately after add_relation succeeds.
