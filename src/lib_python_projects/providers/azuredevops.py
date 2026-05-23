@@ -152,15 +152,28 @@ _TRANSITION_MSG_FRAGMENTS: tuple[str, ...] = (
     "allowed values",
 )
 
+# ADO occasionally returns HTTP 500 for "work item does not exist" instead
+# of the expected 404 / 400.  Narrow-match these so genuine server errors
+# with unrelated messages are not reclassified.
+_500_NOT_FOUND_MSG_FRAGMENTS: tuple[str, ...] = (
+    "does not exist",
+    "could not be found",
+    "was not found",
+)
+
 
 def _check(resp: httpx.Response) -> None:
     """Translate a non-success ADO response into an `AzureDevOpsError`.
 
-    Two extra translations on top of the raw envelope:
+    Three extra translations on top of the raw envelope:
       - ADO returns 400 for several "not found" classes (deleted work
         items, missing PR refs, unknown work-item types). We re-tag
         those as 404 so the tool-layer `_rewrap_404` adds the
         `kind 'project#id' not found` context.
+      - ADO returns 500 for some "work item does not exist" conditions
+        (e.g. add_comment on a missing work item). Message fragments in
+        `_500_NOT_FOUND_MSG_FRAGMENTS` trigger a 500→404 remap; genuine
+        server errors with unrelated messages are NOT reclassified.
       - Work-item state-transition 400s get a hint pointing at
         `list_ticket_statuses`, mirroring the GitHub/GitLab providers.
     """
@@ -195,6 +208,15 @@ def _check(resp: httpx.Response) -> None:
         # the id-echoing context. Two phrasings ADO uses:
         or "too large or too small for an int32" in msg_lower
         or "value was either too large" in msg_lower
+    ):
+        status = 404
+
+    # 500-but-actually-404 normalization.  ADO returns HTTP 500 for
+    # operations on missing work items in some comment endpoints.  Only
+    # reclassify when the message text unambiguously signals "not found";
+    # genuine server errors keep their 500 status.
+    if status == 500 and any(
+        frag in msg_lower for frag in _500_NOT_FOUND_MSG_FRAGMENTS
     ):
         status = 404
 
@@ -356,7 +378,11 @@ def _markdown_to_html(body: str | None) -> str:
     def _flush_para() -> None:
         nonlocal para
         if para:
-            joined = "<br>\n".join(_inline_md(line) for line in para)
+            # Use "<br>" without a trailing newline so the HTMLParser
+            # doesn't deliver the newline as a separate data event,
+            # which would produce a spurious blank line between the
+            # `<br>` and the next line's content on readback.
+            joined = "<br>".join(_inline_md(line) for line in para)
             out.append(f"<p>{joined}</p>")
             para = []
 
@@ -525,6 +551,10 @@ class _MarkdownExtractor(HTMLParser):
         self._link_href: str | None = None
         self._link_text: list[str] = []
         self._in_link = 0
+        # Index into `_out` of the opening fence emitted by the `pre`
+        # handler, waiting for the `code` tag to append a language tag.
+        # None means we're not in a pending-language-fence state.
+        self._pre_fence_idx: int | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr = dict(attrs)
@@ -542,11 +572,30 @@ class _MarkdownExtractor(HTMLParser):
             self._emit("*")
         elif tag == "code":
             self._in_code += 1
-            if not self._in_pre:
+            if self._in_pre:
+                # The `<pre>` handler already emitted the opening fence
+                # as "\n```" (without a trailing newline) and recorded
+                # its index. Now we know the language from the class
+                # attribute (`class="language-X"`). Append the language
+                # tag (if present) and close the fence line with "\n".
+                if self._pre_fence_idx is not None:
+                    cls_attr = attr.get("class") or ""
+                    if cls_attr.startswith("language-"):
+                        lang = cls_attr[len("language-"):]
+                        self._out[self._pre_fence_idx] += lang
+                    self._out[self._pre_fence_idx] += "\n"
+                    self._pre_fence_idx = None
+            else:
                 self._emit("`")
         elif tag == "pre":
             self._in_pre += 1
-            self._emit("\n```\n")
+            # Emit the opening fence without a trailing newline so the
+            # `code` handler can append the language tag first. The
+            # index is stored in `_pre_fence_idx`; the `code` handler
+            # will append "\n" (with or without a language tag) when it
+            # runs, completing the opening fence line.
+            self._emit("\n```")
+            self._pre_fence_idx = len(self._out) - 1
         elif tag == "ul":
             self._list_stack.append("ul")
             self._emit("\n")
@@ -1548,9 +1597,18 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         body_text = _html_to_markdown(
             (raw.get("fields") or {}).get("System.Description")
         )
+        # Build a set of target ids that already appear as typed relations
+        # (phase 1 above).  Any body-text mention of the same id would be
+        # a duplicate — typed links are authoritative, so we skip body refs
+        # to items that are already represented by a typed relation.
+        typed_target_ids: set[str] = {tid for _, tid, _ in typed_targets if tid}
         mention_targets: list[tuple[str, str]] = []
         for ref_kind, ref_id in _scan_refs_for_mentions(body_text):
             if ref_id == str(ticket_id):
+                continue
+            if ref_id in typed_target_ids:
+                # This item already surfaces as a typed relation; don't
+                # also add a separate "mentions" entry for it.
                 continue
             mention_targets.append((ref_kind, ref_id))
 
@@ -1664,6 +1722,21 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         When ``status`` is ``None``, behavior is unchanged: a single POST.
         """
         wi_type = self._default_work_item_type(project, token)
+
+        # Pre-validate the requested status before the POST so the caller
+        # gets a clean ValueError for an unknown state name rather than a
+        # confusing 400 from the follow-up transition PATCH (or, worse, an
+        # orphan work item if the POST succeeds but the transition is
+        # rejected). Mirrors github.py / gitlab.py up-front validation.
+        if status is not None:
+            states = self._states_for_type(project, token, wi_type)
+            valid_names = [s.get("name") for s in states if s.get("name")]
+            if status not in valid_names:
+                raise ValueError(
+                    f"status {status!r} not in accepted values: {valid_names}"
+                    f" — use list_ticket_statuses to discover valid values"
+                )
+
         body_with_marker = ensure_body_prefix(body or "")
         merged_labels = sorted(set([*labels, AI_GENERATED_LABEL]))
 
@@ -2412,6 +2485,11 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         backoff cap is ~3s total; if the merge is still in flight after
         that we raise `AzureDevOpsError(202, …)` so callers know to
         re-fetch rather than treat the snapshot as merged=false.
+
+        Limitation: ADO branch policies can override the requested merge
+        strategy server-side without returning an error. When the settled
+        PR reports a different ``mergeStrategy`` than the one we sent, a
+        warning is emitted so callers are aware of the discrepancy.
         """
         repo_id = self._resolve_repository_id(project, token)
         path = (
@@ -2447,6 +2525,21 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         # Settle-loop: ADO returns the PATCH response before the async
         # merge finishes. Poll until mergeStatus is a terminal state.
         settled = self._wait_for_merge_settle(project, token, path, pr_id)
+
+        # Branch policies may silently override the requested merge
+        # strategy.  Warn when a non-default strategy was requested and
+        # the settled PR reports a different one so callers are aware.
+        if merge_method != "merge":
+            settled_strategy = (
+                settled.get("completionOptions") or {}
+            ).get("mergeStrategy")
+            if settled_strategy and settled_strategy != merge_strategy:
+                log.warning(
+                    "PR %s: requested merge strategy %r (ADO: %r) was "
+                    "overridden to %r by a branch policy",
+                    pr_id, merge_method, merge_strategy, settled_strategy,
+                )
+
         merge_status = settled.get("mergeStatus")
         if merge_status == "conflicts":
             raise AzureDevOpsError(

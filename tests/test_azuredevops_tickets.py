@@ -495,8 +495,12 @@ def test_azuredevops_create_ticket_with_terminal_status_does_two_requests(
     """status='Done' must POST without System.State, then PATCH it to 'Done'."""
     post_bodies: list[list[dict]] = []
     patch_bodies: list[list[dict]] = []
+    bt = _basic_template_handler()  # provides workitemtypes + states endpoints
 
     def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
         path = req.url.path
         if "/_apis/wit/workitems/$" in path and req.method == "POST":
             post_bodies.append(json.loads(req.content.decode("utf-8")))
@@ -543,8 +547,12 @@ def test_azuredevops_create_ticket_terminal_status_upstream_failure_raises_with_
     from lib_python_projects.providers.azuredevops import AzureDevOpsError
 
     deletes: list[httpx.Request] = []
+    bt = _basic_template_handler()  # provides workitemtypes + states endpoints
 
     def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
         path = req.url.path
         if "/_apis/wit/workitems/$" in path and req.method == "POST":
             return _json(_work_item_payload(99, **{"System.State": "To Do"}))
@@ -593,6 +601,75 @@ def test_azuredevops_create_ticket_terminal_status_upstream_failure_raises_with_
     methods = [r.method for r in requests]
     assert "POST" in methods
     assert "PATCH" in methods
+
+
+def test_create_ticket_invalid_status_rejected_before_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown status value must raise ValueError before any POST is issued.
+
+    Defect 1: create_ticket previously allowed the POST to succeed and then
+    failed on the follow-up PATCH, leaving an orphan work item.  Now the
+    status is validated up-front against the state list.
+    """
+    posts: list[httpx.Request] = []
+    bt = _basic_template_handler()  # provides workitemtypes + states endpoints
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if "/_apis/wit/workitems/$" in req.url.path and req.method == "POST":
+            posts.append(req)
+            return _json(_work_item_payload(1))
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="Bogus"):
+        AzureDevOpsProvider().create_ticket(
+            _project(default_type="Issue"),
+            token="t",
+            title="hi",
+            body="b",
+            labels=[],
+            assignees=[],
+            status="Bogus",
+        )
+    # The POST to create the work item must NOT have been issued.
+    assert posts == [], "create_ticket must not POST when status is invalid"
+
+
+def test_add_comment_on_missing_work_item_500_normalized_to_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADO returns HTTP 500 with a 'does not exist' message when the work
+    item is missing.  _check should remap that to status 404.
+
+    Defect 3: without the remap the caller would see a confusing server-
+    error AzureDevOpsError(500, …) instead of a clear not-found 404.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/comments" in req.url.path and req.method == "POST":
+            return _json(
+                {"message": "Work item does not exist"},
+                status_code=500,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().add_comment(
+            _project(),
+            token="t",
+            ticket_id="9999",
+            body="hello",
+        )
+    assert exc.value.status == 404, (
+        f"Expected 404 from 500+'does not exist', got {exc.value.status}"
+    )
 
 
 # ---------- update_ticket ---------------------------------------------------

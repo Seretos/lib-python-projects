@@ -314,6 +314,39 @@ def test_ordered_list_round_trip_keeps_items_adjacent() -> None:
     assert "1. one\n2. two\n3. three" in md_back
 
 
+def test_fenced_code_language_tag_survives_round_trip() -> None:
+    """Defect 2a: the language tag on a fenced code block must survive the
+    markdown→HTML→markdown round-trip unchanged.
+
+    Without the fix the `pre` handler emits ``\\n```\\n`` before seeing the
+    inner ``<code class="language-X">`` tag, losing the language.
+    """
+    md_in = "```python\nprint('hi')\n```"
+    md_back = _html_to_markdown(_markdown_to_html(md_in))
+    assert md_back == md_in, repr(md_back)
+
+
+def test_fenced_code_no_language_round_trips_cleanly() -> None:
+    """Defect 2a (regression): a fence without a language tag must still
+    round-trip without gaining a trailing space or extra newline."""
+    md_in = "```\ncode\n```"
+    md_back = _html_to_markdown(_markdown_to_html(md_in))
+    assert md_back == md_in, repr(md_back)
+
+
+def test_multiline_paragraph_round_trip_no_extra_blank_line() -> None:
+    """Defect 2b: two lines of plain text in the same paragraph must
+    round-trip to exactly ``Line1\\nLine2``, not ``Line1\\n\\nLine2``.
+
+    The extra blank line appeared because the join separator was
+    ``"<br>\\n"``; the trailing ``\\n`` was delivered as a separate data
+    event by HTMLParser, producing a spurious extra newline on readback.
+    """
+    md_in = "Line1\nLine2"
+    md_back = _html_to_markdown(_markdown_to_html(md_in))
+    assert md_back == md_in, repr(md_back)
+
+
 def test_html_to_markdown_strips_trailing_per_line_whitespace() -> None:
     """ADO's HTML editor can leak trailing spaces (notably after the AI
     marker line). `_html_to_markdown` strips them per line so the agent-

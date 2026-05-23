@@ -390,6 +390,67 @@ def test_token_probe_empty_token() -> None:
     assert caps.reason == "bad_credentials"
 
 
+# ---------- duplicate_of double-count guard ---------------------------------
+
+
+def test_duplicate_of_not_double_counted_as_mention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect 5: a work item whose body mentions '#27' AND has a typed
+    Duplicate-Forward relation to #27 must yield exactly ONE Relation for
+    #27 (kind='duplicate_of'), not a second 'mentions' Relation.
+    """
+    from lib_python_projects.providers.azuredevops import _build_work_item_url
+
+    raw = {
+        "id": 10,
+        "fields": {
+            "System.Title": "Source",
+            "System.Description": "<p>Duplicate of #27</p>",
+            "System.State": "Active",
+        },
+        "relations": [
+            {
+                "rel": "System.LinkTypes.Duplicate-Forward",
+                "url": "https://dev.azure.com/seredos/_apis/wit/workItems/27",
+            }
+        ],
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # Batch fetch for title+state of related items.
+        if req.url.path.endswith("/_apis/wit/workitemsbatch"):
+            return _json({
+                "value": [
+                    {
+                        "id": 27,
+                        "fields": {
+                            "System.Title": "Target 27",
+                            "System.State": "Active",
+                        },
+                    }
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    provider = AzureDevOpsProvider()
+    p = _project()
+    relations = provider._build_relations_from_work_item(p, "t", raw, "10")
+
+    # Exactly one relation for #27.
+    rels_27 = [r for r in relations if r.ticket_id == "#27"]
+    assert len(rels_27) == 1, (
+        f"Expected exactly 1 relation for #27, got {len(rels_27)}: {rels_27}"
+    )
+    assert rels_27[0].kind == "duplicate_of", (
+        f"Expected kind='duplicate_of', got {rels_27[0].kind!r}"
+    )
+    # No spurious 'mentions' relation for #27.
+    mentions_27 = [r for r in relations if r.ticket_id == "#27" and r.kind == "mentions"]
+    assert mentions_27 == [], f"Found unexpected mentions relation: {mentions_27}"
+
+
 # ---------- refs URL parsing -----------------------------------------------
 # TODO(ports-adapters): re-enable nach API-Stabilisierung
 # `refs.normalize_id` lives in agent-project-issues (tool-layer URL
