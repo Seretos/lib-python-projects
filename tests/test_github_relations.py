@@ -15,6 +15,7 @@ import pytest
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import github as github_provider
 from lib_python_projects.providers.github import GitHubProvider
+from lib_python_projects.providers.base import RelationNotFound
 
 
 # ---------- helpers ----------------------------------------------------------
@@ -418,8 +419,8 @@ def test_include_relations_false_skips_extra_calls(monkeypatch: pytest.MonkeyPat
     _, _, relations, truncated = provider.get_ticket(
         _project(), token="t", ticket_id="42", include_relations=False
     )
-    assert relations == []
-    assert truncated is False
+    assert relations is None
+    assert truncated is None
     # We expect exactly two calls: the issue and the comments.
     paths = [r.url.path for r in seen]
     assert paths == [
@@ -905,3 +906,174 @@ def test_self_reference_is_filtered(monkeypatch: pytest.MonkeyPatch) -> None:
     ticket_ids = {r.ticket_id for r in relations}
     assert "#99" in ticket_ids
     assert "#42" not in ticket_ids
+
+
+# ---------- F4: remove_relation raises RelationNotFound ---------------------
+
+
+def test_remove_relation_blocked_by_not_found_raises_relation_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing a `blocked_by` link that doesn't exist raises RelationNotFound."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Return a valid issue payload for internal-id resolution.
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        if path == "/repos/acme/backend/issues/3":
+            return _json(_issue_payload(3, id=3001))
+        # blocked_by list is empty — link doesn't exist.
+        if path == "/repos/acme/backend/issues/5/dependencies/blocked_by":
+            return _json([])
+        raise AssertionError(f"unexpected {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound) as exc:
+        GitHubProvider().remove_relation(
+            _project(), token="t", ticket_id="5", kind="blocked_by", target="#3"
+        )
+    assert exc.value.kind == "blocked_by"
+    assert exc.value.ticket_id == "5"
+    assert "#3" in exc.value.target
+    # Must also be a LookupError subclass for _safe wrapper compatibility.
+    assert isinstance(exc.value, LookupError)
+
+
+def test_remove_relation_blocks_not_found_raises_relation_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing a `blocks` link that doesn't exist raises RelationNotFound."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        if path == "/repos/acme/backend/issues/3":
+            return _json(_issue_payload(3, id=3001))
+        # source issue (#5) has no blocked_by links.
+        if path == "/repos/acme/backend/issues/3/dependencies/blocked_by":
+            return _json([])
+        raise AssertionError(f"unexpected {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound) as exc:
+        GitHubProvider().remove_relation(
+            _project(), token="t", ticket_id="5", kind="blocks", target="#3"
+        )
+    assert exc.value.kind == "blocks"
+    assert isinstance(exc.value, LookupError)
+
+
+def test_remove_relation_child_not_found_raises_relation_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing a `child` sub-issue that doesn't exist raises RelationNotFound."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/9":
+            return _json(_issue_payload(9, id=9001))
+        if path == "/repos/acme/backend/issues/5/sub_issue":
+            # GitHub returns 404 when the sub-issue relationship doesn't exist.
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound) as exc:
+        GitHubProvider().remove_relation(
+            _project(), token="t", ticket_id="5", kind="child", target="#9"
+        )
+    assert exc.value.kind == "child"
+    assert isinstance(exc.value, LookupError)
+
+
+def test_remove_relation_parent_not_found_raises_relation_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing a `parent` relation where the target doesn't exist raises RelationNotFound."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # The target (parent) issue returns 404 — it doesn't exist.
+        if path == "/repos/acme/backend/issues/7":
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound) as exc:
+        GitHubProvider().remove_relation(
+            _project(), token="t", ticket_id="5", kind="parent", target="#7"
+        )
+    assert exc.value.kind == "parent"
+    assert "#7" in exc.value.target
+    assert isinstance(exc.value, LookupError)
+
+
+# ---------- F6: resolved field on relations -----------------------------------
+
+
+def test_body_scan_relations_have_resolved_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relations from body scanning carry `resolved=False`."""
+    body = "This closes #11 and mentions other/repo#22."
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/3":
+            return _json(_issue_payload(3, body=body))
+        if path == "/repos/acme/backend/issues/3/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/3/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/3/timeline":
+            return _json([])
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="3")
+    body_scan_rels = [r for r in relations if r.kind in ("closes", "mentions")]
+    assert body_scan_rels, "expected body-scan relations"
+    for rel in body_scan_rels:
+        assert rel.resolved is False, f"{rel.kind} should have resolved=False"
+
+
+def test_api_fetched_relations_have_resolved_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relations fetched via API (parent, child, blocks, blocked_by) carry `resolved=True`."""
+    parent_payload = {
+        "number": 7, "title": "Epic", "state": "open",
+        "html_url": "https://github.com/acme/backend/issues/7",
+        "repository": {"full_name": "acme/backend"},
+    }
+    child = _issue_payload(101, title="Sub A")
+    child["repository"] = {"full_name": "acme/backend"}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/42":
+            return _json(_issue_payload(42, parent=parent_payload))
+        if path == "/repos/acme/backend/issues/42/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/42/sub_issues":
+            return _json([child])
+        if path == "/repos/acme/backend/issues/42/timeline":
+            return _json([])
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="42")
+    api_rels = [r for r in relations if r.kind in ("parent", "child")]
+    assert api_rels, "expected API-fetched relations"
+    for rel in api_rels:
+        assert rel.resolved is True, f"{rel.kind} should have resolved=True"

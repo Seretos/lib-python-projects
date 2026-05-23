@@ -61,6 +61,7 @@ from lib_python_projects.providers.base import (
     PullRequest,
     Relation,
     RelationKindUnsupported,
+    RelationNotFound,
     Review,
     ReviewComment,
     Status,
@@ -1455,7 +1456,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         token: str | None,
         ticket_id: str,
         include_relations: bool = True,
-    ) -> tuple[Ticket, list[Comment], list[Relation], bool]:
+    ) -> tuple[Ticket, list[Comment], list[Relation] | None, bool | None]:
         _validate_int32_id(ticket_id, "ticket")
         params = _api_version_params({"$expand": "Relations"})
         path = f"{_project_scope(project)}/_apis/wit/workitems/{quote(str(ticket_id), safe='')}"
@@ -1470,12 +1471,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
             project, token, ticket_id, limit=200, order="asc"
         )
 
-        relations: list[Relation] = []
-        truncated = False
         if include_relations:
-            relations = self._build_relations_from_work_item(
+            relations: list[Relation] | None = self._build_relations_from_work_item(
                 project, token, raw, ticket_id
             )
+            truncated: bool | None = False
+        else:
+            relations = None
+            truncated = None
 
         return ticket, comments, relations, truncated
 
@@ -1572,6 +1575,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                     url=display_url,
                     state=state,
                     is_pull_request=False,
+                    resolved=True,
                 )
             )
         for ref_kind, ref_id in mention_targets:
@@ -1584,6 +1588,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                     url=_build_work_item_url(project, ref_id),
                     state=state,
                     is_pull_request=False,
+                    resolved=False,
                 )
             )
         return out
@@ -2997,9 +3002,10 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                 index = i
                 break
         if index is None:
-            raise LookupError(
-                f"relation '{kind}' on ticket '#{ticket_id}' targeting "
-                f"'#{target_id}' not found"
+            raise RelationNotFound(
+                kind=kind,
+                ticket_id=ticket_id,
+                target=f"#{target_id}",
             )
 
         patch = [{"op": "remove", "path": f"/relations/{index}"}]

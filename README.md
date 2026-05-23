@@ -45,8 +45,8 @@ from lib_python_projects.providers.base import (
     TicketFilters, PRFilters, RelationKind, Relation,
     StatusSpec, PipelineRun, FailingJob, PipelineFailure,
     TokenCapabilities, TokenCapabilityProvider,
-    RelationKindUnsupported, normalize_timestamp,
-    WRITABLE_RELATION_KINDS,
+    RelationKindUnsupported, RelationNotFound, normalize_timestamp,
+    WRITABLE_RELATION_KINDS, READ_ONLY_RELATION_KINDS,
 )
 ```
 

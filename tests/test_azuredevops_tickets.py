@@ -921,3 +921,40 @@ def test_list_tickets_search_uses_contains_words(
     # Plain CONTAINS without WORDS must not appear for this search term
     import re
     assert not re.search(r"\bCONTAINS\s+'lifecycle'", wiql)
+
+
+# ---------- F22: get_ticket(include_relations=False) sentinel ----------------
+
+
+def test_get_ticket_include_relations_false_returns_none_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`include_relations=False` returns `(None, None)` for relations/truncated.
+
+    This allows callers to distinguish 'skipped' from 'fetched but empty'.
+    """
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/5" in path:
+            return _json({
+                "id": 5,
+                "fields": {
+                    "System.Title": "Test item",
+                    "System.Description": "",
+                    "System.State": "Active",
+                    "System.WorkItemType": "Issue",
+                    "System.Tags": "",
+                    "System.CreatedDate": "2026-01-01T00:00:00Z",
+                    "System.ChangedDate": "2026-01-02T00:00:00Z",
+                },
+            })
+        if "/_apis/wit/workItems/5/comments" in path:
+            return _json({"value": [], "count": 0})
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    _, _, relations, truncated = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="5", include_relations=False
+    )
+    assert relations is None
+    assert truncated is None
