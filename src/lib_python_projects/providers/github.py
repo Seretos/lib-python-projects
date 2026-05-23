@@ -220,7 +220,8 @@ def _map_pr(raw: dict) -> PullRequest:
         back to safe defaults so the dataclass is always constructable.
     """
     state = raw.get("state", "open")
-    merged = bool(raw.get("merged") or raw.get("merged_at"))
+    pr_stub = raw.get("pull_request") or {}
+    merged = bool(raw.get("merged") or raw.get("merged_at") or pr_stub.get("merged_at"))
     if state == "open":
         status: str = "open"
     elif merged:
