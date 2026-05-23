@@ -135,7 +135,11 @@ _TRANSITION_TYPE_KEYS: frozenset[str] = frozenset(
         "WorkItemSaveFailedException",
         "RuleValidationException",
         "WorkItemRuleException",
-        "InvalidArgumentValueException",
+        # InvalidArgumentValueException intentionally excluded: it fires on
+        # Title-empty, Assignee-format, and other non-state errors, causing
+        # the list_ticket_statuses hint to appear in unrelated error messages.
+        # Genuine state-value errors still receive the hint via
+        # _TRANSITION_MSG_FRAGMENTS message matching below.
     }
 )
 
@@ -1360,8 +1364,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
             clauses.append(f"[System.CreatedBy] = '{_escape_wiql(filters.author)}'")
         if filters.search:
             clauses.append(
-                f"([System.Title] CONTAINS '{_escape_wiql(filters.search)}' "
-                f"OR [System.Description] CONTAINS '{_escape_wiql(filters.search)}')"
+                f"([System.Title] CONTAINS WORDS '{_escape_wiql(filters.search)}' "
+                f"OR [System.Description] CONTAINS WORDS '{_escape_wiql(filters.search)}')"
             )
         if filters.created_after:
             clauses.append(f"[System.CreatedDate] >= '{_escape_wiql(filters.created_after)}'")
@@ -1974,7 +1978,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         repo_id = self._resolve_repository_id(project, token)
         status_param = {
             "open": "active",
-            "closed": "abandoned",
+            # "closed" maps to "all" so ADO returns both abandoned and
+            # completed PRs; we post-filter below to exclude active ones.
+            "closed": "all",
             "any": "all",
         }.get(filters.status, "active")
         params = _api_version_params(
@@ -2010,10 +2016,11 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         if filters.search:
             needle = filters.search.lower()
             prs = [pr for pr in prs if needle in pr.title.lower() or needle in pr.body.lower()]
-        if filters.status == "any":
-            # Promote merged PRs (status=completed + mergeStatus=succeeded)
-            # ahead of plain "closed" entries by checking pr.merged.
-            pass
+        # When the caller requests "closed" we asked ADO for "all" PRs so that
+        # both abandoned and completed PRs are included. Post-filter to remove
+        # the active ones that ADO included.
+        if filters.status == "closed":
+            prs = [pr for pr in prs if pr.status != "open"]
         return prs[: max(1, filters.limit)]
 
     def get_pr(

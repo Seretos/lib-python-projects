@@ -1322,3 +1322,61 @@ def test_review_comment_original_line_and_commit_sha(
     assert rc.commit_sha is None or isinstance(rc.commit_sha, str)
     # And critically, never an integer offset.
     assert rc.commit_sha != 1
+
+
+# ---------- list_prs closed status -------------------------------------------
+
+
+def test_list_prs_closed_includes_abandoned_and_completed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """status='closed' must return abandoned PRs (status='closed') and
+    completed+mergeStatus=succeeded PRs (status='merged')."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if "/pullrequests" in req.url.path:
+            return _json({
+                "value": [
+                    _pr_payload(10, status="abandoned"),
+                    _pr_payload(11, status="completed", mergeStatus="succeeded"),
+                ]
+            })
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    prs = AzureDevOpsProvider().list_prs(
+        _project(), token="t", filters=PRFilters(status="closed", limit=30)
+    )
+    assert {p.id for p in prs} == {"10", "11"}
+    by_id = {p.id: p for p in prs}
+    assert by_id["10"].status == "closed"
+    assert by_id["11"].status == "merged"
+
+
+def test_list_prs_closed_excludes_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """status='closed' must not include active PRs even though ADO returns
+    them when we request searchCriteria.status=all."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if "/pullrequests" in req.url.path:
+            return _json({
+                "value": [
+                    _pr_payload(20, status="active"),
+                    _pr_payload(21, status="abandoned"),
+                ]
+            })
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    prs = AzureDevOpsProvider().list_prs(
+        _project(), token="t", filters=PRFilters(status="closed", limit=30)
+    )
+    assert [p.id for p in prs] == ["21"]
