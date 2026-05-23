@@ -1097,3 +1097,351 @@ def test_get_pr_surfaces_gitlab_specific_fields(
     assert pr.mergeable_state is None
     assert pr.auto_merge is None
     assert pr.review_decision is None
+
+
+# ---------- _map_mr head.repo_full_name (ticket #4) --------------------------
+
+
+def test_map_mr_head_repo_full_name_same_project(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same source/target project → repo_full_name == project.path."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5"):
+            return _json(
+                _mr_payload(5, project_id=10, source_project_id=10)
+            )
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    assert pr.head["repo_full_name"] == "acme/backend"
+
+
+def test_map_mr_head_repo_full_name_cross_fork_with_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-fork with source_project_path → repo_full_name == source_project_path."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5"):
+            return _json(
+                _mr_payload(
+                    5,
+                    project_id=10,
+                    source_project_id=99,
+                    source_project_path="fork/backend",
+                )
+            )
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    assert pr.head["repo_full_name"] == "fork/backend"
+
+
+def test_map_mr_head_repo_full_name_cross_fork_no_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-fork without source_project_path → repo_full_name is None."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5"):
+            return _json(
+                _mr_payload(5, project_id=10, source_project_id=99)
+            )
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    assert pr.head["repo_full_name"] is None
+
+
+# ---------- _map_mr base.sha from diff_refs (ticket #4) ----------------------
+
+
+def test_map_mr_base_sha_from_diff_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """diff_refs.base_sha → pr.base['sha']."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5"):
+            return _json(
+                _mr_payload(
+                    5,
+                    diff_refs={"base_sha": "deadbeef", "start_sha": "s1", "head_sha": "h1"},
+                )
+            )
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    assert pr.base["sha"] == "deadbeef"
+
+
+def test_map_mr_base_sha_empty_when_no_diff_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No diff_refs → pr.base['sha'] == ''."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5"):
+            return _json(_mr_payload(5))
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    assert pr.base["sha"] == ""
+
+
+# ---------- list_pr_review_comments side derivation (ticket #4) --------------
+
+
+def test_list_pr_review_comments_side_derivation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """new_line→RIGHT, old_line→LEFT, neither→None."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if (
+            req.method == "GET"
+            and req.url.path.endswith("merge_requests/5/discussions")
+        ):
+            return _json([
+                {
+                    "id": "disc-1",
+                    "notes": [{
+                        "id": 1, "body": "new-line only",
+                        "author": {"username": "alice"},
+                        "position": {
+                            "new_path": "a.py", "new_line": 5,
+                            "old_path": "a.py", "old_line": None,
+                            "head_sha": "h", "base_sha": "b",
+                        },
+                        "created_at": "t",
+                    }],
+                },
+                {
+                    "id": "disc-2",
+                    "notes": [{
+                        "id": 2, "body": "old-line only",
+                        "author": {"username": "alice"},
+                        "position": {
+                            "new_path": "a.py", "new_line": None,
+                            "old_path": "a.py", "old_line": 3,
+                            "head_sha": "h", "base_sha": "b",
+                        },
+                        "created_at": "t",
+                    }],
+                },
+                {
+                    "id": "disc-3",
+                    "notes": [{
+                        "id": 3, "body": "neither",
+                        "author": {"username": "alice"},
+                        "position": {
+                            "new_path": "a.py", "new_line": None,
+                            "old_path": "a.py", "old_line": None,
+                            "head_sha": "h", "base_sha": "b",
+                        },
+                        "created_at": "t",
+                    }],
+                },
+            ])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    rcs = GitLabProvider().list_pr_review_comments(_project(), "t", "5")
+    assert rcs[0].side == "RIGHT"
+    assert rcs[1].side == "LEFT"
+    assert rcs[2].side is None
+
+
+# ---------- add_pr_review_comment URL synthesis (ticket #4) ------------------
+
+
+def test_add_pr_review_comment_new_thread_url_synthesised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New-thread POST without web_url → URL synthesised as note anchor."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.endswith("merge_requests/5"):
+            return _json(
+                _mr_payload(
+                    5,
+                    diff_refs={"base_sha": "b1", "start_sha": "s1", "head_sha": "h1"},
+                )
+            )
+        if req.method == "POST" and url.endswith("merge_requests/5/discussions"):
+            return _json({
+                "id": "disc-new",
+                "notes": [{
+                    "id": 42, "body": "#ai-generated\n\nrename",
+                    "author": {"username": "alice"},
+                    "created_at": "t",
+                }],
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    rc = GitLabProvider().add_pr_review_comment(
+        _project(), "t", "5",
+        body="rename", path="src/foo.py", line=1, commit_sha="h1",
+    )
+    assert rc.url == "https://gitlab.com/acme/backend/-/merge_requests/5#note_42"
+
+
+def test_add_pr_review_comment_reply_url_synthesised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reply POST without web_url → URL synthesised as note anchor."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if (
+            req.method == "POST"
+            and "/discussions/disc-A/notes" in req.url.path
+        ):
+            return _json({
+                "id": 77, "body": "agreed",
+                "author": {"username": "alice"},
+                "created_at": "t",
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    rc = GitLabProvider().add_pr_review_comment(
+        _project(), "t", "5",
+        body="agreed", in_reply_to="disc-A",
+    )
+    assert rc.url.endswith("#note_77")
+    assert "merge_requests/5" in rc.url
+
+
+# ---------- submit_pr_review URL synthesis (ticket #4) -----------------------
+
+
+def test_submit_pr_review_approve_no_body_url_is_mr_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Approve without body → url comes from MR web_url in the approve response."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path.endswith("/approve"):
+            return _json({
+                "iid": 5,
+                "web_url": "https://gitlab.com/acme/backend/-/merge_requests/5",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    review = GitLabProvider().submit_pr_review(_project(), "t", "5", state="approve")
+    assert review.url == "https://gitlab.com/acme/backend/-/merge_requests/5"
+
+
+def test_submit_pr_review_approve_with_body_url_is_note_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Approve with body → note POST has no web_url → url is synthesised note anchor."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path.endswith("/approve"):
+            return _json({"iid": 5, "updated_at": "t"})
+        if req.method == "POST" and req.url.path.endswith("/notes"):
+            return _json({
+                "id": 55, "body": "#ai-generated\n\nlgtm",
+                "author": {"username": "alice"},
+                "created_at": "t",
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    review = GitLabProvider().submit_pr_review(
+        _project(), "t", "5", state="approve", body="lgtm",
+    )
+    assert review.url.endswith("#note_55")
+    assert "merge_requests/5" in review.url
+
+
+def test_submit_pr_review_request_changes_url_synthesised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """request_changes note POST without web_url → url is synthesised note anchor."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path.endswith("/unapprove"):
+            return _json({})
+        if req.method == "POST" and req.url.path.endswith("/notes"):
+            return _json({
+                "id": 66, "body": "#ai-generated\n\nplease fix",
+                "author": {"username": "alice"},
+                "created_at": "t",
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    review = GitLabProvider().submit_pr_review(
+        _project(), "t", "5", state="request_changes", body="please fix",
+    )
+    assert review.url.endswith("#note_66")
+    assert "merge_requests/5" in review.url
+
+
+def test_submit_pr_review_comment_url_synthesised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """comment note POST without web_url → url is synthesised note anchor."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path.endswith("/notes"):
+            return _json({
+                "id": 88, "body": "#ai-generated\n\nfyi",
+                "author": {"username": "alice"},
+                "created_at": "t",
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    review = GitLabProvider().submit_pr_review(
+        _project(), "t", "5", state="comment", body="fyi",
+    )
+    assert review.url.endswith("#note_88")
+    assert "merge_requests/5" in review.url
+
+
+# ---------- list_comments created_after (ticket #4) --------------------------
+
+
+def test_list_comments_since_uses_created_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """since parameter must be forwarded as created_after (not updated_after)."""
+    seen_params: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen_params.update(dict(req.url.params))
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().list_comments(_project(), "t", "5", since="2024-06-01T00:00:00Z")
+    assert seen_params.get("created_after") == "2024-06-01T00:00:00Z"
+    assert "updated_after" not in seen_params
