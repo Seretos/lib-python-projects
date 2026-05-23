@@ -4,9 +4,13 @@ Covers:
   - Default filters route to `/repos/{owner}/{repo}/pulls`.
   - `labels`, `assignee`, and `search` each route to `/search/issues` with
     the expected `q` qualifiers.
-  - `/search/issues` items that omit `head`/`base`/`draft`/`requested_reviewers`
-    are mapped to safe defaults (regression: merged detection via
-    `pull_request.merged_at`).
+  - On the search path, each stub is back-filled via `GET /pulls/{n}`, so
+    the returned PullRequest has fully populated head/base/mergeable_state
+    (ticket #6 core regression).
+  - Status mapping: open/closed/merged driven by the full back-fill payload.
+  - Direct `_map_pr` unit test: issue-stub with `pull_request.merged_at` →
+    status="merged" (covers the merged-detection fix even though list_prs no
+    longer feeds stubs to _map_pr on the search path).
 
 Pattern mirrors `tests/test_github_list_filters.py`:
   httpx.MockTransport + monkeypatch on `github_provider._client`.
@@ -22,7 +26,7 @@ import pytest
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import github as github_provider
 from lib_python_projects.providers.base import PRFilters
-from lib_python_projects.providers.github import GitHubProvider
+from lib_python_projects.providers.github import GitHubProvider, _map_pr
 
 
 # ---------- helpers ----------------------------------------------------------
@@ -38,7 +42,7 @@ def _project() -> ProjectConfig:
 
 
 def _pr_payload(number: int, **overrides) -> dict:
-    """Build a minimal full-PR payload (as returned by `/pulls`)."""
+    """Build a minimal full-PR payload (as returned by `/pulls` or `/pulls/{n}`)."""
     base: dict = {
         "number": number,
         "title": f"PR {number}",
@@ -48,7 +52,7 @@ def _pr_payload(number: int, **overrides) -> dict:
         "merged": False,
         "merged_at": None,
         "mergeable": None,
-        "mergeable_state": None,
+        "mergeable_state": "clean",
         "merge_commit_sha": None,
         "auto_merge": None,
         "user": {"login": "alice"},
@@ -134,6 +138,22 @@ def _json(payload, status_code: int = 200, headers: dict | None = None) -> httpx
     )
 
 
+def _search_and_detail_handler(stubs: list[dict], full_payloads: dict[int, dict]) -> Callable[[httpx.Request], httpx.Response]:
+    """Return a handler that serves /search/issues (returning stubs) and
+    /repos/{o}/{r}/pulls/{n} (returning the corresponding full payload)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/search/issues":
+            return _json({"items": stubs, "total_count": len(stubs)})
+        # Detail endpoint: /repos/acme/backend/pulls/{n}
+        for number, payload in full_payloads.items():
+            if req.url.path == f"/repos/acme/backend/pulls/{number}":
+                return _json(payload)
+        raise AssertionError(f"Unexpected request path: {req.url.path}")
+
+    return handler
+
+
 # ---------- routing tests ----------------------------------------------------
 
 
@@ -161,16 +181,19 @@ def test_default_filters_route_to_pulls_endpoint(monkeypatch: pytest.MonkeyPatch
 
 def test_labels_filter_routes_to_search(monkeypatch: pytest.MonkeyPatch) -> None:
     """`PRFilters(labels=[...])` must route to `/search/issues` with `label:` qualifier."""
+    stub = _search_pr_stub(10)
+    full = _pr_payload(10)
 
     def handler(req: httpx.Request) -> httpx.Response:
-        assert req.url.path == "/search/issues", (
-            f"expected /search/issues, got {req.url}"
-        )
-        q = req.url.params["q"]
-        assert "is:pr" in q
-        assert "repo:acme/backend" in q
-        assert "label:bug" in q
-        return _json({"items": [_search_pr_stub(10)], "total_count": 1})
+        if req.url.path == "/search/issues":
+            q = req.url.params["q"]
+            assert "is:pr" in q
+            assert "repo:acme/backend" in q
+            assert "label:bug" in q
+            return _json({"items": [stub], "total_count": 1})
+        if req.url.path == "/repos/acme/backend/pulls/10":
+            return _json(full)
+        raise AssertionError(f"Unexpected request path: {req.url.path}")
 
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
@@ -180,15 +203,18 @@ def test_labels_filter_routes_to_search(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_assignee_filter_routes_to_search(monkeypatch: pytest.MonkeyPatch) -> None:
     """`PRFilters(assignee=...)` must route to `/search/issues` with `assignee:` qualifier."""
+    stub = _search_pr_stub(20)
+    full = _pr_payload(20)
 
     def handler(req: httpx.Request) -> httpx.Response:
-        assert req.url.path == "/search/issues", (
-            f"expected /search/issues, got {req.url}"
-        )
-        q = req.url.params["q"]
-        assert "is:pr" in q
-        assert "assignee:bob" in q
-        return _json({"items": [_search_pr_stub(20)], "total_count": 1})
+        if req.url.path == "/search/issues":
+            q = req.url.params["q"]
+            assert "is:pr" in q
+            assert "assignee:bob" in q
+            return _json({"items": [stub], "total_count": 1})
+        if req.url.path == "/repos/acme/backend/pulls/20":
+            return _json(full)
+        raise AssertionError(f"Unexpected request path: {req.url.path}")
 
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
@@ -198,15 +224,18 @@ def test_assignee_filter_routes_to_search(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_search_text_filter_routes_to_search(monkeypatch: pytest.MonkeyPatch) -> None:
     """`PRFilters(search=...)` must route to `/search/issues` with search text in `q`."""
+    stub = _search_pr_stub(30)
+    full = _pr_payload(30)
 
     def handler(req: httpx.Request) -> httpx.Response:
-        assert req.url.path == "/search/issues", (
-            f"expected /search/issues, got {req.url}"
-        )
-        q = req.url.params["q"]
-        assert "is:pr" in q
-        assert "fix memory leak" in q
-        return _json({"items": [_search_pr_stub(30)], "total_count": 1})
+        if req.url.path == "/search/issues":
+            q = req.url.params["q"]
+            assert "is:pr" in q
+            assert "fix memory leak" in q
+            return _json({"items": [stub], "total_count": 1})
+        if req.url.path == "/repos/acme/backend/pulls/30":
+            return _json(full)
+        raise AssertionError(f"Unexpected request path: {req.url.path}")
 
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
@@ -214,15 +243,77 @@ def test_search_text_filter_routes_to_search(monkeypatch: pytest.MonkeyPatch) ->
     assert [pr.id for pr in prs] == ["30"]
 
 
-# ---------- search-shape mapping tests ---------------------------------------
+# ---------- ticket #6 core regression: search path must back-fill full shape --
 
 
-def test_search_stub_open_pr_maps_to_open_status(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Search stub with state=open produces status='open' and safe defaults."""
+def test_search_path_backfills_head_base_mergeable_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression #6: on the search path, returned PR must have populated
+    head/base/mergeable_state — not the blank stubs from the search response.
+
+    The handler serves /search/issues with an issue-shaped stub (no head/base),
+    then serves /repos/.../pulls/42 with a full payload. The test asserts that
+    the back-fill fetch happened and that the returned PullRequest carries the
+    full values.
+    """
+    stub = _search_pr_stub(42)
+    full = _pr_payload(
+        42,
+        mergeable_state="clean",
+        head={
+            "ref": "feat/my-feature",
+            "sha": "deadbeef",
+            "repo": {"full_name": "acme/backend"},
+        },
+        base={
+            "ref": "main",
+            "sha": "cafebabe",
+        },
+    )
+
+    seen_paths: list[str] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
-        return _json({"items": [_search_pr_stub(40, state="open")], "total_count": 1})
+        seen_paths.append(req.url.path)
+        if req.url.path == "/search/issues":
+            return _json({"items": [stub], "total_count": 1})
+        if req.url.path == "/repos/acme/backend/pulls/42":
+            return _json(full)
+        raise AssertionError(f"Unexpected request path: {req.url.path}")
 
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    prs = provider.list_prs(_project(), token="t", filters=PRFilters(labels=["my-label"]))
+
+    assert len(prs) == 1
+    pr = prs[0]
+
+    # Back-fill endpoint must have been called.
+    assert "/repos/acme/backend/pulls/42" in seen_paths, (
+        f"Detail endpoint was not requested; seen: {seen_paths}"
+    )
+
+    # Head must be fully populated (not blank stubs).
+    assert pr.head["ref"] == "feat/my-feature", f"head.ref blank: {pr.head}"
+    assert pr.head["sha"] == "deadbeef", f"head.sha blank: {pr.head}"
+    assert pr.head["repo_full_name"] == "acme/backend", f"head.repo_full_name blank: {pr.head}"
+
+    # Base must be fully populated.
+    assert pr.base["ref"] == "main", f"base.ref blank: {pr.base}"
+    assert pr.base["sha"] == "cafebabe", f"base.sha blank: {pr.base}"
+
+    # mergeable_state must be populated.
+    assert pr.mergeable_state == "clean", f"mergeable_state blank: {pr.mergeable_state!r}"
+
+
+# ---------- status mapping via full back-fill payload -------------------------
+
+
+def test_search_path_open_pr_maps_to_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Search path with back-fill: full payload state=open → status='open'."""
+    stub = _search_pr_stub(40, state="open")
+    full = _pr_payload(40, state="open", merged=False, merged_at=None)
+
+    handler = _search_and_detail_handler([stub], {40: full})
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
     prs = provider.list_prs(_project(), token="t", filters=PRFilters(assignee="alice"))
@@ -230,20 +321,18 @@ def test_search_stub_open_pr_maps_to_open_status(monkeypatch: pytest.MonkeyPatch
     pr = prs[0]
     assert pr.status == "open"
     assert pr.merged is False
-    # Safe defaults for absent head/base
-    assert pr.head == {"ref": "", "sha": "", "repo_full_name": ""}
-    assert pr.base == {"ref": "", "sha": ""}
-    # Safe defaults for absent draft and requested_reviewers
+    # Full payload populates head/base.
+    assert pr.head["ref"] == "feat/branch"
     assert pr.draft is False
     assert pr.requested_reviewers == []
 
 
-def test_search_stub_closed_not_merged_maps_to_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Search stub: closed with no merged_at anywhere → status='closed'."""
+def test_search_path_closed_not_merged_maps_to_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Search path with back-fill: full payload state=closed, merged=False → status='closed'."""
+    stub = _search_pr_stub(50, state="closed", merged_at=None)
+    full = _pr_payload(50, state="closed", merged=False, merged_at=None)
 
-    def handler(req: httpx.Request) -> httpx.Response:
-        return _json({"items": [_search_pr_stub(50, state="closed", merged_at=None)], "total_count": 1})
-
+    handler = _search_and_detail_handler([stub], {50: full})
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
     prs = provider.list_prs(_project(), token="t", filters=PRFilters(assignee="alice"))
@@ -253,33 +342,58 @@ def test_search_stub_closed_not_merged_maps_to_closed(monkeypatch: pytest.Monkey
     assert pr.merged is False
 
 
-def test_search_stub_merged_pr_maps_to_merged(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Regression: search stub with pull_request.merged_at set → status='merged'.
+def test_search_path_merged_pr_maps_to_merged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Search path with back-fill: full payload merged=True → status='merged'."""
+    stub = _search_pr_stub(60, state="closed", merged_at="2024-03-15T10:00:00Z")
+    full = _pr_payload(
+        60,
+        state="closed",
+        merged=True,
+        merged_at="2024-03-15T10:00:00Z",
+    )
 
-    Before the fix, _map_pr only checked top-level `merged`/`merged_at`;
-    search stubs only carry the timestamp in `pull_request.merged_at`, so
-    merged PRs were incorrectly reported as 'closed'.
-    """
-
-    def handler(req: httpx.Request) -> httpx.Response:
-        return _json({
-            "items": [
-                _search_pr_stub(
-                    60,
-                    state="closed",
-                    merged_at="2024-03-15T10:00:00Z",
-                )
-            ],
-            "total_count": 1,
-        })
-
+    handler = _search_and_detail_handler([stub], {60: full})
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
     prs = provider.list_prs(_project(), token="t", filters=PRFilters(assignee="alice"))
     assert len(prs) == 1
     pr = prs[0]
     assert pr.status == "merged", (
-        f"Expected 'merged' but got {pr.status!r}; "
-        "pull_request.merged_at was not checked"
+        f"Expected 'merged' but got {pr.status!r}"
+    )
+    assert pr.merged is True
+
+
+# ---------- _map_pr unit test: merged detection via issue-stub ----------------
+
+
+def test_map_pr_merged_detection_from_pull_request_stub() -> None:
+    """Direct unit test: _map_pr with a search-style issue stub carrying
+    pull_request.merged_at must yield status='merged'.
+
+    This covers the nested-merged-detection fix in _map_pr, which stays
+    relevant for callers that construct stub-shaped dicts directly even
+    though list_prs no longer feeds stubs to _map_pr on the search path.
+    """
+    stub = {
+        "number": 99,
+        "title": "Fix thing",
+        "body": "desc",
+        "state": "closed",
+        "user": {"login": "dev"},
+        "assignees": [],
+        "labels": [],
+        "html_url": "https://github.com/acme/backend/pull/99",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-02T00:00:00Z",
+        "pull_request": {
+            "merged_at": "2024-03-10T08:00:00Z",
+            "url": "https://api.github.com/repos/acme/backend/pulls/99",
+        },
+        # deliberately omit top-level `merged` and `merged_at`
+    }
+    pr = _map_pr(stub)
+    assert pr.status == "merged", (
+        f"Expected 'merged' from pull_request.merged_at, got {pr.status!r}"
     )
     assert pr.merged is True
