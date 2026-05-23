@@ -18,11 +18,16 @@ The project id for every project-issues MCP call in this repo is
 ## Preconditions / guards (before anything else)
 
 1. **Confirm the ticket number.** If the user didn't give one, ask.
-2. **Branch guard.** Run `git rev-parse --abbrev-ref HEAD`. If it is `main`
-   or `master`, STOP and tell the user this skill must run inside a prepared
-   feature-branch worktree, which the user owns. Do not create a branch or
-   worktree yourself. Proceed only on a non-default branch. Capture the
-   branch name and the default branch (for the PR base).
+2. **Branch + worktree guard.** This skill runs **only inside a worktree** on a
+   feature branch — it is the worker half of `orchestrate-tickets` (which runs
+   only on the main checkout). Two checks:
+   - `git rev-parse --abbrev-ref HEAD` — if `main`/`master`, STOP.
+   - `git rev-parse --git-dir` vs `git rev-parse --git-common-dir` — if they are
+     EQUAL you're in the main checkout, not a worktree → STOP.
+   On STOP, tell the user this skill must run inside a prepared feature-branch
+   worktree, which the user (or orchestrate-tickets) owns. Do not create a branch
+   or worktree yourself. Capture the branch name and the default branch (for the
+   PR base).
 
 ## Phase sequence
 

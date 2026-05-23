@@ -1,5 +1,6 @@
 {
   "enabledPlugins": {
-    "agent-project-issues@agent-marketplace": true
+    "agent-project-issues@agent-marketplace": true,
+    "agent-worktree@agent-marketplace": true
   }
 }
