@@ -266,10 +266,11 @@ def test_get_ticket_skips_relations_when_disabled(
         return _json([])
 
     _install_mock(monkeypatch, handler)
-    _, _, relations, _ = GitLabProvider().get_ticket(
+    _, _, relations, truncated = GitLabProvider().get_ticket(
         _project(), "t", "5", include_relations=False,
     )
-    assert relations == []
+    assert relations is None
+    assert truncated is None
 
 
 # ---------- create_ticket ----------------------------------------------------

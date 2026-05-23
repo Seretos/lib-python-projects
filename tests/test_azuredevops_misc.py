@@ -29,7 +29,7 @@ from lib_python_projects.providers.azuredevops import (
     _basic_auth_header,
     _cache_clear_all,
 )
-from lib_python_projects.providers.base import RelationKindUnsupported
+from lib_python_projects.providers.base import RelationKindUnsupported, RelationNotFound
 
 # `refs.normalize_id` lives in the agent-project-issues plugin's tool
 # layer (URL → provider-native id mapping). It's not part of the
@@ -225,11 +225,17 @@ def test_remove_relation_not_found_raises_lookup_error(
     _install_mock(monkeypatch, handler)
     # `tools/relations.py` documents that removing a non-existent relation
     # surfaces as `{"error": ...}` via `_safe` — that's a LookupError at
-    # provider level. GitHub does the same; Azure now matches.
-    with pytest.raises(LookupError) as exc:
+    # provider level. The structured RelationNotFound subclass carries
+    # typed attributes and is still a LookupError.
+    with pytest.raises(RelationNotFound) as exc:
         AzureDevOpsProvider().remove_relation(
             _project(), token="t", ticket_id="5", kind="child", target="9"
         )
+    assert exc.value.kind == "child"
+    assert exc.value.ticket_id == "5"
+    assert "#9" in exc.value.target
+    # Must still be a LookupError for _safe wrapper compatibility.
+    assert isinstance(exc.value, LookupError)
     msg = str(exc.value)
     assert "child" in msg
     assert "#5" in msg

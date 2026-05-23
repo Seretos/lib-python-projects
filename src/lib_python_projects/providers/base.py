@@ -95,6 +95,34 @@ WRITABLE_RELATION_KINDS: tuple[str, ...] = (
     "relates_to",
 )
 
+# Kinds that are read-only — they are surfaced by the provider from
+# the other side of a write or from body/text scanning and cannot be
+# set directly via `add_relation` / `remove_relation`.
+READ_ONLY_RELATION_KINDS: tuple[str, ...] = (
+    "closes",
+    "closed_by",
+    "duplicated_by",
+    "mentions",
+    "mentioned_by",
+)
+
+
+class RelationNotFound(LookupError):
+    """Raised when `remove_relation` is called for a link that does not exist.
+
+    Carries `kind`, `ticket_id`, and `target` so the agent can branch on
+    the failure without parsing the message text. Subclass of `LookupError`
+    so the tool-layer `_safe` wrapper translates it to `{"error": "..."}`.
+    """
+
+    def __init__(self, kind: str, ticket_id: str, target: str) -> None:
+        self.kind = kind
+        self.ticket_id = ticket_id
+        self.target = target
+        super().__init__(
+            f"no {kind!r} relation on #{ticket_id} targeting {target!r} found to remove"
+        )
+
 
 class RelationKindUnsupported(NotImplementedError):
     """Raised by a provider when `add_relation` / `remove_relation` is
@@ -139,6 +167,12 @@ class Relation:
     url: str
     state: str
     is_pull_request: bool
+    resolved: bool | None = None
+    """Liveness of the target:
+    - ``True``  — built from a live API response (target exists and was fetched).
+    - ``False`` — built from a body/text scan (target not independently fetched).
+    - ``None``  — not applicable or not set.
+    """
 
 
 SortBy = Literal["created", "updated", "comments"]

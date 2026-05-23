@@ -20,6 +20,7 @@ import pytest
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import gitlab as gitlab_mod
 from lib_python_projects.providers.gitlab import GitLabProvider
+from lib_python_projects.providers.base import RelationNotFound
 
 
 def _project() -> ProjectConfig:
@@ -364,10 +365,11 @@ def test_include_relations_false_skips_link_fetch(
         return _json([], 404)
 
     _install_mock(monkeypatch, handler)
-    _, _, relations, _ = GitLabProvider().get_ticket(
+    _, _, relations, truncated = GitLabProvider().get_ticket(
         _project(), "t", "5", include_relations=False,
     )
-    assert relations == []
+    assert relations is None
+    assert truncated is None
     assert not any("/links" in u for u in seen_urls)
     assert not any("/closed_by" in u for u in seen_urls)
 
@@ -415,3 +417,136 @@ def test_duplicate_of_suppresses_relates_to_for_same_target(
     # Exactly one entry for #1 in total.
     entries_for_1 = [(k, t) for k, t in pairs if t == "#1"]
     assert len(entries_for_1) == 1
+
+
+# ---------- F10: state normalisation -----------------------------------------
+
+
+def test_issue_link_state_opened_normalised_to_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitLab raw `state='opened'` in an issue link must surface as `'open'`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("issues/5"):
+            return _json(_issue_with_body(5))
+        if "/issues/5/links" in url:
+            return _json([{
+                "iid": 10, "link_type": "blocks",
+                "title": "blocked issue",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/10",
+                "state": "opened",
+                "references": {"relative": "#10"},
+            }])
+        if "/issues/5/closed_by" in url or "/issues/5/notes" in url:
+            return _json([])
+        return _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    _, _, relations, _ = GitLabProvider().get_ticket(_project(), "t", "5")
+    blocks_rels = [r for r in relations if r.kind == "blocks"]
+    assert len(blocks_rels) == 1
+    assert blocks_rels[0].state == "open", (
+        f"expected 'open', got {blocks_rels[0].state!r} — raw 'opened' must be normalised"
+    )
+
+
+def test_closing_mr_state_opened_normalised_to_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitLab raw `state='opened'` in a closing MR must surface as `'open'`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("issues/5"):
+            return _json(_issue_with_body(5))
+        if "/closed_by" in url:
+            return _json([{
+                "iid": 50, "title": "open MR",
+                "web_url": "https://gitlab.com/acme/backend/-/merge_requests/50",
+                "state": "opened",
+            }])
+        return _json([], 200) if ("/notes" in url or "/links" in url) else _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    _, _, relations, _ = GitLabProvider().get_ticket(_project(), "t", "5")
+    closed_by = [r for r in relations if r.kind == "closed_by"]
+    assert len(closed_by) == 1
+    assert closed_by[0].state == "open", (
+        f"expected 'open', got {closed_by[0].state!r} — raw 'opened' must be normalised"
+    )
+
+
+# ---------- F4: remove_relation raises RelationNotFound ----------------------
+
+
+def test_remove_relation_link_not_found_raises_relation_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """remove_relation raises RelationNotFound (a LookupError) when link absent."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/issues/5/links" in url:
+            return _json([])  # no links
+        return _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound) as exc:
+        GitLabProvider().remove_relation(
+            _project(), "t", "5", "blocks", "#7"
+        )
+    assert exc.value.kind == "blocks"
+    assert isinstance(exc.value, LookupError)
+
+
+# ---------- F6: resolved field -----------------------------------------------
+
+
+def test_issue_link_relations_have_resolved_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue-links API relations carry `resolved=True`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("issues/5"):
+            return _json(_issue_with_body(5))
+        if "/issues/5/links" in url:
+            return _json([{
+                "iid": 10, "link_type": "blocks",
+                "title": "blocked issue",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/10",
+                "state": "opened",
+                "references": {"relative": "#10"},
+            }])
+        if "/issues/5/closed_by" in url or "/issues/5/notes" in url:
+            return _json([])
+        return _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    _, _, relations, _ = GitLabProvider().get_ticket(_project(), "t", "5")
+    link_rels = [r for r in relations if r.kind == "blocks"]
+    assert link_rels
+    assert link_rels[0].resolved is True
+
+
+def test_body_scan_mentions_have_resolved_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Body-scan `mentions` carry `resolved=False`."""
+    body = "see #42 for details"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("issues/5"):
+            return _json(_issue_with_body(5, body=body))
+        aux = _empty_aux_handler(req)
+        return aux if aux else _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    _, _, relations, _ = GitLabProvider().get_ticket(_project(), "t", "5")
+    mentions = [r for r in relations if r.kind == "mentions"]
+    assert mentions
+    assert mentions[0].resolved is False
