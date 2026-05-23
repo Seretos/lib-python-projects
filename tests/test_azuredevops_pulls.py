@@ -484,6 +484,60 @@ def fast_merge_settle(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def test_merge_pr_squash_policy_override_emits_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    fast_merge_settle: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Defect 4: when ADO branch policy overrides a squash merge strategy,
+    merge_pr must emit a log.warning identifying both the requested and
+    the actual strategy.
+    """
+    import logging
+
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            if "patched" in captured:
+                # Settle-loop response: strategy was overridden by branch policy
+                # to "noFastForward" even though we requested "squash".
+                return _json(_pr_payload(
+                    7,
+                    status="completed",
+                    mergeStatus="succeeded",
+                    completionOptions={"mergeStrategy": "noFastForward"},
+                ))
+            return _json(_pr_payload(7, mergeStatus="notSet"))
+        if req.method == "PATCH" and path.endswith("/pullrequests/7"):
+            captured["body"] = json.loads(req.content.decode("utf-8"))
+            captured["patched"] = True
+            return _json(_pr_payload(7, status="active", mergeStatus="queued"))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING, logger="project-issues.azuredevops"):
+        AzureDevOpsProvider().merge_pr(
+            _project(), token="t", pr_id="7", merge_method="squash"
+        )
+
+    # A warning must have been emitted mentioning both strategies.
+    warning_texts = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning_texts, "Expected a warning about strategy override, got none"
+    combined = " ".join(warning_texts)
+    assert "squash" in combined, f"Expected 'squash' in warning: {combined!r}"
+    assert "noFastForward" in combined or "branch policy" in combined, (
+        f"Expected override context in warning: {combined!r}"
+    )
+
+
 # ---------- add_pr_comment + review comments -------------------------------
 
 
