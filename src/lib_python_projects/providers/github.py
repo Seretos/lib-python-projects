@@ -1455,9 +1455,10 @@ class GitHubProvider:
         """Fetch a single ticket with its comments and (optionally) relations.
 
         Returns `(ticket, comments, relations, relations_truncated)`.
-        When `include_relations` is False, returns `(None, None)` for the
-        relation fields and skips the extra API calls — callers must
-        distinguish `None` (skipped) from `[]` (fetched but empty).
+        When `include_relations` is False, skips the extra relation API
+        calls and returns `([], None)` for the relation fields.
+        `truncated=None` signals "skipped"; `truncated=False` signals
+        "fetched but empty".  `relations` is always a list (never `None`).
         """
         with _client(token) as client:
             r = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
@@ -1475,7 +1476,7 @@ class GitHubProvider:
                     client, project, ticket_id, issue_raw, token=token,
                 )
             else:
-                relations, truncated = None, None
+                relations, truncated = [], None
         return ticket, comments, relations, truncated
 
     def create_ticket(
@@ -1673,6 +1674,8 @@ class GitHubProvider:
         ticket_id: str,
         body: str,
     ) -> Comment:
+        if not body or not body.strip():
+            raise ValueError("body must not be empty")
         prefixed = ensure_comment_prefix(body)
         with _client(token) as client:
             r = client.post(
@@ -1774,7 +1777,12 @@ class GitHubProvider:
         # items newest-first.
         tail = collected_oldest_first[-limit:]
         tail.reverse()
-        has_more = cur >= 1
+        # `cur >= 1` means we stopped before reaching page 1 (older pages
+        # exist that weren't fetched at all).  `len > limit` means we fetched
+        # all remaining pages but collected more items than `limit`, so there
+        # are older comments in `collected_oldest_first` that were trimmed by
+        # the slice and won't be returned in this batch.
+        has_more = cur >= 1 or len(collected_oldest_first) > limit
         return tail, has_more
 
     def get_comment(
@@ -1820,6 +1828,8 @@ class GitHubProvider:
         signal a reader has of authorship — getting it right here is
         important. Costs one extra GET before the PATCH.
         """
+        if not body or not body.strip():
+            raise ValueError("body must not be empty")
         with _client(token) as client:
             r0 = client.get(
                 f"{_repo_path(project)}/issues/comments/{comment_id}",
@@ -2587,8 +2597,8 @@ class GitHubProvider:
                 _github_assert_dependency_exists(
                     client, target_repo, target_number,
                     target_internal_id=source_internal_id,
-                    source_ref=f"#{target_number}",
-                    target_ref=f"#{ticket_id}",
+                    source_ref=f"#{ticket_id}",
+                    target_ref=f"#{target_number}",
                     kind=kind,
                     ticket_id=ticket_id,
                 )

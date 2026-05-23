@@ -419,7 +419,7 @@ def test_include_relations_false_skips_extra_calls(monkeypatch: pytest.MonkeyPat
     _, _, relations, truncated = provider.get_ticket(
         _project(), token="t", ticket_id="42", include_relations=False
     )
-    assert relations is None
+    assert relations == []
     assert truncated is None
     # We expect exactly two calls: the issue and the comments.
     paths = [r.url.path for r in seen]
@@ -963,6 +963,7 @@ def test_remove_relation_blocks_not_found_raises_relation_not_found(
         )
     assert exc.value.kind == "blocks"
     assert isinstance(exc.value, LookupError)
+    assert exc.value.target == "#3"
 
 
 def test_remove_relation_child_not_found_raises_relation_not_found(
@@ -1077,3 +1078,127 @@ def test_api_fetched_relations_have_resolved_true(
     assert api_rels, "expected API-fetched relations"
     for rel in api_rels:
         assert rel.resolved is True, f"{rel.kind} should have resolved=True"
+
+
+# ---------- Defect 2: _list_comments_tail has_more off-by-one ----------------
+
+
+def _comment_payload(comment_id: int) -> dict:
+    return {
+        "id": comment_id,
+        "user": {"login": "alice"},
+        "body": f"comment {comment_id}",
+        "html_url": f"https://github.com/acme/backend/issues/42#issuecomment-{comment_id}",
+        "created_at": f"2024-01-0{comment_id}T00:00:00Z",
+    }
+
+
+def test_list_comments_desc_has_more_true_when_older_pages_collected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """3 comments across 2 pages (limit=2, order=desc): has_more=True.
+
+    Scenario (per_page derived from limit=2):
+      Page 1: [comment1, comment2]
+      Page 2: [comment3]
+    Walking backwards: fetch page 2 (1 item), fetch page 1 (2 items).
+    collected = [comment1, comment2, comment3] — 3 items > limit=2.
+    Returned tail is [comment3, comment2] (newest-first).
+    has_more must be True because comment1 exists but was trimmed.
+    """
+    base_url = "https://api.github.com/repos/acme/backend/issues/42/comments"
+    link_last_2 = (
+        f'<{base_url}?per_page=2&page=1>; rel="first", '
+        f'<{base_url}?per_page=2&page=2>; rel="last"'
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        page = int(req.url.params.get("page", "1"))
+        if page == 1:
+            return _json(
+                [_comment_payload(1), _comment_payload(2)],
+                headers={"Link": link_last_2},
+            )
+        if page == 2:
+            return _json([_comment_payload(3)])
+        raise AssertionError(f"unexpected page {page}")
+
+    _install_mock(monkeypatch, handler)
+    comments, has_more = GitHubProvider().list_comments(
+        _project(), token="t", ticket_id="42", limit=2, order="desc",
+    )
+    assert has_more is True
+    assert [c.id for c in comments] == ["3", "2"]
+
+
+def test_list_comments_desc_has_more_false_when_all_fit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2 comments on 1 page (limit=2, order=desc): has_more=False.
+
+    Single-page path: probe returns no 'last' link; all comments returned.
+    """
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json([_comment_payload(1), _comment_payload(2)])
+
+    _install_mock(monkeypatch, handler)
+    comments, has_more = GitHubProvider().list_comments(
+        _project(), token="t", ticket_id="42", limit=2, order="desc",
+    )
+    assert has_more is False
+    assert [c.id for c in comments] == ["2", "1"]
+
+
+# ---------- Defect 3: empty body raises ValueError (GitHub) ------------------
+
+
+def test_add_comment_empty_body_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_comment with body='' must raise ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="empty"):
+        GitHubProvider().add_comment(_project(), token="t", ticket_id="42", body="")
+
+
+def test_add_comment_whitespace_body_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_comment with body='   ' must raise ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="empty"):
+        GitHubProvider().add_comment(_project(), token="t", ticket_id="42", body="   ")
+
+
+def test_update_comment_empty_body_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_comment with body='' must raise ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="empty"):
+        GitHubProvider().update_comment(
+            _project(), token="t", comment_id="99", body="", ticket_id="42",
+        )
+
+
+def test_update_comment_whitespace_body_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_comment with body='   ' must raise ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="empty"):
+        GitHubProvider().update_comment(
+            _project(), token="t", comment_id="99", body="   ", ticket_id="42",
+        )

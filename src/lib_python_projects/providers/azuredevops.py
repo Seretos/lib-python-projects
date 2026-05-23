@@ -1526,7 +1526,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
             )
             truncated: bool | None = False
         else:
-            relations = None
+            relations = []
             truncated = None
 
         return ticket, comments, relations, truncated
@@ -1920,7 +1920,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         ticket_id: str,
         body: str,
     ) -> Comment:
-        body_with_marker = ensure_comment_prefix(body or "")
+        if not body or not body.strip():
+            raise ValueError("body must not be empty")
+        body_with_marker = ensure_comment_prefix(body)
         path = (
             f"{_project_scope(project)}/_apis/wit/workItems/"
             f"{quote(str(ticket_id), safe='')}/comments"
@@ -2025,6 +2027,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
             )
         _validate_int32_id(ticket_id, "ticket")
         _validate_int32_id(comment_id, "comment")
+        if not body or not body.strip():
+            raise ValueError("body must not be empty")
         # Read current to decide the marker flavour.
         path = (
             f"{_project_scope(project)}/_apis/wit/workItems/"
