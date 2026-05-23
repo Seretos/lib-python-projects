@@ -1173,7 +1173,7 @@ def _dedupe_relations(rels: list[Relation]) -> list[Relation]:
             continue
         if (
             r.kind == "mentions"
-            and "closes" in strong_kinds_by_target.get(r.ticket_id, set())
+            and strong_kinds_by_target.get(r.ticket_id, set()) & {"closes", "duplicate_of"}
         ):
             continue
         out.append(r)

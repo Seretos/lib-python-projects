@@ -532,6 +532,49 @@ def test_duplicate_of_from_own_state(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ("duplicate_of", "#1") in by_kind
 
 
+def test_duplicate_of_no_extra_mentions_from_body_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Body marker 'Duplicate of #1' must not produce a spurious 'mentions' entry.
+
+    After add_relation(kind="duplicate_of") the body contains a
+    'Duplicate of #1' line.  _dedupe_relations must suppress the 'mentions'
+    entry that the plain-mention scanner would otherwise emit for the same
+    target.
+    """
+    body = "Duplicate of #1"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(
+                5, body=body, state="closed", state_reason="duplicate",
+            ))
+        if path == "/repos/acme/backend/issues/5/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/5/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/5/timeline":
+            return _json([])
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(
+        _project(), token="t", ticket_id="5"
+    )
+    # Exactly one relation entry for #1, with kind "duplicate_of".
+    entries_for_target = [(r.kind, r.ticket_id) for r in relations if r.ticket_id == "#1"]
+    assert ("duplicate_of", "#1") in [(r.kind, r.ticket_id) for r in relations]
+    # No spurious "mentions" for the same target.
+    assert not any(r.kind == "mentions" and r.ticket_id == "#1" for r in relations)
+    # Exactly one entry for target #1 total.
+    assert len(entries_for_target) == 1
+
+
 def test_duplicated_by_relabel_from_cross_ref(monkeypatch: pytest.MonkeyPatch) -> None:
     """A cross-ref from a closed-as-duplicate source becomes `duplicated_by`."""
 

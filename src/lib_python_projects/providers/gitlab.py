@@ -1028,6 +1028,18 @@ def _fetch_relations(
             continue
         relations.append(_make_relation(kind="mentions", ref=ref))
 
+    # Dedup: the native issue-link written by _gitlab_mark_duplicate_of
+    # comes back from the links API as "relates_to", while the body scan
+    # above also emits "duplicate_of" for the same target — one target,
+    # two relations.  Drop any "relates_to" whose ticket_id already has a
+    # "duplicate_of" entry (the body-scan result is authoritative).
+    dup_target_ids = {r.ticket_id for r in relations if r.kind == "duplicate_of"}
+    if dup_target_ids:
+        relations = [
+            r for r in relations
+            if not (r.kind == "relates_to" and r.ticket_id in dup_target_ids)
+        ]
+
     return relations
 
 
