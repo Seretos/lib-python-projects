@@ -467,6 +467,27 @@ def test_add_pr_comment_applies_prefix(
     assert captured["body"]["body"].startswith("#ai-generated")
 
 
+def test_add_pr_comment_synthesises_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When GitLab omits noteable_iid/noteable_type/web_url from the MR-note
+    POST response, the URL must still be synthesised from the MR iid and
+    project.web_url that the caller already holds."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST":
+            return _json({
+                "id": 1, "body": "review note",
+                "author": {"username": "a"},
+                "created_at": "2024-01-01T00:00:00Z",
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    c = GitLabProvider().add_pr_comment(_project(), "t", "5", "review note")
+    assert c.url == "https://gitlab.com/acme/backend/-/merge_requests/5#note_1"
+
+
 # ---------- merge_pr ---------------------------------------------------------
 
 

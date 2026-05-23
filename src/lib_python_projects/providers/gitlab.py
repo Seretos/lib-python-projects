@@ -250,7 +250,9 @@ def _map_issue(raw: dict, project: ProjectConfig | None = None) -> Ticket:
 
 
 def _map_note(
-    raw: dict, project: ProjectConfig | None = None,
+    raw: dict,
+    project: ProjectConfig | None = None,
+    mr_iid: str | int | None = None,
 ) -> Comment:
     """Translate a GitLab note (comment) payload into a `Comment`.
 
@@ -260,27 +262,48 @@ def _map_note(
 
     `url` handling (ticket #41 addendum A): GitLab note payloads do
     NOT include a `web_url` field. When `project` is supplied we
-    synthesise the canonical anchor URL from `project.web_url`,
-    `noteable_type` (`Issue` or `MergeRequest`) and `noteable_iid`.
+    synthesise the canonical anchor URL. URL precedence:
+
+    1. ``raw.get("web_url")`` — used if non-empty.
+    2. If `mr_iid` is not None — synthesise directly from
+       ``{project.web_url}/-/merge_requests/{mr_iid}#note_{note_id}``,
+       bypassing the ``noteable_iid``/``noteable_type`` payload fields
+       which GitLab does not reliably include on MR-note write responses.
+    3. Fallback: the existing ``noteable_iid``/``noteable_type`` payload-
+       based synthesis (unchanged — used for issue-note and list paths).
+
     Falls back to empty string when `project` is omitted or the
     payload lacks the noteable hints (e.g. legacy responses).
+
+    Args:
+        raw: Raw GitLab note payload dict.
+        project: The project config, used for ``web_url`` synthesis.
+        mr_iid: When set, the MR iid is used for URL synthesis instead
+            of relying on ``noteable_iid``/``noteable_type`` in the
+            payload (which GitLab omits on MR-note POST responses).
     """
     author = raw.get("author") or {}
     raw_url = raw.get("web_url") or ""
     if not raw_url and project is not None and project.web_url:
-        noteable_iid = raw.get("noteable_iid")
-        noteable_type = (raw.get("noteable_type") or "").lower()
         note_id = raw.get("id")
-        if noteable_iid is not None and note_id is not None:
-            segment = (
-                "merge_requests"
-                if noteable_type == "mergerequest"
-                else "issues"
-            )
+        if mr_iid is not None and note_id is not None:
             raw_url = (
-                f"{project.web_url}/-/{segment}/{noteable_iid}"
+                f"{project.web_url}/-/merge_requests/{mr_iid}"
                 f"#note_{note_id}"
             )
+        else:
+            noteable_iid = raw.get("noteable_iid")
+            noteable_type = (raw.get("noteable_type") or "").lower()
+            if noteable_iid is not None and note_id is not None:
+                segment = (
+                    "merge_requests"
+                    if noteable_type == "mergerequest"
+                    else "issues"
+                )
+                raw_url = (
+                    f"{project.web_url}/-/{segment}/{noteable_iid}"
+                    f"#note_{note_id}"
+                )
     if project is not None:
         raw_url = _canonical_url(raw_url, project)
     return Comment(
@@ -1961,7 +1984,7 @@ class GitLabProvider(TokenCapabilityProvider):
                 json={"body": prefixed},
             )
             _check(r)
-            return _map_note(r.json(), project)
+            return _map_note(r.json(), project, mr_iid=pr_id)
 
     def list_pr_review_comments(
         self,
