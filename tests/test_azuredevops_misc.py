@@ -817,3 +817,48 @@ def test_add_relation_duplicate_of_appends_body_marker_and_closes(
         "body must contain 'Duplicate of #5'"
     )
     assert state_ops[0].get("value") == "Closed"
+
+
+# ---------- Issue #17 defect fixes -------------------------------------------
+
+
+def test_get_run_404_names_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_run that receives a 404 must re-raise naming the project and run_id."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(
+            {"message": "Build not found"},
+            status_code=404,
+        )
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().get_run(_project(), token="t", run_id="9999")
+    assert exc.value.status == 404
+    assert "pipeline 'azure-tests#9999' not found" in exc.value.message
+
+
+def test_check_invalid_argument_allowed_values_non_state_no_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """InvalidArgumentValueException with 'allowed values' in the message but
+    NOT about a state field must NOT trigger the list_ticket_statuses hint.
+    (Ticket #17 issue 4: the fragment match was firing on non-state errors.)
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(
+            {
+                "message": (
+                    "The field 'AssignedTo' contains a value that is not"
+                    " in the allowed values for this field."
+                ),
+                "typeKey": "InvalidArgumentValueException",
+            },
+            status_code=400,
+        )
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().get_ticket(_project(), token="t", ticket_id="5")
+    assert "list_ticket_statuses" not in str(exc.value)

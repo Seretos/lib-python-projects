@@ -1573,7 +1573,14 @@ class GitHubProvider:
     ) -> Ticket:
         with _client(token) as client:
             r0 = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
-            _check(r0)
+            try:
+                _check(r0)
+            except GitHubError as exc:
+                if exc.status == 404:
+                    raise GitHubError(
+                        404, f"ticket '{project.id}#{ticket_id}' not found"
+                    ) from exc
+                raise
             current = r0.json()
             current_labels = {lbl["name"] for lbl in (current.get("labels") or [])}
             current_assignees = {a["login"] for a in (current.get("assignees") or [])}
@@ -1682,7 +1689,14 @@ class GitHubProvider:
                 f"{_repo_path(project)}/issues/{ticket_id}/comments",
                 json={"body": prefixed},
             )
-            _check(r)
+            try:
+                _check(r)
+            except GitHubError as exc:
+                if exc.status == 404:
+                    raise GitHubError(
+                        404, f"ticket '{project.id}#{ticket_id}' not found"
+                    ) from exc
+                raise
             return _map_comment(r.json())
 
     def list_comments(
@@ -1834,7 +1848,14 @@ class GitHubProvider:
             r0 = client.get(
                 f"{_repo_path(project)}/issues/comments/{comment_id}",
             )
-            _check(r0)
+            try:
+                _check(r0)
+            except GitHubError as exc:
+                if exc.status == 404:
+                    raise GitHubError(
+                        404, f"comment '{project.id}#{comment_id}' not found"
+                    ) from exc
+                raise
             current_body = r0.json().get("body") or ""
             will_be_ai_generated = has_ai_generated_marker(current_body)
             prefixed = apply_body_marker(
@@ -2289,7 +2310,19 @@ class GitHubProvider:
                 f"{_repo_path(project)}/pulls/{pr_id}/comments",
                 json=payload,
             )
-            _check(r)
+            try:
+                _check(r)
+            except GitHubError as exc:
+                if exc.status == 422:
+                    raise GitHubError(
+                        422,
+                        f"add_pr_review_comment: could not resolve diff location"
+                        f" — check that path={path!r}, line={line!r},"
+                        f" commit_sha={commit_sha!r} refer to an existing"
+                        f" position in PR {pr_id};"
+                        f" original error: {exc.message}",
+                    ) from exc
+                raise
             return _map_review_comment(r.json())
 
     def submit_pr_review(
@@ -2725,7 +2758,14 @@ class GitHubProvider:
             r = client.get(
                 f"{_repo_path(project)}/actions/runs/{run_id}"
             )
-            _check(r)
+            try:
+                _check(r)
+            except GitHubError as exc:
+                if exc.status == 404:
+                    raise GitHubError(
+                        404, f"pipeline '{project.id}#{run_id}' not found"
+                    ) from exc
+                raise
             raw = r.json()
             run = _map_run(raw)
             if (
