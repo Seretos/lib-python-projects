@@ -14,9 +14,10 @@ Schema policy (carried over from the plugin):
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from lib_python_config import LoadResult
 
@@ -77,7 +78,13 @@ class ProjectConfig(BaseModel):
     provider: Provider
     path: str | None = None
     base_url: str | None = None
-    token_env: str | None = None
+    token_env: str | None = Field(default=None, exclude=True)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def token_available(self) -> bool:
+        return bool(self.token_env and os.environ.get(self.token_env))
+
     permissions: Permissions = Field(default_factory=Permissions)
     source: Source = "config"
     # Azure DevOps only. When unset, the provider discovers a sensible
