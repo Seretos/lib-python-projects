@@ -220,7 +220,8 @@ def _map_pr(raw: dict) -> PullRequest:
         back to safe defaults so the dataclass is always constructable.
     """
     state = raw.get("state", "open")
-    merged = bool(raw.get("merged") or raw.get("merged_at"))
+    pr_stub = raw.get("pull_request") or {}
+    merged = bool(raw.get("merged") or raw.get("merged_at") or pr_stub.get("merged_at"))
     if state == "open":
         status: str = "open"
     elif merged:
@@ -1858,7 +1859,17 @@ class GitHubProvider:
                 q = " ".join(pieces)
                 r = client.get("/search/issues", params={"q": q, "per_page": per_page})
                 _check(r)
-                items = r.json().get("items", [])
+                stubs = r.json().get("items", [])
+                # Back-fill: search items are issue-shaped stubs that lack PR
+                # fields (head/base/mergeable_state/draft). Fetch the full PR
+                # payload for each stub so callers always get complete objects.
+                full_items: list[dict] = []
+                for stub in stubs:
+                    number = stub.get("number")
+                    detail = client.get(f"{_repo_path(project)}/pulls/{number}")
+                    _check(detail)
+                    full_items.append(detail.json())
+                return [_map_pr(it) for it in full_items]
             else:
                 params: dict[str, Any] = {
                     "per_page": per_page,
