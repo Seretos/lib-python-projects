@@ -902,3 +902,62 @@ def test_update_comment_whitespace_body_raises_value_error(
     _install_mock(monkeypatch, handler)
     with pytest.raises(ValueError, match="empty"):
         GitLabProvider().update_comment(_project(), "t", "5/99", "   ")
+
+
+# ---------- Issue #17 defect fixes -------------------------------------------
+
+
+def test_update_ticket_404_names_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """update_ticket on a missing ticket wraps the 404 with the resource id."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().update_ticket(
+            _project(), "t", "42", title="x",
+        )
+    assert exc.value.status == 404
+    assert "ticket 'acme#42' not found" in exc.value.message
+
+
+def test_add_comment_404_names_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """add_comment on a missing ticket wraps the 404 with the resource id."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "404 Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_comment(_project(), "t", "42", "hello")
+    assert exc.value.status == 404
+    assert "ticket 'acme#42' not found" in exc.value.message
+
+
+def test_update_comment_404_names_comment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """update_comment on a missing note wraps the 404 with the resource id."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().update_comment(
+            _project(), "t", comment_id="99", body="x", ticket_id="5",
+        )
+    assert exc.value.status == 404
+    assert "comment 'acme#99' not found" in exc.value.message
+
+
+def test_check_no_double_status_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GitLab returns {"message": "404 Not Found"}; the error string must NOT
+    duplicate the status code (i.e. must not contain '404: 404')."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "404 Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().list_tickets(_project(), "t", filters=TicketFilters())
+    assert "404: 404" not in str(exc.value)

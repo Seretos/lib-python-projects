@@ -778,6 +778,29 @@ def test_add_pr_review_comment_reply_posts_to_discussion(
     assert all("/merge_requests/5" not in p or "/discussions/" in p for p in seen)
 
 
+# ---------- Issue #17: merge_pr 405 → "already merged" ----------------------
+
+
+def test_merge_pr_405_reports_already_merged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitLab returns 405 when trying to merge an already-merged MR.
+    The provider must surface a clear 'already merged' message."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "405 Method Not Allowed"}, status_code=405)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "7", merge_method="merge")
+    assert exc.value.status == 405
+    assert "already merged" in exc.value.message
+    assert "acme#7" in exc.value.message
+
+
 def test_create_then_reply_round_trip_uses_surfaced_discussion_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

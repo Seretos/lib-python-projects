@@ -152,6 +152,14 @@ _TRANSITION_MSG_FRAGMENTS: tuple[str, ...] = (
     "allowed values",
 )
 
+# When typeKey is in this set the transition hint fires ONLY when the message
+# also mentions a state-related term.  This prevents the hint appearing on
+# non-state InvalidArgumentValueException errors (e.g. Title-empty, bad
+# assignee format) whose messages happen to contain words like "allowed values".
+_FRAGMENT_GATED_TYPE_KEYS: frozenset[str] = frozenset(
+    {"InvalidArgumentValueException"}
+)
+
 # ADO occasionally returns HTTP 500 for "work item does not exist" instead
 # of the expected 404 / 400.  Narrow-match these so genuine server errors
 # with unrelated messages are not reclassified.
@@ -224,11 +232,22 @@ def _check(resp: httpx.Response) -> None:
     # invalid System.State values under a handful of typeKeys with
     # message fragments that all boil down to "your value isn't in the
     # allowed list" — match any of them so the hint reliably fires.
+    #
+    # Exception: for typeKeys in _FRAGMENT_GATED_TYPE_KEYS (specifically
+    # InvalidArgumentValueException) the fragment match is only honoured
+    # when the message also contains the word "state". This prevents
+    # Title-empty or Assignee-format errors from triggering the
+    # list_ticket_statuses hint just because their messages happen to
+    # contain "allowed values" or similar fragments.
+    _frag_match = any(frag in msg_lower for frag in _TRANSITION_MSG_FRAGMENTS)
+    if type_key in _FRAGMENT_GATED_TYPE_KEYS:
+        _frag_match = _frag_match and "state" in msg_lower
+
     if (
         status in (400, 409)
         and (
             type_key in _TRANSITION_TYPE_KEYS
-            or any(frag in msg_lower for frag in _TRANSITION_MSG_FRAGMENTS)
+            or _frag_match
         )
         and "list_ticket_statuses" not in msg
     ):
@@ -1805,7 +1824,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         path = f"{_project_scope(project)}/_apis/wit/workitems/{quote(str(ticket_id), safe='')}"
         with _client(project, token) as c:
             resp = c.get(path, params=_api_version_params())
-        _check(resp)
+        try:
+            _check(resp)
+        except AzureDevOpsError as exc:
+            if exc.status == 404:
+                raise AzureDevOpsError(
+                    404, f"ticket '{project.id}#{ticket_id}' not found"
+                ) from exc
+            raise
         current = resp.json()
         cur_fields = current.get("fields") or {}
 
@@ -1933,7 +1959,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                 params=_api_version_params({"api-version": API_VERSION_COMMENTS}),
                 json={"text": _markdown_to_html(body_with_marker)},
             )
-        _check(resp)
+        try:
+            _check(resp)
+        except AzureDevOpsError as exc:
+            if exc.status == 404:
+                raise AzureDevOpsError(
+                    404, f"ticket '{project.id}#{ticket_id}' not found"
+                ) from exc
+            raise
         return _map_work_item_comment(resp.json(), project, str(ticket_id))
 
     def list_comments(
@@ -2036,7 +2069,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         )
         with _client(project, token) as c:
             resp = c.get(path, params=_api_version_params({"api-version": API_VERSION_COMMENTS}))
-        _check(resp)
+        try:
+            _check(resp)
+        except AzureDevOpsError as exc:
+            if exc.status == 404:
+                raise AzureDevOpsError(
+                    404, f"comment '{project.id}#{comment_id}' not found"
+                ) from exc
+            raise
         cur_markdown = _html_to_markdown((resp.json() or {}).get("text") or "")
         already_ai = has_ai_generated_marker(cur_markdown)
         new_body = apply_body_marker(body, will_be_ai_generated=already_ai)
@@ -3238,7 +3278,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         path = f"{_project_scope(project)}/_apis/build/builds/{quote(str(run_id), safe='')}"
         with _client(project, token) as c:
             resp = c.get(path, params=_api_version_params())
-        _check(resp)
+        try:
+            _check(resp)
+        except AzureDevOpsError as exc:
+            if exc.status == 404:
+                raise AzureDevOpsError(
+                    404, f"pipeline '{project.id}#{run_id}' not found"
+                ) from exc
+            raise
         run = _map_build_run(resp.json(), project)
         if include_failure_excerpt and run.conclusion == "failure":
             run.failure = self._fetch_build_failure_context(

@@ -231,3 +231,35 @@ def test_issue_ticket_skips_pr_early_bail(monkeypatch: pytest.MonkeyPatch) -> No
     assert runs == []
     # Confirm /pulls/42 was never in any of the requests.
     assert "/repos/acme/backend/pulls/42" not in requested_paths
+
+
+# ---------- Issue #17: get_run 404 naming ------------------------------------
+
+
+def test_get_run_404_names_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_run that receives a 404 must re-raise naming the project and run_id."""
+    from lib_python_projects.providers.github import GitHubError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().get_run(_project(), token="t", run_id="99999")
+    assert exc.value.status == 404
+    assert "pipeline 'acme#99999' not found" in exc.value.message
+
+
+def test_get_run_non_numeric_404_naming(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_run with a non-numeric run_id (e.g. 'main') gets a 404 that names
+    the run_id in the error (GitHub simply returns 404 for unknown ids)."""
+    from lib_python_projects.providers.github import GitHubError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().get_run(_project(), token="t", run_id="main")
+    assert exc.value.status == 404
+    assert "main" in exc.value.message

@@ -269,3 +269,23 @@ def test_get_run_failed_handles_jobs_endpoint_unreachable(
     assert run.failure is not None
     assert run.failure.failing_jobs == []
     assert run.failure.note is not None
+
+
+# ---------- Issue #17: get_run non-numeric run_id ----------------------------
+
+
+def test_get_run_non_numeric_run_id_raises_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """get_run with a non-numeric run_id must raise GitLabError(404, ...)
+    naming the run_id — GitLab would otherwise return 400."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call should be made for non-numeric id")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().get_run(_project(), "t", "not-a-number")
+    assert exc.value.status == 404
+    assert "not-a-number" in exc.value.message

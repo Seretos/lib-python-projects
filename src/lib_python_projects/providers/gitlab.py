@@ -70,6 +70,10 @@ log = logging.getLogger("project-issues.gitlab")
 USER_AGENT = "claude-code-project-issues-plugin/0.1.0"
 DEFAULT_BASE_URL = "https://gitlab.com"
 
+# GitLab sometimes returns {"message": "404 Not Found"} whose numeric prefix
+# duplicates the HTTP status code already in GitLabError.__str__. Strip it.
+_STATUS_PREFIX_RE = re.compile(r"^\d{3}\s+")
+
 
 class GitLabError(RuntimeError):
     """Raised on any non-success response from the GitLab REST API.
@@ -141,6 +145,10 @@ def _check(resp: httpx.Response) -> None:
                 msg = "; ".join(parts) or resp.reason_phrase
             else:
                 msg = str(raw) or resp.reason_phrase
+            # Strip leading "NNN " prefix (e.g. "404 Not Found") to avoid
+            # "GitLab 404: 404 Not Found" double-status in the error string.
+            if _STATUS_PREFIX_RE.match(msg):
+                msg = _STATUS_PREFIX_RE.sub("", msg, count=1)
             extra = payload.get("error_description")
             if extra:
                 msg = f"{msg} ({extra})"
@@ -1450,7 +1458,14 @@ class GitLabProvider(TokenCapabilityProvider):
             # Always fetch current — needed for the ai-modified marker
             # decision, and for assignee delta resolution.
             r0 = client.get(f"/projects/{path}/issues/{ticket_id}")
-            _check(r0)
+            try:
+                _check(r0)
+            except GitLabError as exc:
+                if exc.status == 404:
+                    raise GitLabError(
+                        404, f"ticket '{project.id}#{ticket_id}' not found"
+                    ) from exc
+                raise
             current = r0.json()
             current_labels = set(current.get("labels") or [])
 
@@ -1550,7 +1565,14 @@ class GitLabProvider(TokenCapabilityProvider):
                 f"/projects/{path}/issues/{ticket_id}/notes",
                 json={"body": prefixed},
             )
-            _check(r)
+            try:
+                _check(r)
+            except GitLabError as exc:
+                if exc.status == 404:
+                    raise GitLabError(
+                        404, f"ticket '{project.id}#{ticket_id}' not found"
+                    ) from exc
+                raise
             return _map_note(r.json(), project)
 
     def list_comments(
@@ -1733,7 +1755,14 @@ class GitLabProvider(TokenCapabilityProvider):
             r0 = client.get(
                 f"/projects/{path}/issues/{issue_iid}/notes/{note_id}",
             )
-            _check(r0)
+            try:
+                _check(r0)
+            except GitLabError as exc:
+                if exc.status == 404:
+                    raise GitLabError(
+                        404, f"comment '{project.id}#{comment_id}' not found"
+                    ) from exc
+                raise
             current_body = r0.json().get("body") or ""
             will_be_ai_generated = has_ai_generated_marker(current_body)
             prefixed = apply_body_marker(
@@ -2444,7 +2473,14 @@ class GitLabProvider(TokenCapabilityProvider):
             r = client.put(
                 f"/projects/{path}/merge_requests/{pr_id}/merge", json=payload,
             )
-            _check(r)
+            try:
+                _check(r)
+            except GitLabError as exc:
+                if exc.status == 405:
+                    raise GitLabError(
+                        405, f"PR '{project.id}#{pr_id}' is already merged"
+                    ) from exc
+                raise
             # Re-fetch so the response captures the post-merge state
             # (merged_at, merge_commit_sha, state=merged). The merge
             # endpoint returns the MR, but mirror GitHub's pattern of
@@ -2698,6 +2734,12 @@ class GitLabProvider(TokenCapabilityProvider):
         each. GitLab does not expose GitHub-style annotations; the
         `annotations` field on each `FailingJob` is therefore `[]`.
         """
+        if not str(run_id).strip().isdigit():
+            raise GitLabError(
+                404,
+                f"pipeline '{project.id}#{run_id}' not found"
+                f" — run_id must be a numeric pipeline id",
+            )
         path = _project_path(project)
         with _client(project, token) as client:
             r = client.get(f"/projects/{path}/pipelines/{run_id}")

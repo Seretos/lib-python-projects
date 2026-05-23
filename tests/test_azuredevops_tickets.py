@@ -1090,3 +1090,65 @@ def test_update_comment_whitespace_body_raises_value_error(
         AzureDevOpsProvider().update_comment(
             _project(), token="t", comment_id="11", body="   ", ticket_id="5",
         )
+
+
+# ---------- Issue #17 defect fixes -------------------------------------------
+
+
+def test_update_ticket_404_names_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """update_ticket on a missing work item wraps the 404 with resource id."""
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(
+            {"message": "Work item does not exist.", "typeKey": "WorkItemNotFoundException"},
+            status_code=400,  # ADO 400-as-404
+        )
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().update_ticket(
+            _project(), token="t", ticket_id="42", title="x",
+        )
+    assert exc.value.status == 404
+    assert "ticket 'azure-tests#42' not found" in exc.value.message
+
+
+def test_add_comment_404_names_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """add_comment on a missing work item wraps the 404 with resource id."""
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "/comments" in req.url.path:
+            return _json(
+                {"message": "Work item does not exist."},
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().add_comment(
+            _project(), token="t", ticket_id="42", body="hello",
+        )
+    assert exc.value.status == 404
+    assert "ticket 'azure-tests#42' not found" in exc.value.message
+
+
+def test_update_comment_404_names_comment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """update_comment on a missing comment wraps the 404 with resource id."""
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(
+            {"message": "Comment not found.", "typeKey": "CommentNotFoundException"},
+            status_code=400,  # ADO 400-as-404
+        )
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().update_comment(
+            _project(), token="t", comment_id="99", body="x", ticket_id="5",
+        )
+    assert exc.value.status == 404
+    assert "comment 'azure-tests#99' not found" in exc.value.message

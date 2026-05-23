@@ -148,7 +148,10 @@ def test_check_simple_message_payload() -> None:
     with pytest.raises(GitLabError) as exc:
         _check(_resp({"message": "404 Project Not Found"}, status=404))
     assert exc.value.status == 404
-    assert "404 Project Not Found" in str(exc.value)
+    # The leading "404 " prefix is stripped to avoid "GitLab 404: 404 Project Not Found"
+    # double-status in the error string (ticket #17 issue 2 fix).
+    assert "Project Not Found" in str(exc.value)
+    assert "GitLab 404: 404" not in str(exc.value)
 
 
 def test_check_oauth_error_payload() -> None:
