@@ -269,7 +269,7 @@ def test_get_ticket_skips_relations_when_disabled(
     _, _, relations, truncated = GitLabProvider().get_ticket(
         _project(), "t", "5", include_relations=False,
     )
-    assert relations is None
+    assert relations == []
     assert truncated is None
 
 
@@ -851,3 +851,54 @@ def test_update_comment_preserves_generated_for_ai_note(
     _install_mock(monkeypatch, handler)
     GitLabProvider().update_comment(_project(), "t", "5/99", "follow-up")
     assert captured["body"]["body"] == "#ai-generated\n\nfollow-up"
+
+
+# ---------- Defect 3: empty body raises ValueError (GitLab) ------------------
+
+
+def test_add_comment_empty_body_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_comment with body='' must raise ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="empty"):
+        GitLabProvider().add_comment(_project(), "t", "5", "")
+
+
+def test_add_comment_whitespace_body_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_comment with body='   ' must raise ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="empty"):
+        GitLabProvider().add_comment(_project(), "t", "5", "   ")
+
+
+def test_update_comment_empty_body_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_comment with body='' must raise ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="empty"):
+        GitLabProvider().update_comment(_project(), "t", "5/99", "")
+
+
+def test_update_comment_whitespace_body_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_comment with body='   ' must raise ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="empty"):
+        GitLabProvider().update_comment(_project(), "t", "5/99", "   ")

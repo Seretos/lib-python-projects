@@ -1311,9 +1311,10 @@ class GitLabProvider(TokenCapabilityProvider):
         """Fetch a single issue plus its non-system notes.
 
         Returns `(ticket, comments, relations, relations_truncated)`.
-        When `include_relations` is False, returns `(None, None)` for the
-        relation fields and skips the extra API calls — callers must
-        distinguish `None` (skipped) from `[]` (fetched but empty).
+        When `include_relations` is False, skips the extra relation API
+        calls and returns `([], None)` for the relation fields.
+        `truncated=None` signals "skipped"; `truncated=False` signals
+        "fetched but empty".  `relations` is always a list (never `None`).
 
         System notes (state changes, label edits) are filtered out —
         they're not user-facing comments.
@@ -1339,7 +1340,7 @@ class GitLabProvider(TokenCapabilityProvider):
                 )
                 truncated: bool | None = False
             else:
-                relations = None
+                relations = []
                 truncated = None
         return ticket, comments, relations, truncated
 
@@ -1540,6 +1541,8 @@ class GitLabProvider(TokenCapabilityProvider):
         body: str,
     ) -> Comment:
         """Post a note on an issue. The AI-comment prefix is applied."""
+        if not body or not body.strip():
+            raise ValueError("body must not be empty")
         prefixed = ensure_comment_prefix(body)
         path = _project_path(project)
         with _client(project, token) as client:
@@ -1720,6 +1723,8 @@ class GitLabProvider(TokenCapabilityProvider):
         #41 addendum B/C): composite `"<iid>/<note_id>"` in `comment_id`,
         or bare note id in `comment_id` plus parent iid in `ticket_id`.
         """
+        if not body or not body.strip():
+            raise ValueError("body must not be empty")
         path = _project_path(project)
         issue_iid, note_id = _split_composite_comment_id(
             comment_id, ticket_id,

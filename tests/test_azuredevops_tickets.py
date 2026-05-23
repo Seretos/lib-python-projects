@@ -1033,5 +1033,60 @@ def test_get_ticket_include_relations_false_returns_none_sentinel(
     _, _, relations, truncated = AzureDevOpsProvider().get_ticket(
         _project(), token="t", ticket_id="5", include_relations=False
     )
-    assert relations is None
+    assert relations == []
     assert truncated is None
+
+
+# ---------- Defect 3: empty body raises ValueError (Azure DevOps) ------------
+
+
+def test_add_comment_empty_body_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_comment with body='' must raise ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="empty"):
+        AzureDevOpsProvider().add_comment(_project(), token="t", ticket_id="5", body="")
+
+
+def test_add_comment_whitespace_body_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_comment with body='   ' must raise ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="empty"):
+        AzureDevOpsProvider().add_comment(_project(), token="t", ticket_id="5", body="   ")
+
+
+def test_update_comment_empty_body_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_comment with body='' must raise ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="empty"):
+        AzureDevOpsProvider().update_comment(
+            _project(), token="t", comment_id="11", body="", ticket_id="5",
+        )
+
+
+def test_update_comment_whitespace_body_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_comment with body='   ' must raise ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="empty"):
+        AzureDevOpsProvider().update_comment(
+            _project(), token="t", comment_id="11", body="   ", ticket_id="5",
+        )

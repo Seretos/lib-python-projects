@@ -368,7 +368,7 @@ def test_include_relations_false_skips_link_fetch(
     _, _, relations, truncated = GitLabProvider().get_ticket(
         _project(), "t", "5", include_relations=False,
     )
-    assert relations is None
+    assert relations == []
     assert truncated is None
     assert not any("/links" in u for u in seen_urls)
     assert not any("/closed_by" in u for u in seen_urls)
