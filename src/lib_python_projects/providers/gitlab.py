@@ -250,7 +250,9 @@ def _map_issue(raw: dict, project: ProjectConfig | None = None) -> Ticket:
 
 
 def _map_note(
-    raw: dict, project: ProjectConfig | None = None,
+    raw: dict,
+    project: ProjectConfig | None = None,
+    mr_iid: str | int | None = None,
 ) -> Comment:
     """Translate a GitLab note (comment) payload into a `Comment`.
 
@@ -260,27 +262,48 @@ def _map_note(
 
     `url` handling (ticket #41 addendum A): GitLab note payloads do
     NOT include a `web_url` field. When `project` is supplied we
-    synthesise the canonical anchor URL from `project.web_url`,
-    `noteable_type` (`Issue` or `MergeRequest`) and `noteable_iid`.
+    synthesise the canonical anchor URL. URL precedence:
+
+    1. ``raw.get("web_url")`` — used if non-empty.
+    2. If `mr_iid` is not None — synthesise directly from
+       ``{project.web_url}/-/merge_requests/{mr_iid}#note_{note_id}``,
+       bypassing the ``noteable_iid``/``noteable_type`` payload fields
+       which GitLab does not reliably include on MR-note write responses.
+    3. Fallback: the existing ``noteable_iid``/``noteable_type`` payload-
+       based synthesis (unchanged — used for issue-note and list paths).
+
     Falls back to empty string when `project` is omitted or the
     payload lacks the noteable hints (e.g. legacy responses).
+
+    Args:
+        raw: Raw GitLab note payload dict.
+        project: The project config, used for ``web_url`` synthesis.
+        mr_iid: When set, the MR iid is used for URL synthesis instead
+            of relying on ``noteable_iid``/``noteable_type`` in the
+            payload (which GitLab omits on MR-note POST responses).
     """
     author = raw.get("author") or {}
     raw_url = raw.get("web_url") or ""
     if not raw_url and project is not None and project.web_url:
-        noteable_iid = raw.get("noteable_iid")
-        noteable_type = (raw.get("noteable_type") or "").lower()
         note_id = raw.get("id")
-        if noteable_iid is not None and note_id is not None:
-            segment = (
-                "merge_requests"
-                if noteable_type == "mergerequest"
-                else "issues"
-            )
+        if mr_iid is not None and note_id is not None:
             raw_url = (
-                f"{project.web_url}/-/{segment}/{noteable_iid}"
+                f"{project.web_url}/-/merge_requests/{mr_iid}"
                 f"#note_{note_id}"
             )
+        else:
+            noteable_iid = raw.get("noteable_iid")
+            noteable_type = (raw.get("noteable_type") or "").lower()
+            if noteable_iid is not None and note_id is not None:
+                segment = (
+                    "merge_requests"
+                    if noteable_type == "mergerequest"
+                    else "issues"
+                )
+                raw_url = (
+                    f"{project.web_url}/-/{segment}/{noteable_iid}"
+                    f"#note_{note_id}"
+                )
     if project is not None:
         raw_url = _canonical_url(raw_url, project)
     return Comment(
@@ -353,19 +376,21 @@ def _map_mr(
     reviewer_usernames = [
         r.get("username", "") for r in (raw.get("reviewers") or [])
     ]
+    source_project_id = raw.get("source_project_id")
+    project_id = raw.get("project_id")
+    if source_project_id and project_id and source_project_id != project_id:
+        repo_full_name = raw.get("source_project_path") or None
+    else:
+        repo_full_name = (project.path if project is not None else None) or None
     head = {
         "ref": raw.get("source_branch", "") or "",
         "sha": raw.get("sha", "") or "",
-        # Project full name is the target path by default; cross-fork
-        # callers can re-resolve via source_project_id if needed.
-        "repo_full_name": "",
+        "repo_full_name": repo_full_name,
     }
+    diff_refs = raw.get("diff_refs") or {}
     base = {
         "ref": raw.get("target_branch", "") or "",
-        # GitLab doesn't expose target-base SHA on the MR root —
-        # callers reading this can compare against `diff_refs.base_sha`
-        # but we don't surface that to keep the shape uniform.
-        "sha": "",
+        "sha": diff_refs.get("base_sha") or "",
     }
     head_pipeline = raw.get("head_pipeline") or raw.get("pipeline") or {}
     pipeline_status = head_pipeline.get("status") if head_pipeline else None
@@ -1502,7 +1527,7 @@ class GitLabProvider(TokenCapabilityProvider):
         filtered out — they aren't user-facing comments.
 
         Returns `(rows, has_more)`. `since` maps to GitLab's
-        `updated_after` query parameter (ISO-8601). `page` is 1-based.
+        `created_after` query parameter (ISO-8601). `page` is 1-based.
 
         Tail-fetch (ticket #47 follow-up): when `order="desc"`,
         `page=1`, and no `since`, the implementation probes the
@@ -1533,7 +1558,7 @@ class GitLabProvider(TokenCapabilityProvider):
                 "order_by": "created_at",
             }
             if since:
-                params["updated_after"] = since
+                params["created_after"] = since
             r = client.get(
                 f"/projects/{path}/issues/{ticket_id}/notes",
                 params=params,
@@ -1961,7 +1986,7 @@ class GitLabProvider(TokenCapabilityProvider):
                 json={"body": prefixed},
             )
             _check(r)
-            return _map_note(r.json(), project)
+            return _map_note(r.json(), project, mr_iid=pr_id)
 
     def list_pr_review_comments(
         self,
@@ -2003,6 +2028,12 @@ class GitLabProvider(TokenCapabilityProvider):
                 discussion_id = str(disc.get("id", ""))
                 for idx, note in enumerate(notes):
                     pos = note.get("position") or first_position or {}
+                    if pos.get("new_line") is not None:
+                        side = "RIGHT"
+                    elif pos.get("old_line") is not None:
+                        side = "LEFT"
+                    else:
+                        side = None
                     out.append(ReviewComment(
                         id=str(note.get("id", "")),
                         author=(note.get("author") or {}).get("username", ""),
@@ -2010,7 +2041,7 @@ class GitLabProvider(TokenCapabilityProvider):
                         path=pos.get("new_path") or pos.get("old_path"),
                         line=pos.get("new_line"),
                         original_line=pos.get("old_line"),
-                        side=None,
+                        side=side,
                         commit_sha=pos.get("head_sha")
                         or pos.get("base_sha")
                         or "",
@@ -2058,6 +2089,19 @@ class GitLabProvider(TokenCapabilityProvider):
                 )
                 _check(r)
                 note_raw = r.json()
+                note_id = note_raw.get("id")
+                if (
+                    project is not None
+                    and project.web_url
+                    and note_id is not None
+                ):
+                    _reply_url = _canonical_url(
+                        f"{project.web_url}/-/merge_requests/{pr_id}"
+                        f"#note_{note_id}",
+                        project,
+                    )
+                else:
+                    _reply_url = note_raw.get("web_url") or ""
                 return ReviewComment(
                     id=str(note_raw.get("id", "")),
                     author=(note_raw.get("author") or {}).get("username", ""),
@@ -2067,7 +2111,7 @@ class GitLabProvider(TokenCapabilityProvider):
                     in_reply_to=in_reply_to,
                     created_at=note_raw.get("created_at") or "",
                     updated_at=note_raw.get("updated_at") or "",
-                    url=note_raw.get("web_url") or "",
+                    url=_reply_url,
                     # Thread anchor is the discussion the reply joined.
                     discussion_id=in_reply_to,
                 )
@@ -2102,6 +2146,19 @@ class GitLabProvider(TokenCapabilityProvider):
             # a second GET. Without this the discussion id is unreachable
             # on a freshly-created thread (live-verify bug from #43).
             discussion_id = str(disc_raw.get("id", ""))
+            note_id = note_raw.get("id")
+            if (
+                project is not None
+                and project.web_url
+                and note_id is not None
+            ):
+                _new_thread_url = _canonical_url(
+                    f"{project.web_url}/-/merge_requests/{pr_id}"
+                    f"#note_{note_id}",
+                    project,
+                )
+            else:
+                _new_thread_url = note_raw.get("web_url") or ""
             return ReviewComment(
                 id=str(note_raw.get("id", "")),
                 author=(note_raw.get("author") or {}).get("username", ""),
@@ -2113,7 +2170,7 @@ class GitLabProvider(TokenCapabilityProvider):
                 in_reply_to=None,
                 created_at=note_raw.get("created_at") or "",
                 updated_at=note_raw.get("updated_at") or "",
-                url=note_raw.get("web_url") or "",
+                url=_new_thread_url,
                 discussion_id=discussion_id or None,
             )
 
@@ -2169,6 +2226,24 @@ class GitLabProvider(TokenCapabilityProvider):
                     _check(rn)
                     note_raw = rn.json()
                 mr_raw = r.json()
+                if note_raw is not None:
+                    _approve_note_id = note_raw.get("id")
+                    if (
+                        project is not None
+                        and project.web_url
+                        and _approve_note_id is not None
+                    ):
+                        _approve_url = _canonical_url(
+                            f"{project.web_url}/-/merge_requests/{pr_id}"
+                            f"#note_{_approve_note_id}",
+                            project,
+                        )
+                    else:
+                        _approve_url = note_raw.get("web_url") or ""
+                else:
+                    _approve_url = _canonical_url(
+                        mr_raw.get("web_url") or "", project
+                    )
                 return Review(
                     id=str((note_raw or {}).get("id") or mr_raw.get("iid", "")),
                     state="approve",
@@ -2177,9 +2252,7 @@ class GitLabProvider(TokenCapabilityProvider):
                     )
                     or (mr_raw.get("user") or {}).get("username", ""),
                     body=(note_raw or {}).get("body", "") if note_raw else "",
-                    url=(note_raw or {}).get("web_url")
-                    or mr_raw.get("web_url")
-                    or "",
+                    url=_approve_url,
                     submitted_at=(note_raw or {}).get("created_at")
                     or mr_raw.get("updated_at")
                     or "",
@@ -2201,12 +2274,25 @@ class GitLabProvider(TokenCapabilityProvider):
                 )
                 _check(rn)
                 note_raw = rn.json()
+                _rc_note_id = note_raw.get("id")
+                if (
+                    project is not None
+                    and project.web_url
+                    and _rc_note_id is not None
+                ):
+                    _rc_url = _canonical_url(
+                        f"{project.web_url}/-/merge_requests/{pr_id}"
+                        f"#note_{_rc_note_id}",
+                        project,
+                    )
+                else:
+                    _rc_url = note_raw.get("web_url") or ""
                 return Review(
                     id=str(note_raw.get("id", "")),
                     state="request_changes",
                     author=(note_raw.get("author") or {}).get("username", ""),
                     body=note_raw.get("body", ""),
-                    url=note_raw.get("web_url") or "",
+                    url=_rc_url,
                     submitted_at=note_raw.get("created_at") or "",
                     commit_sha=None,
                 )
@@ -2219,12 +2305,25 @@ class GitLabProvider(TokenCapabilityProvider):
             )
             _check(rn)
             note_raw = rn.json()
+            _comment_note_id = note_raw.get("id")
+            if (
+                project is not None
+                and project.web_url
+                and _comment_note_id is not None
+            ):
+                _comment_url = _canonical_url(
+                    f"{project.web_url}/-/merge_requests/{pr_id}"
+                    f"#note_{_comment_note_id}",
+                    project,
+                )
+            else:
+                _comment_url = note_raw.get("web_url") or ""
             return Review(
                 id=str(note_raw.get("id", "")),
                 state="comment",
                 author=(note_raw.get("author") or {}).get("username", ""),
                 body=note_raw.get("body", ""),
-                url=note_raw.get("web_url") or "",
+                url=_comment_url,
                 submitted_at=note_raw.get("created_at") or "",
                 commit_sha=None,
             )
