@@ -15,7 +15,13 @@ import pytest
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import github as github_provider
 from lib_python_projects.providers import gitlab as gitlab_provider
-from lib_python_projects.providers.base import normalize_timestamp
+from lib_python_projects.providers.base import (
+    normalize_timestamp,
+    RelationKind,
+    RelationNotFound,
+    READ_ONLY_RELATION_KINDS,
+    WRITABLE_RELATION_KINDS,
+)
 from lib_python_projects.providers.github import GitHubProvider
 from lib_python_projects.providers.gitlab import GitLabProvider, _canonical_url
 
@@ -441,3 +447,92 @@ def test_github_labels_sorted_alphabetically(monkeypatch):
         p, "t", "3", include_relations=False,
     )
     assert ticket.labels == ["ai-generated", "bug", "test-label"]
+
+
+# ---------- F20: READ_ONLY_RELATION_KINDS constant ---------------------------
+
+
+def test_read_only_and_writable_kinds_cover_all_relation_kind_args():
+    """The union of READ_ONLY and WRITABLE must equal all RelationKind args."""
+    all_kinds = set(RelationKind.__args__)
+    covered = set(READ_ONLY_RELATION_KINDS) | set(WRITABLE_RELATION_KINDS)
+    assert covered == all_kinds, (
+        f"Missing kinds: {all_kinds - covered}; extra kinds: {covered - all_kinds}"
+    )
+
+
+def test_read_only_and_writable_kinds_are_disjoint():
+    """No kind should appear in both sets."""
+    overlap = set(READ_ONLY_RELATION_KINDS) & set(WRITABLE_RELATION_KINDS)
+    assert overlap == set(), f"Kinds in both sets: {overlap}"
+
+
+# ---------- F4: RelationNotFound class invariants ----------------------------
+
+
+def test_relation_not_found_is_lookup_error():
+    """RelationNotFound must be a LookupError subclass (tool-layer contract)."""
+    err = RelationNotFound(kind="blocked_by", ticket_id="5", target="#3")
+    assert isinstance(err, LookupError)
+
+
+def test_relation_not_found_carries_typed_attributes():
+    """RelationNotFound exposes .kind, .ticket_id, .target."""
+    err = RelationNotFound(kind="child", ticket_id="10", target="#20")
+    assert err.kind == "child"
+    assert err.ticket_id == "10"
+    assert err.target == "#20"
+
+
+def test_relation_not_found_message_is_descriptive():
+    """The str() of RelationNotFound contains the key facts."""
+    err = RelationNotFound(kind="blocks", ticket_id="7", target="#99")
+    msg = str(err)
+    assert "blocks" in msg
+    assert "#7" in msg
+    assert "#99" in msg
+
+
+# ---------- F10 regression guard: GitLab relation.state never "opened" -------
+
+
+def test_gitlab_relation_state_never_raw_opened(monkeypatch):
+    """Regression: GitLab link state 'opened' must surface as 'open'."""
+    issue_payload = {
+        "iid": 5, "title": "T", "description": "",
+        "state": "opened", "author": {"username": "a"},
+        "assignees": [], "labels": [],
+        "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/5",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z",
+    }
+    link_row = {
+        "iid": 7, "link_type": "blocks", "title": "Other",
+        "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/7",
+        "state": "opened",  # raw GitLab value
+        "references": {"relative": "#7"},
+    }
+
+    def handler(req):
+        if req.url.path.endswith("/issues/5/notes"):
+            return _resp([])
+        if req.url.path.endswith("/issues/5/links"):
+            return _resp([link_row])
+        if req.url.path.endswith("/issues/5/closed_by"):
+            return _resp([])
+        if req.url.path.endswith("/issues/5"):
+            return _resp(issue_payload)
+        return _resp({}, 404)
+
+    _install_gitlab_mock(monkeypatch, handler)
+    p = _gitlab_project(path="seredos/gitlab-tests")
+    _ticket, _comments, relations, _trunc = GitLabProvider().get_ticket(
+        p, "t", "5", include_relations=True,
+    )
+    blocks_rels = [r for r in relations if r.kind == "blocks"]
+    assert blocks_rels, "expected a 'blocks' relation"
+    for rel in blocks_rels:
+        assert rel.state != "opened", (
+            f"raw 'opened' leaked through as relation.state — must be 'open'"
+        )
+        assert rel.state == "open"

@@ -54,6 +54,7 @@ from lib_python_projects.providers.base import (
     PullRequest,
     Relation,
     RelationKindUnsupported,
+    RelationNotFound,
     Review,
     ReviewComment,
     Status,
@@ -206,6 +207,32 @@ def _canonical_url(url: str, project: ProjectConfig) -> str:
     return url
 
 
+# ---------- state normalisation ----------------------------------------------
+
+
+def _normalise_gl_state(state: str) -> str:
+    """Normalise a raw GitLab state string to the canonical relation vocab.
+
+    GitLab issues and MRs use ``"opened"`` where the provider-agnostic
+    surface uses ``"open"``.  This helper is the single source of truth
+    so the mapping is applied consistently at every ``Relation`` construction
+    site (issue links, closing MRs, ``_map_issue``, ``_map_pr``).
+
+    Returns:
+      - ``"open"``   for ``opened`` / ``reopened``
+      - ``"merged"`` for ``merged``
+      - ``"closed"`` for ``closed``
+      - ``""``       for anything else (e.g. empty / unknown)
+    """
+    if state in ("opened", "reopened"):
+        return "open"
+    if state == "merged":
+        return "merged"
+    if state == "closed":
+        return "closed"
+    return ""
+
+
 # ---------- mappers ----------------------------------------------------------
 
 
@@ -224,11 +251,9 @@ def _map_issue(raw: dict, project: ProjectConfig | None = None) -> Ticket:
     (lowercase the project path segment, rewrite `/-/work_items/N` to
     `/-/issues/N` — ticket #49 findings 3 & 4).
     """
-    state = raw.get("state", "opened")
-    if state in ("opened", "reopened"):
-        status: Status = "open"
-    else:
-        status = "closed"
+    gl_state = raw.get("state", "opened")
+    norm = _normalise_gl_state(gl_state)
+    status: Status = norm if norm in ("open", "closed") else "closed"
     author = raw.get("author") or {}
     url = raw.get("web_url") or ""
     if project is not None:
@@ -363,12 +388,7 @@ def _map_mr(
     `None`.
     """
     state = raw.get("state", "opened")
-    if state in ("opened", "reopened"):
-        status: str = "open"
-    elif state == "merged":
-        status = "merged"
-    else:
-        status = "closed"
+    status: str = _normalise_gl_state(state) or "closed"
     merged = state == "merged" or bool(raw.get("merged_at"))
     author = raw.get("author") or {}
     # Reviewers: GitLab MR `reviewers` is the assigned list. There's no
@@ -633,6 +653,7 @@ def _gitlab_delete_issue_link(
     *,
     target_project_path: str,
     target_issue_iid: str,
+    kind: str = "relates_to",
 ) -> None:
     """Find the link id between source and target, then DELETE it."""
     r = client.get(
@@ -650,10 +671,10 @@ def _gitlab_delete_issue_link(
             link_id = link["issue_link_id"]
             break
     if link_id is None:
-        raise GitLabError(
-            404,
-            f"no issue link from #{source_iid} to "
-            f"#{target_issue_iid} found to remove",
+        raise RelationNotFound(
+            kind=kind,
+            ticket_id=source_iid,
+            target=f"#{target_issue_iid}",
         )
     r2 = client.delete(
         f"/projects/{source_project_path}/issues/{source_iid}"
@@ -882,11 +903,15 @@ def _make_relation(
     url: str = "",
     state: str = "",
     is_pull_request: bool = False,
+    resolved: bool | None = None,
 ) -> Relation:
     """Build a `Relation` with the canonical ticket-id format.
 
     `ref` is either `#N` (same-project) or `group/project#N`. Strip
     leading `#` only when present standalone; otherwise pass through.
+    `resolved` follows the ``Relation.resolved`` semantics: ``True`` for
+    API-sourced relations, ``False`` for body-scan relations, ``None`` when
+    not set.
     """
     return Relation(
         kind=kind,
@@ -895,6 +920,7 @@ def _make_relation(
         url=url,
         state=state,
         is_pull_request=is_pull_request,
+        resolved=resolved,
     )
 
 
@@ -977,9 +1003,8 @@ def _fetch_relations(
                 # /-/issues/N form as ticket / comment URLs
                 # (ticket #49 F4 side-finding from test-agent live-verify).
                 url=_canonical_url(link.get("web_url", "") or "", project),
-                state="opened" if link.get("state") == "opened" else (
-                    "closed" if link.get("state") == "closed" else ""
-                ),
+                state=_normalise_gl_state(link.get("state", "") or ""),
+                resolved=True,
             ))
 
     # --- (2) closing MRs ---
@@ -994,8 +1019,9 @@ def _fetch_relations(
                 ref=f"#{mr_iid}",
                 title=mr.get("title", "") or "",
                 url=_canonical_url(mr.get("web_url", "") or "", project),
-                state=mr.get("state", "") or "",
+                state=_normalise_gl_state(mr.get("state", "") or ""),
                 is_pull_request=True,
+                resolved=True,
             ))
 
     # --- (3) outgoing scans ---
@@ -1013,20 +1039,20 @@ def _fetch_relations(
     close_refs = _scan_refs(full_text, _CLOSE_PATTERN)
     close_ref_set = set(close_refs)
     for ref in close_refs:
-        relations.append(_make_relation(kind="closes", ref=ref))
+        relations.append(_make_relation(kind="closes", ref=ref, resolved=False))
 
     # Duplicate-of detection.
     dup_refs = _scan_refs(full_text, _DUPLICATE_PATTERN)
     dup_ref_set = set(dup_refs)
     for ref in dup_refs:
-        relations.append(_make_relation(kind="duplicate_of", ref=ref))
+        relations.append(_make_relation(kind="duplicate_of", ref=ref, resolved=False))
 
     # Plain mentions (filtered against the above two sets and self-ref).
     self_ref = f"#{ticket_id}"
     for ref in _scan_refs(full_text, _MENTION_PATTERN):
         if ref == self_ref or ref in close_ref_set or ref in dup_ref_set:
             continue
-        relations.append(_make_relation(kind="mentions", ref=ref))
+        relations.append(_make_relation(kind="mentions", ref=ref, resolved=False))
 
     # Dedup: the native issue-link written by _gitlab_mark_duplicate_of
     # comes back from the links API as "relates_to", while the body scan
@@ -1281,13 +1307,13 @@ class GitLabProvider(TokenCapabilityProvider):
         ticket_id: str,
         *,
         include_relations: bool = True,
-    ) -> tuple[Ticket, list[Comment], list[Relation], bool]:
+    ) -> tuple[Ticket, list[Comment], list[Relation] | None, bool | None]:
         """Fetch a single issue plus its non-system notes.
 
-        Relations are populated by a separate code path (see
-        `_fetch_gitlab_relations` once implemented in task #7); for now
-        relations come back as `[]` regardless of `include_relations`
-        so this method is usable for the basic "view ticket" flow.
+        Returns `(ticket, comments, relations, relations_truncated)`.
+        When `include_relations` is False, returns `(None, None)` for the
+        relation fields and skips the extra API calls — callers must
+        distinguish `None` (skipped) from `[]` (fetched but empty).
 
         System notes (state changes, label edits) are filtered out —
         they're not user-facing comments.
@@ -1306,13 +1332,15 @@ class GitLabProvider(TokenCapabilityProvider):
                 _map_note(it, project) for it in c.json()
                 if not it.get("system", False)
             ]
-            relations: list[Relation] = []
-            truncated = False
             if include_relations:
-                relations = _fetch_relations(
+                relations: list[Relation] | None = _fetch_relations(
                     client, project, ticket_id, ticket_body=ticket.body,
                     comments=comments,
                 )
+                truncated: bool | None = False
+            else:
+                relations = None
+                truncated = None
         return ticket, comments, relations, truncated
 
     def create_ticket(
@@ -2521,6 +2549,7 @@ class GitLabProvider(TokenCapabilityProvider):
                     client, path, ticket_id,
                     target_project_path=target_project,
                     target_issue_iid=target_iid,
+                    kind=kind,
                 )
                 return {"removed": True}
             if kind == "duplicate_of":
@@ -2531,8 +2560,9 @@ class GitLabProvider(TokenCapabilityProvider):
                         client, path, ticket_id,
                         target_project_path=target_project,
                         target_issue_iid=target_iid,
+                        kind=kind,
                     )
-                except GitLabError:
+                except (GitLabError, RelationNotFound):
                     # Link may already be gone; reopen anyway.
                     pass
                 pr = client.put(

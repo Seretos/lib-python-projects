@@ -30,6 +30,7 @@ from lib_python_projects.providers.base import (
     PullRequest,
     Relation,
     RelationKindUnsupported,
+    RelationNotFound,
     Review,
     ReviewComment,
     Status,
@@ -424,15 +425,17 @@ def _github_assert_dependency_exists(
     target_internal_id: int,
     source_ref: str,
     target_ref: str,
+    kind: str = "blocked_by",
+    ticket_id: str = "",
 ) -> None:
-    """Raise 404 when no `blocked_by` dependency exists from source→target.
+    """Raise `RelationNotFound` when no `blocked_by` dependency exists.
 
     Ticket #49 finding 8 / #48 finding 3: GitHub's
     `DELETE /dependencies/blocked_by/{id}` is silently idempotent —
     succeeds whether the link exists or not. The documented contract
     of `remove_relation` says removing a non-existent relation must
-    raise, so we read the current dependency list first and 404
-    ourselves before the DELETE.
+    raise, so we read the current dependency list first and raise
+    `RelationNotFound` (a `LookupError` subclass) before the DELETE.
     """
     r = client.get(
         f"{repo_path}/issues/{source_issue_number}/dependencies/blocked_by",
@@ -445,9 +448,10 @@ def _github_assert_dependency_exists(
         candidate = row.get("id") or row.get("internal_id")
         if isinstance(candidate, int) and candidate == target_internal_id:
             return
-    raise GitHubError(
-        404,
-        f"no blocks/blocked_by link from {source_ref} to {target_ref} found to remove",
+    raise RelationNotFound(
+        kind=kind,
+        ticket_id=ticket_id or source_issue_number,
+        target=target_ref,
     )
 
 
@@ -550,8 +554,18 @@ def _ref_for(issue_raw: dict, project: ProjectConfig) -> tuple[str, bool]:
     return f"{full_name}#{number}", is_pr
 
 
-def _map_relation_from_sub_issue(raw: dict, project: ProjectConfig, kind: str) -> Relation:
-    """Map a sub-issue (or the issue's own `parent` field) into a Relation."""
+def _map_relation_from_sub_issue(
+    raw: dict,
+    project: ProjectConfig,
+    kind: str,
+    *,
+    resolved: bool | None = True,
+) -> Relation:
+    """Map a sub-issue (or the issue's own `parent` field) into a Relation.
+
+    `resolved=True` (default) for API-fetched relations. Pass `resolved=False`
+    for body-scan / text-inferred relations where the target was not fetched.
+    """
     ticket_id, is_pr = _ref_for(raw, project)
     return Relation(
         kind=kind,
@@ -560,6 +574,7 @@ def _map_relation_from_sub_issue(raw: dict, project: ProjectConfig, kind: str) -
         url=raw.get("html_url") or "",
         state=_issue_state(raw),
         is_pull_request=is_pr,
+        resolved=resolved,
     )
 
 
@@ -736,6 +751,7 @@ def _ref_to_relation(
         url=url,
         state="",
         is_pull_request=False,
+        resolved=False,
     )
 
 
@@ -889,6 +905,7 @@ def _relabel_incoming(
                     url=rel.url,
                     state=rel.state,
                     is_pull_request=rel.is_pull_request,
+                    resolved=rel.resolved,
                 )
 
     if is_pr and merged_at and ticket_num is not None:
@@ -901,6 +918,7 @@ def _relabel_incoming(
                     url=rel.url,
                     state=rel.state,
                     is_pull_request=rel.is_pull_request,
+                    resolved=rel.resolved,
                 )
 
     return rel
@@ -1433,12 +1451,13 @@ class GitHubProvider:
         ticket_id: str,
         *,
         include_relations: bool = True,
-    ) -> tuple[Ticket, list[Comment], list[Relation], bool]:
+    ) -> tuple[Ticket, list[Comment], list[Relation] | None, bool | None]:
         """Fetch a single ticket with its comments and (optionally) relations.
 
         Returns `(ticket, comments, relations, relations_truncated)`.
-        When `include_relations` is False, returns `([], False)` for the
-        relation fields and skips the extra API calls.
+        When `include_relations` is False, returns `(None, None)` for the
+        relation fields and skips the extra API calls — callers must
+        distinguish `None` (skipped) from `[]` (fetched but empty).
         """
         with _client(token) as client:
             r = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
@@ -1456,7 +1475,7 @@ class GitHubProvider:
                     client, project, ticket_id, issue_raw, token=token,
                 )
             else:
-                relations, truncated = [], False
+                relations, truncated = None, None
         return ticket, comments, relations, truncated
 
     def create_ticket(
@@ -2474,27 +2493,63 @@ class GitHubProvider:
             )
         with _client(token) as client:
             target_repo, target_number = _parse_relation_target(target, project)
-            target_internal_id, _ = _fetch_issue_internal_id(
-                client, target_repo, target_number,
-            )
+            try:
+                target_internal_id, _ = _fetch_issue_internal_id(
+                    client, target_repo, target_number,
+                )
+            except GitHubError as exc:
+                if exc.status == 404:
+                    raise RelationNotFound(
+                        kind=kind,
+                        ticket_id=ticket_id,
+                        target=f"#{target_number}",
+                    ) from exc
+                raise
             if kind == "parent":
-                source_internal_id, _ = _fetch_issue_internal_id(
-                    client, _repo_path(project), ticket_id,
-                )
-                r = client.request(
-                    "DELETE",
-                    f"{target_repo}/issues/{target_number}/sub_issue",
-                    json={"sub_issue_id": source_internal_id},
-                )
-                _check(r)
+                try:
+                    source_internal_id, _ = _fetch_issue_internal_id(
+                        client, _repo_path(project), ticket_id,
+                    )
+                except GitHubError as exc:
+                    if exc.status == 404:
+                        raise RelationNotFound(
+                            kind=kind,
+                            ticket_id=ticket_id,
+                            target=f"#{target_number}",
+                        ) from exc
+                    raise
+                try:
+                    r = client.request(
+                        "DELETE",
+                        f"{target_repo}/issues/{target_number}/sub_issue",
+                        json={"sub_issue_id": source_internal_id},
+                    )
+                    _check(r)
+                except GitHubError as exc:
+                    if exc.status == 404:
+                        raise RelationNotFound(
+                            kind=kind,
+                            ticket_id=ticket_id,
+                            target=f"#{target_number}",
+                        ) from exc
+                    raise
                 return {"removed": True}
             if kind == "child":
-                r = client.request(
-                    "DELETE",
-                    f"{_repo_path(project)}/issues/{ticket_id}/sub_issue",
-                    json={"sub_issue_id": target_internal_id},
-                )
-                _check(r)
+                try:
+                    r = client.request(
+                        "DELETE",
+                        f"{_repo_path(project)}/issues/{ticket_id}/sub_issue",
+                        json={"sub_issue_id": target_internal_id},
+                    )
+                    _check(r)
+                except GitHubError as exc:
+                    if exc.status == 404:
+                        raise RelationNotFound(
+                            kind=kind,
+                            ticket_id=ticket_id,
+                            target=f"#{target_number}",
+                        ) from exc
+                    raise
                 return {"removed": True}
             if kind == "blocked_by":
                 # Pre-check existence so the documented "remove returns
@@ -2507,6 +2562,8 @@ class GitHubProvider:
                     target_internal_id=target_internal_id,
                     source_ref=f"#{ticket_id}",
                     target_ref=f"#{target_number}",
+                    kind=kind,
+                    ticket_id=ticket_id,
                 )
                 r = client.delete(
                     f"{_repo_path(project)}/issues/{ticket_id}"
@@ -2515,14 +2572,25 @@ class GitHubProvider:
                 _check(r)
                 return {"removed": True}
             if kind == "blocks":
-                source_internal_id, _ = _fetch_issue_internal_id(
-                    client, _repo_path(project), ticket_id,
-                )
+                try:
+                    source_internal_id, _ = _fetch_issue_internal_id(
+                        client, _repo_path(project), ticket_id,
+                    )
+                except GitHubError as exc:
+                    if exc.status == 404:
+                        raise RelationNotFound(
+                            kind=kind,
+                            ticket_id=ticket_id,
+                            target=f"#{target_number}",
+                        ) from exc
+                    raise
                 _github_assert_dependency_exists(
                     client, target_repo, target_number,
                     target_internal_id=source_internal_id,
                     source_ref=f"#{target_number}",
                     target_ref=f"#{ticket_id}",
+                    kind=kind,
+                    ticket_id=ticket_id,
                 )
                 r = client.delete(
                     f"{target_repo}/issues/{target_number}"
