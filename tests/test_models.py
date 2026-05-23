@@ -6,9 +6,15 @@ This file focuses on the new-in-v0.1.0 surface: `ProjectConfig.local_path`.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from lib_python_projects import ProjectConfig, ProjectsLoadResult
+
+
+def _make_project(**kwargs) -> ProjectConfig:
+    return ProjectConfig(id="x", provider="github", path="acme/backend", **kwargs)
 
 
 class TestLocalPathField:
@@ -84,3 +90,59 @@ class TestProjectsLoadResult:
         )
         assert len(r.projects) == 1
         assert r.projects[0].id == "x"
+
+
+class TestTokenAvailableField:
+    """`token_env` is excluded from serialization; `token_available` is
+    exposed as a computed boolean that reflects whether the named env var
+    holds a non-empty value at call time.
+    """
+
+    def test_token_available_false_when_token_env_is_none(self) -> None:
+        p = _make_project()
+        assert p.token_available is False
+
+    def test_token_available_false_when_env_var_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MY_TEST_TOKEN", raising=False)
+        p = _make_project(token_env="MY_TEST_TOKEN")
+        assert p.token_available is False
+
+    def test_token_available_false_when_env_var_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MY_TEST_TOKEN", "")
+        p = _make_project(token_env="MY_TEST_TOKEN")
+        assert p.token_available is False
+
+    def test_token_available_true_when_env_var_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MY_TEST_TOKEN", "secret-value")
+        p = _make_project(token_env="MY_TEST_TOKEN")
+        assert p.token_available is True
+
+    def test_token_env_excluded_from_model_dump(self) -> None:
+        p = _make_project(token_env="MY_TEST_TOKEN")
+        assert "token_env" not in p.model_dump()
+        # The JSON wire format (MCP-facing) must also omit it.
+        assert "token_env" not in json.loads(p.model_dump_json())
+
+    def test_token_available_in_model_dump(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MY_TEST_TOKEN", "secret-value")
+        p = _make_project(token_env="MY_TEST_TOKEN")
+        d = p.model_dump()
+        assert "token_available" in d
+        assert d["token_available"] is True
+
+    def test_token_available_false_in_model_dump_when_env_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MY_TEST_TOKEN", raising=False)
+        p = _make_project(token_env="MY_TEST_TOKEN")
+        d = p.model_dump()
+        assert "token_available" in d
+        assert d["token_available"] is False

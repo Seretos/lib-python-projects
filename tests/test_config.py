@@ -63,6 +63,11 @@ def _isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "XDG_CONFIG_HOME",
         "APPDATA",
         "USERPROFILE",
+        # Provider token vars: wiped so a developer's locally-set tokens
+        # can't flip the `token_available` computed field to True in tests.
+        "GITHUB_TOKEN",
+        "GITLAB_TOKEN",
+        "AZURE_DEVOPS_TOKEN",
     ):
         monkeypatch.delenv(var, raising=False)
     _make_git_repo(tmp_path)
@@ -513,6 +518,11 @@ class TestAdditiveAutoDiscovery:
         assert auto[0].id == "_auto"
         assert auto[0].path == "Seretos/agent-plugin-dev"
         assert auto[0].token_env == "GITHUB_TOKEN"
+        # Serialization shape: token_env must be hidden, token_available exposed.
+        dumped = auto[0].model_dump()
+        assert "token_env" not in dumped
+        assert "token_available" in dumped
+        assert dumped["token_available"] is False  # GITHUB_TOKEN wiped by _isolated_env
 
     def test_auto_suppressed_when_cwd_repo_is_in_config(self, tmp_path: Path):
         """Dedup by (provider, path): if the CWD repo is explicitly
