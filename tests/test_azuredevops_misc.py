@@ -624,3 +624,50 @@ def test_refs_bare_hash_and_number_pass_through() -> None:
     p = _project()
     assert normalize_id("#7", p) == "7"
     assert normalize_id(123, p) == "123"
+
+
+# ---------- UX1: list_ticket_statuses hint scope narrowing --------------------
+
+
+def test_check_invalid_argument_title_no_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """InvalidArgumentValueException with a Title-empty message must NOT
+    receive the list_ticket_statuses hint — that exception type has been
+    removed from _TRANSITION_TYPE_KEYS because it fires on non-state errors."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(
+            {
+                "message": "TF401232: Work item field Title cannot be empty.",
+                "typeKey": "InvalidArgumentValueException",
+            },
+            status_code=400,
+        )
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().get_ticket(_project(), token="t", ticket_id="5")
+    assert "list_ticket_statuses" not in str(exc.value)
+
+
+def test_check_invalid_argument_state_still_hints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """InvalidArgumentValueException whose message contains a state-value
+    fragment (e.g. "allowed values") must still get the hint — via the
+    _TRANSITION_MSG_FRAGMENTS message-matching path."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(
+            {
+                "message": "The value 'Bogus' is not in the allowed values for System.State",
+                "typeKey": "InvalidArgumentValueException",
+            },
+            status_code=400,
+        )
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().get_ticket(_project(), token="t", ticket_id="5")
+    assert "list_ticket_statuses" in str(exc.value)

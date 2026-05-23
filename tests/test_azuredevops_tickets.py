@@ -886,3 +886,38 @@ def test_get_comment_int32_overflow_via_check_layer(
             ticket_id="5",
         )
     assert exc.value.status == 404
+
+
+# ---------- list_tickets search CONTAINS WORDS --------------------------------
+
+
+def test_list_tickets_search_uses_contains_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """filters.search must emit CONTAINS WORDS (tokenized full-text) for both
+    Title and Description, not bare CONTAINS (substring match)."""
+    bt = _basic_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(search="lifecycle"),
+    )
+    wiql = captured["wiql"]
+    assert "CONTAINS WORDS 'lifecycle'" in wiql
+    # Both Title and Description must use CONTAINS WORDS
+    assert wiql.count("CONTAINS WORDS 'lifecycle'") == 2
+    # Plain CONTAINS without WORDS must not appear for this search term
+    import re
+    assert not re.search(r"\bCONTAINS\s+'lifecycle'", wiql)
