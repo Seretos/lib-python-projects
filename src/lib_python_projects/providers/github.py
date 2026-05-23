@@ -2789,6 +2789,17 @@ def _resolved_refs_for_ticket(
     if issue_r.status_code == 404:
         return []
     _check(issue_r)
+
+    # Early bail: if the ticket is itself a PR, use its own head.sha directly.
+    # The `/issues/{id}` endpoint includes a `pull_request` key for PRs.
+    if (issue_r.json() or {}).get("pull_request"):
+        pr_r = client.get(f"{_repo_path(project)}/pulls/{ticket_id}")
+        if pr_r.is_success:
+            sha = ((pr_r.json() or {}).get("head") or {}).get("sha")
+            if sha:
+                return [sha]
+        return []
+
     issue_body = (issue_r.json() or {}).get("body") or ""
 
     # Linked PR numbers we should fetch for their head.sha.
