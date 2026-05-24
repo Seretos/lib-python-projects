@@ -1,10 +1,13 @@
-"""Tests for GitHub provider error-contract fixes (ticket #17).
+"""Tests for GitHub provider error-contract fixes (tickets #17 and #28).
 
 Covers:
 - update_ticket 404 → "ticket '<project>#<id>' not found"
 - add_comment 404 → "ticket '<project>#<id>' not found"
 - update_comment 404 → "comment '<project>#<id>' not found"
 - add_pr_review_comment 422 → named parameter message
+- create_pr reviewer 422 → PR still returned with warning (ticket #28)
+- create_pr reviewer 500 → GitHubError raised
+- create_pr primary 422 → GitHubError raised
 """
 from __future__ import annotations
 
@@ -147,3 +150,138 @@ def test_add_pr_review_comment_422_names_inputs(
     assert "line" in msg
     assert "commit_sha" in msg
     assert "7" in msg  # PR id
+
+
+# ---------- Ticket #28: create_pr side-step 422 is non-fatal -----------------
+
+
+def _minimal_pr_payload(number: int = 42) -> dict:
+    """Return a minimal GitHub PR REST payload accepted by `_map_pr`."""
+    return {
+        "number": number,
+        "state": "open",
+        "title": "Test PR",
+        "body": "<!-- #ai-generated -->\nDescription.",
+        "user": {"login": "bot"},
+        "assignees": [],
+        "requested_reviewers": [],
+        "labels": [],
+        "head": {"ref": "feature", "sha": "abc", "repo": {"full_name": "acme/backend"}},
+        "base": {"ref": "main", "sha": "def"},
+        "draft": False,
+        "merged": False,
+        "mergeable": None,
+        "html_url": f"https://github.com/acme/backend/pull/{number}",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z",
+    }
+
+
+def test_create_pr_reviewer_422_returns_pr_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_pr with a reviewer 422 must still return the PR with a warning."""
+
+    pr_payload = _minimal_pr_payload(42)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Label ensure (GET or POST /repos/.../labels/...)
+        if "/labels" in path and req.method in ("GET", "POST"):
+            if req.method == "GET":
+                return _json({"name": "ai-generated", "color": "0075ca"})
+            # POST /issues/.../labels — success, return label list
+            return _json([{"name": "ai-generated"}])
+        # Primary PR creation
+        if path.endswith("/pulls") and req.method == "POST":
+            return _json(pr_payload, status_code=201)
+        # Reviewer request — 422
+        if "/requested_reviewers" in path and req.method == "POST":
+            return _json(
+                {"message": "Review cannot be requested from pull request author."},
+                status_code=422,
+            )
+        # Fallback success for any other call
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    pr = GitHubProvider().create_pr(
+        _project(),
+        token="t",
+        title="Test PR",
+        body="Description.",
+        head="feature",
+        base="main",
+        requested_reviewers=["author-user"],
+    )
+
+    assert pr.number == 42
+    assert pr.url == "https://github.com/acme/backend/pull/42"
+    assert len(pr.warnings) == 1
+    assert "requested_reviewers" in pr.warnings[0]
+    assert "422" in pr.warnings[0] or "Review cannot" in pr.warnings[0]
+
+
+def test_create_pr_reviewer_500_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_pr with a reviewer 500 must raise GitHubError."""
+
+    pr_payload = _minimal_pr_payload(43)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/labels" in path and req.method == "GET":
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if "/labels" in path and req.method == "POST":
+            return _json([{"name": "ai-generated"}])
+        if path.endswith("/pulls") and req.method == "POST":
+            return _json(pr_payload, status_code=201)
+        if "/requested_reviewers" in path and req.method == "POST":
+            return _json({"message": "Internal Server Error"}, status_code=500)
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().create_pr(
+            _project(),
+            token="t",
+            title="Test PR",
+            body="Description.",
+            head="feature",
+            base="main",
+            requested_reviewers=["reviewer"],
+        )
+    assert exc.value.status == 500
+
+
+def test_create_pr_primary_failure_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_pr with a 422 on the primary POST /pulls must raise GitHubError."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/labels" in path and req.method == "GET":
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if path.endswith("/pulls") and req.method == "POST":
+            return _json(
+                {
+                    "message": "Validation Failed",
+                    "errors": [{"message": "head branch does not exist"}],
+                },
+                status_code=422,
+            )
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().create_pr(
+            _project(),
+            token="t",
+            title="Test PR",
+            body="Description.",
+            head="nonexistent",
+            base="main",
+        )
+    assert exc.value.status == 422

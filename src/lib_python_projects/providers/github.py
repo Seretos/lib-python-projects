@@ -1,6 +1,7 @@
 """GitHub provider — REST v3 implementation."""
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import re
@@ -110,6 +111,31 @@ def _check(resp: httpx.Response) -> None:
             msg = f"{msg}: {_format_github_validation_errors(errs)}"
     except Exception:
         msg = resp.reason_phrase or "request failed"
+    if resp.status_code == 403 and resp.headers.get("x-ratelimit-remaining") == "0":
+        reset = resp.headers.get("x-ratelimit-reset", "?")
+        msg = f"rate-limited (reset unix={reset}); {msg}"
+    raise GitHubError(resp.status_code, msg)
+
+
+def _check_side_step(resp: httpx.Response) -> str | None:
+    """Like `_check`, but treats a 422 response as a non-fatal warning.
+
+    Returns ``None`` on success, a warning string on 422, and raises
+    ``GitHubError`` for any other failure status — identical behaviour to
+    ``_check`` for those cases.
+    """
+    if resp.is_success:
+        return None
+    try:
+        payload = resp.json()
+        msg = payload.get("message") or resp.reason_phrase
+        errs = payload.get("errors")
+        if errs:
+            msg = f"{msg}: {_format_github_validation_errors(errs)}"
+    except Exception:
+        msg = resp.reason_phrase or "request failed"
+    if resp.status_code == 422:
+        return f"side-step 422: {msg}"
     if resp.status_code == 403 and resp.headers.get("x-ratelimit-remaining") == "0":
         reset = resp.headers.get("x-ratelimit-reset", "?")
         msg = f"rate-limited (reset unix={reset}); {msg}"
@@ -2021,46 +2047,59 @@ class GitHubProvider:
                 if label_ok
                 else [lbl for lbl in merged_labels if lbl != AI_GENERATED_LABEL]
             )
+            warnings: list[str] = []
             if labels_to_apply:
                 lbl_resp = client.post(
                     f"{_repo_path(project)}/issues/{pr_number}/labels",
                     json={"labels": labels_to_apply},
                 )
-                _check(lbl_resp)
-                applied_raw = lbl_resp.json()
-                # Reflect the new labels back into the PR payload so the
-                # returned dataclass advertises them.
-                pr_raw["labels"] = applied_raw
-                if label_ok and not _label_present(
-                    {"labels": applied_raw}, AI_GENERATED_LABEL
-                ):
-                    log.warning(
-                        "PR #%s created on %s/%s without '%s' label "
-                        "(GitHub silently dropped it — caller likely "
-                        "lacks triage permission); body-prefix marker "
-                        "remains",
-                        pr_number, project.owner, project.repo,
-                        AI_GENERATED_LABEL,
-                    )
+                lbl_warn = _check_side_step(lbl_resp)
+                if lbl_warn is not None:
+                    warnings.append(f"labels: {lbl_warn}")
+                else:
+                    applied_raw = lbl_resp.json()
+                    # Reflect the new labels back into the PR payload so the
+                    # returned dataclass advertises them.
+                    pr_raw["labels"] = applied_raw
+                    if label_ok and not _label_present(
+                        {"labels": applied_raw}, AI_GENERATED_LABEL
+                    ):
+                        log.warning(
+                            "PR #%s created on %s/%s without '%s' label "
+                            "(GitHub silently dropped it — caller likely "
+                            "lacks triage permission); body-prefix marker "
+                            "remains",
+                            pr_number, project.owner, project.repo,
+                            AI_GENERATED_LABEL,
+                        )
             if assignees:
                 a_resp = client.post(
                     f"{_repo_path(project)}/issues/{pr_number}/assignees",
                     json={"assignees": assignees},
                 )
-                _check(a_resp)
-                # The /assignees endpoint returns the issue payload with
-                # the updated assignee list; mirror it.
-                pr_raw["assignees"] = a_resp.json().get("assignees") or []
+                a_warn = _check_side_step(a_resp)
+                if a_warn is not None:
+                    warnings.append(f"assignees: {a_warn}")
+                else:
+                    # The /assignees endpoint returns the issue payload with
+                    # the updated assignee list; mirror it.
+                    pr_raw["assignees"] = a_resp.json().get("assignees") or []
             if requested_reviewers:
                 rv_resp = client.post(
                     f"{_repo_path(project)}/pulls/{pr_number}/requested_reviewers",
                     json={"reviewers": requested_reviewers},
                 )
-                _check(rv_resp)
-                pr_raw["requested_reviewers"] = (
-                    rv_resp.json().get("requested_reviewers") or []
-                )
-            return _map_pr(pr_raw)
+                rv_warn = _check_side_step(rv_resp)
+                if rv_warn is not None:
+                    warnings.append(f"requested_reviewers: {rv_warn}")
+                else:
+                    pr_raw["requested_reviewers"] = (
+                        rv_resp.json().get("requested_reviewers") or []
+                    )
+            pr = _map_pr(pr_raw)
+            if warnings:
+                pr = dataclasses.replace(pr, warnings=warnings)
+            return pr
 
     def update_pr(
         self,
