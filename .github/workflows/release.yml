@@ -129,3 +129,51 @@ jobs:
             --title "$TAG" \
             --generate-notes \
             $PRE_FLAG
+
+      - name: Open dependency-update ticket in consumers
+        # continue-on-error: a missing/invalid PROJECTS_TICKET_TOKEN must
+        # never fail the release itself.
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TICKET_TOKEN }}
+        run: |
+          TITLE="chore(deps): bump lib-python-projects to v${{ inputs.version }}"
+          BODY=$(cat <<'EOF'
+## Dependency update
+
+A new release of **lib-python-projects** has been published: `v${{ inputs.version }}`.
+
+### Action required
+
+1. Update the pin in `pyproject.toml` to:
+   ```
+   lib-python-projects @ git+https://github.com/Seretos/lib-python-projects@v${{ inputs.version }}
+   ```
+2. Run `pwsh scripts/test.ps1` to verify the test suite passes.
+3. Run `pwsh scripts/build.ps1` to confirm the build succeeds.
+4. Commit and open a PR.
+EOF
+)
+
+          CONSUMER="Seretos/agent-project-issues"
+
+          # Idempotency: skip if an open issue with this exact title already exists.
+          # --paginate follows all pages; jq filter excludes pull requests.
+          EXISTING=$(gh api --paginate "repos/${CONSUMER}/issues?state=open&per_page=100" \
+            --jq 'map(select(.pull_request|not)) | .[].title' 2>/dev/null || true)
+          if echo "$EXISTING" | grep -qxF "$TITLE"; then
+            echo "Issue already exists in ${CONSUMER}, skipping."
+          else
+            # Attempt creation with the 'dependencies' label; fall back
+            # without it if the label does not exist in the consumer repo.
+            gh issue create \
+              --repo "$CONSUMER" \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label dependencies \
+            || gh issue create \
+              --repo "$CONSUMER" \
+              --title "$TITLE" \
+              --body "$BODY"
+          fi
