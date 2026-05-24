@@ -196,6 +196,12 @@ class TicketFilters:
     sort_order: SortOrder = "desc"
 
 
+def _validate_limit(limit: int, name: str = "limit") -> None:
+    """Raise ValueError if `limit` is not a positive integer."""
+    if limit <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {limit!r}")
+
+
 PRStatus = Literal["open", "closed", "merged"]
 PRListStatus = Literal["open", "closed", "any"]
 

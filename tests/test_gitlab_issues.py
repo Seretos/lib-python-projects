@@ -107,7 +107,7 @@ def test_list_tickets_default_filters(monkeypatch: pytest.MonkeyPatch) -> None:
         return _json([_issue_payload(1), _issue_payload(2)])
 
     _install_mock(monkeypatch, handler)
-    tickets = GitLabProvider().list_tickets(
+    tickets, has_more = GitLabProvider().list_tickets(
         _project(), token="tok", filters=TicketFilters(),
     )
     assert len(tickets) == 2
@@ -201,6 +201,61 @@ def test_list_tickets_limit_capped_at_100(
     GitLabProvider().list_tickets(
         _project(), "t", TicketFilters(limit=500),
     )
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+def test_list_tickets_nonpositive_limit_raises_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_limit: int,
+) -> None:
+    """limit <= 0 must raise ValueError without any HTTP call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for limit={bad_limit}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="positive integer"):
+        GitLabProvider().list_tickets(
+            _project(), "t", TicketFilters(limit=bad_limit),
+        )
+
+
+def test_list_tickets_has_more_true_when_full_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """has_more is True when the API returns exactly per_page items."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # Return exactly 2 items matching limit=2.
+        return _json([_issue_payload(1), _issue_payload(2)])
+
+    _install_mock(monkeypatch, handler)
+    tickets, has_more = GitLabProvider().list_tickets(
+        _project(),
+        token="tok",
+        filters=TicketFilters(limit=2),
+    )
+    assert len(tickets) == 2
+    assert has_more is True
+
+
+def test_list_tickets_has_more_false_when_partial_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """has_more is False when the API returns fewer than per_page items."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # Return 1 item when limit=5.
+        return _json([_issue_payload(1)])
+
+    _install_mock(monkeypatch, handler)
+    tickets, has_more = GitLabProvider().list_tickets(
+        _project(),
+        token="tok",
+        filters=TicketFilters(limit=5),
+    )
+    assert len(tickets) == 1
+    assert has_more is False
 
 
 def test_list_tickets_propagates_error(monkeypatch: pytest.MonkeyPatch) -> None:

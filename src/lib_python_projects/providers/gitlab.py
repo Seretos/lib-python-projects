@@ -63,6 +63,7 @@ from lib_python_projects.providers.base import (
     TicketFilters,
     TokenCapabilities,
     TokenCapabilityProvider,
+    _validate_limit,
 )
 
 log = logging.getLogger("project-issues.gitlab")
@@ -1129,6 +1130,7 @@ def _list_pipelines(
     `status`, `source`, etc. Callers pass the addressing param via
     `extra_params`; we add `per_page` and order.
     """
+    _validate_limit(limit)
     per_page = min(max(1, limit), 100)
     params: dict[str, Any] = {
         "per_page": per_page,
@@ -1270,7 +1272,7 @@ class GitLabProvider(TokenCapabilityProvider):
         project: ProjectConfig,
         token: str | None,
         filters: TicketFilters,
-    ) -> list[Ticket]:
+    ) -> tuple[list[Ticket], bool]:
         """List issues in a project.
 
         Filter mapping (GitLab REST `/projects/:id/issues`):
@@ -1283,6 +1285,7 @@ class GitLabProvider(TokenCapabilityProvider):
             `comments`→`user_notes_count`. `sort_order` → `sort`.
           - `limit` is `per_page`, capped at 100. Single page only.
         """
+        _validate_limit(filters.limit)
         per_page = min(max(1, filters.limit), 100)
         sort_by_map = {
             "created": "created_at",
@@ -1322,7 +1325,9 @@ class GitLabProvider(TokenCapabilityProvider):
                 f"/projects/{_project_path(project)}/issues", params=params,
             )
             _check(r)
-            return [_map_issue(it, project) for it in r.json()]
+            items = r.json()
+            has_more = len(items) >= per_page
+            return [_map_issue(it, project) for it in items], has_more
 
     def get_ticket(
         self,
@@ -2707,6 +2712,7 @@ class GitLabProvider(TokenCapabilityProvider):
         filter for this aggregation path; client-side filtering would
         be misleading here.
         """
+        _validate_limit(limit)
         path = _project_path(project)
         per_page = min(max(1, limit), 100)
         resolved_refs: list[str] = []

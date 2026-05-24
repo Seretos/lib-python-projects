@@ -251,15 +251,32 @@ def test_get_run_404_names_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_get_run_non_numeric_404_naming(monkeypatch: pytest.MonkeyPatch) -> None:
-    """get_run with a non-numeric run_id (e.g. 'main') gets a 404 that names
-    the run_id in the error (GitHub simply returns 404 for unknown ids)."""
+    """get_run with a non-numeric run_id (e.g. 'main') raises 404 proactively
+    without making any HTTP call."""
     from lib_python_projects.providers.github import GitHubError
 
     def handler(req: httpx.Request) -> httpx.Response:
-        return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError("no HTTP call should be made for non-numeric id")
 
     _install_mock(monkeypatch, handler)
     with pytest.raises(GitHubError) as exc:
         GitHubProvider().get_run(_project(), token="t", run_id="main")
     assert exc.value.status == 404
     assert "main" in exc.value.message
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+def test_list_runs_for_branch_nonpositive_limit_raises_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_limit: int,
+) -> None:
+    """limit <= 0 must raise ValueError without any HTTP call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for limit={bad_limit}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="positive integer"):
+        GitHubProvider().list_runs_for_branch(
+            _project(), token="t", branch="main", limit=bad_limit,
+        )

@@ -109,7 +109,7 @@ def test_default_filters_hit_issues_endpoint(monkeypatch: pytest.MonkeyPatch) ->
 
     seen = _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
-    tickets = provider.list_tickets(_project(), token="t", filters=TicketFilters())
+    tickets, has_more = provider.list_tickets(_project(), token="t", filters=TicketFilters())
     assert [t.id for t in tickets] == ["1", "2"]
     assert len(seen) == 1
     assert seen[0].url.path == "/repos/acme/backend/issues"
@@ -133,7 +133,7 @@ def test_not_labels_routes_to_search(monkeypatch: pytest.MonkeyPatch) -> None:
 
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
-    tickets = provider.list_tickets(
+    tickets, _ = provider.list_tickets(
         _project(),
         token="t",
         filters=TicketFilters(not_labels=["bug"]),
@@ -309,3 +309,60 @@ def test_author_routes_to_search_with_qualifier(monkeypatch: pytest.MonkeyPatch)
         token="t",
         filters=TicketFilters(author="bob"),
     )
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+def test_list_tickets_nonpositive_limit_raises_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_limit: int,
+) -> None:
+    """limit <= 0 must raise ValueError without any HTTP call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for limit={bad_limit}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="positive integer"):
+        GitHubProvider().list_tickets(
+            _project(),
+            token="t",
+            filters=TicketFilters(limit=bad_limit),
+        )
+
+
+def test_list_tickets_has_more_true_when_full_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """has_more is True when the API returns exactly per_page items."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # Return exactly 2 items matching limit=2.
+        return _json([_issue_payload(1), _issue_payload(2)])
+
+    _install_mock(monkeypatch, handler)
+    tickets, has_more = GitHubProvider().list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(limit=2),
+    )
+    assert len(tickets) == 2
+    assert has_more is True
+
+
+def test_list_tickets_has_more_false_when_partial_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """has_more is False when the API returns fewer than per_page items."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # Return 1 item when limit=5.
+        return _json([_issue_payload(1)])
+
+    _install_mock(monkeypatch, handler)
+    tickets, has_more = GitHubProvider().list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(limit=5),
+    )
+    assert len(tickets) == 1
+    assert has_more is False
