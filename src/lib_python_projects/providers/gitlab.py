@@ -346,6 +346,7 @@ def _map_note(
         body=raw.get("body") or "",
         url=raw_url,
         created_at=normalize_timestamp(raw.get("created_at") or ""),
+        updated_at=normalize_timestamp(raw.get("updated_at") or ""),
     )
 
 
@@ -401,7 +402,7 @@ def _map_mr(
       payloads that have been through at least one pipeline or diff
       computation. On freshly-created MR payloads (e.g. the response from
       `create_pr`) `diff_refs` is absent and therefore `base.sha` is
-      `""`. The field is reliably populated on a subsequent `get_pr` call.
+      `None`. The field is reliably populated on a subsequent `get_pr` call.
     """
     state = raw.get("state", "opened")
     status: str = _normalise_gl_state(state) or "closed"
@@ -426,7 +427,7 @@ def _map_mr(
     diff_refs = raw.get("diff_refs") or {}
     base = {
         "ref": raw.get("target_branch", "") or "",
-        "sha": diff_refs.get("base_sha") or "",
+        "sha": diff_refs.get("base_sha") or None,
     }
     head_pipeline = raw.get("head_pipeline") or raw.get("pipeline") or {}
     pipeline_status = head_pipeline.get("status") if head_pipeline else None
@@ -482,7 +483,7 @@ def _map_mr(
     return PullRequest(
         id=str(raw["iid"]),
         number=int(raw["iid"]),
-        title=raw.get("title") or "",
+        title=_DRAFT_PREFIX_RE.sub("", raw.get("title") or ""),
         body=raw.get("description") or "",
         status=status,  # type: ignore[arg-type]
         draft=bool(raw.get("draft") or raw.get("work_in_progress")),
@@ -2189,11 +2190,11 @@ class GitLabProvider(TokenCapabilityProvider):
                         side=side,
                         commit_sha=pos.get("head_sha")
                         or pos.get("base_sha")
-                        or "",
+                        or None,
                         in_reply_to=None if idx == 0 else discussion_id,
-                        created_at=note.get("created_at") or "",
-                        updated_at=note.get("updated_at") or "",
-                        url=note.get("web_url") or "",
+                        created_at=normalize_timestamp(note.get("created_at") or ""),
+                        updated_at=normalize_timestamp(note.get("updated_at") or ""),
+                        url=note.get("web_url") or None,
                         discussion_id=discussion_id,
                     ))
             return out
@@ -2253,10 +2254,11 @@ class GitLabProvider(TokenCapabilityProvider):
                     body=note_raw.get("body") or "",
                     path=None,
                     line=None,
+                    commit_sha=None,
                     in_reply_to=in_reply_to,
-                    created_at=note_raw.get("created_at") or "",
-                    updated_at=note_raw.get("updated_at") or "",
-                    url=_reply_url,
+                    created_at=normalize_timestamp(note_raw.get("created_at") or ""),
+                    updated_at=normalize_timestamp(note_raw.get("updated_at") or ""),
+                    url=_reply_url or None,
                     # Thread anchor is the discussion the reply joined.
                     discussion_id=in_reply_to,
                 )
@@ -2311,11 +2313,11 @@ class GitLabProvider(TokenCapabilityProvider):
                 path=path,
                 line=line,
                 side=None,
-                commit_sha=commit_sha or "",
+                commit_sha=commit_sha or None,
                 in_reply_to=None,
-                created_at=note_raw.get("created_at") or "",
-                updated_at=note_raw.get("updated_at") or "",
-                url=_new_thread_url,
+                created_at=normalize_timestamp(note_raw.get("created_at") or ""),
+                updated_at=normalize_timestamp(note_raw.get("updated_at") or ""),
+                url=_new_thread_url or None,
                 discussion_id=discussion_id or None,
             )
 

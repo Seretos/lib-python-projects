@@ -698,3 +698,73 @@ def test_list_tickets_nonpositive_limit_raises_azuredevops(
         AzureDevOpsProvider().list_tickets(
             _ado_project(), "tok", TicketFilters(limit=bad_limit)
         )
+
+
+# ---------- ticket #30: Comment.updated_at cross-provider parity -------------
+
+
+def test_comment_dataclass_exposes_updated_at():
+    """Comment must have an updated_at field so all three providers return
+    a consistent shape. This is a static structural assertion."""
+    from lib_python_projects.providers.base import Comment
+    import dataclasses
+    field_names = {f.name for f in dataclasses.fields(Comment)}
+    assert "updated_at" in field_names, (
+        "Comment.updated_at field is missing — all three providers "
+        "populate it but the dataclass contract doesn't expose it yet."
+    )
+
+
+def test_github_comment_updated_at_populated(monkeypatch):
+    """GitHub's _map_comment must populate updated_at from the wire payload."""
+    comment_payload = {
+        "id": 1,
+        "user": {"login": "alice"},
+        "body": "hello",
+        "html_url": "https://github.com/acme/backend/issues/1#issuecomment-1",
+        "created_at": "2026-05-18T10:00:00Z",
+        "updated_at": "2026-05-19T12:30:00Z",
+    }
+
+    def handler(req):
+        if req.url.path.endswith("/issues/1/comments"):
+            return _resp([comment_payload])
+        return _resp([], 404)
+
+    _install_github_mock(monkeypatch, handler)
+    p = ProjectConfig(id="acme", provider="github", path="acme/backend")
+    from lib_python_projects.providers.github import GitHubProvider
+    comments, _ = GitHubProvider().list_comments(p, "tok", "1")
+    assert comments[0].updated_at == "2026-05-19T12:30:00Z"
+
+
+def test_gitlab_comment_updated_at_populated(monkeypatch):
+    """GitLab's _map_note must populate updated_at from the wire payload."""
+    note_payload = {
+        "id": 99,
+        "body": "hi",
+        "author": {"username": "bob"},
+        "created_at": "2026-05-20T10:00:00.123Z",
+        "updated_at": "2026-05-21T11:30:45.456Z",
+        "system": False,
+    }
+
+    def handler(req):
+        if "/issues/3/notes" in req.url.path:
+            return _resp([note_payload])
+        if "/issues/3" in req.url.path:
+            return _resp({
+                "iid": 3, "title": "T", "description": "",
+                "state": "opened", "author": {"username": "a"},
+                "assignees": [], "labels": [],
+                "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/3",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        return _resp({}, 404)
+
+    _install_gitlab_mock(monkeypatch, handler)
+    _ticket, comments, _rels, _trunc = GitLabProvider().get_ticket(
+        _gitlab_project(), "tok", "3", include_relations=False,
+    )
+    assert comments[0].updated_at == "2026-05-21T11:30:45Z"

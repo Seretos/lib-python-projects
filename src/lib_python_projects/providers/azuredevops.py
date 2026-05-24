@@ -855,6 +855,7 @@ def _map_work_item_comment(raw: dict, project: ProjectConfig, work_item_id: str)
         body=_html_to_markdown(raw.get("text") or ""),
         url=_build_work_item_url(project, work_item_id) + f"?commentId={raw.get('id', '')}",
         created_at=normalize_timestamp(raw.get("createdDate") or ""),
+        updated_at=normalize_timestamp(raw.get("modifiedDate") or ""),
     )
 
 
@@ -957,6 +958,7 @@ def _map_thread_comment(
         body=_html_to_markdown(raw.get("content") or ""),
         url=_build_pr_url(project, pr_id) + f"?discussionId={thread_id}",
         created_at=normalize_timestamp(raw.get("publishedDate") or ""),
+        updated_at=normalize_timestamp(raw.get("lastUpdatedDate") or ""),
     )
 
 
@@ -1401,18 +1403,17 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
 
         # Process templates without a "Removed" category (notably Basic)
         # don't have a distinct declined state — surface that honestly as
-        # an empty string rather than collapsing it onto
-        # terminal_completed, which previously left both fields equal
-        # and agents thinking they had two interchangeable terminal
-        # states to choose from.
+        # None rather than collapsing it onto terminal_completed, which
+        # previously left both fields equal and agents thinking they had
+        # two interchangeable terminal states to choose from.
         terminal = (by_cat.get("Completed") or []) + (by_cat.get("Removed") or [])
         terminal_completed = by_cat.get("Completed") or []
         terminal_declined = by_cat.get("Removed") or []
-        hints: dict[str, str | list[str]] = {
+        hints: dict[str, str | list[str] | None] = {
             "default_open": default_open,
             "terminal": terminal,
-            "terminal_completed": terminal_completed[0] if terminal_completed else "",
-            "terminal_declined": terminal_declined[0] if terminal_declined else "",
+            "terminal_completed": terminal_completed[0] if terminal_completed else None,
+            "terminal_declined": terminal_declined[0] if terminal_declined else None,
         }
         return StatusSpec(values=values, transitions=transitions, hints=hints)
 

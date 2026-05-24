@@ -211,6 +211,7 @@ def _map_comment(raw: dict) -> Comment:
         body=raw.get("body") or "",
         url=raw.get("html_url") or "",
         created_at=normalize_timestamp(raw.get("created_at") or ""),
+        updated_at=normalize_timestamp(raw.get("updated_at") or ""),
     )
 
 
@@ -233,11 +234,11 @@ def _map_review_comment(raw: dict) -> ReviewComment:
         line=raw.get("line"),
         original_line=raw.get("original_line"),
         side=raw.get("side"),
-        commit_sha=raw.get("commit_id") or raw.get("original_commit_id") or "",
+        commit_sha=raw.get("commit_id") or raw.get("original_commit_id") or None,
         in_reply_to=str(in_reply_to) if in_reply_to is not None else None,
         created_at=normalize_timestamp(raw.get("created_at") or ""),
         updated_at=normalize_timestamp(raw.get("updated_at") or ""),
-        url=raw.get("html_url") or "",
+        url=raw.get("html_url") or None,
         discussion_id=discussion_id,
     )
 

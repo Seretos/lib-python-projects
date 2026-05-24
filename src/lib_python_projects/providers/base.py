@@ -65,6 +65,7 @@ class Comment:
     body: str
     url: str
     created_at: str
+    updated_at: str = ""
 
 
 RelationKind = Literal[
@@ -316,11 +317,11 @@ class ReviewComment:
     line: int | None
     original_line: int | None = None
     side: str | None = None
-    commit_sha: str = ""
+    commit_sha: str | None = None
     in_reply_to: str | None = None
     created_at: str = ""
     updated_at: str = ""
-    url: str = ""
+    url: str | None = None
     discussion_id: str | None = None
 
 
@@ -373,7 +374,7 @@ class StatusSpec:
 
     values: list[str]
     transitions: dict[str, list[str]]
-    hints: dict[str, str | list[str]]
+    hints: dict[str, str | list[str] | None]
 
 
 @dataclass

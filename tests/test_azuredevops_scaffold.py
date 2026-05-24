@@ -526,10 +526,10 @@ def test_list_statuses_basic_template(monkeypatch: pytest.MonkeyPatch) -> None:
     assert spec.values == ["To Do", "Doing", "Done"]
     assert spec.hints["default_open"] == "To Do"
     assert spec.hints["terminal_completed"] == "Done"
-    # Basic has no Removed state — surface that honestly as "" rather
+    # Basic has no Removed state — surface that honestly as None rather
     # than collapsing onto terminal_completed, which would mislead
     # agents into thinking they had two terminal states to pick from.
-    assert spec.hints["terminal_declined"] == ""
+    assert spec.hints["terminal_declined"] is None
     # transitions: all states can reach every other state (we don't
     # restrict because ADO doesn't expose the legal-transitions graph).
     assert set(spec.transitions["To Do"]) == {"Doing", "Done"}
