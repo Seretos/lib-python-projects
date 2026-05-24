@@ -228,6 +228,12 @@ class PullRequest:
         `running`, ...). `None` when no pipeline is attached.
       - `approvals_required` / `approvals_received`: GitLab approval
         counts (Premium+); both `None` on free tier.
+
+    Mergeability note (Issue 6):
+      `list_prs` never populates `mergeable` or `mergeable_state` — the
+      list endpoint does not compute mergeability for cost reasons. Both
+      fields are always `None` in `list_prs` results. Call `get_pr` for
+      the single-PR path, which does populate them.
     """
 
     id: str
@@ -276,7 +282,12 @@ class ReviewComment:
         only; GitLab leaves it `None`.
       - `side`: `"LEFT"` for a deletion-side anchor, `"RIGHT"` for the
         addition side. `None` for GitLab (uses `old_line`/`new_line`
-        directly).
+        directly). Note: `side` and `url` may differ between the
+        `add_pr_review_comment` response and the same comment as returned
+        by `get_pr`. GitLab does not echo `side` on write and constructs
+        the `url` only after the comment is saved, so the write response
+        carries `side=None` and an empty or provisional `url`; the
+        authoritative values are available via `get_pr` afterwards.
       - `commit_sha`: the diff base the comment was anchored against.
       - `in_reply_to`: the id of the comment / discussion this is a
         reply to, or `None` for new threads. On GitHub this is the

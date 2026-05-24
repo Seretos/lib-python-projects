@@ -2545,6 +2545,10 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
             resp = c.get(path, params=_api_version_params())
         _check(resp)
         cur = resp.json() or {}
+        if cur.get("status") == "completed" and cur.get("mergeStatus") == "succeeded":
+            raise AzureDevOpsError(
+                405, f"PR '{project.id}#{pr_id}' is already merged"
+            )
         merge_strategy = {
             "merge": "noFastForward",
             "squash": "squash",
@@ -3016,6 +3020,28 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         target_id = _parse_relation_target(target, project)
         rel_name = _RELATION_FORWARD[kind]
         target_url = _build_workitem_api_url(project, target_id)
+        path = f"{_project_scope(project)}/_apis/wit/workitems/{quote(str(ticket_id), safe='')}"
+
+        # Pre-flight duplicate check: fetch current relations and raise 409
+        # if the same rel+target already exists (mirrors GitHub 422 /
+        # GitLab 409 natural behaviour).
+        target_url_marker = f"/workItems/{target_id}"
+        with _client(project, token) as c:
+            preflight_resp = c.get(
+                path, params=_api_version_params({"$expand": "Relations"})
+            )
+        _check(preflight_resp)
+        existing_relations = (preflight_resp.json() or {}).get("relations") or []
+        for existing_rel in existing_relations:
+            if (
+                existing_rel.get("rel") == rel_name
+                and target_url_marker in (existing_rel.get("url") or "")
+            ):
+                raise AzureDevOpsError(
+                    409,
+                    f"relation '{kind}' from #{ticket_id} to #{target_id} already exists",
+                )
+
         patch = [
             {
                 "op": "add",
@@ -3023,7 +3049,6 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                 "value": {"rel": rel_name, "url": target_url},
             }
         ]
-        path = f"{_project_scope(project)}/_apis/wit/workitems/{quote(str(ticket_id), safe='')}"
         with _client(project, token) as c:
             resp = c.patch(
                 path,
@@ -3109,6 +3134,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
             url=_build_work_item_url(project, target_id),
             state=state,
             is_pull_request=False,
+            resolved=True,
         )
 
     def remove_relation(
@@ -3154,7 +3180,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                 json=patch,
             )
         _check(resp)
-        return {"removed": True, "kind": kind, "target": f"#{target_id}"}
+        return {"removed": True}
 
     # ---------- pipelines -------------------------------------------------
 

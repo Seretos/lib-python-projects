@@ -2408,7 +2408,14 @@ class GitHubProvider:
             r = client.put(
                 f"{_repo_path(project)}/pulls/{pr_id}/merge", json=payload
             )
-            _check(r)
+            try:
+                _check(r)
+            except GitHubError as exc:
+                if exc.status == 405:
+                    raise GitHubError(
+                        405, f"PR '{project.id}#{pr_id}' is already merged"
+                    ) from exc
+                raise
             # Re-fetch so the response carries the merged state/timestamp.
             r2 = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
             _check(r2)

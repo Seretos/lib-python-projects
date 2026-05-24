@@ -1202,3 +1202,27 @@ def test_update_comment_whitespace_body_raises_value_error(
         GitHubProvider().update_comment(
             _project(), token="t", comment_id="99", body="   ", ticket_id="42",
         )
+
+
+# ---------- merge_pr already-merged (Issue 1) --------------------------------
+
+
+def test_merge_pr_already_merged_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub returns HTTP 405 when merging an already-merged PR.
+    The provider must re-raise as GitHubError(405, '... already merged').
+    """
+    from lib_python_projects.providers.github import GitHubError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/pulls/7/merge" in req.url.path:
+            return _json({"message": "Pull Request is not mergeable"}, status_code=405)
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+    assert exc.value.status == 405
+    assert "already merged" in exc.value.message
+    assert "acme#7" in exc.value.message
