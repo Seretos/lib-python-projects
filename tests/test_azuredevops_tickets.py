@@ -141,7 +141,7 @@ def test_list_tickets_runs_wiql_then_batch(monkeypatch: pytest.MonkeyPatch) -> N
         raise AssertionError(f"unexpected path {path}")
 
     seen = _install_mock(monkeypatch, handler)
-    tickets = AzureDevOpsProvider().list_tickets(
+    tickets, _ = AzureDevOpsProvider().list_tickets(
         _project(default_type="Issue"),
         token="t",
         filters=TicketFilters(status="open", limit=30),
@@ -271,12 +271,88 @@ def test_list_tickets_caps_at_limit(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError(f"unexpected {req.url.path}")
 
     _install_mock(monkeypatch, handler)
-    tickets = AzureDevOpsProvider().list_tickets(
+    tickets, _ = AzureDevOpsProvider().list_tickets(
         _project(default_type="Issue"),
         token="t",
         filters=TicketFilters(limit=2),
     )
     assert len(tickets) == 2
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+def test_list_tickets_nonpositive_limit_raises_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_limit: int,
+) -> None:
+    """limit <= 0 must raise ValueError without any HTTP call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for limit={bad_limit}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="positive integer"):
+        AzureDevOpsProvider().list_tickets(
+            _project(default_type="Issue"),
+            token="t",
+            filters=TicketFilters(limit=bad_limit),
+        )
+
+
+def test_list_tickets_has_more_true_when_full_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """has_more is True when WIQL returns exactly limit IDs."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            # Return exactly 2 IDs matching limit=2.
+            return _json({"workItems": [{"id": 1}, {"id": 2}]})
+        if req.url.path.endswith("/_apis/wit/workitemsbatch"):
+            body = json.loads(req.content.decode("utf-8"))
+            assert body["ids"] == [1, 2]
+            return _json({"value": [_work_item_payload(1), _work_item_payload(2)]})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    tickets, has_more = AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(limit=2),
+    )
+    assert len(tickets) == 2
+    assert has_more is True
+
+
+def test_list_tickets_has_more_false_when_partial_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """has_more is False when WIQL returns fewer IDs than limit."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            # Return only 2 IDs when limit=5.
+            return _json({"workItems": [{"id": 1}, {"id": 2}]})
+        if req.url.path.endswith("/_apis/wit/workitemsbatch"):
+            body = json.loads(req.content.decode("utf-8"))
+            return _json({"value": [_work_item_payload(wid) for wid in body["ids"]]})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    tickets, has_more = AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(limit=5),
+    )
+    assert len(tickets) == 2
+    assert has_more is False
 
 
 # ---------- get_ticket -------------------------------------------------------

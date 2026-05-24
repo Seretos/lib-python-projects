@@ -289,3 +289,20 @@ def test_get_run_non_numeric_run_id_raises_404(
         GitLabProvider().get_run(_project(), "t", "not-a-number")
     assert exc.value.status == 404
     assert "not-a-number" in exc.value.message
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+def test_list_runs_for_branch_nonpositive_limit_raises_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_limit: int,
+) -> None:
+    """limit <= 0 must raise ValueError without any HTTP call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for limit={bad_limit}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="positive integer"):
+        GitLabProvider().list_runs_for_branch(
+            _project(), "t", "main", limit=bad_limit,
+        )

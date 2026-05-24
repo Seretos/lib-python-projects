@@ -15,15 +15,18 @@ import pytest
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import github as github_provider
 from lib_python_projects.providers import gitlab as gitlab_provider
+from lib_python_projects.providers import azuredevops as azuredevops_provider
 from lib_python_projects.providers.base import (
     normalize_timestamp,
     RelationKind,
     RelationNotFound,
     READ_ONLY_RELATION_KINDS,
     WRITABLE_RELATION_KINDS,
+    TicketFilters,
 )
 from lib_python_projects.providers.github import GitHubProvider
 from lib_python_projects.providers.gitlab import GitLabProvider, _canonical_url
+from lib_python_projects.providers.azuredevops import AzureDevOpsProvider, _basic_auth_header
 
 
 def _github_project(path: str = "Seretos/agent-project-issues") -> ProjectConfig:
@@ -585,3 +588,90 @@ def test_gitlab_add_relation_relates_to_returns_populated_relation(monkeypatch):
     assert rel.url != ""
     assert "issues/7" in rel.url
     assert rel.resolved is True
+
+
+# ---------- Issue #19: cross-provider list_tickets limit validation ----------
+
+
+def _install_azuredevops_mock(monkeypatch, handler):
+    def wrapped(req):
+        return handler(req)
+    transport = httpx.MockTransport(wrapped)
+
+    def fake_client(project, token):
+        headers = {"Accept": "application/json"}
+        if token:
+            headers["Authorization"] = _basic_auth_header(token)
+        base = (project.base_url or "https://dev.azure.com").rstrip("/")
+        return httpx.Client(base_url=base, headers=headers, transport=transport)
+
+    monkeypatch.setattr(azuredevops_provider, "_client", fake_client)
+
+
+def _ado_project() -> ProjectConfig:
+    return ProjectConfig(
+        id="azure-tests",
+        provider="azuredevops",
+        path="seredos/azure-tests/azure-tests",
+        token_env="AZURE_TOKEN",
+    )
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+@pytest.mark.parametrize("provider_name,make_provider,make_project,install_mock", [
+    (
+        "github",
+        lambda: GitHubProvider(),
+        lambda: _github_project(),
+        "_install_github_mock",
+    ),
+    (
+        "gitlab",
+        lambda: GitLabProvider(),
+        lambda: _gitlab_project(),
+        "_install_gitlab_mock",
+    ),
+])
+def test_list_tickets_nonpositive_limit_raises_on_all_providers(
+    monkeypatch,
+    bad_limit: int,
+    provider_name: str,
+    make_provider,
+    make_project,
+    install_mock: str,
+) -> None:
+    """All providers must raise ValueError for limit <= 0 without HTTP I/O."""
+
+    def handler(req):
+        raise AssertionError(
+            f"no HTTP call expected for {provider_name} with limit={bad_limit}"
+        )
+
+    # Use the appropriate mock installer.
+    if install_mock == "_install_github_mock":
+        _install_github_mock(monkeypatch, handler)
+    else:
+        _install_gitlab_mock(monkeypatch, handler)
+
+    provider = make_provider()
+    with pytest.raises(ValueError, match="positive integer"):
+        provider.list_tickets(make_project(), "tok", TicketFilters(limit=bad_limit))
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+def test_list_tickets_nonpositive_limit_raises_azuredevops(
+    monkeypatch,
+    bad_limit: int,
+) -> None:
+    """Azure DevOps raises ValueError for limit <= 0 without HTTP I/O."""
+    from lib_python_projects.providers.azuredevops import _cache_clear_all
+    _cache_clear_all()
+
+    def handler(req):
+        raise AssertionError(f"no HTTP call expected for limit={bad_limit}")
+
+    _install_azuredevops_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="positive integer"):
+        AzureDevOpsProvider().list_tickets(
+            _ado_project(), "tok", TicketFilters(limit=bad_limit)
+        )

@@ -927,6 +927,39 @@ def test_get_run_404_names_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "pipeline 'azure-tests#9999' not found" in exc.value.message
 
 
+def test_get_run_non_numeric_run_id_raises_404_without_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """get_run with a non-numeric run_id must raise AzureDevOpsError(404)
+    proactively without making any HTTP call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call should be made for non-numeric id")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().get_run(_project(), token="t", run_id="not-a-number")
+    assert exc.value.status == 404
+    assert "not-a-number" in exc.value.message
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+def test_list_runs_for_branch_nonpositive_limit_raises_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_limit: int,
+) -> None:
+    """limit <= 0 must raise ValueError without any HTTP call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for limit={bad_limit}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="positive integer"):
+        AzureDevOpsProvider().list_runs_for_branch(
+            _project(), token="t", ref="main", limit=bad_limit,
+        )
+
+
 def test_check_invalid_argument_allowed_values_non_state_no_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

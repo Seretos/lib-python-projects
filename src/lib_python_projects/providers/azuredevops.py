@@ -72,6 +72,7 @@ from lib_python_projects.providers.base import (
     TokenCapabilityProvider,
     WRITABLE_RELATION_KINDS,
     normalize_timestamp,
+    _validate_limit,
 )
 
 log = logging.getLogger("project-issues.azuredevops")
@@ -1463,7 +1464,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         project: ProjectConfig,
         token: str | None,
         filters: TicketFilters,
-    ) -> list[Ticket]:
+    ) -> tuple[list[Ticket], bool]:
+        _validate_limit(filters.limit)
         wiql = self._build_wiql(project, token, filters)
         with _client(project, token) as c:
             resp = c.post(
@@ -1478,8 +1480,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
             if item.get("id") is not None
         ][: max(1, filters.limit)]
         if not ids:
-            return []
-        return self._fetch_work_items_batch(project, token, ids)
+            return [], False
+        has_more = len(ids) >= filters.limit
+        return self._fetch_work_items_batch(project, token, ids), has_more
 
     def _fetch_work_items_batch(
         self,
@@ -3204,6 +3207,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         status: str = "all",
         limit: int = 20,
     ) -> list[PipelineRun]:
+        _validate_limit(limit)
         # ADO doesn't filter by sourceVersion server-side on the public
         # /builds list; fetch the last page and filter client-side.
         params = _api_version_params({"$top": 200})
@@ -3240,6 +3244,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         `build/{id}` markers we walked from the work item's
         ArtifactLink relations — mirrors GitLab's `!{iid}` shape.
         """
+        _validate_limit(limit)
         # Walk the work item's relations for ArtifactLink entries pointing
         # at Build artifacts.
         path = (
@@ -3285,6 +3290,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         status: str,
         limit: int,
     ) -> list[PipelineRun]:
+        _validate_limit(limit)
         if status and status != "all":
             params["statusFilter"] = status
         path = f"{_project_scope(project)}/_apis/build/builds"
@@ -3301,6 +3307,12 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         run_id: str,
         include_failure_excerpt: bool = False,
     ) -> PipelineRun:
+        if not str(run_id).strip().isdigit():
+            raise AzureDevOpsError(
+                404,
+                f"pipeline '{project.id}#{run_id}' not found"
+                f" — run_id must be numeric for Azure DevOps",
+            )
         path = f"{_project_scope(project)}/_apis/build/builds/{quote(str(run_id), safe='')}"
         with _client(project, token) as c:
             resp = c.get(path, params=_api_version_params())

@@ -38,6 +38,7 @@ from lib_python_projects.providers.base import (
     Ticket,
     TicketFilters,
     TokenCapabilities,
+    _validate_limit,
 )
 
 log = logging.getLogger("project-issues.github")
@@ -1419,7 +1420,8 @@ class GitHubProvider:
         project: ProjectConfig,
         token: str | None,
         filters: TicketFilters,
-    ) -> list[Ticket]:
+    ) -> tuple[list[Ticket], bool]:
+        _validate_limit(filters.limit)
         per_page = min(max(1, filters.limit), 100)
         # Normalize `not_labels=[]` (truthy-but-empty containers) to "not set".
         if not filters.not_labels:
@@ -1427,6 +1429,8 @@ class GitHubProvider:
         with _client(token) as client:
             if filters.search or _requires_search(filters):
                 items = _list_via_search(client, project, filters)
+                has_more = len(items) >= per_page
+                return [_map_issue(it) for it in items if "pull_request" not in it], has_more
             else:
                 params: dict[str, Any] = {
                     "per_page": per_page,
@@ -1441,8 +1445,9 @@ class GitHubProvider:
                 r = client.get(f"{_repo_path(project)}/issues", params=params)
                 _check(r)
                 items = r.json()
-            # The /issues endpoints include PRs; filter them out.
-            return [_map_issue(it) for it in items if "pull_request" not in it]
+                has_more = len(items) >= per_page
+                # The /issues endpoints include PRs; filter them out.
+                return [_map_issue(it) for it in items if "pull_request" not in it], has_more
 
     def get_ticket(
         self,
@@ -2761,6 +2766,12 @@ class GitHubProvider:
         and a small log excerpt. In-progress runs (`conclusion=None`)
         never trigger the failure-context fetch.
         """
+        if not str(run_id).strip().isdigit():
+            raise GitHubError(
+                404,
+                f"pipeline '{project.id}#{run_id}' not found"
+                f" — run_id must be numeric for GitHub Actions",
+            )
         with _client(token) as client:
             r = client.get(
                 f"{_repo_path(project)}/actions/runs/{run_id}"
@@ -2808,6 +2819,7 @@ def _map_run(raw: dict) -> PipelineRun:
 
 
 def _runs_params(status: str, limit: int) -> dict[str, Any]:
+    _validate_limit(limit)
     per_page = min(max(1, limit), 100)
     params: dict[str, Any] = {"per_page": per_page}
     if status and status != "all" and status in _RUN_STATUS_FILTERS:
