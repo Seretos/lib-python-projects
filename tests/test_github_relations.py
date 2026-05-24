@@ -15,7 +15,7 @@ import pytest
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import github as github_provider
 from lib_python_projects.providers.github import GitHubError, GitHubProvider
-from lib_python_projects.providers.base import RelationNotFound
+from lib_python_projects.providers.base import RelationAlreadyExists, RelationNotFound
 
 
 # ---------- helpers ----------------------------------------------------------
@@ -1297,8 +1297,8 @@ def test_merge_pr_already_merged_raises(
 def test_add_relation_child_duplicate_sub_issue_422(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """add_relation 'child' hitting a duplicate-sub-issue 422 must surface
-    'relation already exists' with kind and target in the message."""
+    """add_relation 'child' hitting a duplicate-sub-issue 422 must raise
+    RelationAlreadyExists with kind and target info."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
@@ -1317,14 +1317,13 @@ def test_add_relation_child_duplicate_sub_issue_422(
         raise AssertionError(f"unexpected {req.method} {req.url}")
 
     _install_mock(monkeypatch, handler)
-    with pytest.raises(GitHubError) as exc:
+    with pytest.raises(RelationAlreadyExists) as exc:
         GitHubProvider().add_relation(
             _project(), token="t", ticket_id="1", kind="child", target="#5"
         )
-    assert exc.value.status == 422
-    assert "relation already exists" in exc.value.message
-    assert "child" in exc.value.message
-    assert "#5" in exc.value.message
+    assert exc.value.kind == "child"
+    assert "#5" in exc.value.target
+    assert isinstance(exc.value, ValueError)
 
 
 def test_add_relation_blocked_by_cycle_422(
@@ -1356,3 +1355,404 @@ def test_add_relation_blocked_by_cycle_422(
     assert "cycle" in exc.value.message
     assert "blocked_by" in exc.value.message
     assert "#5" in exc.value.message
+
+
+# ---------- Defects from ticket #37 -----------------------------------------
+
+
+def test_add_relation_child_duplicate_raises_relation_already_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation 'child' hitting a duplicate-sub-issue 422 must raise
+    RelationAlreadyExists (a ValueError), not a raw GitHubError."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Target issue resolution (for internal id).
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        # Sub-issues POST → duplicate 422.
+        if "/sub_issues" in path and req.method == "POST":
+            return _json(
+                {
+                    "message": "Issue may not contain duplicate sub-issues",
+                    "errors": [{"message": "Issue may not contain duplicate sub-issues"}],
+                },
+                status_code=422,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationAlreadyExists) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="child", target="#5"
+        )
+    assert exc.value.kind == "child"
+    assert "#5" in exc.value.target
+    # Must be a ValueError subclass for _safe wrapper compatibility.
+    assert isinstance(exc.value, ValueError)
+
+
+def test_add_relation_blocked_by_duplicate_raises_relation_already_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation 'blocked_by' hitting an already-exists 422 must raise
+    RelationAlreadyExists, not a raw GitHubError."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        if "/dependencies/blocked_by" in path and req.method == "POST":
+            return _json(
+                {
+                    "message": "Dependency already assigned",
+                    "errors": [{"message": "Dependency already assigned"}],
+                },
+                status_code=422,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationAlreadyExists) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="blocked_by", target="#5"
+        )
+    assert exc.value.kind == "blocked_by"
+    assert "#5" in exc.value.target
+    assert isinstance(exc.value, ValueError)
+
+
+def test_add_relation_self_relation_github(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation with ticket_id == target must raise ValueError with
+    'self-relation' in the message — no HTTP call should be made."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for self-relation: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="self-relation"):
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="5", kind="child", target="#5"
+        )
+
+
+def test_add_relation_self_relation_github_no_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Self-relation guard fires when target is given without '#' prefix."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for self-relation: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="self-relation"):
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="5", kind="child", target="5"
+        )
+
+
+def test_duplicate_of_from_body_without_state_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """get_ticket for a ticket with 'Duplicate of #1' in body and state='open'
+    (no state_reason) must surface ('duplicate_of', '#1') in relations,
+    and '#1' must NOT appear as a plain 'mentions' entry."""
+
+    body = "Duplicate of #1"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/4":
+            return _json(_issue_payload(
+                4, body=body, state="open",
+                # No state_reason — the old gated-path would suppress this.
+            ))
+        if path == "/repos/acme/backend/issues/4/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/4/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/4/timeline":
+            return _json([])
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="4")
+    by_kind = {(r.kind, r.ticket_id) for r in relations}
+    # duplicate_of must be present even without state_reason='duplicate'.
+    assert ("duplicate_of", "#1") in by_kind, (
+        f"expected duplicate_of #1, got {by_kind}"
+    )
+    # The '#1' in the 'Duplicate of #1' text must NOT also appear as 'mentions'.
+    assert ("mentions", "#1") not in by_kind, (
+        f"'#1' must not also surface as 'mentions'; got {by_kind}"
+    )
+
+
+def test_duplicate_of_from_body_with_state_reason_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When body contains 'Duplicate of #1' AND state_reason='duplicate',
+    exactly one duplicate_of relation for #1 results (no double)."""
+
+    body = "Duplicate of #1"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/4":
+            return _json(_issue_payload(
+                4, body=body, state="closed", state_reason="duplicate",
+            ))
+        if path == "/repos/acme/backend/issues/4/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/4/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/4/timeline":
+            return _json([])
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="4")
+    dup_rels = [(r.kind, r.ticket_id) for r in relations if r.ticket_id == "#1"]
+    assert ("duplicate_of", "#1") in dup_rels, (
+        f"expected duplicate_of #1, got {dup_rels}"
+    )
+    # Exactly one entry for #1 (no double due to both scan paths firing).
+    assert len(dup_rels) == 1, (
+        f"expected exactly 1 relation for #1, got {len(dup_rels)}: {dup_rels}"
+    )
+
+
+# ---------- Regression: remove_relation("duplicate_of") strips body marker ----
+
+
+def test_remove_relation_duplicate_of_strips_body_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #37 finding 1: remove_relation('duplicate_of')
+    must strip the 'Duplicate of #N' body line (not just reopen the issue).
+
+    Contract: after removal, get_ticket must not report duplicate_of because
+    the body is the sole source of truth — reopening alone would leave the
+    marker and keep reporting the relation.
+    """
+    # The issue body as written by add_relation("duplicate_of").
+    original_body = "Duplicate of #99\n\nOriginal description."
+    patched_bodies: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Target issue resolution for internal-id lookup.
+        if path == "/repos/acme/backend/issues/99":
+            return _json(_issue_payload(99, id=9901))
+        # Source issue GET (to read current body before patching).
+        if path == "/repos/acme/backend/issues/10" and req.method == "GET":
+            return _json(_issue_payload(
+                10, id=1001,
+                body=original_body,
+                state="closed",
+                state_reason="duplicate",
+                labels=[],
+            ))
+        # PATCH to strip body + reopen.
+        if path == "/repos/acme/backend/issues/10" and req.method == "PATCH":
+            import json as _json_mod
+            payload = _json_mod.loads(req.content)
+            patched_bodies.append(payload.get("body", ""))
+            assert payload.get("state") == "open", (
+                "remove_relation must reopen the issue"
+            )
+            return _json(_issue_payload(10, state="open", body=payload.get("body", "")))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().remove_relation(
+        _project(), token="t", ticket_id="10", kind="duplicate_of", target="#99"
+    )
+    assert result == {"removed": True}
+
+    # Confirm the PATCH was issued and the body no longer contains the marker.
+    assert patched_bodies, "expected at least one PATCH body"
+    final_body = patched_bodies[-1]
+    assert "Duplicate of #99" not in final_body, (
+        f"marker must be stripped from body; got: {final_body!r}"
+    )
+    # The original description should be preserved.
+    assert "Original description." in final_body, (
+        f"original description must be kept; got: {final_body!r}"
+    )
+
+
+# ---------- Regression: add_relation('blocks') duplicate raises correct id ----
+
+
+def test_add_relation_blocks_duplicate_raises_relation_already_exists_with_caller_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #37 finding 2 & 3: add_relation('blocks') hitting
+    a duplicate 422 must raise RelationAlreadyExists with ticket_id equal to
+    the *caller's* logical source ticket (A), not the wire-level source (B).
+
+    For blocks(A→B), the wire call is POST /issues/B/dependencies/blocked_by,
+    so source_issue_number on the wire is B.  Before the fix, the exception
+    reported ticket_id=B; it must report ticket_id=A (the caller).
+    """
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Resolve target issue (B = #5) for internal id.
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        # Resolve caller issue (A = #1) for internal id.
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, id=1001))
+        # Wire POST is to B's endpoint; return duplicate 422.
+        if "/repos/acme/backend/issues/5/dependencies/blocked_by" in path and req.method == "POST":
+            return _json(
+                {
+                    "message": "Dependency already assigned",
+                    "errors": [{"message": "Dependency already assigned"}],
+                },
+                status_code=422,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationAlreadyExists) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="blocks", target="#5"
+        )
+    # ticket_id must be the caller's logical source (A="1"), NOT the wire source (B="5").
+    assert exc.value.ticket_id == "1", (
+        f"expected ticket_id='1' (caller's A), got {exc.value.ticket_id!r}"
+    )
+    assert exc.value.kind == "blocks"
+    assert "#5" in exc.value.target
+    assert isinstance(exc.value, ValueError)
+
+
+def test_add_relation_parent_duplicate_raises_relation_already_exists_with_caller_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation('parent') hitting a duplicate 422 must raise
+    RelationAlreadyExists with ticket_id equal to the caller's logical
+    source ticket (A), not the wire-level parent (B).
+    """
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Resolve target (parent, B = #7) for internal id.
+        if path == "/repos/acme/backend/issues/7":
+            return _json(_issue_payload(7, id=7001))
+        # Resolve caller (child, A = #3) for internal id.
+        if path == "/repos/acme/backend/issues/3":
+            return _json(_issue_payload(3, id=3001))
+        # Wire POST is to B's sub_issues endpoint; return duplicate 422.
+        if "/repos/acme/backend/issues/7/sub_issues" in path and req.method == "POST":
+            return _json(
+                {
+                    "message": "Issue may not contain duplicate sub-issues",
+                    "errors": [{"message": "Issue may not contain duplicate sub-issues"}],
+                },
+                status_code=422,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationAlreadyExists) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="3", kind="parent", target="#7"
+        )
+    # ticket_id must be the caller's logical source (A="3").
+    assert exc.value.ticket_id == "3", (
+        f"expected ticket_id='3' (caller's A), got {exc.value.ticket_id!r}"
+    )
+    assert exc.value.kind == "parent"
+    assert "#7" in exc.value.target
+    assert isinstance(exc.value, ValueError)
+
+
+# ---------- Regression: body prose must not be misclassified as duplicate_of --
+
+
+def test_duplicate_of_body_prose_not_misclassified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #37: 'duplicate of #N' embedded in prose must NOT
+    yield a duplicate_of relation — only a dedicated marker line qualifies.
+
+    The read-path regex must be line-anchored so sentences like
+    "This is not a duplicate of #12, see discussion." do not produce a
+    false-positive duplicate_of entry.  The #12 reference may still surface
+    as a plain 'mentions' relation.
+    """
+    # Prose mention mid-sentence — must NOT trigger duplicate_of.
+    body = "This is not a duplicate of #12, see discussion."
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/7":
+            return _json(_issue_payload(7, body=body, state="open"))
+        if path == "/repos/acme/backend/issues/7/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/7/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/7/timeline":
+            return _json([])
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="7")
+
+    # No duplicate_of relation must appear.
+    assert not any(r.kind == "duplicate_of" for r in relations), (
+        f"prose 'duplicate of #12' must not yield duplicate_of; got {relations}"
+    )
+    # #12 may still appear as a plain mentions entry (body scan picks it up).
+    # We only assert there is no duplicate_of — not that mentions is absent.
+
+
+def test_duplicate_of_dedicated_line_is_detected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Complementary check: a body where 'Duplicate of #N' is its own line
+    (as written by add_relation) still produces a duplicate_of relation,
+    confirming the line-anchor does not over-reject valid markers.
+    """
+    # Marker on its own line followed by additional prose.
+    body = "Duplicate of #1\n\nSome other context here."
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/8":
+            return _json(_issue_payload(8, body=body, state="open"))
+        if path == "/repos/acme/backend/issues/8/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/8/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/8/timeline":
+            return _json([])
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="8")
+
+    assert any(r.kind == "duplicate_of" and r.ticket_id == "#1" for r in relations), (
+        f"dedicated marker line must yield duplicate_of #1; got {relations}"
+    )

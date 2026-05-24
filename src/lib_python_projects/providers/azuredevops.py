@@ -60,6 +60,7 @@ from lib_python_projects.providers.base import (
     PipelineRun,
     PullRequest,
     Relation,
+    RelationAlreadyExists,
     RelationKindUnsupported,
     RelationNotFound,
     Review,
@@ -72,6 +73,7 @@ from lib_python_projects.providers.base import (
     TokenCapabilityProvider,
     WRITABLE_RELATION_KINDS,
     normalize_timestamp,
+    _assert_not_self_relation,
     _validate_limit,
 )
 
@@ -3104,13 +3106,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                 kind, "azuredevops", SUPPORTED_RELATION_KINDS
             )
         target_id = _parse_relation_target(target, project)
+        _assert_not_self_relation(ticket_id, target_id)
         rel_name = _RELATION_FORWARD[kind]
         target_url = _build_workitem_api_url(project, target_id)
         path = f"{_project_scope(project)}/_apis/wit/workitems/{quote(str(ticket_id), safe='')}"
 
-        # Pre-flight duplicate check: fetch current relations and raise 409
-        # if the same rel+target already exists (mirrors GitHub 422 /
-        # GitLab 409 natural behaviour).
+        # Pre-flight duplicate check: fetch current relations and raise
+        # RelationAlreadyExists if the same rel+target already exists
+        # (mirrors GitHub 422 / GitLab 409 natural behaviour).
         target_url_marker = f"/workItems/{target_id}"
         with _client(project, token) as c:
             preflight_resp = c.get(
@@ -3123,9 +3126,10 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                 existing_rel.get("rel") == rel_name
                 and target_url_marker in (existing_rel.get("url") or "")
             ):
-                raise AzureDevOpsError(
-                    409,
-                    f"relation '{kind}' from #{ticket_id} to #{target_id} already exists",
+                raise RelationAlreadyExists(
+                    kind=kind,
+                    ticket_id=str(ticket_id),
+                    target=f"#{target_id}",
                 )
 
         patch = [

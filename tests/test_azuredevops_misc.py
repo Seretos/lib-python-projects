@@ -29,7 +29,11 @@ from lib_python_projects.providers.azuredevops import (
     _basic_auth_header,
     _cache_clear_all,
 )
-from lib_python_projects.providers.base import RelationKindUnsupported, RelationNotFound
+from lib_python_projects.providers.base import (
+    RelationAlreadyExists,
+    RelationKindUnsupported,
+    RelationNotFound,
+)
 
 # `refs.normalize_id` lives in the agent-project-issues plugin's tool
 # layer (URL → provider-native id mapping). It's not part of the
@@ -254,7 +258,7 @@ def test_remove_relation_not_found_raises_lookup_error(
 def test_add_relation_duplicate_raises_409(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pre-flight GET finds a matching relation → 409, PATCH never issued."""
+    """Pre-flight GET finds a matching relation → RelationAlreadyExists, PATCH never issued."""
     patch_called = []
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -274,14 +278,76 @@ def test_add_relation_duplicate_raises_409(
         raise AssertionError(f"unexpected {req.method} {req.url.path}")
 
     _install_mock(monkeypatch, handler)
-    with pytest.raises(AzureDevOpsError) as exc:
+    with pytest.raises(RelationAlreadyExists) as exc:
         AzureDevOpsProvider().add_relation(
             _project(), token="t", ticket_id="5", kind="child", target="9"
         )
-    assert exc.value.status == 409
-    assert "already exists" in exc.value.message
+    assert exc.value.kind == "child"
+    assert exc.value.ticket_id == "5"
+    assert "#9" in exc.value.target
+    assert isinstance(exc.value, ValueError)
     # PATCH must never be issued when duplicate is found.
     assert not patch_called
+
+
+def test_add_relation_self_relation_ado(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation with ticket_id == target must raise ValueError with
+    'self-relation' in the message — no HTTP call should be made."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for self-relation: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="self-relation"):
+        AzureDevOpsProvider().add_relation(
+            _project(), token="t", ticket_id="5", kind="child", target="5"
+        )
+
+
+def test_add_relation_self_relation_ado_with_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Self-relation guard fires when target has '#' prefix."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for self-relation: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="self-relation"):
+        AzureDevOpsProvider().add_relation(
+            _project(), token="t", ticket_id="5", kind="child", target="#5"
+        )
+
+
+def test_add_relation_duplicate_already_exists_ado(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-flight GET finds an existing matching relation → RelationAlreadyExists raised."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and "/workitems/10" in req.url.path:
+            return _json({
+                "id": 10,
+                "relations": [
+                    {
+                        "rel": "System.LinkTypes.Related",
+                        "url": "https://dev.azure.com/seredos/_apis/wit/workItems/20",
+                    },
+                ],
+            })
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationAlreadyExists) as exc:
+        AzureDevOpsProvider().add_relation(
+            _project(), token="t", ticket_id="10", kind="relates_to", target="20"
+        )
+    assert exc.value.kind == "relates_to"
+    assert exc.value.ticket_id == "10"
+    assert "#20" in exc.value.target
+    assert isinstance(exc.value, ValueError)
 
 
 def test_add_relation_no_duplicate_proceeds(
