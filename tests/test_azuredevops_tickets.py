@@ -664,10 +664,12 @@ def test_azuredevops_create_ticket_terminal_status_upstream_failure_raises_with_
     # The wrapper must signal that this was the post-create transition
     # that failed (not the create itself) and include the upstream error
     # text so the agent can act on it. update_ticket already wraps the
-    # raw ADO 400 into a curated "state '<x>' rejected" ValueError; that
+    # raw ADO 400 into a curated "unsupported status" ValueError; that
     # rewrap is the upstream signal we surface here.
     assert "state transition" in msg
-    assert "rejected" in msg
+    # The embedded ValueError message signals the problem — check it carries
+    # the aligned "unsupported status" wording rather than the old "rejected".
+    assert "unsupported status" in msg or "list_ticket_statuses" in msg
     # And the chained __cause__ carries the upstream exception so the
     # agent can introspect if needed.
     assert exc.value.__cause__ is not None
@@ -1023,8 +1025,10 @@ def test_update_ticket_invalid_status_includes_accepted_list(
             token="t", ticket_id="5", status="Bogus",
         )
     msg = str(exc.value)
-    assert "ticket #5" in msg
+    # New format: "unsupported status 'Bogus' for Azure DevOps — use list_ticket_statuses ..."
     assert "Bogus" in msg
+    assert "Azure DevOps" in msg
+    assert "list_ticket_statuses" in msg
     assert "accepted" in msg.lower()
     # The accepted list must include the discovered states.
     assert "To Do" in msg
@@ -1275,3 +1279,80 @@ def test_update_comment_404_names_comment(monkeypatch: pytest.MonkeyPatch) -> No
         )
     assert exc.value.status == 404
     assert "comment 'azure-tests#99' not found" in exc.value.message
+
+
+# ---------- Case 5: invalid-status message format ----------------------------
+
+
+def test_create_ticket_invalid_status_message_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_ticket with an invalid status must surface the aligned error
+    message matching the GitHub/GitLab format: 'unsupported status ... for Azure
+    DevOps — use list_ticket_statuses ...'."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # Work item type list (for default type resolution).
+        if "/_apis/wit/workitemtypes" in req.url.path and req.method == "GET":
+            return _json({"value": [{"name": "Task"}]})
+        # States endpoint — return a small valid list.
+        if "/_apis/wit/workitemtypes/Task/states" in req.url.path:
+            return _json({"value": [{"name": "To Do"}, {"name": "Done"}]})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError) as exc:
+        AzureDevOpsProvider().create_ticket(
+            _project(), token="t", title="Test", body="body",
+            labels=[], assignees=[], status="Bogus",
+        )
+    msg = str(exc.value)
+    assert "unsupported status" in msg
+    assert "Azure DevOps" in msg
+    assert "list_ticket_statuses" in msg
+
+
+def test_update_ticket_invalid_status_message_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_ticket with an invalid status rejected by ADO must surface the
+    aligned error message format."""
+
+    wi_fields = {
+        "System.Title": "Old title",
+        "System.Description": "<p>body</p>",
+        "System.State": "To Do",
+        "System.Tags": "",
+        "System.WorkItemType": "Task",
+        "System.AssignedTo": None,
+    }
+    wi_payload = {"id": 42, "fields": wi_fields}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # GET /workitems/42
+        if "/workitems/42" in path and req.method == "GET":
+            return _json(wi_payload)
+        # PATCH /workitems/42 → ADO rejects the state transition.
+        if "/workitems/42" in path and req.method == "PATCH":
+            return _json(
+                {
+                    "message": "The field 'State' contains the value 'Bogus' which is not in the list of supported values",
+                    "typeKey": "RuleValidationException",
+                },
+                status_code=400,
+            )
+        # list_statuses fallback used by the re-wrap.
+        if "/_apis/wit/workitemtypes/Task/states" in path:
+            return _json({"value": [{"name": "To Do"}, {"name": "Done"}]})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError) as exc:
+        AzureDevOpsProvider().update_ticket(
+            _project(), token="t", ticket_id="42", status="Bogus",
+        )
+    msg = str(exc.value)
+    assert "unsupported status" in msg
+    assert "Azure DevOps" in msg
+    assert "list_ticket_statuses" in msg

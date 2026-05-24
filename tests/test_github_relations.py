@@ -14,7 +14,7 @@ import pytest
 
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import github as github_provider
-from lib_python_projects.providers.github import GitHubProvider
+from lib_python_projects.providers.github import GitHubError, GitHubProvider
 from lib_python_projects.providers.base import RelationNotFound
 
 
@@ -1226,3 +1226,70 @@ def test_merge_pr_already_merged_raises(
     assert exc.value.status == 405
     assert "already merged" in exc.value.message
     assert "acme#7" in exc.value.message
+
+
+# ---------- Case 3: add_relation already-exists / cycle normalization --------
+
+
+def test_add_relation_child_duplicate_sub_issue_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation 'child' hitting a duplicate-sub-issue 422 must surface
+    'relation already exists' with kind and target in the message."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Target issue resolution (for internal id).
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        # Sub-issues POST → duplicate 422.
+        if "/sub_issues" in path and req.method == "POST":
+            return _json(
+                {
+                    "message": "Issue may not contain duplicate sub-issues",
+                    "errors": [{"message": "Issue may not contain duplicate sub-issues"}],
+                },
+                status_code=422,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="child", target="#5"
+        )
+    assert exc.value.status == 422
+    assert "relation already exists" in exc.value.message
+    assert "child" in exc.value.message
+    assert "#5" in exc.value.message
+
+
+def test_add_relation_blocked_by_cycle_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation 'blocked_by' hitting a cycle-would-be-created 422 must
+    surface 'relation would create a cycle' with kind and target."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        if "/dependencies/blocked_by" in path and req.method == "POST":
+            return _json(
+                {
+                    "message": "this dependency would create a cycle",
+                    "errors": [{"message": "this dependency would create a cycle"}],
+                },
+                status_code=422,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="blocked_by", target="#5"
+        )
+    assert exc.value.status == 422
+    assert "cycle" in exc.value.message
+    assert "blocked_by" in exc.value.message
+    assert "#5" in exc.value.message

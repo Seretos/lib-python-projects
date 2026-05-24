@@ -22,6 +22,7 @@ import pytest
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import azuredevops as azure_mod
 from lib_python_projects.providers.azuredevops import (
+    AzureDevOpsError,
     AzureDevOpsProvider,
     _basic_auth_header,
     _cache_clear_all,
@@ -1468,3 +1469,104 @@ def test_list_prs_closed_excludes_active(
         _project(), token="t", filters=PRFilters(status="closed", limit=30)
     )
     assert [p.id for p in prs] == ["21"]
+
+
+# ---------- Case 1: submit_pr_review on merged PR → human-readable error -----
+
+
+def test_submit_pr_review_on_merged_pr_raises_human_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """submit_pr_review on a merged/completed PR returns TF401181 from ADO.
+    The provider must surface a human-readable AzureDevOpsError, not the raw
+    Microsoft error code."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        # connectionData — identity resolution.
+        if "/_apis/connectionData" in req.url.path:
+            return _json({"authenticatedUser": {"id": "user-guid-123"}})
+        # Reviewer PUT → TF401181 (merged PR cannot be edited).
+        if "/reviewers/" in req.url.path and req.method == "PUT":
+            return _json(
+                {"message": "TF401181: The pull request cannot be edited because its status is not 'Active'."},
+                status_code=400,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().submit_pr_review(
+            _project(), token="t", pr_id="7", state="approve",
+        )
+    assert exc.value.status == 400
+    assert "merged" in exc.value.message or "completed" in exc.value.message
+    # Must NOT expose the raw TF401181 code in the user-facing message.
+    assert "TF401181" not in exc.value.message
+
+
+def test_submit_pr_review_409_tf401181_raises_human_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """submit_pr_review TF401181 delivered as 409 also gets normalized."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if "/_apis/connectionData" in req.url.path:
+            return _json({"authenticatedUser": {"id": "user-guid-123"}})
+        if "/reviewers/" in req.url.path and req.method == "PUT":
+            return _json(
+                {"message": "TF401181: cannot be edited"},
+                status_code=409,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().submit_pr_review(
+            _project(), token="t", pr_id="7", state="approve",
+        )
+    assert exc.value.status == 409
+    assert "TF401181" not in exc.value.message
+    assert "merged" in exc.value.message or "completed" in exc.value.message
+
+
+# ---------- Case 2: pre-flight validation errors have status 400 not 0 -------
+
+
+def test_get_comment_missing_ticket_id_raises_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """get_comment without ticket_id must raise AzureDevOpsError with status 400."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().get_comment(
+            _project(), token="t", comment_id="1", ticket_id=None,
+        )
+    assert exc.value.status == 400
+    assert exc.value.status != 0
+
+
+def test_update_comment_missing_ticket_id_raises_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_comment without ticket_id must raise AzureDevOpsError with status 400."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected HTTP call: {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().update_comment(
+            _project(), token="t", comment_id="1", body="test", ticket_id=None,
+        )
+    assert exc.value.status == 400
+    assert exc.value.status != 0

@@ -49,11 +49,17 @@ ACCEPT = "application/vnd.github+json"
 API_BASE = "https://api.github.com"
 
 
+_GITHUB_SUFFIX_RE = re.compile(r"\s*\(GitHub\s+\d+\)\s*$")
+
+
 class GitHubError(RuntimeError):
     def __init__(self, status: int, message: str):
-        super().__init__(f"GitHub {status}: {message}")
+        # Strip any trailing "(GitHub NNN)" parenthetical to avoid the message
+        # ending up as "GitHub 404: … (GitHub 404)" when errors are re-wrapped.
+        cleaned = _GITHUB_SUFFIX_RE.sub("", message)
+        super().__init__(f"GitHub {status}: {cleaned}")
         self.status = status
-        self.message = message
+        self.message = cleaned
 
 
 def _client(token: str | None) -> httpx.Client:
@@ -416,7 +422,18 @@ def _github_post_sub_issue(
         f"{parent_repo_path}/issues/{parent_issue_number}/sub_issues",
         json={"sub_issue_id": sub_issue_internal_id},
     )
-    _check(r)
+    try:
+        _check(r)
+    except GitHubError as exc:
+        if exc.status == 422:
+            msg_lower = exc.message.lower()
+            target_ref = f"#{target_raw.get('number', '?')}"
+            if "duplicate sub-issue" in msg_lower or "may not contain duplicate" in msg_lower:
+                raise GitHubError(
+                    422,
+                    f"relation already exists — kind: {relation_kind_for_caller!r}, target: {target_ref}",
+                ) from exc
+        raise
     return _map_relation_from_sub_issue(
         target_raw, project, relation_kind_for_caller,
     )
@@ -438,7 +455,23 @@ def _github_post_dependency(
         f"{repo_path}/issues/{source_issue_number}/dependencies/{dep_endpoint}",
         json={"issue_id": target_internal_id},
     )
-    _check(r)
+    try:
+        _check(r)
+    except GitHubError as exc:
+        if exc.status == 422:
+            msg_lower = exc.message.lower()
+            target_ref = f"#{target_raw.get('number', '?')}"
+            if "cycle" in msg_lower or "circular" in msg_lower:
+                raise GitHubError(
+                    422,
+                    f"relation would create a cycle — kind: {relation_kind_for_caller!r}, target: {target_ref}",
+                ) from exc
+            if "already" in msg_lower or "duplicate" in msg_lower or "already assigned" in msg_lower:
+                raise GitHubError(
+                    422,
+                    f"relation already exists — kind: {relation_kind_for_caller!r}, target: {target_ref}",
+                ) from exc
+        raise
     return _map_relation_from_sub_issue(
         target_raw, project, relation_kind_for_caller,
     )
@@ -2430,7 +2463,15 @@ class GitHubProvider:
                 f"{_repo_path(project)}/pulls/{pr_id}/reviews",
                 json=payload,
             )
-            _check(r)
+            try:
+                _check(r)
+            except GitHubError as exc:
+                if exc.status == 422 and "can not approve your own pull request" in exc.message.lower():
+                    raise GitHubError(
+                        422,
+                        exc.message + " (GitHub platform restriction; use another account)",
+                    ) from exc
+                raise
             raw = r.json()
         return Review(
             id=str(raw.get("id", "")),
