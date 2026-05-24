@@ -1204,7 +1204,70 @@ def test_update_comment_whitespace_body_raises_value_error(
         )
 
 
-# ---------- merge_pr already-merged (Issue 1) --------------------------------
+# ---------- merge_pr tests ---------------------------------------------------
+
+
+def _pr_payload(number: int, **overrides) -> dict:
+    """Build a minimal full-PR payload (as returned by `/pulls` or `/pulls/{n}`)."""
+    base: dict = {
+        "number": number,
+        "title": f"PR {number}",
+        "body": "body",
+        "state": "open",
+        "draft": False,
+        "merged": False,
+        "merged_at": None,
+        "mergeable": None,
+        "mergeable_state": "clean",
+        "merge_commit_sha": None,
+        "auto_merge": None,
+        "user": {"login": "alice"},
+        "assignees": [],
+        "labels": [],
+        "requested_reviewers": [],
+        "head": {
+            "ref": "feat/branch",
+            "sha": "abc123",
+            "repo": {"full_name": "acme/backend"},
+        },
+        "base": {
+            "ref": "main",
+            "sha": "def456",
+        },
+        "html_url": f"https://github.com/acme/backend/pull/{number}",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-02T00:00:00Z",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_merge_pr_success_returns_merged_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Happy path: PUT /pulls/7/merge returns 200, re-fetch returns merged PR.
+    merge_pr must return a PullRequest with status='merged' and merged=True.
+    """
+    merged_payload = _pr_payload(
+        7,
+        state="closed",
+        merged=True,
+        merged_at="2024-05-01T12:00:00Z",
+        merge_commit_sha="deadbeef",
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/pulls/7/merge" in req.url.path:
+            return _json({"sha": "deadbeef", "merged": True, "message": "Pull Request successfully merged"})
+        if req.method == "GET" and "/pulls/7" in req.url.path:
+            return _json(merged_payload)
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    pr = GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+    assert pr.status == "merged"
+    assert pr.merged is True
+    assert pr.id == "7"
 
 
 def test_merge_pr_already_merged_raises(

@@ -397,3 +397,47 @@ def test_map_pr_merged_detection_from_pull_request_stub() -> None:
         f"Expected 'merged' from pull_request.merged_at, got {pr.status!r}"
     )
     assert pr.merged is True
+
+
+# ---------- head filter auto-qualification (Bug #36) --------------------------
+
+
+def test_head_filter_bare_name_auto_qualified(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PRFilters(head='feat/my-branch') must send 'acme:feat/my-branch' to the
+    /pulls endpoint — bare branch names are silently unfiltered by GitHub's API
+    without the 'owner:branch' qualification.
+    """
+    captured_params: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/pulls"
+        captured_params.update(dict(req.url.params))
+        return _json([_pr_payload(1)])
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    prs = provider.list_prs(_project(), token="t", filters=PRFilters(head="feat/my-branch"))
+    assert [pr.id for pr in prs] == ["1"]
+    assert captured_params.get("head") == "acme:feat/my-branch", (
+        f"Expected 'acme:feat/my-branch', got {captured_params.get('head')!r}"
+    )
+
+
+def test_head_filter_already_qualified_passes_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PRFilters(head='acme:feat/my-branch') — already in 'owner:branch' form —
+    must pass through unchanged (no double-prefix).
+    """
+    captured_params: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/pulls"
+        captured_params.update(dict(req.url.params))
+        return _json([_pr_payload(2)])
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    prs = provider.list_prs(_project(), token="t", filters=PRFilters(head="acme:feat/my-branch"))
+    assert [pr.id for pr in prs] == ["2"]
+    assert captured_params.get("head") == "acme:feat/my-branch", (
+        f"Expected 'acme:feat/my-branch' (unchanged), got {captured_params.get('head')!r}"
+    )

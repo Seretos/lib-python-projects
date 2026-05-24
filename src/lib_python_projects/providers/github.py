@@ -2011,7 +2011,14 @@ class GitHubProvider:
                     "direction": "desc",
                 }
                 if filters.head:
-                    params["head"] = filters.head
+                    # GitHub /pulls requires "owner:branch" format; auto-qualify
+                    # bare branch names (those without a colon) so callers can
+                    # pass plain branch names without the filter being silently
+                    # ignored by the API.
+                    head_val = filters.head
+                    if ":" not in head_val and project.owner:
+                        head_val = f"{project.owner}:{head_val}"
+                    params["head"] = head_val
                 if filters.base:
                     params["base"] = filters.base
                 r = client.get(f"{_repo_path(project)}/pulls", params=params)
