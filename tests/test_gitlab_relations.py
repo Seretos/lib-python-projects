@@ -20,7 +20,11 @@ import pytest
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import gitlab as gitlab_mod
 from lib_python_projects.providers.gitlab import GitLabProvider
-from lib_python_projects.providers.base import RelationNotFound, RelationKindUnsupported
+from lib_python_projects.providers.base import (
+    RelationAlreadyExists,
+    RelationKindUnsupported,
+    RelationNotFound,
+)
 
 
 def _project() -> ProjectConfig:
@@ -619,8 +623,7 @@ def test_add_relation_relates_to_already_assigned_409(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """add_relation 'relates_to' hitting a 409 'Issue(s) already assigned'
-    must surface 'relation already exists' with kind and target in the message."""
-    from lib_python_projects.providers.gitlab import GitLabError
+    must raise RelationAlreadyExists with kind and target info."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         url = str(req.url)
@@ -636,9 +639,24 @@ def test_add_relation_relates_to_already_assigned_409(
         raise AssertionError(f"unexpected {req.method} {req.url}")
 
     _install_mock(monkeypatch, handler)
-    with pytest.raises(GitLabError) as exc:
+    with pytest.raises(RelationAlreadyExists) as exc:
         GitLabProvider().add_relation(_project(), "t", "5", "relates_to", "#7")
-    assert exc.value.status == 409
-    assert "relation already exists" in exc.value.message
-    assert "relates_to" in exc.value.message
-    assert "#7" in exc.value.message
+    assert exc.value.kind == "relates_to"
+    assert exc.value.ticket_id == "5"
+    assert "#7" in exc.value.target
+    # Must be a ValueError subclass for _safe wrapper compatibility.
+    assert isinstance(exc.value, ValueError)
+
+
+def test_add_relation_self_relation_gitlab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation with ticket_id == target must raise ValueError with
+    'self-relation' in the message — no HTTP call should be made."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for self-relation: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="self-relation"):
+        GitLabProvider().add_relation(_project(), "t", "5", "relates_to", "#5")

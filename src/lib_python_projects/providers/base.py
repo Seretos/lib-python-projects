@@ -125,6 +125,52 @@ class RelationNotFound(LookupError):
         )
 
 
+class RelationAlreadyExists(ValueError):
+    """Raised when `add_relation` is called for a link that already exists.
+
+    Carries `kind`, `ticket_id`, and `target` so the agent can branch on
+    the failure without parsing the message text. Subclass of `ValueError`
+    so the tool-layer `_safe` wrapper translates it to `{"error": "..."}`.
+    """
+
+    def __init__(self, kind: str, ticket_id: str, target: str) -> None:
+        self.kind = kind
+        self.ticket_id = ticket_id
+        self.target = target
+        super().__init__(
+            f"relation {kind!r} from #{ticket_id} to {target!r} already exists"
+        )
+
+
+def _assert_not_self_relation(ticket_id: str, target_number: str) -> None:
+    """Raise ValueError when `ticket_id` and `target_number` refer to the same issue.
+
+    Only fires for same-repo targets (no `/` in either argument).
+    Both arguments are expected to be bare numeric strings (the `#` prefix
+    must be stripped by the caller before passing in).
+
+    Examples of matches that raise:
+      ticket_id="5", target_number="5"
+      ticket_id="5", target_number="#5" (caller strips "#" first — not needed,
+      but harmless if the caller passes the raw form)
+
+    Cross-repo targets (containing `/`) are never a self-relation even when
+    the issue numbers coincide, so this helper is a no-op for them.
+    """
+    # Strip any leading "#" for robustness — callers vary slightly.
+    t_num = ticket_id.lstrip("#").strip()
+    r_num = target_number.lstrip("#").strip()
+    if not t_num or not r_num:
+        return
+    # Cross-repo qualifiers: "owner/repo#N" — never a self-relation.
+    if "/" in t_num or "/" in r_num:
+        return
+    if t_num == r_num:
+        raise ValueError(
+            f"self-relation: ticket and target are the same issue (#{t_num})"
+        )
+
+
 class RelationKindUnsupported(NotImplementedError):
     """Raised by a provider when `add_relation` / `remove_relation` is
     called with a relation kind that provider cannot model natively.

@@ -53,6 +53,7 @@ from lib_python_projects.providers.base import (
     PRFilters,
     PullRequest,
     Relation,
+    RelationAlreadyExists,
     RelationKindUnsupported,
     RelationNotFound,
     Review,
@@ -63,6 +64,7 @@ from lib_python_projects.providers.base import (
     TicketFilters,
     TokenCapabilities,
     TokenCapabilityProvider,
+    _assert_not_self_relation,
     _validate_limit,
 )
 
@@ -663,9 +665,10 @@ def _gitlab_post_issue_link(
             exc.status in (400, 409, 422)
             and ("already assigned" in exc.message.lower() or "already exists" in exc.message.lower())
         ):
-            raise GitLabError(
-                exc.status,
-                f"relation already exists — kind: {relation_kind_for_caller!r}, target: #{target_issue_iid}",
+            raise RelationAlreadyExists(
+                kind=relation_kind_for_caller,
+                ticket_id=source_iid,
+                target=f"#{target_issue_iid}",
             ) from exc
         raise
     raw = r.json()
@@ -2611,6 +2614,7 @@ class GitLabProvider(TokenCapabilityProvider):
         target_project, target_iid = _parse_gitlab_relation_target(
             target, project,
         )
+        _assert_not_self_relation(ticket_id, target_iid)
         path = _project_path(project)
         with _client(project, token) as client:
             if kind == "relates_to":

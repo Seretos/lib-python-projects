@@ -30,6 +30,7 @@ from lib_python_projects.providers.base import (
     PRFilters,
     PullRequest,
     Relation,
+    RelationAlreadyExists,
     RelationKindUnsupported,
     RelationNotFound,
     Review,
@@ -39,6 +40,7 @@ from lib_python_projects.providers.base import (
     Ticket,
     TicketFilters,
     TokenCapabilities,
+    _assert_not_self_relation,
     _validate_limit,
 )
 
@@ -417,8 +419,16 @@ def _github_post_sub_issue(
     relation_kind_for_caller: str,
     target_raw: dict,
     project: ProjectConfig,
+    caller_ticket_id: str,
+    caller_target_ref: str,
 ) -> Relation:
-    """POST to the Sub-Issues endpoint and return a `Relation` for the agent."""
+    """POST to the Sub-Issues endpoint and return a `Relation` for the agent.
+
+    `caller_ticket_id` is the *logical* source ticket as seen by the caller
+    (may differ from `parent_issue_number` when the wire direction is swapped,
+    e.g. for `kind="parent"`).  `caller_target_ref` is the caller's logical
+    target reference (e.g. "#7").
+    """
     r = client.post(
         f"{parent_repo_path}/issues/{parent_issue_number}/sub_issues",
         json={"sub_issue_id": sub_issue_internal_id},
@@ -428,11 +438,11 @@ def _github_post_sub_issue(
     except GitHubError as exc:
         if exc.status == 422:
             msg_lower = exc.message.lower()
-            target_ref = f"#{target_raw.get('number', '?')}"
             if "duplicate sub-issue" in msg_lower or "may not contain duplicate" in msg_lower:
-                raise GitHubError(
-                    422,
-                    f"relation already exists — kind: {relation_kind_for_caller!r}, target: {target_ref}",
+                raise RelationAlreadyExists(
+                    kind=relation_kind_for_caller,
+                    ticket_id=caller_ticket_id,
+                    target=caller_target_ref,
                 ) from exc
         raise
     return _map_relation_from_sub_issue(
@@ -450,8 +460,16 @@ def _github_post_dependency(
     relation_kind_for_caller: str,
     target_raw: dict,
     project: ProjectConfig,
+    caller_ticket_id: str,
+    caller_target_ref: str,
 ) -> Relation:
-    """POST to the Dependencies endpoint (api 2026-03-10)."""
+    """POST to the Dependencies endpoint (api 2026-03-10).
+
+    `caller_ticket_id` is the *logical* source ticket as seen by the caller
+    (may differ from `source_issue_number` when the wire direction is swapped,
+    e.g. for `kind="blocks"`).  `caller_target_ref` is the caller's logical
+    target reference (e.g. "#5").
+    """
     r = client.post(
         f"{repo_path}/issues/{source_issue_number}/dependencies/{dep_endpoint}",
         json={"issue_id": target_internal_id},
@@ -461,16 +479,16 @@ def _github_post_dependency(
     except GitHubError as exc:
         if exc.status == 422:
             msg_lower = exc.message.lower()
-            target_ref = f"#{target_raw.get('number', '?')}"
             if "cycle" in msg_lower or "circular" in msg_lower:
                 raise GitHubError(
                     422,
-                    f"relation would create a cycle — kind: {relation_kind_for_caller!r}, target: {target_ref}",
+                    f"relation would create a cycle — kind: {relation_kind_for_caller!r}, target: {caller_target_ref}",
                 ) from exc
             if "already" in msg_lower or "duplicate" in msg_lower or "already assigned" in msg_lower:
-                raise GitHubError(
-                    422,
-                    f"relation already exists — kind: {relation_kind_for_caller!r}, target: {target_ref}",
+                raise RelationAlreadyExists(
+                    kind=relation_kind_for_caller,
+                    ticket_id=caller_ticket_id,
+                    target=caller_target_ref,
                 ) from exc
         raise
     return _map_relation_from_sub_issue(
@@ -526,16 +544,19 @@ def _github_mark_duplicate_of(
 ) -> Relation:
     """Mark `source` as duplicate of `target` via body edit + state change.
 
-    GitHub has no native typed `duplicate_of` link surface; the read
-    path detects duplicates from `state=closed AND
-    state_reason="duplicate"` on the queried ticket (`_fetch_relations`
-    at github.py:653-672), optionally cross-checked against a
-    `Duplicate of #N` body regex. We replicate that here:
+    GitHub has no native typed `duplicate_of` link surface.  The read
+    path (`_fetch_relations`) detects `duplicate_of` solely from a
+    ``Duplicate of #N`` line in the ticket body — the authoritative
+    source of truth regardless of issue state.  We persist the link by:
 
       1. GET the source issue to read its current body + labels.
-      2. Append a `Duplicate of #N` line to the body (after the AI
+      2. Prepend a ``Duplicate of #N`` line to the body (after the AI
          marker, so `apply_body_marker` keeps the marker correct).
       3. PATCH with state=closed, state_reason="duplicate", body=new.
+
+    Removal (`remove_relation("duplicate_of")`) strips the
+    ``Duplicate of #N`` line from the body (and reopens the issue) so
+    the read path no longer reports the relation.
     """
     src = _fetch_issue_payload(
         client, _repo_path(project), source_issue_number,
@@ -1052,8 +1073,9 @@ def _fetch_relations(
       - `child` — `/sub_issues` walk.
       - `closes` / `mentions` — outgoing, scanned from queried ticket's
         body (and comments per env-configurable depth).
-      - `duplicate_of` — outgoing, from `state == closed` and
-        `state_reason == "duplicate"` on the queried ticket itself.
+      - `duplicate_of` — outgoing, detected from a ``Duplicate of #N``
+        line in the ticket body (body is the source of truth; state is
+        irrelevant).
       - `mentioned_by` — generic incoming cross-references.
       - `duplicated_by` / `closed_by` — re-labeled from incoming
         cross-refs by inspecting source state / body.
@@ -1136,30 +1158,30 @@ def _fetch_relations(
     for owner, repo, num in mentions_only:
         relations.append(_ref_to_relation(owner, repo, num, project, "mentions"))
 
-    if (
-        issue_payload.get("state") == "closed"
-        and issue_payload.get("state_reason") == "duplicate"
-    ):
-        m = re.search(
-            r"duplicate\s+of\s+(?:(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?)"
-            r"/(?P<repo>[A-Za-z0-9._\-]+))?#(?P<num>\d+)",
-            self_body or "",
-            re.IGNORECASE,
-        )
-        if m:
-            try:
-                num = int(m.group("num"))
-            except (TypeError, ValueError):
-                num = None
-            if num is not None and not _is_self(
-                m.group("owner"), m.group("repo"), num
-            ):
-                relations.append(
-                    _ref_to_relation(
-                        m.group("owner"), m.group("repo"), num,
-                        project, "duplicate_of",
-                    )
+    # Line-anchored match: the marker must occupy its own line, exactly as
+    # `_github_mark_duplicate_of` writes it ("Duplicate of #N" at line start).
+    # Anchoring prevents false positives from embedded prose like
+    # "this is not a duplicate of #12, see discussion."
+    m = re.search(
+        r"(?m)^duplicate\s+of\s+(?:(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?)"
+        r"/(?P<repo>[A-Za-z0-9._\-]+))?#(?P<num>\d+)\s*$",
+        self_body or "",
+        re.IGNORECASE,
+    )
+    if m:
+        try:
+            num = int(m.group("num"))
+        except (TypeError, ValueError):
+            num = None
+        if num is not None and not _is_self(
+            m.group("owner"), m.group("repo"), num
+        ):
+            relations.append(
+                _ref_to_relation(
+                    m.group("owner"), m.group("repo"), num,
+                    project, "duplicate_of",
                 )
+            )
 
     # incoming: timeline scan
     tl_r = client.get(
@@ -2605,9 +2627,15 @@ class GitHubProvider:
             raise RelationKindUnsupported(
                 kind, "github", self._SUPPORTED_RELATION_KINDS,
             )
+        # Resolve target to (repo_path, issue_number) before opening a
+        # network connection so the self-relation guard fires cheaply.
+        target_repo, target_number = _parse_relation_target(target, project)
+        # Self-relation guard: for parent/child, the relation is expressed
+        # as ticket_id vs target_number in their *logical* direction.
+        # For blocks, the wire direction is flipped but the logical relation
+        # is still between ticket_id and target_number.
+        _assert_not_self_relation(ticket_id, target_number)
         with _client(token) as client:
-            # Resolve target to (cross_repo, issue_number, internal_id).
-            target_repo, target_number = _parse_relation_target(target, project)
             target_internal_id, target_raw = _fetch_issue_internal_id(
                 client, target_repo, target_number,
             )
@@ -2624,6 +2652,8 @@ class GitHubProvider:
                         client, target_repo, target_number,
                     ),
                     project=project,
+                    caller_ticket_id=ticket_id,
+                    caller_target_ref=f"#{target_number}",
                 )
             if kind == "child":
                 return _github_post_sub_issue(
@@ -2632,6 +2662,8 @@ class GitHubProvider:
                     relation_kind_for_caller="child",
                     target_raw=target_raw,
                     project=project,
+                    caller_ticket_id=ticket_id,
+                    caller_target_ref=f"#{target_number}",
                 )
             if kind == "blocked_by":
                 return _github_post_dependency(
@@ -2641,6 +2673,8 @@ class GitHubProvider:
                     relation_kind_for_caller="blocked_by",
                     target_raw=target_raw,
                     project=project,
+                    caller_ticket_id=ticket_id,
+                    caller_target_ref=f"#{target_number}",
                 )
             if kind == "blocks":
                 # blocks(A→B): A blocks B → on B's endpoint, add A as
@@ -2655,6 +2689,8 @@ class GitHubProvider:
                     relation_kind_for_caller="blocks",
                     target_raw=target_raw,
                     project=project,
+                    caller_ticket_id=ticket_id,
+                    caller_target_ref=f"#{target_number}",
                 )
             if kind == "duplicate_of":
                 return _github_mark_duplicate_of(
@@ -2676,11 +2712,11 @@ class GitHubProvider:
     ) -> dict:
         """Remove a typed relation. Inverse of `add_relation`.
 
-        For `duplicate_of`, removal reopens the source issue (state →
-        open, state_reason → cleared) but does NOT strip the `Duplicate
-        of #N` line from the body — body history is preserved
-        deliberately so a reader can see the historic intent. Removing
-        the body line is the caller's job via `update_ticket(body=...)`.
+        For `duplicate_of`, removal strips the ``Duplicate of #N`` marker
+        line from the source issue's body *and* reopens the issue.  The
+        body is the sole source of truth for this relation kind
+        (`_fetch_relations` scans the body regardless of state), so
+        stripping the marker is the only reliable way to stop reporting it.
         """
         if kind not in self._SUPPORTED_RELATION_KINDS:
             raise RelationKindUnsupported(
@@ -2794,11 +2830,43 @@ class GitHubProvider:
                 _check(r)
                 return {"removed": True}
             if kind == "duplicate_of":
-                # Reopen source — the read path's duplicate_of detection
-                # is gated on `state=closed AND state_reason=duplicate`.
+                # The read path detects duplicate_of solely from a
+                # ``Duplicate of #N`` body line (body is the source of
+                # truth regardless of state).  Removal must therefore:
+                #   1. Strip the ``Duplicate of #N`` line from the body.
+                #   2. Reopen the source issue.
+                # After these two changes, the body scan no longer finds
+                # the marker, so get_ticket stops reporting the relation.
+                src = _fetch_issue_payload(
+                    client, _repo_path(project), ticket_id,
+                )
+                current_body = src.get("body") or ""
+                current_labels = {
+                    lbl["name"] for lbl in (src.get("labels") or [])
+                }
+                will_be_ai_generated = AI_GENERATED_LABEL in current_labels
+                # Strip the AI marker first so we can work on the core body.
+                body_core = strip_leading_ai_marker(current_body)
+                # Remove the ``Duplicate of #N`` line (and any surrounding
+                # blank lines it introduced) using a case-insensitive match.
+                dup_pattern = re.compile(
+                    r"(?i)^duplicate\s+of\s+(?:[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?/"
+                    r"[A-Za-z0-9._\-]+)?#"
+                    + re.escape(target_number)
+                    + r"\s*$",
+                    re.MULTILINE,
+                )
+                # Remove the matching line and collapse resulting double
+                # blank lines produced by the surrounding \n\n separators.
+                body_stripped = dup_pattern.sub("", body_core)
+                # Collapse multiple consecutive blank lines to a single one.
+                body_stripped = re.sub(r"\n{3,}", "\n\n", body_stripped).strip()
+                new_body = apply_body_marker(
+                    body_stripped, will_be_ai_generated=will_be_ai_generated,
+                )
                 pr = client.patch(
                     f"{_repo_path(project)}/issues/{ticket_id}",
-                    json={"state": "open"},
+                    json={"state": "open", "body": new_body},
                 )
                 _check(pr)
                 return {"removed": True}
