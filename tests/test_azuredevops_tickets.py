@@ -1356,3 +1356,103 @@ def test_update_ticket_invalid_status_message_format(
     assert "unsupported status" in msg
     assert "Azure DevOps" in msg
     assert "list_ticket_statuses" in msg
+
+
+# ---------- ticket #30: return-shape None vs "" fixes -------------------------
+
+
+def test_map_work_item_comment_populates_updated_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_map_work_item_comment must populate updated_at from modifiedDate."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitems/7"):
+            return _json(_work_item_payload(7))
+        if "workItems/7/comments" in path:
+            return _json({
+                "comments": [{
+                    "id": 1,
+                    "text": "<p>Hello</p>",
+                    "createdBy": {"displayName": "Alice"},
+                    "createdDate": "2026-05-18T10:00:00Z",
+                    "modifiedDate": "2026-05-19T12:30:00Z",
+                }],
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    _ticket, comments, _rels, _trunc = AzureDevOpsProvider().get_ticket(
+        _project(default_type="Issue"), token="t", ticket_id="7",
+        include_relations=False,
+    )
+    assert len(comments) == 1
+    assert comments[0].updated_at == "2026-05-19T12:30:00Z"
+
+
+def test_list_statuses_terminal_declined_none_when_no_removed_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A template without a 'Removed' category must report terminal_declined=None
+    rather than '' so agents can test `if x.hints['terminal_declined'] is None`."""
+    bt = _basic_template_handler()
+
+    _install_mock(monkeypatch, bt)
+    spec = AzureDevOpsProvider().list_statuses(_project(default_type="Issue"), token="t")
+    assert spec.hints["terminal_declined"] is None
+
+
+def test_list_statuses_terminal_completed_none_when_no_completed_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A template without a 'Completed' category must report terminal_completed=None."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if path.endswith("/_apis/wit/workitemtypes/Issue/states"):
+            return _json({
+                "value": [
+                    {"name": "Active", "category": "InProgress"},
+                    {"name": "Removed", "category": "Removed"},
+                ]
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    spec = AzureDevOpsProvider().list_statuses(_project(default_type="Issue"), token="t")
+    assert spec.hints["terminal_completed"] is None
+    assert spec.hints["terminal_declined"] == "Removed"
+
+
+def test_list_statuses_both_terminals_populated_when_both_categories_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both terminal hints are strings when Completed and Removed categories exist."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Bug"}]})
+        if path.endswith("/_apis/wit/workitemtypes/Bug/states"):
+            return _json({
+                "value": [
+                    {"name": "New", "category": "Proposed"},
+                    {"name": "Closed", "category": "Completed"},
+                    {"name": "Removed", "category": "Removed"},
+                ]
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    p = _project()
+    p.default_work_item_type = "Bug"  # type: ignore[misc]
+    spec = AzureDevOpsProvider().list_statuses(p, token="t")
+    assert spec.hints["terminal_completed"] == "Closed"
+    assert spec.hints["terminal_declined"] == "Removed"

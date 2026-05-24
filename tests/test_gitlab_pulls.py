@@ -1231,7 +1231,7 @@ def test_map_mr_base_sha_empty_when_no_diff_refs(
 
     _install_mock(monkeypatch, handler)
     pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
-    assert pr.base["sha"] == ""
+    assert pr.base["sha"] is None
 
 
 # ---------- list_pr_review_comments side derivation (ticket #4) --------------
@@ -1468,3 +1468,208 @@ def test_list_comments_since_uses_created_after(
     GitLabProvider().list_comments(_project(), "t", "5", since="2024-06-01T00:00:00Z")
     assert seen_params.get("created_after") == "2024-06-01T00:00:00Z"
     assert "updated_after" not in seen_params
+
+
+# ---------- ticket #30: return-shape None vs "" fixes -------------------------
+
+
+def test_map_note_populates_updated_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_map_note must populate updated_at from the GitLab payload."""
+    note = {
+        "id": 1,
+        "body": "hi",
+        "author": {"username": "alice"},
+        "created_at": "2026-05-20T10:00:00.123Z",
+        "updated_at": "2026-05-21T11:30:45.456Z",
+        "system": False,
+        "noteable_iid": 5,
+        "noteable_type": "Issue",
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/issues/5/notes"):
+            return _json([note])
+        if req.url.path.endswith("/issues/5"):
+            return _json({
+                "iid": 5, "title": "T", "description": "",
+                "state": "opened", "author": {"username": "a"},
+                "assignees": [], "labels": [],
+                "web_url": "https://gitlab.com/acme/backend/-/issues/5",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    _ticket, comments, _rels, _trunc = GitLabProvider().get_ticket(
+        _project(), "t", "5", include_relations=False,
+    )
+    assert len(comments) == 1
+    assert comments[0].updated_at == "2026-05-21T11:30:45Z"
+
+
+def test_map_mr_strips_draft_prefix_from_title(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_map_mr must strip the 'Draft: ' prefix from MR titles so that
+    `pr.draft=True` and `pr.title` contains only the bare title."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/3"):
+            return _json(_mr_payload(3, title="Draft: My feature", draft=True))
+        if "merge_requests/3/approvals" in url:
+            return _json({}, status_code=404)
+        if "merge_requests/3/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "3")
+    assert pr.draft is True
+    assert pr.title == "My feature"
+
+
+def test_map_mr_strips_wip_prefix_from_title(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WIP: prefix variant is also stripped."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/4"):
+            return _json(_mr_payload(4, title="WIP: Old style", draft=True))
+        if "merge_requests/4/approvals" in url:
+            return _json({}, status_code=404)
+        if "merge_requests/4/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "4")
+    assert pr.title == "Old style"
+
+
+def test_map_mr_no_draft_prefix_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-draft MRs with a regular title are returned unchanged."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/6"):
+            return _json(_mr_payload(6, title="Normal title", draft=False))
+        if "merge_requests/6/approvals" in url:
+            return _json({}, status_code=404)
+        if "merge_requests/6/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "6")
+    assert pr.title == "Normal title"
+
+
+def test_map_mr_base_sha_none_when_diff_refs_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """base.sha must be None when GitLab omits diff_refs (fresh MR)."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/7"):
+            # No diff_refs key at all.
+            return _json(_mr_payload(7))
+        if "merge_requests/7/approvals" in url:
+            return _json({}, status_code=404)
+        if "merge_requests/7/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "7")
+    assert pr.base["sha"] is None
+
+
+def test_map_mr_base_sha_populated_when_diff_refs_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """base.sha must be populated when GitLab includes diff_refs."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/8"):
+            return _json(
+                _mr_payload(8, diff_refs={"base_sha": "abc123", "head_sha": "def456", "start_sha": "abc123"})
+            )
+        if "merge_requests/8/approvals" in url:
+            return _json({}, status_code=404)
+        if "merge_requests/8/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "8")
+    assert pr.base["sha"] == "abc123"
+
+
+def test_review_comment_reply_has_commit_sha_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reply review comments (in_reply_to set) must have commit_sha=None
+    because replies have no diff anchor of their own."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "/discussions/disc-X/notes" in req.url.path:
+            return _json({
+                "id": 55, "body": "agreed",
+                "author": {"username": "alice"},
+                "created_at": "2026-01-01T00:00:00Z",
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    rc = GitLabProvider().add_pr_review_comment(
+        _project(), "t", "5",
+        body="agreed", in_reply_to="disc-X",
+    )
+    assert rc.commit_sha is None
+
+
+def test_list_pr_review_comments_commit_sha_none_when_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When position carries no sha at all, commit_sha must be None."""
+    discussions = [{
+        "id": "disc-1",
+        "notes": [{
+            "id": 10, "body": "review",
+            "author": {"username": "alice"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "position": {"new_path": "src/a.py", "new_line": 5},
+            # No head_sha or base_sha.
+        }],
+    }]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/discussions" in req.url.path:
+            return _json(discussions)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    rcs = GitLabProvider().list_pr_review_comments(_project(), "t", "5")
+    assert rcs[0].commit_sha is None
+
+
+def test_update_pr_draft_true_title_stripped_in_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_pr(draft=True) returns a pr whose title has the Draft: prefix
+    stripped — the agent receives the clean title, not the prefixed wire value."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.endswith("merge_requests/9"):
+            return _json(_mr_payload(9, title="My feature"))
+        if req.method == "PUT" and url.endswith("merge_requests/9"):
+            captured["sent"] = json.loads(req.content.decode())
+            # GitLab echoes back the prefixed title.
+            return _json(_mr_payload(9, title="Draft: My feature", draft=True))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr = GitLabProvider().update_pr(_project(), "t", "9", draft=True)
+    # Wire title is "Draft: My feature" but _map_mr must strip it.
+    assert pr.title == "My feature"
+    assert pr.draft is True

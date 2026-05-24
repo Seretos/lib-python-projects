@@ -1570,3 +1570,44 @@ def test_update_comment_missing_ticket_id_raises_400(
         )
     assert exc.value.status == 400
     assert exc.value.status != 0
+
+
+# ---------- ticket #30: return-shape None vs "" fixes -------------------------
+
+
+def test_map_thread_comment_populates_updated_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_map_thread_comment must populate updated_at from lastUpdatedDate."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if "/_apis/git/repositories" in req.url.path and "/pullrequests/" not in req.url.path:
+            return _repos_response()
+        if "/pullrequests/1" in req.url.path and "/threads" not in req.url.path:
+            return _json({"value": [_pr_payload(1)]}) if "pullrequests?" in req.url.path else _json(_pr_payload(1))
+        if "/threads" in req.url.path:
+            # Single top-level-discussion thread (no threadContext).
+            return _json({"value": [{
+                "id": 100,
+                "threadContext": None,
+                "isDeleted": False,
+                "comments": [{
+                    "id": 1,
+                    "content": "<p>nice work</p>",
+                    "author": {"displayName": "Alice"},
+                    "publishedDate": "2026-05-20T10:00:00Z",
+                    "lastUpdatedDate": "2026-05-21T14:00:00Z",
+                }],
+                "status": "active",
+            }]})
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    _pr, comments = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="1")
+    # The comment from the non-review thread should carry updated_at.
+    assert len(comments) >= 1
+    pr_comments = [c for c in comments if hasattr(c, "updated_at")]
+    assert pr_comments[0].updated_at == "2026-05-21T14:00:00Z"
