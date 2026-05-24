@@ -82,11 +82,13 @@ def test_gitlab_list_runs_for_branch_accepts_status_kwarg(monkeypatch):
     captured: dict = {}
 
     def handler(req):
+        if "/repository/branches/" in str(req.url):
+            return _resp({"commit": {"id": "sha-main"}})
         captured["scope"] = req.url.params.get("scope", "")
         return _resp([])
 
     _install_gitlab_mock(monkeypatch, handler)
-    GitLabProvider().list_runs_for_branch(
+    _, _ = GitLabProvider().list_runs_for_branch(
         _gitlab_project(), "t", "main", status="completed",
     )
     assert captured["scope"] == "finished"
@@ -96,11 +98,13 @@ def test_gitlab_list_runs_for_branch_status_all_omits_scope(monkeypatch):
     captured: dict = {}
 
     def handler(req):
+        if "/repository/branches/" in str(req.url):
+            return _resp({"commit": {"id": "sha-main"}})
         captured["scope"] = req.url.params.get("scope", None)
         return _resp([])
 
     _install_gitlab_mock(monkeypatch, handler)
-    GitLabProvider().list_runs_for_branch(
+    _, _ = GitLabProvider().list_runs_for_branch(
         _gitlab_project(), "t", "main", status="all",
     )
     # `all` maps to None → no scope query param at all.
@@ -252,16 +256,15 @@ def test_gitlab_map_issue_canonicalises_ticket_url(monkeypatch):
     )
 
 
-# ---------- finding 2 follow-up: GitLab add_relation 404 for blocks/etc. ----
+# ---------- finding 2 follow-up: GitLab add_relation 404 for relates_to ------
 
 
-def test_gitlab_add_relation_blocks_uses_numeric_project_id(monkeypatch):
-    """Ticket #49 finding 2 follow-up flagged by the test agent: the
-    atomic-write fix alone didn't address the underlying 404 because
-    it only touched `_gitlab_mark_duplicate_of`. The real root cause
-    is the issue-links endpoint rejecting the URL-encoded path for
-    `target_project_id` — we now resolve the project's numeric id
-    first and send THAT in the body."""
+def test_gitlab_add_relation_relates_to_uses_numeric_project_id(monkeypatch):
+    """Ticket #49 finding 2 follow-up: the issue-links endpoint rejects the
+    URL-encoded path for `target_project_id` — we now resolve the project's
+    numeric id first and send THAT in the body.
+    Note: blocks/blocked_by are no longer supported (ticket #20); this test
+    uses relates_to which routes through the same code path."""
     captured: dict = {}
     seen_get_project = []
 
@@ -271,21 +274,41 @@ def test_gitlab_add_relation_blocks_uses_numeric_project_id(monkeypatch):
             return _resp({"id": 12345, "path_with_namespace": "Seredos/gitlab-tests"})
         if req.method == "POST" and "/issues/5/links" in req.url.path:
             captured["body"] = json.loads(req.content.decode())
-            return _resp({"iid": 7, "title": "T", "state": "opened",
-                          "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/7"})
+            return _resp({
+                "source_issue": {"iid": 5, "title": "S", "state": "opened",
+                                 "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/5"},
+                "target_issue": {"iid": 7, "title": "T", "state": "opened",
+                                 "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/7"},
+            })
         return _resp({}, status_code=404)
 
     _install_gitlab_mock(monkeypatch, handler)
     rel = GitLabProvider().add_relation(
-        _gitlab_project(), "tok", "5", "blocks", "#7",
+        _gitlab_project(), "tok", "5", "relates_to", "#7",
     )
     assert seen_get_project, "Should resolve project numeric id before posting"
     assert captured["body"]["target_project_id"] == 12345  # numeric, not path
-    assert captured["body"]["link_type"] == "blocks"
-    assert rel.kind == "blocks"
+    assert captured["body"]["link_type"] == "relates_to"
+    assert rel.kind == "relates_to"
 
 
-def test_gitlab_add_relation_blocks_propagates_404_from_resolver(monkeypatch):
+def test_gitlab_add_relation_blocks_raises_unsupported(monkeypatch):
+    """blocks is now an unsupported kind on GitLab (ticket #20 — license-gated).
+    The guard fires before any HTTP call."""
+    from lib_python_projects.providers.base import RelationKindUnsupported
+
+    def handler(req):
+        raise AssertionError("no HTTP call expected for unsupported kind")
+
+    _install_gitlab_mock(monkeypatch, handler)
+    with pytest.raises(RelationKindUnsupported) as exc:
+        GitLabProvider().add_relation(
+            _gitlab_project(), "tok", "5", "blocks", "#7",
+        )
+    assert exc.value.kind == "blocks"
+
+
+def test_gitlab_add_relation_relates_to_propagates_404_from_resolver(monkeypatch):
     """If the project-id resolver 404s, the link write never fires and
     no body is mutated (atomic semantics preserved)."""
     def handler(req):
@@ -299,7 +322,7 @@ def test_gitlab_add_relation_blocks_propagates_404_from_resolver(monkeypatch):
     from lib_python_projects.providers.gitlab import GitLabError
     with pytest.raises(GitLabError):
         GitLabProvider().add_relation(
-            _gitlab_project(), "tok", "5", "blocks", "#7",
+            _gitlab_project(), "tok", "5", "relates_to", "#7",
         )
 
 

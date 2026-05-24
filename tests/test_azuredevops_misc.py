@@ -354,19 +354,26 @@ def test_list_runs_for_branch_normalises_ref(monkeypatch: pytest.MonkeyPatch) ->
     captured: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
+        # Repository id resolution
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        # Branch existence probe
+        if "/_apis/git/repositories/repo-guid/refs" in req.url.path:
+            return _json({"count": 1, "value": [{"name": "refs/heads/main"}]})
         if req.url.path.endswith("/_apis/build/builds"):
             captured["params"] = dict(req.url.params)
             return _json({"value": [_build_payload(101)]})
         raise AssertionError(f"unexpected {req.url.path}")
 
     _install_mock(monkeypatch, handler)
-    runs = AzureDevOpsProvider().list_runs_for_branch(
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_for_branch(
         _project(), token="t", ref="main", limit=5
     )
     assert captured["params"]["branchName"] == "refs/heads/main"
     assert len(runs) == 1
     assert runs[0].id == "101"
     assert runs[0].conclusion == "success"
+    assert resolved_refs == ["main"]
 
 
 def test_list_runs_for_commit_filters_client_side(
@@ -384,10 +391,11 @@ def test_list_runs_for_commit_filters_client_side(
         raise AssertionError
 
     _install_mock(monkeypatch, handler)
-    runs = AzureDevOpsProvider().list_runs_for_commit(
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_for_commit(
         _project(), token="t", sha="abc", limit=10
     )
     assert sorted(r.id for r in runs) == ["1", "3"]
+    assert resolved_refs == ["abc"]
 
 
 def test_get_run_includes_failure_context(
@@ -941,6 +949,49 @@ def test_get_run_non_numeric_run_id_raises_404_without_http(
         AzureDevOpsProvider().get_run(_project(), token="t", run_id="not-a-number")
     assert exc.value.status == 404
     assert "not-a-number" in exc.value.message
+
+
+def test_list_runs_for_branch_branch_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refs endpoint returns count=0 → branch does not exist → ([], [])."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in req.url.path:
+            return _json({"count": 0, "value": []})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_for_branch(
+        _project(), token="t", ref="nonexistent", limit=5
+    )
+    assert runs == []
+    assert resolved_refs == []
+
+
+def test_list_runs_for_commit_no_matching_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No build has the requested sourceVersion → resolved_refs == []."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({
+                "value": [
+                    _build_payload(10, sourceVersion="aaaa"),
+                    _build_payload(11, sourceVersion="bbbb"),
+                ]
+            })
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_for_commit(
+        _project(), token="t", sha="cccc", limit=10
+    )
+    assert runs == []
+    assert resolved_refs == []
 
 
 @pytest.mark.parametrize("bad_limit", [0, -1, -100])

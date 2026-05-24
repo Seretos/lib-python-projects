@@ -280,3 +280,161 @@ def test_list_runs_for_branch_nonpositive_limit_raises_before_http(
         GitHubProvider().list_runs_for_branch(
             _project(), token="t", branch="main", limit=bad_limit,
         )
+
+
+# ---------- list_runs_for_branch / list_runs_for_commit tuple shape ----------
+
+
+def test_list_runs_for_branch_branch_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Branch probe 404 → ([], [])."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/branches/nonexistent" in req.url.path:
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitHubProvider().list_runs_for_branch(
+        _project(), token="t", branch="nonexistent",
+    )
+    assert runs == []
+    assert resolved_refs == []
+
+
+def test_list_runs_for_branch_no_runs_no_ci(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Branch resolves, no runs, no workflows → ([], [sha, 'no-ci'])."""
+    sha = "aabbccdd1234"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/branches/feat" in path:
+            return _json({"commit": {"sha": sha}})
+        if path.endswith("/actions/runs"):
+            return _json({"workflow_runs": []})
+        if path.endswith("/actions/workflows"):
+            return _json({"total_count": 0, "workflows": []})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitHubProvider().list_runs_for_branch(
+        _project(), token="t", branch="feat",
+    )
+    assert runs == []
+    assert resolved_refs == [sha, "no-ci"]
+
+
+def test_list_runs_for_branch_no_runs_ci_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Branch resolves, no runs, but workflows exist → ([], [sha])."""
+    sha = "aabbccdd1234"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/branches/feat" in path:
+            return _json({"commit": {"sha": sha}})
+        if path.endswith("/actions/runs"):
+            return _json({"workflow_runs": []})
+        if path.endswith("/actions/workflows"):
+            return _json({"total_count": 2, "workflows": [{}, {}]})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitHubProvider().list_runs_for_branch(
+        _project(), token="t", branch="feat",
+    )
+    assert runs == []
+    assert resolved_refs == [sha]
+
+
+def test_list_runs_for_branch_with_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Branch resolves and runs exist → (runs, [sha])."""
+    sha = "aabbccdd1234"
+    run_id = 7777
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/branches/main" in path:
+            return _json({"commit": {"sha": sha}})
+        if path.endswith("/actions/runs"):
+            return _json({"workflow_runs": [_run_payload(run_id, sha)]})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitHubProvider().list_runs_for_branch(
+        _project(), token="t", branch="main",
+    )
+    assert len(runs) == 1
+    assert runs[0].id == str(run_id)
+    assert resolved_refs == [sha]
+
+
+def test_list_runs_for_commit_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commit probe 404 → ([], [])."""
+    sha = "deadbeef"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if f"/commits/{sha}" in req.url.path:
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitHubProvider().list_runs_for_commit(
+        _project(), token="t", sha=sha,
+    )
+    assert runs == []
+    assert resolved_refs == []
+
+
+def test_list_runs_for_commit_found_with_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commit found, one run → ([run], [sha])."""
+    sha = "cafebabe1234"
+    run_id = 8888
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if f"/commits/{sha}" in path:
+            return _json({"sha": sha})
+        if path.endswith("/actions/runs"):
+            return _json({"workflow_runs": [_run_payload(run_id, sha)]})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitHubProvider().list_runs_for_commit(
+        _project(), token="t", sha=sha,
+    )
+    assert len(runs) == 1
+    assert runs[0].head_sha == sha
+    assert resolved_refs == [sha]
+
+
+def test_list_runs_for_commit_found_no_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commit found, no runs → ([], [sha])."""
+    sha = "cafebabe1234"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if f"/commits/{sha}" in path:
+            return _json({"sha": sha})
+        if path.endswith("/actions/runs"):
+            return _json({"workflow_runs": []})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitHubProvider().list_runs_for_commit(
+        _project(), token="t", sha=sha,
+    )
+    assert runs == []
+    assert resolved_refs == [sha]

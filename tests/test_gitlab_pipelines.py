@@ -73,12 +73,14 @@ def _pipeline(pid: int, **overrides) -> dict:
 
 def test_list_runs_for_branch_sends_ref(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(req: httpx.Request) -> httpx.Response:
+        if "/repository/branches/" in str(req.url):
+            return _json({"commit": {"id": "sha-main"}})
         assert "/pipelines" in str(req.url)
         assert req.url.params.get("ref") == "main"
         return _json([_pipeline(1), _pipeline(2)])
 
     _install_mock(monkeypatch, handler)
-    runs = GitLabProvider().list_runs_for_branch(_project(), "t", "main")
+    runs, _ = GitLabProvider().list_runs_for_branch(_project(), "t", "main")
     assert [r.id for r in runs] == ["1", "2"]
 
 
@@ -101,20 +103,24 @@ def test_list_runs_for_commit_sends_sha(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def handler(req: httpx.Request) -> httpx.Response:
+        if "/repository/commits/" in str(req.url):
+            return _json({"id": "deadbeef"})
         assert req.url.params.get("sha") == "deadbeef"
         return _json([])
 
     _install_mock(monkeypatch, handler)
-    GitLabProvider().list_runs_for_commit(_project(), "t", "deadbeef")
+    runs, _ = GitLabProvider().list_runs_for_commit(_project(), "t", "deadbeef")
 
 
 def test_list_runs_limit_capped(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(req: httpx.Request) -> httpx.Response:
+        if "/repository/branches/" in str(req.url):
+            return _json({"commit": {"id": "sha-main"}})
         assert req.url.params.get("per_page") == "100"
         return _json([])
 
     _install_mock(monkeypatch, handler)
-    GitLabProvider().list_runs_for_branch(_project(), "t", "main", limit=500)
+    runs, _ = GitLabProvider().list_runs_for_branch(_project(), "t", "main", limit=500)
 
 
 # ---------- list_runs_for_ticket ---------------------------------------------
@@ -306,3 +312,106 @@ def test_list_runs_for_branch_nonpositive_limit_raises_before_http(
         GitLabProvider().list_runs_for_branch(
             _project(), "t", "main", limit=bad_limit,
         )
+
+
+# ---------- list_runs_for_branch / list_runs_for_commit tuple shape ----------
+
+
+def test_list_runs_for_branch_branch_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Branch probe 404 → ([], [])."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/repository/branches/missing" in str(req.url):
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitLabProvider().list_runs_for_branch(
+        _project(), "t", "missing",
+    )
+    assert runs == []
+    assert resolved_refs == []
+
+
+def test_list_runs_for_branch_found_no_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Branch resolves to sha, pipelines empty → ([], [sha])."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/repository/branches/main" in str(req.url):
+            return _json({"commit": {"id": "abc123"}})
+        if "/pipelines" in str(req.url):
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitLabProvider().list_runs_for_branch(
+        _project(), "t", "main",
+    )
+    assert runs == []
+    assert resolved_refs == ["abc123"]
+
+
+def test_list_runs_for_branch_found_with_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Branch resolves and pipelines returned → ([run], [sha])."""
+    sha = "def456"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/repository/branches/feat" in str(req.url):
+            return _json({"commit": {"id": sha}})
+        if "/pipelines" in str(req.url):
+            return _json([_pipeline(42)])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitLabProvider().list_runs_for_branch(
+        _project(), "t", "feat",
+    )
+    assert len(runs) == 1
+    assert runs[0].id == "42"
+    assert resolved_refs == [sha]
+
+
+def test_list_runs_for_commit_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commit probe 404 → ([], [])."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/repository/commits/deadbeef" in str(req.url):
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitLabProvider().list_runs_for_commit(
+        _project(), "t", "deadbeef",
+    )
+    assert runs == []
+    assert resolved_refs == []
+
+
+def test_list_runs_for_commit_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commit found, one pipeline → ([run], [sha])."""
+    sha = "deadbeef"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if f"/repository/commits/{sha}" in str(req.url):
+            return _json({"id": sha})
+        if "/pipelines" in str(req.url):
+            return _json([_pipeline(99)])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitLabProvider().list_runs_for_commit(
+        _project(), "t", sha,
+    )
+    assert len(runs) == 1
+    assert runs[0].id == "99"
+    assert resolved_refs == [sha]

@@ -1224,6 +1224,36 @@ def _ado_rel_to_kind(rel: str) -> str | None:
     return _RELATION_REVERSE.get(rel)
 
 
+def _resolve_ado_branch(
+    client: "httpx.Client",
+    project: "ProjectConfig",
+    repo_id: str,
+    branch: str,
+) -> bool:
+    """Return ``True`` if `branch` exists in `repo_id`, ``False`` otherwise.
+
+    Uses the refs filter endpoint; non-success responses are treated as
+    ``False`` (best-effort — we do not want a secondary auth failure to
+    shadow the primary result).
+    """
+    # ADO refs filter: `heads/<branch>` (without `refs/` prefix)
+    branch_ref = branch.removeprefix("refs/heads/")
+    path = (
+        f"{_project_scope(project)}/_apis/git/repositories"
+        f"/{repo_id}/refs"
+    )
+    try:
+        resp = client.get(
+            path,
+            params=_api_version_params({"filter": f"heads/{branch_ref}"}),
+        )
+        if not resp.is_success:
+            return False
+        return (resp.json() or {}).get("count", 0) > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ---------- the provider class ----------------------------------------------
 
 
@@ -3194,10 +3224,23 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         ref: str,
         status: str = "all",
         limit: int = 20,
-    ) -> list[PipelineRun]:
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List builds filtered by branch.
+
+        Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape:
+        - ``([], [])`` — branch not found in repository
+        - ``(runs, [ref])`` — branch exists (runs may be empty)
+        """
+        _validate_limit(limit)
+        repo_id = self._resolve_repository_id(project, token)
         branch = ref if ref.startswith("refs/") else f"refs/heads/{ref}"
+        with _client(project, token) as c:
+            exists = _resolve_ado_branch(c, project, repo_id, branch)
+        if not exists:
+            return [], []
         params = _api_version_params({"branchName": branch, "$top": max(1, limit)})
-        return self._list_builds(project, token, params, status, limit)
+        runs = self._list_builds(project, token, params, status, limit)
+        return runs, [ref]
 
     def list_runs_for_commit(
         self,
@@ -3206,14 +3249,23 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         sha: str,
         status: str = "all",
         limit: int = 20,
-    ) -> list[PipelineRun]:
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List builds whose ``sourceVersion`` matches ``sha``.
+
+        Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape.
+        ADO does not expose a commit-existence probe on the public REST
+        surface, so ``resolved_refs`` is ``[sha]`` when there are runs and
+        ``[]`` when there are none — callers cannot distinguish "commit not
+        found" from "no builds for this commit" via this provider.
+        """
         _validate_limit(limit)
         # ADO doesn't filter by sourceVersion server-side on the public
         # /builds list; fetch the last page and filter client-side.
         params = _api_version_params({"$top": 200})
         runs = self._list_builds(project, token, params, status, 200)
         filtered = [r for r in runs if r.head_sha == sha]
-        return filtered[: max(1, limit)]
+        result = filtered[: max(1, limit)]
+        return result, ([sha] if result else [])
 
     def list_runs_for_tag(
         self,
