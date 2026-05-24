@@ -1963,7 +1963,7 @@ class GitHubProvider:
         project: ProjectConfig,
         token: str | None,
         filters: PRFilters,
-    ) -> list[PullRequest]:
+    ) -> tuple[list[PullRequest], bool]:
         """List pull requests for a project.
 
         Routing mirrors `list_tickets`: when `labels`, `assignee`, or
@@ -1971,6 +1971,9 @@ class GitHubProvider:
         `/search/issues` with `is:pr` so the additional filters can be
         expressed as Search qualifiers. The `head`/`base` filters work on
         both paths (Search via the `head:`/`base:` qualifiers).
+
+        Returns `(prs, has_more)`. `has_more` is True when the API returned
+        exactly `per_page` results, indicating more pages may exist.
         """
         per_page = min(max(1, filters.limit), 100)
         use_search = bool(
@@ -2007,7 +2010,8 @@ class GitHubProvider:
                     detail = client.get(f"{_repo_path(project)}/pulls/{number}")
                     _check(detail)
                     full_items.append(detail.json())
-                return [_map_pr(it) for it in full_items]
+                has_more = len(full_items) >= per_page
+                return [_map_pr(it) for it in full_items], has_more
             else:
                 params: dict[str, Any] = {
                     "per_page": per_page,
@@ -2031,7 +2035,8 @@ class GitHubProvider:
                 r = client.get(f"{_repo_path(project)}/pulls", params=params)
                 _check(r)
                 items = r.json()
-        return [_map_pr(it) for it in items]
+        has_more = len(items) >= per_page
+        return [_map_pr(it) for it in items], has_more
 
     def get_pr(
         self,

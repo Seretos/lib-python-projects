@@ -1854,7 +1854,7 @@ class GitLabProvider(TokenCapabilityProvider):
         project: ProjectConfig,
         token: str | None,
         filters: PRFilters,
-    ) -> list[PullRequest]:
+    ) -> tuple[list[PullRequest], bool]:
         """List merge requests for a project.
 
         Filter mapping (GitLab REST `/projects/:id/merge_requests`):
@@ -1867,6 +1867,9 @@ class GitLabProvider(TokenCapabilityProvider):
           - `head` → `source_branch`. `base` → `target_branch`.
           - `search` → `search` (matches title + description).
           - `limit` → `per_page`, capped at 100.
+
+        Returns `(prs, has_more)`. `has_more` is True when the API returned
+        exactly `per_page` results, indicating more pages may exist.
         """
         per_page = min(max(1, filters.limit), 100)
         state_map = {"open": "opened", "closed": "closed", "any": "all"}
@@ -1892,7 +1895,9 @@ class GitLabProvider(TokenCapabilityProvider):
                 params=params,
             )
             _check(r)
-            return [_map_mr(it, project) for it in r.json()]
+            items = r.json()
+            has_more = len(items) >= per_page
+            return [_map_mr(it, project) for it in items], has_more
 
     def get_pr(
         self,

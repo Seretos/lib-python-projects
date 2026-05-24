@@ -91,7 +91,7 @@ def test_list_prs_default_filters(monkeypatch: pytest.MonkeyPatch) -> None:
         return _json([_mr_payload(1), _mr_payload(2)])
 
     _install_mock(monkeypatch, handler)
-    prs = GitLabProvider().list_prs(_project(), "t", PRFilters())
+    prs, _ = GitLabProvider().list_prs(_project(), "t", PRFilters())
     assert [p.id for p in prs] == ["1", "2"]
 
 
@@ -102,7 +102,7 @@ def test_list_prs_branch_filters(monkeypatch: pytest.MonkeyPatch) -> None:
         return _json([])
 
     _install_mock(monkeypatch, handler)
-    GitLabProvider().list_prs(
+    GitLabProvider().list_prs(  # return value intentionally ignored
         _project(), "t", PRFilters(head="feat/x", base="main"),
     )
 
@@ -116,10 +116,43 @@ def test_list_prs_state_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
 
     _install_mock(monkeypatch, handler)
     p = _project()
-    GitLabProvider().list_prs(p, "t", PRFilters(status="open"))
-    GitLabProvider().list_prs(p, "t", PRFilters(status="closed"))
-    GitLabProvider().list_prs(p, "t", PRFilters(status="any"))
+    GitLabProvider().list_prs(p, "t", PRFilters(status="open"))   # result ignored
+    GitLabProvider().list_prs(p, "t", PRFilters(status="closed"))  # result ignored
+    GitLabProvider().list_prs(p, "t", PRFilters(status="any"))     # result ignored
     assert seen == ["opened", "closed", "all"]
+
+
+# ---------- has_more boundary regression (ticket #39) -------------------------
+
+
+def test_list_prs_has_more_true_when_full_page_returned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression #39: list_prs returns has_more=True when the API returns
+    exactly per_page (limit) items, indicating more pages may exist."""
+    limit = 3
+    payloads = [_mr_payload(i) for i in range(1, limit + 1)]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(payloads)
+
+    _install_mock(monkeypatch, handler)
+    prs, has_more = GitLabProvider().list_prs(_project(), "t", PRFilters(limit=limit))
+    assert len(prs) == limit
+    assert has_more is True, "has_more must be True when API returns exactly per_page items"
+
+
+def test_list_prs_has_more_false_when_partial_page_returned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression #39: list_prs returns has_more=False when the API returns
+    fewer than per_page items, indicating no further pages."""
+    limit = 10
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # Return only 2 items when limit is 10 — partial page.
+        return _json([_mr_payload(1), _mr_payload(2)])
+
+    _install_mock(monkeypatch, handler)
+    prs, has_more = GitLabProvider().list_prs(_project(), "t", PRFilters(limit=limit))
+    assert len(prs) == 2
+    assert has_more is False, "has_more must be False when API returns fewer than per_page items"
 
 
 # ---------- get_pr -----------------------------------------------------------

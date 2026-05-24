@@ -2159,7 +2159,13 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         project: ProjectConfig,
         token: str | None,
         filters: PRFilters,
-    ) -> list[PullRequest]:
+    ) -> tuple[list[PullRequest], bool]:
+        """List pull requests for a project.
+
+        Returns `(prs, has_more)`. `has_more` is derived from the raw API
+        result count before client-side filtering: if the API returned at
+        least `filters.limit` items, there may be more pages available.
+        """
         repo_id = self._resolve_repository_id(project, token)
         status_param = {
             "open": "active",
@@ -2193,7 +2199,11 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         with _client(project, token) as c:
             resp = c.get(path, params=params)
         _check(resp)
-        prs = [_map_pr(raw, project) for raw in (resp.json().get("value") or [])]
+        raw_items = resp.json().get("value") or []
+        # has_more is derived from the pre-filter API count, mirroring how
+        # list_tickets derives it from len(ids) >= filters.limit.
+        has_more = len(raw_items) >= filters.limit
+        prs = [_map_pr(raw, project) for raw in raw_items]
         # ADO doesn't filter labels server-side; do it client-side.
         if filters.labels:
             wanted = set(filters.labels)
@@ -2206,7 +2216,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         # the active ones that ADO included.
         if filters.status == "closed":
             prs = [pr for pr in prs if pr.status != "open"]
-        return prs[: max(1, filters.limit)]
+        return prs[: max(1, filters.limit)], has_more
 
     def get_pr(
         self,
