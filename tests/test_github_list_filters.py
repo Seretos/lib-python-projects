@@ -366,3 +366,41 @@ def test_list_tickets_has_more_false_when_partial_page(
     )
     assert len(tickets) == 1
     assert has_more is False
+
+
+def test_list_tickets_pr_filtered_returns_full_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRs mixed into /issues pages must not shrink the result below limit.
+
+    Page 1 returns [PR, issue, PR] — only 1 real issue.
+    Page 2 returns [issue, issue] — 2 more real issues.
+    With limit=2 the provider must paginate to collect 2 real issues
+    and has_more must be True (page 2 was a full page of per_page=2).
+    """
+    pr_payload = _issue_payload(10, pull_request={"url": "https://github.com/acme/backend/pull/10"})
+
+    pages: dict[str, list] = {
+        "1": [pr_payload, _issue_payload(1), pr_payload],
+        "2": [_issue_payload(2), _issue_payload(3)],
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/issues"
+        page_num = req.url.params.get("page", "1")
+        return _json(pages.get(page_num, []))
+
+    _install_mock(monkeypatch, handler)
+    tickets, has_more = GitHubProvider().list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(limit=2),
+    )
+    assert len(tickets) == 2
+    # The id assertions below implicitly prove PR items were excluded
+    # (only real issue ids 1 and 2 appear, not the PR id 10).
+    assert tickets[0].id == "1"
+    assert tickets[1].id == "2"
+    # Page 2 had exactly per_page=2 items, so has_more should be True
+    # (we cannot tell whether more pages exist — the page was full).
+    assert has_more is True

@@ -1458,22 +1458,38 @@ class GitHubProvider:
                 has_more = len(items) >= per_page
                 return [_map_issue(it) for it in items if "pull_request" not in it], has_more
             else:
-                params: dict[str, Any] = {
+                base_params: dict[str, Any] = {
                     "per_page": per_page,
                     "state": filters.status if filters.status in ("open", "closed") else "all",
                     "sort": filters.sort_by,
                     "direction": filters.sort_order,
                 }
                 if filters.labels:
-                    params["labels"] = ",".join(filters.labels)
+                    base_params["labels"] = ",".join(filters.labels)
                 if filters.assignee:
-                    params["assignee"] = filters.assignee
-                r = client.get(f"{_repo_path(project)}/issues", params=params)
-                _check(r)
-                items = r.json()
-                has_more = len(items) >= per_page
-                # The /issues endpoints include PRs; filter them out.
-                return [_map_issue(it) for it in items if "pull_request" not in it], has_more
+                    base_params["assignee"] = filters.assignee
+                # Paginate until we have `limit` real issues (filtering
+                # out mixed-in PRs client-side) or the API runs dry.
+                collected: list[Any] = []
+                page = 1
+                last_raw_page_full = False
+                while len(collected) < filters.limit:
+                    params = {**base_params, "page": page}
+                    r = client.get(f"{_repo_path(project)}/issues", params=params)
+                    _check(r)
+                    raw_page = r.json()
+                    last_raw_page_full = len(raw_page) >= per_page
+                    # The /issues endpoint includes PRs; skip them.
+                    for it in raw_page:
+                        if "pull_request" not in it:
+                            collected.append(it)
+                            if len(collected) >= filters.limit:
+                                break
+                    if not last_raw_page_full:
+                        break
+                    page += 1
+                has_more = len(collected) >= filters.limit and last_raw_page_full
+                return [_map_issue(it) for it in collected[: filters.limit]], has_more
 
     def get_ticket(
         self,

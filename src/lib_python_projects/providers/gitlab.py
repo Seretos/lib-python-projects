@@ -1689,6 +1689,10 @@ class GitLabProvider(TokenCapabilityProvider):
                 _map_note(it, project) for it in r.json()
                 if not it.get("system", False)
             ]
+            # GitLab's `created_after` server hint is not reliably
+            # honoured for notes — apply the filter client-side.
+            if since:
+                rows = [c for c in rows if c.created_at and c.created_at >= since]
             next_page = (r.headers.get("X-Next-Page") or "").strip()
             has_more = bool(next_page)
             return rows, has_more

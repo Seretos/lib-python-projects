@@ -780,6 +780,38 @@ def test_list_comments_filters_system_notes(
     assert has_more is False
 
 
+def test_list_comments_since_filters_old_comments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Comments created before `since` must be excluded even when GitLab's
+    `created_after` server hint doesn't filter them out."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # Return both old and new notes regardless of created_after param —
+        # simulating GitLab ignoring the server hint.
+        return _json([
+            {
+                "id": 1, "body": "old comment", "system": False,
+                "author": {"username": "alice"},
+                "created_at": "2024-01-01T00:00:00Z",
+            },
+            {
+                "id": 2, "body": "new comment", "system": False,
+                "author": {"username": "bob"},
+                "created_at": "2024-03-01T00:00:00Z",
+            },
+        ])
+
+    _install_mock(monkeypatch, handler)
+    comments, has_more = GitLabProvider().list_comments(
+        _project(), "t", "5", since="2024-02-01T00:00:00Z"
+    )
+    assert len(comments) == 1
+    assert comments[0].body == "new comment"
+    assert comments[0].id == "2"
+    assert has_more is False
+
+
 def test_get_comment_composite_key(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(req: httpx.Request) -> httpx.Response:
         assert "acme%2Fbackend/issues/5/notes/99" in str(req.url)
