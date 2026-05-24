@@ -285,3 +285,79 @@ def test_create_pr_primary_failure_propagates(
             base="main",
         )
     assert exc.value.status == 422
+
+
+# ---------- Case 4: no duplicated provider prefix in error messages ----------
+
+
+def test_github_error_strips_trailing_suffix() -> None:
+    """GitHubError must strip any trailing '(GitHub NNN)' from the message."""
+    err = GitHubError(404, "resource not found (GitHub 404)")
+    assert err.status == 404
+    assert "(GitHub 404)" not in err.message
+    assert "resource not found" in err.message
+    # The __str__ should not double-embed the prefix.
+    assert str(err) == "GitHub 404: resource not found"
+
+
+def test_github_error_no_suffix_unchanged() -> None:
+    """GitHubError with a clean message must be stored as-is."""
+    err = GitHubError(404, "resource not found")
+    assert err.message == "resource not found"
+    assert str(err) == "GitHub 404: resource not found"
+
+
+def test_github_error_strips_suffix_with_whitespace() -> None:
+    """Whitespace before the suffix is also removed."""
+    err = GitHubError(422, "some error  (GitHub 422) ")
+    assert "(GitHub" not in err.message
+    assert "some error" in err.message
+
+
+# ---------- Case 6: self-review 422 gets platform-restriction note -----------
+
+
+def test_submit_pr_review_self_review_422_adds_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """submit_pr_review 422 'Can not approve your own pull request' must include
+    a platform-restriction note pointing the caller to use another account."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "/reviews" in req.url.path:
+            return _json(
+                {"message": "Can not approve your own pull request"},
+                status_code=422,
+            )
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().submit_pr_review(
+            _project(), token="t", pr_id="7", state="approve",
+        )
+    assert exc.value.status == 422
+    assert "GitHub platform restriction" in exc.value.message
+    assert "another account" in exc.value.message
+
+
+def test_submit_pr_review_other_422_not_modified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """submit_pr_review 422 with a different message must propagate unchanged."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "/reviews" in req.url.path:
+            return _json(
+                {"message": "Unprocessable entity"},
+                status_code=422,
+            )
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().submit_pr_review(
+            _project(), token="t", pr_id="7", state="approve",
+        )
+    assert exc.value.status == 422
+    assert "GitHub platform restriction" not in exc.value.message

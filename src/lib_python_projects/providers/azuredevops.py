@@ -265,7 +265,7 @@ def _project_scope(project: ProjectConfig) -> str:
     org, proj = project.organization, project.ado_project
     if not org or not proj:
         raise AzureDevOpsError(
-            0,
+            400,
             f"project '{project.id}': missing organization/project in "
             f"path {project.path!r}",
         )
@@ -277,7 +277,7 @@ def _org_scope(project: ProjectConfig) -> str:
     org = project.organization
     if not org:
         raise AzureDevOpsError(
-            0,
+            400,
             f"project '{project.id}': missing organization in path "
             f"{project.path!r}",
         )
@@ -1785,8 +1785,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
             valid_names = [s.get("name") for s in states if s.get("name")]
             if status not in valid_names:
                 raise ValueError(
-                    f"status {status!r} not in accepted values: {valid_names}"
-                    f" — use list_ticket_statuses to discover valid values"
+                    f"unsupported status {status!r} for Azure DevOps — "
+                    f"use list_ticket_statuses to discover valid values. "
+                    f"Accepted: {valid_names}."
                 )
 
         body_with_marker = ensure_body_prefix(body or "")
@@ -1964,7 +1965,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                     f" — accepted: {accepted}" if accepted else ""
                 )
                 raise ValueError(
-                    f"ticket #{ticket_id} state {status!r} rejected"
+                    f"unsupported status {status!r} for Azure DevOps — "
+                    f"use list_ticket_statuses to discover valid values."
                     f"{accepted_clause}"
                 ) from exc
             raise
@@ -2089,7 +2091,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
     ) -> Comment:
         if not ticket_id:
             raise AzureDevOpsError(
-                0,
+                400,
                 "azuredevops.get_comment requires ticket_id "
                 "(work-item comment ids are scoped to a work item).",
             )
@@ -2114,7 +2116,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
     ) -> Comment:
         if not ticket_id:
             raise AzureDevOpsError(
-                0,
+                400,
                 "azuredevops.update_comment requires ticket_id "
                 "(work-item comment ids are scoped to a work item).",
             )
@@ -2991,7 +2993,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         reviewer_id = identity.get("id") or ""
         if not reviewer_id:
             raise AzureDevOpsError(
-                0,
+                400,
                 "could not resolve current user id for PR review submission",
             )
 
@@ -3002,7 +3004,20 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         )
         with _client(project, token) as c:
             resp = c.put(rev_path, params=_api_version_params(), json={"vote": vote})
-        _check(resp)
+        try:
+            _check(resp)
+        except AzureDevOpsError as exc:
+            # TF401181: "The pull request cannot be edited because its status
+            # is not 'Active'." — surfaces when the PR is merged/completed.
+            if "TF401181" in exc.message or (
+                exc.status in (400, 409)
+                and "cannot be edited" in exc.message
+            ):
+                raise AzureDevOpsError(
+                    exc.status,
+                    "cannot submit a review on a merged or completed pull request",
+                ) from exc
+            raise
         # The reviewer PUT response carries the full identity
         # (displayName + uniqueName), while connectionData often returns
         # only the GUID. Prefer the PUT response, falling back to

@@ -610,3 +610,35 @@ def test_remove_relation_blocked_by_unsupported(monkeypatch: pytest.MonkeyPatch)
     with pytest.raises(RelationKindUnsupported) as exc:
         GitLabProvider().remove_relation(_project(), "t", "5", "blocked_by", "#3")
     assert exc.value.kind == "blocked_by"
+
+
+# ---------- Case 3: add_relation already-assigned 409 normalization ----------
+
+
+def test_add_relation_relates_to_already_assigned_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation 'relates_to' hitting a 409 'Issue(s) already assigned'
+    must surface 'relation already exists' with kind and target in the message."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        # Numeric project-id resolution.
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"id": 42})
+        # Issue links POST → already-assigned 409.
+        if "/issues/5/links" in url and req.method == "POST":
+            return _json(
+                {"message": "Issue(s) already assigned"},
+                status_code=409,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "relates_to", "#7")
+    assert exc.value.status == 409
+    assert "relation already exists" in exc.value.message
+    assert "relates_to" in exc.value.message
+    assert "#7" in exc.value.message

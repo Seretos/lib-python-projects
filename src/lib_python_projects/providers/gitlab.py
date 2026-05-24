@@ -655,7 +655,18 @@ def _gitlab_post_issue_link(
         f"/projects/{source_project_path}/issues/{source_iid}/links",
         json=body,
     )
-    _check(r)
+    try:
+        _check(r)
+    except GitLabError as exc:
+        if exc.status == 409 or (
+            exc.status in (400, 409, 422)
+            and ("already assigned" in exc.message.lower() or "already exists" in exc.message.lower())
+        ):
+            raise GitLabError(
+                exc.status,
+                f"relation already exists — kind: {relation_kind_for_caller!r}, target: #{target_issue_iid}",
+            ) from exc
+        raise
     raw = r.json()
     # The POST /issues/:iid/links response wraps the target issue inside
     # a "target_issue" key: {"source_issue": {...}, "target_issue": {...}}.
