@@ -46,6 +46,7 @@ from lib_python_projects.providers.base import (
     StatusSpec, PipelineRun, FailingJob, PipelineFailure,
     TokenCapabilities, TokenCapabilityProvider,
     RelationKindUnsupported, RelationNotFound, RelationAlreadyExists,
+    Label, LabelOperationUnsupported,
     normalize_timestamp,
     WRITABLE_RELATION_KINDS, READ_ONLY_RELATION_KINDS,
 )

@@ -55,6 +55,8 @@ from lib_python_projects.markers import (
 from lib_python_projects.providers.base import (
     Comment,
     FailingJob,
+    Label,
+    LabelOperationUnsupported,
     PRFilters,
     PipelineFailure,
     PipelineRun,
@@ -3527,6 +3529,83 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
             pulls_modify=True,
             pulls_merge=True,
         )
+
+    # ---------- label management ---------------------------------------------
+
+    def list_labels(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+    ) -> list[Label]:
+        """List work-item tags for the project (best-effort approximation).
+
+        Azure DevOps tags are implicit — they have no dedicated create/
+        rename/delete API and carry no colour or description metadata.
+        This method approximates a label list by calling:
+
+          ``GET /{org}/{project}/_apis/wit/tags?api-version=7.1``
+
+        If that endpoint is unavailable or returns no items, an empty
+        list is returned. Each `Label` is returned with `color=""` and
+        `description=""` because ADO tags have no such fields.
+        """
+        path = f"{_project_scope(project)}/_apis/wit/tags"
+        with _client(project, token) as c:
+            resp = c.get(path, params=_api_version_params())
+        if not resp.is_success:
+            return []
+        payload = resp.json() or {}
+        items = payload.get("value") or []
+        return [
+            Label(name=item.get("name") or "", color="", description="")
+            for item in items
+            if item.get("name")
+        ]
+
+    def create_label(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        name: str,
+        color: str | None = None,
+        description: str | None = None,
+    ) -> Label:
+        """Not supported on Azure DevOps.
+
+        ADO tags are implicit — they emerge when applied to a work item
+        and have no dedicated create API. Raises `LabelOperationUnsupported`
+        immediately without making any HTTP call.
+        """
+        raise LabelOperationUnsupported("create_label", "azuredevops")
+
+    def update_label(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        name: str,
+        new_name: str | None = None,
+        color: str | None = None,
+        description: str | None = None,
+    ) -> Label:
+        """Not supported on Azure DevOps.
+
+        ADO tags have no rename/recolour API. Raises
+        `LabelOperationUnsupported` immediately without making any HTTP call.
+        """
+        raise LabelOperationUnsupported("update_label", "azuredevops")
+
+    def delete_label(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        name: str,
+    ) -> None:
+        """Not supported on Azure DevOps.
+
+        ADO tags have no delete API. Raises `LabelOperationUnsupported`
+        immediately without making any HTTP call.
+        """
+        raise LabelOperationUnsupported("delete_label", "azuredevops")
 
 
 # ---------- module-level helpers used by the provider ----------------------
