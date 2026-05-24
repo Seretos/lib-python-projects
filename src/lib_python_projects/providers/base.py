@@ -268,6 +268,7 @@ class PullRequest:
     pipeline_status: str | None = None
     approvals_required: int | None = None
     approvals_received: int | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
