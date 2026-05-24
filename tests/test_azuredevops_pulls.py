@@ -157,7 +157,7 @@ def test_list_prs_open_translates_status(monkeypatch: pytest.MonkeyPatch) -> Non
         raise AssertionError(f"unexpected {req.url.path}")
 
     _install_mock(monkeypatch, handler)
-    prs = AzureDevOpsProvider().list_prs(
+    prs, _ = AzureDevOpsProvider().list_prs(
         _project(), token="t", filters=PRFilters(status="open", limit=30)
     )
     assert [p.id for p in prs] == ["1", "2"]
@@ -206,7 +206,7 @@ def test_list_prs_filters_by_label_client_side(
         raise AssertionError
 
     _install_mock(monkeypatch, handler)
-    prs = AzureDevOpsProvider().list_prs(
+    prs, _ = AzureDevOpsProvider().list_prs(
         _project(),
         token="t",
         filters=PRFilters(labels=["bug"]),
@@ -1436,7 +1436,7 @@ def test_list_prs_closed_includes_abandoned_and_completed(
         raise AssertionError(f"unexpected {req.url.path}")
 
     _install_mock(monkeypatch, handler)
-    prs = AzureDevOpsProvider().list_prs(
+    prs, _ = AzureDevOpsProvider().list_prs(
         _project(), token="t", filters=PRFilters(status="closed", limit=30)
     )
     assert {p.id for p in prs} == {"10", "11"}
@@ -1465,10 +1465,61 @@ def test_list_prs_closed_excludes_active(
         raise AssertionError(f"unexpected {req.url.path}")
 
     _install_mock(monkeypatch, handler)
-    prs = AzureDevOpsProvider().list_prs(
+    prs, _ = AzureDevOpsProvider().list_prs(
         _project(), token="t", filters=PRFilters(status="closed", limit=30)
     )
     assert [p.id for p in prs] == ["21"]
+
+
+# ---------- has_more boundary regression (ticket #39) -------------------------
+
+
+def test_list_prs_has_more_true_when_raw_api_count_equals_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression #39: has_more is True when the raw ADO API response
+    contains at least `limit` items (measured before client-side filtering)."""
+    limit = 3
+    payloads = [_pr_payload(i) for i in range(1, limit + 1)]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if "/pullrequests" in req.url.path:
+            return _json({"value": payloads})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    prs, has_more = AzureDevOpsProvider().list_prs(
+        _project(), token="t", filters=PRFilters(status="open", limit=limit)
+    )
+    assert len(prs) == limit
+    assert has_more is True, "has_more must be True when API returns exactly limit items"
+
+
+def test_list_prs_has_more_false_when_raw_api_count_below_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression #39: has_more is False when the raw ADO API response
+    contains fewer than `limit` items."""
+    limit = 10
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if "/pullrequests" in req.url.path:
+            # Return only 2 items when limit is 10 — partial page.
+            return _json({"value": [_pr_payload(1), _pr_payload(2)]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    prs, has_more = AzureDevOpsProvider().list_prs(
+        _project(), token="t", filters=PRFilters(status="open", limit=limit)
+    )
+    assert len(prs) == 2
+    assert has_more is False, "has_more must be False when API returns fewer than limit items"
 
 
 # ---------- Case 1: submit_pr_review on merged PR → human-readable error -----

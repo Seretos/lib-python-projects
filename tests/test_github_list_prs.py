@@ -173,7 +173,7 @@ def test_default_filters_route_to_pulls_endpoint(monkeypatch: pytest.MonkeyPatch
 
     seen = _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
-    prs = provider.list_prs(_project(), token="t", filters=PRFilters())
+    prs, has_more = provider.list_prs(_project(), token="t", filters=PRFilters())
     assert [pr.id for pr in prs] == ["1", "2"]
     assert len(seen) == 1
     assert seen[0].url.path == "/repos/acme/backend/pulls"
@@ -197,7 +197,7 @@ def test_labels_filter_routes_to_search(monkeypatch: pytest.MonkeyPatch) -> None
 
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
-    prs = provider.list_prs(_project(), token="t", filters=PRFilters(labels=["bug"]))
+    prs, _ = provider.list_prs(_project(), token="t", filters=PRFilters(labels=["bug"]))
     assert [pr.id for pr in prs] == ["10"]
 
 
@@ -218,7 +218,7 @@ def test_assignee_filter_routes_to_search(monkeypatch: pytest.MonkeyPatch) -> No
 
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
-    prs = provider.list_prs(_project(), token="t", filters=PRFilters(assignee="bob"))
+    prs, _ = provider.list_prs(_project(), token="t", filters=PRFilters(assignee="bob"))
     assert [pr.id for pr in prs] == ["20"]
 
 
@@ -239,7 +239,7 @@ def test_search_text_filter_routes_to_search(monkeypatch: pytest.MonkeyPatch) ->
 
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
-    prs = provider.list_prs(_project(), token="t", filters=PRFilters(search="fix memory leak"))
+    prs, _ = provider.list_prs(_project(), token="t", filters=PRFilters(search="fix memory leak"))
     assert [pr.id for pr in prs] == ["30"]
 
 
@@ -282,7 +282,7 @@ def test_search_path_backfills_head_base_mergeable_state(monkeypatch: pytest.Mon
 
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
-    prs = provider.list_prs(_project(), token="t", filters=PRFilters(labels=["my-label"]))
+    prs, _ = provider.list_prs(_project(), token="t", filters=PRFilters(labels=["my-label"]))
 
     assert len(prs) == 1
     pr = prs[0]
@@ -316,7 +316,7 @@ def test_search_path_open_pr_maps_to_open(monkeypatch: pytest.MonkeyPatch) -> No
     handler = _search_and_detail_handler([stub], {40: full})
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
-    prs = provider.list_prs(_project(), token="t", filters=PRFilters(assignee="alice"))
+    prs, _ = provider.list_prs(_project(), token="t", filters=PRFilters(assignee="alice"))
     assert len(prs) == 1
     pr = prs[0]
     assert pr.status == "open"
@@ -335,7 +335,7 @@ def test_search_path_closed_not_merged_maps_to_closed(monkeypatch: pytest.Monkey
     handler = _search_and_detail_handler([stub], {50: full})
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
-    prs = provider.list_prs(_project(), token="t", filters=PRFilters(assignee="alice"))
+    prs, _ = provider.list_prs(_project(), token="t", filters=PRFilters(assignee="alice"))
     assert len(prs) == 1
     pr = prs[0]
     assert pr.status == "closed"
@@ -355,7 +355,7 @@ def test_search_path_merged_pr_maps_to_merged(monkeypatch: pytest.MonkeyPatch) -
     handler = _search_and_detail_handler([stub], {60: full})
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
-    prs = provider.list_prs(_project(), token="t", filters=PRFilters(assignee="alice"))
+    prs, _ = provider.list_prs(_project(), token="t", filters=PRFilters(assignee="alice"))
     assert len(prs) == 1
     pr = prs[0]
     assert pr.status == "merged", (
@@ -416,7 +416,7 @@ def test_head_filter_bare_name_auto_qualified(monkeypatch: pytest.MonkeyPatch) -
 
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
-    prs = provider.list_prs(_project(), token="t", filters=PRFilters(head="feat/my-branch"))
+    prs, _ = provider.list_prs(_project(), token="t", filters=PRFilters(head="feat/my-branch"))
     assert [pr.id for pr in prs] == ["1"]
     assert captured_params.get("head") == "acme:feat/my-branch", (
         f"Expected 'acme:feat/my-branch', got {captured_params.get('head')!r}"
@@ -436,8 +436,80 @@ def test_head_filter_already_qualified_passes_through(monkeypatch: pytest.Monkey
 
     _install_mock(monkeypatch, handler)
     provider = GitHubProvider()
-    prs = provider.list_prs(_project(), token="t", filters=PRFilters(head="acme:feat/my-branch"))
+    prs, _ = provider.list_prs(_project(), token="t", filters=PRFilters(head="acme:feat/my-branch"))
     assert [pr.id for pr in prs] == ["2"]
     assert captured_params.get("head") == "acme:feat/my-branch", (
         f"Expected 'acme:feat/my-branch' (unchanged), got {captured_params.get('head')!r}"
     )
+
+
+# ---------- has_more boundary regression (ticket #39) -------------------------
+
+
+def test_list_prs_has_more_true_when_full_page_returned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression #39: non-search path returns has_more=True when API
+    returns exactly per_page (limit) items, indicating more pages exist."""
+    limit = 3
+    payloads = [_pr_payload(i) for i in range(1, limit + 1)]  # exactly `limit` items
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/pulls"
+        return _json(payloads)
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    prs, has_more = provider.list_prs(_project(), token="t", filters=PRFilters(limit=limit))
+    assert len(prs) == limit
+    assert has_more is True, "has_more must be True when API returns exactly per_page items"
+
+
+def test_list_prs_has_more_false_when_partial_page_returned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression #39: non-search path returns has_more=False when API
+    returns fewer than per_page items, indicating no further pages."""
+    limit = 10
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/pulls"
+        # Return only 2 items when limit is 10 — partial page.
+        return _json([_pr_payload(1), _pr_payload(2)])
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    prs, has_more = provider.list_prs(_project(), token="t", filters=PRFilters(limit=limit))
+    assert len(prs) == 2
+    assert has_more is False, "has_more must be False when API returns fewer than per_page items"
+
+
+def test_list_prs_search_path_has_more_true_when_full_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression #39: search path returns has_more=True when back-filled
+    results count equals per_page."""
+    limit = 2
+    stubs = [_search_pr_stub(i) for i in range(1, limit + 1)]
+    full_payloads = {i: _pr_payload(i) for i in range(1, limit + 1)}
+
+    handler = _search_and_detail_handler(stubs, full_payloads)
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    # Use assignee= to force the search path.
+    prs, has_more = provider.list_prs(
+        _project(), token="t", filters=PRFilters(assignee="alice", limit=limit)
+    )
+    assert len(prs) == limit
+    assert has_more is True, "search path has_more must be True when full page returned"
+
+
+def test_list_prs_search_path_has_more_false_when_partial_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression #39: search path returns has_more=False when fewer
+    results than per_page are returned."""
+    limit = 10
+    stubs = [_search_pr_stub(1)]
+    full_payloads = {1: _pr_payload(1)}
+
+    handler = _search_and_detail_handler(stubs, full_payloads)
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    prs, has_more = provider.list_prs(
+        _project(), token="t", filters=PRFilters(assignee="alice", limit=limit)
+    )
+    assert len(prs) == 1
+    assert has_more is False, "search path has_more must be False when partial page returned"
