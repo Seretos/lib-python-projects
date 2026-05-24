@@ -582,7 +582,16 @@ def _parse_gitlab_relation_target(
 
 
 def _gitlab_link_type(kind: str) -> str:
-    """Map our kind vocabulary to GitLab's `link_type` string."""
+    """Map our kind vocabulary to GitLab's `link_type` string.
+
+    The ``blocks`` / ``blocked_by`` branches below are retained for
+    read-side symmetry (``_fetch_relations`` maps the raw ``link_type``
+    values back to our vocabulary).  They are unreachable from
+    ``add_relation`` / ``remove_relation`` because those methods guard
+    on ``_SUPPORTED_RELATION_KINDS`` — which no longer includes
+    ``"blocks"`` / ``"blocked_by"`` (ticket #20) — before reaching this
+    helper.
+    """
     if kind == "blocks":
         return "blocks"
     if kind == "blocked_by":
@@ -1116,6 +1125,32 @@ def _gitlab_pipeline_scope(status: str) -> str | None:
         "completed": "finished",
     }
     return mapping.get(status)
+
+
+def _resolve_gitlab_branch_sha(
+    client: httpx.Client,
+    project_path: str,
+    branch: str,
+) -> str | None:
+    """Return the commit SHA for `branch`, or ``None`` if not found (404)."""
+    r = client.get(f"/projects/{project_path}/repository/branches/{branch}")
+    if r.status_code == 404:
+        return None
+    _check(r)
+    return (r.json() or {}).get("commit", {}).get("id")
+
+
+def _resolve_gitlab_commit(
+    client: httpx.Client,
+    project_path: str,
+    sha: str,
+) -> bool:
+    """Return ``True`` if `sha` exists as a commit, ``False`` on 404."""
+    r = client.get(f"/projects/{project_path}/repository/commits/{sha}")
+    if r.status_code == 404:
+        return False
+    _check(r)
+    return True
 
 
 def _list_pipelines(
@@ -2513,9 +2548,7 @@ class GitLabProvider(TokenCapabilityProvider):
 
     # ---------- relations (write side) ---------------------------------------
 
-    _SUPPORTED_RELATION_KINDS: tuple[str, ...] = (
-        "blocks", "blocked_by", "relates_to", "duplicate_of",
-    )
+    _SUPPORTED_RELATION_KINDS: tuple[str, ...] = ("relates_to", "duplicate_of")
 
     def add_relation(
         self,
@@ -2558,7 +2591,7 @@ class GitLabProvider(TokenCapabilityProvider):
         )
         path = _project_path(project)
         with _client(project, token) as client:
-            if kind in ("blocks", "blocked_by", "relates_to"):
+            if kind == "relates_to":
                 link_type = _gitlab_link_type(kind)
                 return _gitlab_post_issue_link(
                     client, path, ticket_id,
@@ -2606,7 +2639,7 @@ class GitLabProvider(TokenCapabilityProvider):
         )
         path = _project_path(project)
         with _client(project, token) as client:
-            if kind in ("blocks", "blocked_by", "relates_to"):
+            if kind == "relates_to":
                 _gitlab_delete_issue_link(
                     client, path, ticket_id,
                     target_project_path=target_project,
@@ -2646,12 +2679,25 @@ class GitLabProvider(TokenCapabilityProvider):
         branch: str,
         status: str = "all",
         limit: int = 20,
-    ) -> list[PipelineRun]:
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List pipelines for `branch`.
+
+        Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape:
+        - ``([], [])`` — branch not found
+        - ``(runs, [sha])`` — branch exists (runs may be empty)
+        """
+        _validate_limit(limit)
+        path = _project_path(project)
+        with _client(project, token) as client:
+            sha = _resolve_gitlab_branch_sha(client, path, branch)
+        if sha is None:
+            return [], []
         params: dict[str, Any] = {"ref": branch}
         scope = _gitlab_pipeline_scope(status)
         if scope:
             params["scope"] = scope
-        return _list_pipelines(project, token, params, limit)
+        runs = _list_pipelines(project, token, params, limit)
+        return runs, [sha]
 
     def list_runs_for_commit(
         self,
@@ -2660,12 +2706,25 @@ class GitLabProvider(TokenCapabilityProvider):
         sha: str,
         status: str = "all",
         limit: int = 20,
-    ) -> list[PipelineRun]:
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List pipelines whose ``sha`` matches.
+
+        Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape:
+        - ``([], [])`` — commit not found
+        - ``(runs, [sha])`` — commit exists (runs may be empty)
+        """
+        _validate_limit(limit)
+        path = _project_path(project)
+        with _client(project, token) as client:
+            exists = _resolve_gitlab_commit(client, path, sha)
+        if not exists:
+            return [], []
         params: dict[str, Any] = {"sha": sha}
         scope = _gitlab_pipeline_scope(status)
         if scope:
             params["scope"] = scope
-        return _list_pipelines(project, token, params, limit)
+        runs = _list_pipelines(project, token, params, limit)
+        return runs, [sha]
 
     def list_runs_for_tag(
         self,

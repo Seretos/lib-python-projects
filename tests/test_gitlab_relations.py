@@ -20,7 +20,7 @@ import pytest
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import gitlab as gitlab_mod
 from lib_python_projects.providers.gitlab import GitLabProvider
-from lib_python_projects.providers.base import RelationNotFound
+from lib_python_projects.providers.base import RelationNotFound, RelationKindUnsupported
 
 
 def _project() -> ProjectConfig:
@@ -495,9 +495,9 @@ def test_remove_relation_link_not_found_raises_relation_not_found(
     _install_mock(monkeypatch, handler)
     with pytest.raises(RelationNotFound) as exc:
         GitLabProvider().remove_relation(
-            _project(), "t", "5", "blocks", "#7"
+            _project(), "t", "5", "relates_to", "#7"
         )
-    assert exc.value.kind == "blocks"
+    assert exc.value.kind == "relates_to"
     assert isinstance(exc.value, LookupError)
 
 
@@ -550,3 +550,63 @@ def test_body_scan_mentions_have_resolved_false(
     mentions = [r for r in relations if r.kind == "mentions"]
     assert mentions
     assert mentions[0].resolved is False
+
+
+# ---------- blocks / blocked_by unsupported (ticket #20) --------------------
+
+
+def test_blocks_relation_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """add_relation with 'blocks' must raise RelationKindUnsupported — no HTTP
+    call needed because the guard fires before any I/o."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationKindUnsupported) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "blocks", "#2")
+    assert exc.value.kind == "blocks"
+
+
+def test_blocked_by_relation_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """add_relation with 'blocked_by' must raise RelationKindUnsupported."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationKindUnsupported) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "blocked_by", "#3")
+    assert exc.value.kind == "blocked_by"
+
+
+def test_supported_relation_kinds_excludes_blocks_and_blocked_by() -> None:
+    """_SUPPORTED_RELATION_KINDS must not advertise blocks or blocked_by."""
+    kinds = GitLabProvider._SUPPORTED_RELATION_KINDS
+    assert "blocks" not in kinds
+    assert "blocked_by" not in kinds
+
+
+def test_remove_relation_blocks_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """remove_relation with 'blocks' must raise RelationKindUnsupported — no
+    HTTP call needed because the guard fires before any I/O."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationKindUnsupported) as exc:
+        GitLabProvider().remove_relation(_project(), "t", "5", "blocks", "#2")
+    assert exc.value.kind == "blocks"
+
+
+def test_remove_relation_blocked_by_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """remove_relation with 'blocked_by' must raise RelationKindUnsupported."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationKindUnsupported) as exc:
+        GitLabProvider().remove_relation(_project(), "t", "5", "blocked_by", "#3")
+    assert exc.value.kind == "blocked_by"

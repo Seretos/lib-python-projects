@@ -2675,11 +2675,26 @@ class GitHubProvider:
         branch: str,
         status: str = "all",
         limit: int = 10,
-    ) -> list[PipelineRun]:
-        """List Actions workflow runs filtered by branch."""
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List Actions workflow runs filtered by branch.
+
+        Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape:
+        - ``([], [])`` — branch not found
+        - ``([], [sha, "no-ci"])`` — branch exists, no runs, no workflows
+        - ``([], [sha])`` — branch exists, no runs, CI is configured
+        - ``(runs, [sha])`` — branch exists, runs found
+        """
+        _validate_limit(limit)
         with _client(token) as client:
-            runs = _list_runs_for_branch(client, project, branch, status, limit)
-            return [_map_run(r) for r in runs]
+            sha = _resolve_branch_sha(client, project, branch)
+            if sha is None:
+                return [], []
+            raw_runs = _list_runs_for_branch(client, project, branch, status, limit)
+            if raw_runs:
+                return [_map_run(r) for r in raw_runs], [sha]
+            if not _has_workflows(client, project):
+                return [], [sha, "no-ci"]
+            return [], [sha]
 
     def list_runs_for_commit(
         self,
@@ -2688,11 +2703,19 @@ class GitHubProvider:
         sha: str,
         status: str = "all",
         limit: int = 10,
-    ) -> list[PipelineRun]:
-        """List runs whose `head_sha` matches `sha`."""
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List runs whose ``head_sha`` matches ``sha``.
+
+        Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape:
+        - ``([], [])`` — commit not found
+        - ``(runs, [sha])`` — commit found (runs may be empty)
+        """
+        _validate_limit(limit)
         with _client(token) as client:
-            runs = _list_runs_for_commit(client, project, sha, status, limit)
-            return [_map_run(r) for r in runs]
+            if not _resolve_commit(client, project, sha):
+                return [], []
+            raw_runs = _list_runs_for_commit(client, project, sha, status, limit)
+            return [_map_run(r) for r in raw_runs], [sha]
 
     def list_runs_for_tag(
         self,
@@ -2853,6 +2876,51 @@ def _list_runs_for_commit(
     r = client.get(f"{_repo_path(project)}/actions/runs", params=params)
     _check(r)
     return (r.json() or {}).get("workflow_runs", [])
+
+
+def _resolve_branch_sha(
+    client: httpx.Client,
+    project: ProjectConfig,
+    branch: str,
+) -> str | None:
+    """Return the HEAD commit SHA for `branch`, or ``None`` on 404/422."""
+    r = client.get(f"{_repo_path(project)}/branches/{branch}")
+    if r.status_code in (404, 422):
+        return None
+    _check(r)
+    return ((r.json() or {}).get("commit") or {}).get("sha")
+
+
+def _resolve_commit(
+    client: httpx.Client,
+    project: ProjectConfig,
+    sha: str,
+) -> bool:
+    """Return ``True`` if `sha` resolves to a commit, ``False`` on 404/422."""
+    r = client.get(f"{_repo_path(project)}/commits/{sha}")
+    if r.status_code in (404, 422):
+        return False
+    _check(r)
+    return True
+
+
+def _has_workflows(
+    client: httpx.Client,
+    project: ProjectConfig,
+) -> bool:
+    """Return ``True`` if the repository has at least one Actions workflow.
+
+    Only 404 (repository or endpoint not found) is treated as "no
+    workflows / not applicable" and returns ``False``.  Auth failures
+    (401/403) and server errors (5xx) are propagated via ``_check`` so
+    real credential or infrastructure problems surface rather than being
+    silently misclassified as the ``"no-ci"`` sentinel.
+    """
+    r = client.get(f"{_repo_path(project)}/actions/workflows")
+    if r.status_code == 404:
+        return False
+    _check(r)
+    return ((r.json() or {}).get("total_count") or 0) > 0
 
 
 def _resolve_tag_sha(
