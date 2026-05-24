@@ -1543,7 +1543,14 @@ class GitHubProvider:
         """
         with _client(token) as client:
             r = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
-            _check(r)
+            try:
+                _check(r)
+            except GitHubError as exc:
+                if exc.status == 404:
+                    raise GitHubError(
+                        404, f"ticket '{project.id}#{ticket_id}' not found"
+                    ) from exc
+                raise
             issue_raw = r.json()
             ticket = _map_issue(issue_raw)
             c = client.get(
@@ -1934,7 +1941,7 @@ class GitHubProvider:
             except GitHubError as exc:
                 if exc.status == 404:
                     raise GitHubError(
-                        404, f"comment '{project.id}#{comment_id}' not found"
+                        404, f"comment {comment_id!r} not found in {project.id}"
                     ) from exc
                 raise
             current_body = r0.json().get("body") or ""
@@ -2092,7 +2099,20 @@ class GitHubProvider:
                 "draft": draft,
             }
             r = client.post(f"{_repo_path(project)}/pulls", json=payload)
-            _check(r)
+            try:
+                _check(r)
+            except GitHubError as exc:
+                if exc.status == 422 and (
+                    "pullrequest.head" in exc.message.lower()
+                    or "head branch" in exc.message.lower()
+                ):
+                    raise GitHubError(
+                        422,
+                        f"create_pr: head branch {head!r} does not exist in"
+                        f" {project.id} — push it first;"
+                        f" original error: {exc.message}",
+                    ) from exc
+                raise
             pr_raw = r.json()
             pr_number = pr_raw["number"]
             # Apply labels via the issues endpoint (PRs share it). Skip
@@ -2344,7 +2364,14 @@ class GitHubProvider:
                 f"{_repo_path(project)}/issues/{pr_id}/comments",
                 json={"body": prefixed},
             )
-            _check(r)
+            try:
+                _check(r)
+            except GitHubError as exc:
+                if exc.status == 404:
+                    raise GitHubError(
+                        404, f"PR '{project.id}#{pr_id}' not found"
+                    ) from exc
+                raise
             return _map_comment(r.json())
 
     def list_pr_review_comments(
@@ -2474,6 +2501,10 @@ class GitHubProvider:
             try:
                 _check(r)
             except GitHubError as exc:
+                if exc.status == 404:
+                    raise GitHubError(
+                        404, f"PR '{project.id}#{pr_id}' not found"
+                    ) from exc
                 if exc.status == 422 and "can not approve your own pull request" in exc.message.lower():
                     raise GitHubError(
                         422,

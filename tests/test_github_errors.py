@@ -112,7 +112,7 @@ def test_update_comment_404_names_comment(monkeypatch: pytest.MonkeyPatch) -> No
             _project(), token="t", comment_id="99", body="x",
         )
     assert exc.value.status == 404
-    assert "comment 'acme#99' not found" in exc.value.message
+    assert "comment '99' not found in acme" in exc.value.message
 
 
 # ---------- Issue #17 defect 6: add_pr_review_comment 422 names params -------
@@ -258,7 +258,7 @@ def test_create_pr_reviewer_500_propagates(
 def test_create_pr_primary_failure_propagates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """create_pr with a 422 on the primary POST /pulls must raise GitHubError."""
+    """create_pr with a head-branch 422 names the branch and gives a push hint."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
@@ -285,6 +285,8 @@ def test_create_pr_primary_failure_propagates(
             base="main",
         )
     assert exc.value.status == 422
+    assert "nonexistent" in exc.value.message
+    assert "push it first" in exc.value.message
 
 
 # ---------- Case 4: no duplicated provider prefix in error messages ----------
@@ -361,3 +363,117 @@ def test_submit_pr_review_other_422_not_modified(
         )
     assert exc.value.status == 422
     assert "GitHub platform restriction" not in exc.value.message
+
+
+# ---------- Ticket #38 regression tests: error-message contract fixes ---------
+
+
+def test_get_ticket_404_names_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_ticket on a missing ticket wraps the 404 with the resource id."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().get_ticket(_project(), token="t", ticket_id="7")
+    assert exc.value.status == 404
+    assert "ticket 'acme#7' not found" in exc.value.message
+
+
+def test_add_pr_comment_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """add_pr_comment on a missing PR wraps the 404 with the resource id."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_pr_comment(
+            _project(), token="t", pr_id="55", body="hi",
+        )
+    assert exc.value.status == 404
+    assert "PR 'acme#55' not found" in exc.value.message
+
+
+def test_submit_pr_review_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """submit_pr_review on a missing PR wraps the 404 with the resource id."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "/reviews" in req.url.path:
+            return _json({"message": "Not Found"}, status_code=404)
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().submit_pr_review(
+            _project(), token="t", pr_id="7", state="approve",
+        )
+    assert exc.value.status == 404
+    assert "PR 'acme#7' not found" in exc.value.message
+
+
+def test_create_pr_head_branch_missing_422_names_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_pr 422 with PullRequest.head invalid payload names the head branch."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/labels" in path and req.method == "GET":
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if path.endswith("/pulls") and req.method == "POST":
+            return _json(
+                {
+                    "message": "Validation Failed",
+                    "errors": [
+                        {"resource": "PullRequest", "field": "head", "code": "invalid"}
+                    ],
+                },
+                status_code=422,
+            )
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().create_pr(
+            _project(),
+            token="t",
+            title="Test PR",
+            body="Description.",
+            head="my-feature",
+            base="main",
+        )
+    assert exc.value.status == 422
+    assert "my-feature" in exc.value.message
+    assert "push it first" in exc.value.message
+
+
+def test_create_pr_non_head_422_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_pr 422 that is NOT about the head branch propagates without enrichment."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/labels" in path and req.method == "GET":
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if path.endswith("/pulls") and req.method == "POST":
+            return _json(
+                {"message": "a pull request already exists for this branch"},
+                status_code=422,
+            )
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().create_pr(
+            _project(),
+            token="t",
+            title="Dup PR",
+            body="Description.",
+            head="feature",
+            base="main",
+        )
+    assert exc.value.status == 422
+    assert "push it first" not in exc.value.message
