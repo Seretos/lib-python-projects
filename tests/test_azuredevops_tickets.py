@@ -913,6 +913,53 @@ def test_list_comments_respects_order_desc(
     assert truncated is False
 
 
+def test_list_comments_desc_multi_page_returns_newest_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """desc + limit=2 across two pages must return the two NEWEST comments,
+    newest first — not the oldest two reversed.
+
+    Page 1 (via continuationToken=None): comments 1 and 2 (oldest).
+    Page 2 (via continuationToken='tok2'): comment 3 (newest).
+    Expected result: [comment 3, comment 2] (ids "3", "2").
+    """
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/wit/workItems/5/comments"):
+            ct = req.url.params.get("continuationToken")
+            if not ct:
+                return _json({
+                    "comments": [
+                        {
+                            "id": 1, "createdBy": {"displayName": "A"},
+                            "text": "<p>oldest</p>", "createdDate": "2026-05-18T09:00:00Z",
+                        },
+                        {
+                            "id": 2, "createdBy": {"displayName": "B"},
+                            "text": "<p>middle</p>", "createdDate": "2026-05-18T10:00:00Z",
+                        },
+                    ],
+                    "continuationToken": "tok2",
+                })
+            if ct == "tok2":
+                return _json({
+                    "comments": [
+                        {
+                            "id": 3, "createdBy": {"displayName": "C"},
+                            "text": "<p>newest</p>", "createdDate": "2026-05-18T11:00:00Z",
+                        },
+                    ],
+                    "continuationToken": None,
+                })
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    comments, truncated = AzureDevOpsProvider().list_comments(
+        _project(), token="t", ticket_id="5", limit=2, order="desc"
+    )
+    assert [c.id for c in comments] == ["3", "2"]
+    assert truncated is False
+
+
 def test_update_comment_requires_ticket_id() -> None:
     from lib_python_projects.providers.azuredevops import AzureDevOpsError
 

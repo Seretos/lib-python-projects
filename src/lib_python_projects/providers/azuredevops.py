@@ -2020,6 +2020,35 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         )
         per_page = max(1, min(limit, 200))
         skip = max(0, (page - 1) * per_page)
+
+        if order == "desc":
+            # Drain ALL pages first (newest is at the end when the API
+            # returns ascending order), then reverse and slice to limit.
+            all_comments: list[Comment] = []
+            params_desc: dict[str, Any] = _api_version_params(
+                {"api-version": API_VERSION_COMMENTS, "$top": 200, "order": "asc"}
+            )
+            continuation_desc: str | None = None
+            with _client(project, token) as c:
+                while True:
+                    if continuation_desc:
+                        params_desc["continuationToken"] = continuation_desc
+                    resp = c.get(path, params=params_desc)
+                    _check(resp)
+                    payload = resp.json()
+                    for raw in payload.get("comments") or []:
+                        comment = _map_work_item_comment(raw, project, str(ticket_id))
+                        if since and comment.created_at and comment.created_at < since:
+                            continue
+                        all_comments.append(comment)
+                    continuation_desc = payload.get("continuationToken")
+                    if not continuation_desc:
+                        break
+            all_comments.reverse()
+            # Apply page-based skip (rarely used in desc, but keep consistent).
+            all_comments = all_comments[skip:]
+            return all_comments[:limit], False
+
         collected: list[Comment] = []
         truncated = False
         params: dict[str, Any] = _api_version_params(
@@ -2049,8 +2078,6 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                 if not continuation or len(collected) >= per_page:
                     truncated = bool(continuation) and len(collected) >= per_page
                     break
-        if order == "desc":
-            collected.reverse()
         return collected, truncated
 
     def get_comment(
