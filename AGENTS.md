@@ -41,3 +41,29 @@ do those phases by hand on the main thread — let the skill drive them.
   exist and that you are inside them.
 - **AI attribution:** The project-issues MCP automatically prefixes every
   comment and PR body with `#ai-generated`. Never type that prefix yourself.
+
+## Downstream dependency notifications
+
+After every release, `release.yml` automatically opens a
+`chore(deps): bump lib-python-projects to vX.Y.Z` issue in
+`Seretos/agent-project-issues` via the `PROJECTS_TICKET_TOKEN` repo secret.
+The step is `continue-on-error: true` so a missing or invalid token never
+blocks the release itself.
+
+**If the automatic step was skipped or failed**, re-file manually by running
+the `open-dep-ticket` workflow (`.github/workflows/ticket.yml`) via
+"Run workflow" in GitHub Actions. Supply:
+
+- `version` — the semver string (no leading `v`), e.g. `0.2.0`.
+- `consumers` — space-separated list of `owner/repo` targets to file in
+  (default: `Seretos/agent-project-issues`).
+
+The workflow is idempotent: it checks for an open issue with the exact same
+title before creating one, so running it twice is safe.
+
+**Human prerequisite — `PROJECTS_TICKET_TOKEN`:**
+This must be a repository secret (Settings → Secrets → Actions) containing a
+fine-grained or classic PAT with **Issues: write** permission on each consumer
+repo listed above. `GITHUB_TOKEN` cannot open cross-repo issues.
+Creating/rotating this token is a human task that must be done once before the
+first release.
