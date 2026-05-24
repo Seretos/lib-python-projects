@@ -787,6 +787,40 @@ def test_merge_pr_stuck_in_progress_raises_202(
     assert "in progress" in str(exc.value).lower()
 
 
+def test_merge_pr_already_merged_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Initial GET shows status=completed + mergeStatus=succeeded →
+    raise AzureDevOpsError(405, '... already merged') before the PATCH."""
+    patch_called = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7, status="completed", mergeStatus="succeeded"
+            ))
+        if req.method == "PATCH":
+            patch_called.append(True)
+            return _json(_pr_payload(7))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().merge_pr(
+            _project(), token="t", pr_id="7", merge_method="merge"
+        )
+    assert exc.value.status == 405
+    assert "already merged" in exc.value.message
+    # PATCH must never be issued.
+    assert not patch_called
+
+
 def test_add_pr_review_comment_rejects_line_outside_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -113,6 +113,9 @@ def test_add_relation_emits_json_patch(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
+        # Pre-flight GET: returns empty relations so the duplicate check passes.
+        if req.method == "GET" and "/workitems/5" in req.url.path:
+            return _json({"id": 5, "relations": []})
         if req.method == "PATCH" and "/workitems/5" in req.url.path:
             captured["patch"] = json.loads(req.content.decode("utf-8"))
             assert req.headers.get("Content-Type") == "application/json-patch+json"
@@ -151,6 +154,8 @@ def test_add_relation_emits_json_patch(monkeypatch: pytest.MonkeyPatch) -> None:
     # Title + state now populated via the batch lookup.
     assert rel.title == "target 9"
     assert rel.state == "Active"
+    # resolved=True: add_relation responses are built from live API data.
+    assert rel.resolved is True
 
 
 def test_add_relation_unsupported_kind_raises() -> None:
@@ -208,6 +213,7 @@ def test_remove_relation_finds_index_and_emits_remove(
         _project(), token="t", ticket_id="5", kind="child", target="9"
     )
     assert result["removed"] is True
+    assert set(result.keys()) == {"removed"}
     op = captured["patch"][0]
     assert op["op"] == "remove"
     # Index 1 in the relations array.
@@ -240,6 +246,89 @@ def test_remove_relation_not_found_raises_lookup_error(
     assert "child" in msg
     assert "#5" in msg
     assert "#9" in msg
+
+
+# ---------- add_relation duplicate guard (Issue 5) --------------------------
+
+
+def test_add_relation_duplicate_raises_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-flight GET finds a matching relation → 409, PATCH never issued."""
+    patch_called = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and "/workitems/5" in req.url.path:
+            return _json({
+                "id": 5,
+                "relations": [
+                    {
+                        "rel": "System.LinkTypes.Hierarchy-Forward",
+                        "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
+                    },
+                ],
+            })
+        if req.method == "PATCH":
+            patch_called.append(True)
+            return _json({"id": 5})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().add_relation(
+            _project(), token="t", ticket_id="5", kind="child", target="9"
+        )
+    assert exc.value.status == 409
+    assert "already exists" in exc.value.message
+    # PATCH must never be issued when duplicate is found.
+    assert not patch_called
+
+
+def test_add_relation_no_duplicate_proceeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-flight GET shows a non-matching relation → PATCH fires, Relation returned."""
+    patch_count = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and "/workitems/5" in req.url.path:
+            return _json({
+                "id": 5,
+                "relations": [
+                    {
+                        # Different rel type — not a match.
+                        "rel": "System.LinkTypes.Hierarchy-Reverse",
+                        "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
+                    },
+                ],
+            })
+        if req.method == "PATCH" and "/workitems/5" in req.url.path:
+            patch_count.append(True)
+            return _json({"id": 5})
+        if req.url.path.endswith("/_apis/wit/workitemsbatch"):
+            ids = json.loads(req.content.decode("utf-8"))["ids"]
+            return _json({
+                "value": [
+                    {
+                        "id": wid,
+                        "fields": {
+                            "System.Title": f"target {wid}",
+                            "System.State": "Active",
+                        },
+                    }
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    rel = AzureDevOpsProvider().add_relation(
+        _project(), token="t", ticket_id="5", kind="child", target="9"
+    )
+    # PATCH fired exactly once.
+    assert len(patch_count) == 1
+    assert rel.kind == "child"
+    assert rel.ticket_id == "#9"
 
 
 # ---------- pipelines -------------------------------------------------------

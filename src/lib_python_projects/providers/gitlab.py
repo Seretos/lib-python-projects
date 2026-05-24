@@ -394,6 +394,13 @@ def _map_mr(
     we fall back to whatever (usually `None`) the MR root happened to
     carry and leave `review_decision` at the dataclass default of
     `None`.
+
+    Note on `diff_refs` / `base.sha` (Issue 7):
+      GitLab only populates `diff_refs` (which carries `base_sha`) on MR
+      payloads that have been through at least one pipeline or diff
+      computation. On freshly-created MR payloads (e.g. the response from
+      `create_pr`) `diff_refs` is absent and therefore `base.sha` is
+      `""`. The field is reliably populated on a subsequent `get_pr` call.
     """
     state = raw.get("state", "opened")
     status: str = _normalise_gl_state(state) or "closed"
@@ -640,17 +647,26 @@ def _gitlab_post_issue_link(
     )
     _check(r)
     raw = r.json()
-    # Response carries the *target* issue payload nested. The shape is
-    # documented as a "single issue link" wrapping target_issue fields
-    # at top level — best-effort map back to a Relation.
-    target_url = raw.get("web_url") or raw.get("target_web_url") or ""
+    # The POST /issues/:iid/links response wraps the target issue inside
+    # a "target_issue" key: {"source_issue": {...}, "target_issue": {...}}.
+    # Read from that nested dict; fall back to top-level for compatibility
+    # with older GitLab versions that may return the flat shape.
+    target = raw.get("target_issue") or raw
+    target_url = (
+        target.get("web_url")
+        or target.get("target_web_url")
+        or raw.get("web_url")
+        or raw.get("target_web_url")
+        or ""
+    )
     return Relation(
         kind=relation_kind_for_caller,
         ticket_id=f"#{target_issue_iid}",
-        title=raw.get("title") or "",
+        title=target.get("title") or "",
         url=_canonical_url(target_url, project),
-        state=raw.get("state") or "",
+        state=_normalise_gl_state(target.get("state") or ""),
         is_pull_request=False,
+        resolved=True,
     )
 
 

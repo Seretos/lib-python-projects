@@ -536,3 +536,52 @@ def test_gitlab_relation_state_never_raw_opened(monkeypatch):
             f"raw 'opened' leaked through as relation.state — must be 'open'"
         )
         assert rel.state == "open"
+
+
+# ---------- Issue 2: GitLab add_relation returns populated Relation ----------
+
+
+def test_gitlab_add_relation_relates_to_returns_populated_relation(monkeypatch):
+    """POST /issues/:iid/links returns a nested shape:
+    {"source_issue": {...}, "target_issue": {"iid":N,"title":"...","state":"opened","web_url":"..."}}.
+    The provider must read title/state/url from target_issue, normalise the
+    state, build a canonical URL, and set resolved=True.
+    """
+    captured: dict = {}
+
+    def handler(req):
+        # Project numeric-id resolver (called before the POST).
+        if req.method == "GET" and req.url.path.endswith(
+            "/projects/seredos%2Fgitlab-tests"
+        ) or (req.method == "GET" and "/api/v4/projects/Seredos" in req.url.path):
+            return _resp({"id": 99, "path_with_namespace": "seredos/gitlab-tests"})
+        if req.method == "GET" and "/api/v4/projects/" in req.url.path and "/issues" not in req.url.path:
+            return _resp({"id": 99, "path_with_namespace": "seredos/gitlab-tests"})
+        if req.method == "POST" and "/issues/5/links" in req.url.path:
+            captured["body"] = json.loads(req.content.decode())
+            # The real GitLab shape for this endpoint.
+            return _resp({
+                "source_issue": {
+                    "iid": 5,
+                    "title": "Source issue",
+                    "state": "opened",
+                    "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/5",
+                },
+                "target_issue": {
+                    "iid": 7,
+                    "title": "Target issue",
+                    "state": "opened",
+                    "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/7",
+                },
+            })
+        return _resp({}, status_code=404)
+
+    _install_gitlab_mock(monkeypatch, handler)
+    rel = GitLabProvider().add_relation(
+        _gitlab_project(), "tok", "5", "relates_to", "#7",
+    )
+    assert rel.title == "Target issue"
+    assert rel.state == "open"   # normalised from "opened"
+    assert rel.url != ""
+    assert "issues/7" in rel.url
+    assert rel.resolved is True
