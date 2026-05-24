@@ -197,6 +197,49 @@ class RelationKindUnsupported(NotImplementedError):
         )
 
 
+class LabelOperationUnsupported(NotImplementedError):
+    """Raised by a provider when a label mutating operation is called but
+    the provider cannot model that operation natively.
+
+    Carries `operation` and `provider` string attributes so the agent can
+    branch on the failure without parsing the message text. Subclass of
+    `NotImplementedError` so the generic `_safe` wrapper in
+    `tools/_providers.py` translates it to `{"error": "..."}` without
+    further plumbing.
+
+    Azure DevOps uses implicit tags with no create/rename/delete API, so
+    `create_label`, `update_label`, and `delete_label` all raise this
+    exception on that provider.
+    """
+
+    def __init__(self, operation: str, provider: str) -> None:
+        self.operation = operation
+        self.provider = provider
+        super().__init__(
+            f"label operation {operation!r} is not supported on provider "
+            f"{provider!r}"
+        )
+
+
+@dataclass
+class Label:
+    """A repository label (tag) as returned by the provider API.
+
+    `name` is the label's display name. `color` is the provider-native
+    colour string — for GitHub a 6-hex string without `#` (e.g.
+    ``"ededed"``), for GitLab a `#RRGGBB` string (e.g. ``"#ededed"``).
+    Azure DevOps tags have no colour concept so `color` is always ``""``.
+
+    `description` is an optional human-readable summary. Fields default
+    to ``""`` so callers that receive partial payloads (Azure DevOps) can
+    construct the object without conditional guards.
+    """
+
+    name: str = ""
+    color: str = ""
+    description: str = ""
+
+
 @dataclass
 class Relation:
     """A typed link between this ticket and another ticket / PR.

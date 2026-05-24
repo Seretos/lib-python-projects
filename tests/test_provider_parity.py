@@ -768,3 +768,61 @@ def test_gitlab_comment_updated_at_populated(monkeypatch):
         _gitlab_project(), "tok", "3", include_relations=False,
     )
     assert comments[0].updated_at == "2026-05-21T11:30:45Z"
+
+
+# ---------- ticket #35: label management cross-provider parity ---------------
+
+
+def test_all_providers_expose_label_methods():
+    """All three providers must expose the four label management methods
+    as callables. This is a static structural assertion."""
+    from lib_python_projects.providers.github import GitHubProvider
+    from lib_python_projects.providers.gitlab import GitLabProvider
+    from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+
+    label_methods = ("list_labels", "create_label", "update_label", "delete_label")
+    for provider_cls in (GitHubProvider, GitLabProvider, AzureDevOpsProvider):
+        for method_name in label_methods:
+            assert callable(getattr(provider_cls, method_name, None)), (
+                f"{provider_cls.__name__} is missing callable {method_name!r}"
+            )
+
+
+# ---------- ticket #35: Label dataclass and LabelOperationUnsupported --------
+
+
+def test_label_dataclass_fields():
+    """Label has name, color, description fields via dataclasses.fields."""
+    import dataclasses
+    from lib_python_projects.providers.base import Label
+
+    field_names = {f.name for f in dataclasses.fields(Label)}
+    assert "name" in field_names
+    assert "color" in field_names
+    assert "description" in field_names
+
+
+def test_label_dataclass_defaults():
+    """Label fields all default to empty string."""
+    from lib_python_projects.providers.base import Label
+
+    lbl = Label()
+    assert lbl.name == ""
+    assert lbl.color == ""
+    assert lbl.description == ""
+
+
+def test_label_operation_unsupported_carries_operation_and_provider():
+    """LabelOperationUnsupported attributes survive construction."""
+    from lib_python_projects.providers.base import LabelOperationUnsupported
+
+    exc = LabelOperationUnsupported("create_label", "azuredevops")
+    assert exc.operation == "create_label"
+    assert exc.provider == "azuredevops"
+
+
+def test_label_operation_unsupported_is_not_implemented_error():
+    """LabelOperationUnsupported is a NotImplementedError subclass."""
+    from lib_python_projects.providers.base import LabelOperationUnsupported
+
+    assert issubclass(LabelOperationUnsupported, NotImplementedError)

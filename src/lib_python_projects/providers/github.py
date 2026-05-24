@@ -24,6 +24,7 @@ from lib_python_projects.markers import (
 from lib_python_projects.providers.base import (
     Comment,
     FailingJob,
+    Label,
     normalize_timestamp,
     PipelineFailure,
     PipelineRun,
@@ -3024,6 +3025,146 @@ class GitHubProvider:
             ):
                 run.failure = _get_failure_excerpt(client, project, token, run_id)
             return run
+
+    # ---------- label management ---------------------------------------------
+
+    def list_labels(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+    ) -> list[Label]:
+        """List all labels on the repository.
+
+        Uses `GET /repos/{owner}/{repo}/labels` with `per_page=100`.
+        Returns one page (up to 100 labels). GitHub returns `color` as a
+        6-hex string without `#` (e.g. ``"ededed"``); passed through as-is.
+        """
+        with _client(token) as client:
+            r = client.get(
+                f"{_repo_path(project)}/labels",
+                params={"per_page": 100},
+            )
+            _check(r)
+            return [
+                Label(
+                    name=item.get("name") or "",
+                    color=item.get("color") or "",
+                    description=item.get("description") or "",
+                )
+                for item in r.json()
+            ]
+
+    def create_label(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        name: str,
+        color: str | None = None,
+        description: str | None = None,
+    ) -> Label:
+        """Create a new label on the repository.
+
+        Unlike the internal `_ensure_label` helper (which silently ignores
+        422-already-exists), this public surface raises `GitHubError(422,
+        …)` when the label already exists so callers get an explicit signal.
+
+        For 422 responses, only the ``already_exists`` error code triggers
+        the human-readable "already exists" message. Other 422 validation
+        errors (e.g. invalid color) fall through to `_check(r)` so the
+        original GitHub error text surfaces accurately.
+
+        `color` is a 6-hex string without `#` (e.g. ``"ededed"``).
+        Defaults to ``"ededed"`` when not supplied.
+        """
+        payload: dict[str, Any] = {
+            "name": name,
+            "color": color if color is not None else "ededed",
+        }
+        if description is not None:
+            payload["description"] = description
+        with _client(token) as client:
+            r = client.post(f"{_repo_path(project)}/labels", json=payload)
+            if r.status_code == 422:
+                try:
+                    err_code = r.json().get("errors", [{}])[0].get("code")
+                except Exception:
+                    err_code = None
+                if err_code == "already_exists":
+                    raise GitHubError(
+                        422,
+                        f"label {name!r} already exists in {project.id}",
+                    )
+                # Non-conflict 422 (e.g. invalid color) — surface GitHub's own message.
+                _check(r)
+            _check(r)
+            raw = r.json()
+            return Label(
+                name=raw.get("name") or "",
+                color=raw.get("color") or "",
+                description=raw.get("description") or "",
+            )
+
+    def update_label(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        name: str,
+        new_name: str | None = None,
+        color: str | None = None,
+        description: str | None = None,
+    ) -> Label:
+        """Rename / recolour / redescribe an existing label.
+
+        At least one of `new_name`, `color`, or `description` must be
+        supplied; passing none raises `ValueError` without any HTTP call.
+
+        Uses `PATCH /repos/{owner}/{repo}/labels/{name}`.
+        404 → `GitHubError(404, "label '{name}' not found in {project.id}")`.
+        """
+        if new_name is None and color is None and description is None:
+            raise ValueError(
+                "update_label requires at least one of: new_name, color, description"
+            )
+        payload: dict[str, Any] = {}
+        if new_name is not None:
+            payload["new_name"] = new_name
+        if color is not None:
+            payload["color"] = color
+        if description is not None:
+            payload["description"] = description
+        with _client(token) as client:
+            r = client.patch(
+                f"{_repo_path(project)}/labels/{name}",
+                json=payload,
+            )
+            if r.status_code == 404:
+                raise GitHubError(404, f"label {name!r} not found in {project.id}")
+            _check(r)
+            raw = r.json()
+            return Label(
+                name=raw.get("name") or "",
+                color=raw.get("color") or "",
+                description=raw.get("description") or "",
+            )
+
+    def delete_label(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        name: str,
+    ) -> None:
+        """Delete a label from the repository.
+
+        Uses `DELETE /repos/{owner}/{repo}/labels/{name}`.
+        GitHub returns 204 on success.
+        404 → `GitHubError(404, "label '{name}' not found in {project.id}")`.
+        """
+        with _client(token) as client:
+            r = client.delete(f"{_repo_path(project)}/labels/{name}")
+            if r.status_code == 404:
+                raise GitHubError(404, f"label {name!r} not found in {project.id}")
+            _check(r)
+        return None
 
 
 # ---------- pipeline helpers (module-level so providers can reuse) ----------

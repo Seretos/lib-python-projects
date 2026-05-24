@@ -47,6 +47,7 @@ from lib_python_projects.markers import (
 from lib_python_projects.providers.base import (
     Comment,
     FailingJob,
+    Label,
     normalize_timestamp,
     PipelineFailure,
     PipelineRun,
@@ -2857,6 +2858,155 @@ class GitLabProvider(TokenCapabilityProvider):
                     client, project, run_id,
                 )
         return run
+
+    # ---------- label management ---------------------------------------------
+
+    def list_labels(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+    ) -> list[Label]:
+        """List all labels on the project.
+
+        Uses `GET /projects/{id}/labels` with `per_page=100`.
+        GitLab returns `color` as `#RRGGBB`; passed through as-is.
+        """
+        path = _project_path(project)
+        with _client(project, token) as client:
+            r = client.get(
+                f"/projects/{path}/labels",
+                params={"per_page": 100},
+            )
+            _check(r)
+            return [
+                Label(
+                    name=item.get("name") or "",
+                    color=item.get("color") or "",
+                    description=item.get("description") or "",
+                )
+                for item in r.json()
+            ]
+
+    def create_label(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        name: str,
+        color: str | None = None,
+        description: str | None = None,
+    ) -> Label:
+        """Create a new label on the project.
+
+        `color` is a `#RRGGBB` string. If the caller passes a bare 6-hex
+        string without `#`, this method prefixes it automatically.
+        Defaults to ``"#ededed"`` when `color` is ``None``.
+
+        409 conflict → `GitLabError(409, "label '{name}' already exists")`.
+        """
+        payload: dict[str, Any] = {
+            "name": name,
+            "color": _normalize_gitlab_color(color),
+        }
+        if description is not None:
+            payload["description"] = description
+        path = _project_path(project)
+        with _client(project, token) as client:
+            r = client.post(f"/projects/{path}/labels", json=payload)
+        if r.status_code == 409:
+            raise GitLabError(409, f"label {name!r} already exists")
+        _check(r)
+        raw = r.json()
+        return Label(
+            name=raw.get("name") or "",
+            color=raw.get("color") or "",
+            description=raw.get("description") or "",
+        )
+
+    def update_label(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        name: str,
+        new_name: str | None = None,
+        color: str | None = None,
+        description: str | None = None,
+    ) -> Label:
+        """Rename / recolour / redescribe an existing label.
+
+        At least one of `new_name`, `color`, or `description` must be
+        supplied; passing none raises `ValueError` without any HTTP call.
+
+        Uses `PUT /projects/{id}/labels/{name}` (GitLab 14+).
+        Color normalization same as `create_label`.
+        404 → `GitLabError(404, "label '{name}' not found in {project.id}")`.
+        """
+        if new_name is None and color is None and description is None:
+            raise ValueError(
+                "update_label requires at least one of: new_name, color, description"
+            )
+        payload: dict[str, Any] = {}
+        if new_name is not None:
+            payload["new_name"] = new_name
+        if color is not None:
+            payload["color"] = _normalize_gitlab_color(color)
+        if description is not None:
+            payload["description"] = description
+        path = _project_path(project)
+        with _client(project, token) as client:
+            r = client.put(
+                f"/projects/{path}/labels/{name}",
+                json=payload,
+            )
+        if r.status_code == 404:
+            raise GitLabError(404, f"label {name!r} not found in {project.id}")
+        _check(r)
+        raw = r.json()
+        return Label(
+            name=raw.get("name") or "",
+            color=raw.get("color") or "",
+            description=raw.get("description") or "",
+        )
+
+    def delete_label(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        name: str,
+    ) -> None:
+        """Delete a label from the project.
+
+        Uses `DELETE /projects/{id}/labels?name={name}`.
+        GitLab returns 204 on success.
+        404 → `GitLabError(404, "label '{name}' not found in {project.id}")`.
+
+        Note: The GitLab REST API does NOT support the label name as a
+        path segment for DELETE. The name must be passed as a query
+        parameter: `DELETE /projects/{id}/labels?name={name}`.
+        """
+        path = _project_path(project)
+        with _client(project, token) as client:
+            r = client.delete(f"/projects/{path}/labels", params={"name": name})
+        if r.status_code == 404:
+            raise GitLabError(404, f"label {name!r} not found in {project.id}")
+        _check(r)
+        return None
+
+
+# ---------- module-level helpers ---------------------------------------------
+
+
+def _normalize_gitlab_color(color: str | None) -> str:
+    """Normalise a GitLab label colour to the required `#RRGGBB` form.
+
+    - ``None``         → ``"#ededed"`` (default colour)
+    - ``"ff0000"``     → ``"#ff0000"`` (bare hex → prefixed)
+    - ``"#ff0000"``    → ``"#ff0000"`` (already correct, unchanged)
+    """
+    if not color:
+        return "#ededed"
+    if not color.startswith("#"):
+        return f"#{color}"
+    return color
 
 
 __all__ = [
