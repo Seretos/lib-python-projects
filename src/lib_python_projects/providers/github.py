@@ -42,6 +42,7 @@ from lib_python_projects.providers.base import (
     TicketFilters,
     TokenCapabilities,
     _assert_not_self_relation,
+    _validate_label_lists,
     _validate_limit,
 )
 
@@ -1682,6 +1683,7 @@ class GitHubProvider:
         assignees_add: list[str] | None = None,
         assignees_remove: list[str] | None = None,
     ) -> Ticket:
+        _validate_label_lists(labels_add, labels_remove)
         with _client(token) as client:
             r0 = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
             try:
@@ -2245,6 +2247,7 @@ class GitHubProvider:
         Applies the `ai-modified` label (mirroring `update_ticket`) when
         the PR wasn't originally created by us.
         """
+        _validate_label_lists(labels_add, labels_remove)
         with _client(token) as client:
             r0 = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
             _check(r0)

@@ -66,6 +66,7 @@ from lib_python_projects.providers.base import (
     TokenCapabilities,
     TokenCapabilityProvider,
     _assert_not_self_relation,
+    _validate_label_lists,
     _validate_limit,
 )
 
@@ -1525,6 +1526,7 @@ class GitLabProvider(TokenCapabilityProvider):
         `ai-generated` originally — same heuristic as the GitHub
         provider but implemented with the GitLab params.
         """
+        _validate_label_lists(labels_add, labels_remove)
         path = _project_path(project)
         with _client(project, token) as client:
             # Always fetch current — needed for the ai-modified marker
@@ -2057,6 +2059,7 @@ class GitLabProvider(TokenCapabilityProvider):
                 f"unsupported PR status {status!r} — use merge_pr() to "
                 f"merge; accepted: open, closed"
             )
+        _validate_label_lists(labels_add, labels_remove)
         with _client(project, token) as client:
             r0 = client.get(f"/projects/{path}/merge_requests/{pr_id}")
             _check(r0)

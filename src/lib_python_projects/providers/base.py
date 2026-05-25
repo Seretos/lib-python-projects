@@ -292,6 +292,18 @@ def _validate_limit(limit: int, name: str = "limit") -> None:
         raise ValueError(f"{name} must be a positive integer, got {limit!r}")
 
 
+def _validate_label_lists(
+    labels_add: list[str] | None,
+    labels_remove: list[str] | None,
+) -> None:
+    """Raise ValueError if the same label appears in both lists."""
+    conflict = set(labels_add or []) & set(labels_remove or [])
+    if conflict:
+        raise ValueError(
+            f"labels_add and labels_remove overlap — conflicting labels: {sorted(conflict)}"
+        )
+
+
 PRStatus = Literal["open", "closed", "merged"]
 PRListStatus = Literal["open", "closed", "any"]
 
