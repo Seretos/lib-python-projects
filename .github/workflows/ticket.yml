@@ -30,34 +30,35 @@ jobs:
     steps:
       - name: Open dependency-update ticket in each consumer
         shell: bash
+        # TITLE/BODY live in env (not a run-block heredoc): a heredoc body at
+        # column 0 dedents out of the YAML block scalar and breaks the file.
+        # A YAML block scalar holds the markdown verbatim and ${{ }} still
+        # expands. Bash just references "$TITLE"/"$BODY".
         env:
           GH_TOKEN: ${{ secrets.PROJECTS_TICKET_TOKEN }}
           CONSUMERS: ${{ inputs.consumers }}
           VERSION: ${{ inputs.version }}
+          TITLE: "chore(deps): bump lib-python-projects to v${{ inputs.version }}"
+          BODY: |
+            ## Dependency update
+
+            A new release of **lib-python-projects** has been published: `v${{ inputs.version }}`.
+
+            ### Action required
+
+            1. Update the pin in `pyproject.toml` to:
+               ```
+               lib-python-projects @ git+https://github.com/Seretos/lib-python-projects@v${{ inputs.version }}
+               ```
+            2. Run `pwsh scripts/test.ps1` to verify the test suite passes.
+            3. Run `pwsh scripts/build.ps1` to confirm the build succeeds.
+            4. Commit and open a PR.
         run: |
           # Validate version is semver without a leading 'v'.
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
             echo "ERROR: version must be semver without a leading 'v' (e.g. 0.2.0), got: $VERSION"
             exit 1
           fi
-
-          TITLE="chore(deps): bump lib-python-projects to v${VERSION}"
-          BODY=$(cat <<EOF
-## Dependency update
-
-A new release of **lib-python-projects** has been published: \`v${VERSION}\`.
-
-### Action required
-
-1. Update the pin in \`pyproject.toml\` to:
-   \`\`\`
-   lib-python-projects @ git+https://github.com/Seretos/lib-python-projects@v${VERSION}
-   \`\`\`
-2. Run \`pwsh scripts/test.ps1\` to verify the test suite passes.
-3. Run \`pwsh scripts/build.ps1\` to confirm the build succeeds.
-4. Commit and open a PR.
-EOF
-)
 
           for CONSUMER in $CONSUMERS; do
             echo "Processing consumer: ${CONSUMER}"
