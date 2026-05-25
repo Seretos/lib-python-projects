@@ -76,6 +76,7 @@ from lib_python_projects.providers.base import (
     WRITABLE_RELATION_KINDS,
     normalize_timestamp,
     _assert_not_self_relation,
+    _validate_label_lists,
     _validate_limit,
 )
 
@@ -1858,6 +1859,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         assignees_add: list[str] | None = None,
         assignees_remove: list[str] | None = None,
     ) -> Ticket:
+        _validate_label_lists(labels_add, labels_remove)
         _validate_int32_id(ticket_id, "ticket")
         # Read current work item (need tags + assignee for diff semantics).
         path = f"{_project_scope(project)}/_apis/wit/workitems/{quote(str(ticket_id), safe='')}"
@@ -2494,6 +2496,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         write — the returned `pr.updated_at` therefore reflects "this
         call mutated the PR" rather than ADO's persisted state.
         """
+        _validate_label_lists(labels_add, labels_remove)
         repo_id = self._resolve_repository_id(project, token)
         path = (
             f"{_project_scope(project)}/_apis/git/repositories/"
