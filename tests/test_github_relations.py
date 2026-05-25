@@ -1247,7 +1247,12 @@ def test_merge_pr_success_returns_merged_pr(
 ) -> None:
     """Happy path: PUT /pulls/7/merge returns 200, re-fetch returns merged PR.
     merge_pr must return a PullRequest with status='merged' and merged=True.
+
+    The handler returns merged=False for the pre-flight GET (ticket #56:
+    the pre-flight must see an open PR for the merge to proceed), then
+    merged=True for the re-fetch GET after the PUT succeeds.
     """
+    open_payload = _pr_payload(7)  # merged=False by default
     merged_payload = _pr_payload(
         7,
         state="closed",
@@ -1256,11 +1261,15 @@ def test_merge_pr_success_returns_merged_pr(
         merge_commit_sha="deadbeef",
     )
 
+    get_count: dict[str, int] = {"n": 0}
+
     def handler(req: httpx.Request) -> httpx.Response:
         if req.method == "PUT" and "/pulls/7/merge" in req.url.path:
             return _json({"sha": "deadbeef", "merged": True, "message": "Pull Request successfully merged"})
         if req.method == "GET" and "/pulls/7" in req.url.path:
-            return _json(merged_payload)
+            get_count["n"] += 1
+            # First GET is the pre-flight (not yet merged); second is the re-fetch.
+            return _json(open_payload if get_count["n"] == 1 else merged_payload)
         raise AssertionError(f"unexpected {req.method} {req.url.path}")
 
     _install_mock(monkeypatch, handler)

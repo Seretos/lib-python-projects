@@ -1339,6 +1339,32 @@ def _ensure_label_best_effort(
         return False
 
 
+def _assert_labels_exist(
+    client: httpx.Client, project: ProjectConfig, names: list[str]
+) -> None:
+    """Raise GitHubError(404) for any label name in *names* that does not
+    exist on the repo.
+
+    Uses ``GET /repos/{owner}/{repo}/labels/{name}`` (one call per name).
+    Internal AI-attribution labels (``ai-generated``, ``ai-modified``) are
+    excluded — they keep intentional best-effort auto-create via
+    ``_ensure_label_best_effort``.
+
+    404 → ``GitHubError(404, "label {name!r} does not exist in {project.id}")``.
+    Other non-2xx statuses go through ``_check`` as usual.
+    """
+    _ai_labels = {AI_GENERATED_LABEL, AI_MODIFIED_LABEL}
+    for name in names:
+        if name in _ai_labels:
+            continue
+        r = client.get(f"{_repo_path(project)}/labels/{name}")
+        if r.status_code == 404:
+            raise GitHubError(
+                404, f"label {name!r} does not exist in {project.id}"
+            )
+        _check(r)
+
+
 def _label_present(payload: dict, name: str) -> bool:
     """True iff GitHub's response payload includes a label named `name`.
 
@@ -1627,6 +1653,7 @@ class GitHubProvider:
         # the POST commits an issue we'd then have to delete or close.
         patch_state, patch_state_reason = _split_github_status(status)
         with _client(token) as client:
+            _assert_labels_exist(client, project, labels)
             label_ok = _ensure_label_best_effort(
                 client, project, AI_GENERATED_LABEL
             )
@@ -1697,6 +1724,9 @@ class GitHubProvider:
             current = r0.json()
             current_labels = {lbl["name"] for lbl in (current.get("labels") or [])}
             current_assignees = {a["login"] for a in (current.get("assignees") or [])}
+
+            if labels_add:
+                _assert_labels_exist(client, project, labels_add)
 
             new_labels = set(current_labels)
             if labels_add:
@@ -2122,6 +2152,7 @@ class GitHubProvider:
         merged_labels = list(dict.fromkeys([*(labels or []), AI_GENERATED_LABEL]))
         prefixed_body = ensure_body_prefix(body)
         with _client(token) as client:
+            _assert_labels_exist(client, project, labels or [])
             label_ok = _ensure_label_best_effort(
                 client, project, AI_GENERATED_LABEL
             )
@@ -2254,6 +2285,9 @@ class GitHubProvider:
             current = r0.json()
             current_labels = {lbl["name"] for lbl in (current.get("labels") or [])}
             current_assignees = {a["login"] for a in (current.get("assignees") or [])}
+
+            if labels_add:
+                _assert_labels_exist(client, project, labels_add)
 
             new_labels = set(current_labels)
             if labels_add:
@@ -2580,6 +2614,15 @@ class GitHubProvider:
         if commit_message is not None:
             payload["commit_message"] = commit_message
         with _client(token) as client:
+            # Pre-flight: if the PR is already merged, raise before PUT so
+            # callers get a clear "already merged" error rather than a silent
+            # HTTP 200 that looks like a fresh merge.
+            preflight = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
+            _check(preflight)
+            if preflight.json().get("merged") is True:
+                raise GitHubError(
+                    405, f"PR '{project.id}#{pr_id}' is already merged"
+                )
             r = client.put(
                 f"{_repo_path(project)}/pulls/{pr_id}/merge", json=payload
             )

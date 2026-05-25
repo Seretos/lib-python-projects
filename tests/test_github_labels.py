@@ -308,3 +308,260 @@ def test_create_label_consistency_with_ensure_label(monkeypatch: pytest.MonkeyPa
     with pytest.raises(GitHubError) as exc:
         GitHubProvider().create_label(_project(), token="t", name="ai-generated")
     assert exc.value.status == 422
+
+
+# ---------- label existence validation (ticket #56) ---------------------------
+
+
+def _issue_payload(number: int = 1) -> dict:
+    """Minimal GitHub issue REST payload accepted by _map_issue."""
+    return {
+        "number": number,
+        "state": "open",
+        "title": "Test Issue",
+        "body": "<!-- #ai-generated -->\nDescription.",
+        "user": {"login": "bot"},
+        "assignees": [],
+        "labels": [],
+        "milestone": None,
+        "html_url": f"https://github.com/acme/backend/issues/{number}",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z",
+    }
+
+
+def _pr_payload(number: int = 42) -> dict:
+    """Minimal GitHub PR REST payload accepted by _map_pr."""
+    return {
+        "number": number,
+        "state": "open",
+        "title": "Test PR",
+        "body": "<!-- #ai-generated -->\nDescription.",
+        "user": {"login": "bot"},
+        "assignees": [],
+        "requested_reviewers": [],
+        "labels": [],
+        "head": {"ref": "feature", "sha": "abc", "repo": {"full_name": "acme/backend"}},
+        "base": {"ref": "main", "sha": "def"},
+        "draft": False,
+        "merged": False,
+        "mergeable": None,
+        "html_url": f"https://github.com/acme/backend/pull/{number}",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z",
+    }
+
+
+def test_create_ticket_unknown_label_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """create_ticket: label GET 404 → GitHubError(404), no POST to /issues."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        path = req.url.path
+        # Label validation GET for caller-supplied label → 404
+        if req.method == "GET" and path.endswith("/labels/typo-label"):
+            return _json({"message": "Not Found"}, status_code=404)
+        # ai-generated ensure (GET or POST)
+        if "/labels" in path and req.method in ("GET", "POST"):
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        # The POST to /issues must NOT be reached
+        if path.endswith("/issues") and req.method == "POST":
+            raise AssertionError("POST /issues should not be called")
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().create_ticket(
+            _project(), token="t",
+            title="T", body="B", labels=["typo-label"], assignees=[],
+        )
+    assert exc.value.status == 404
+    assert "typo-label" in exc.value.message
+    assert not any(
+        r.method == "POST" and r.url.path.endswith("/issues") for r in seen
+    ), "POST /issues must not be called when label validation fails"
+
+
+def test_create_ticket_known_label_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """create_ticket: label GET 200 → proceeds normally, returns Ticket."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Label validation GET or ai-generated ensure
+        if "/labels" in path and req.method in ("GET", "POST"):
+            return _json({"name": "bug", "color": "ee0701"})
+        if path.endswith("/issues") and req.method == "POST":
+            return _json(_issue_payload(7), status_code=201)
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    from lib_python_projects.providers.base import Ticket
+    ticket = GitHubProvider().create_ticket(
+        _project(), token="t",
+        title="T", body="B", labels=["bug"], assignees=[],
+    )
+    assert isinstance(ticket, Ticket)
+    assert ticket.id == "7"
+
+
+def test_create_ticket_empty_labels_no_validation_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_ticket with labels=[] makes no label-validation GET."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        path = req.url.path
+        # ai-generated ensure (POST is fine)
+        if "/labels" in path:
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if path.endswith("/issues") and req.method == "POST":
+            return _json(_issue_payload(3), status_code=201)
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().create_ticket(
+        _project(), token="t",
+        title="T", body="B", labels=[], assignees=[],
+    )
+    # Only the ai-generated ensure POST (or GET) is allowed — no per-label GET
+    label_gets = [
+        r for r in seen
+        if r.method == "GET" and "/labels/" in r.url.path
+        and "ai-generated" not in r.url.path
+    ]
+    assert label_gets == [], "empty labels list must not trigger validation calls"
+
+
+def test_update_ticket_labels_add_unknown_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_ticket: labels_add with unknown label 404s → raises, no PATCH."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        path = req.url.path
+        # Current-state GET
+        if req.method == "GET" and path.endswith("/issues/5"):
+            return _json(_issue_payload(5))
+        # Label validation GET → 404
+        if req.method == "GET" and path.endswith("/labels/typo-label"):
+            return _json({"message": "Not Found"}, status_code=404)
+        # PATCH must NOT be reached
+        if req.method == "PATCH" and "/issues/5" in path:
+            raise AssertionError("PATCH must not be called when label validation fails")
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().update_ticket(
+            _project(), token="t", ticket_id="5",
+            labels_add=["typo-label"],
+        )
+    assert exc.value.status == 404
+    assert "typo-label" in exc.value.message
+    assert not any(
+        r.method == "PATCH" and "/issues/5" in r.url.path for r in seen
+    )
+
+
+def test_update_ticket_ai_label_skips_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_ticket: labels_add=['ai-modified'] does NOT call GET /labels/ai-modified
+    (AI labels keep intentional best-effort auto-create)."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/5"):
+            return _json(_issue_payload(5))
+        # ai-modified ensure
+        if "/labels" in path and req.method == "POST":
+            return _json({"name": "ai-modified", "color": "ededed"})
+        if req.method == "PATCH" and "/issues/5" in path:
+            raw = _issue_payload(5)
+            raw["labels"] = [{"name": "ai-modified"}]
+            return _json(raw)
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().update_ticket(
+        _project(), token="t", ticket_id="5",
+        labels_add=["ai-modified"],
+    )
+    # Must NOT have called GET /labels/ai-modified as a validation step
+    validation_gets = [
+        r for r in seen
+        if r.method == "GET" and r.url.path.endswith("/labels/ai-modified")
+    ]
+    assert validation_gets == [], (
+        "GET /labels/ai-modified should be skipped — AI labels bypass validation"
+    )
+
+
+def test_create_pr_unknown_label_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """create_pr: unknown label 404 → GitHubError(404), no POST to /pulls."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        path = req.url.path
+        # Label validation GET for caller-supplied label → 404
+        if req.method == "GET" and path.endswith("/labels/typo-label"):
+            return _json({"message": "Not Found"}, status_code=404)
+        # ai-generated ensure
+        if "/labels" in path:
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        # POST /pulls must NOT be reached
+        if path.endswith("/pulls") and req.method == "POST":
+            raise AssertionError("POST /pulls should not be called")
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().create_pr(
+            _project(), token="t",
+            title="T", body="B", head="feature", base="main",
+            labels=["typo-label"],
+        )
+    assert exc.value.status == 404
+    assert "typo-label" in exc.value.message
+    assert not any(
+        r.method == "POST" and r.url.path.endswith("/pulls") for r in seen
+    )
+
+
+def test_update_pr_labels_add_unknown_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """update_pr: labels_add with unknown label 404s → raises before the PATCH."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        path = req.url.path
+        # Current-state GET
+        if req.method == "GET" and path.endswith("/pulls/10"):
+            return _json(_pr_payload(10))
+        # Label validation GET → 404
+        if req.method == "GET" and path.endswith("/labels/typo-label"):
+            return _json({"message": "Not Found"}, status_code=404)
+        # PATCH must NOT be reached
+        if req.method == "PATCH" and "/pulls/10" in path:
+            raise AssertionError("PATCH must not be called when label validation fails")
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().update_pr(
+            _project(), token="t", pr_id="10",
+            labels_add=["typo-label"],
+        )
+    assert exc.value.status == 404
+    assert "typo-label" in exc.value.message
+    assert not any(
+        r.method == "PATCH" and "/pulls/10" in r.url.path for r in seen
+    )
