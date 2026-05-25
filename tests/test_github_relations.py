@@ -1275,12 +1275,23 @@ def test_merge_pr_already_merged_raises(
 ) -> None:
     """GitHub returns HTTP 405 when merging an already-merged PR.
     The provider must re-raise as GitHubError(405, '... already merged').
+    The disambiguation probe GET returns merged=True.
     """
     from lib_python_projects.providers.github import GitHubError
+
+    already_merged_payload = _pr_payload(
+        7,
+        state="closed",
+        merged=True,
+        merged_at="2024-05-01T12:00:00Z",
+        mergeable_state="unknown",
+    )
 
     def handler(req: httpx.Request) -> httpx.Response:
         if req.method == "PUT" and "/pulls/7/merge" in req.url.path:
             return _json({"message": "Pull Request is not mergeable"}, status_code=405)
+        if req.method == "GET" and "/pulls/7" in req.url.path:
+            return _json(already_merged_payload)
         raise AssertionError(f"unexpected {req.method} {req.url.path}")
 
     _install_mock(monkeypatch, handler)
@@ -1288,6 +1299,73 @@ def test_merge_pr_already_merged_raises(
         GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
     assert exc.value.status == 405
     assert "already merged" in exc.value.message
+    assert "acme#7" in exc.value.message
+
+
+def test_merge_pr_405_conflict_raises_unmergeable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: GitHub returns 405 for a PR with a merge conflict.
+    The provider must raise GitHubError(405) describing the unmergeable state,
+    NOT the misleading 'already merged' message.
+    """
+    from lib_python_projects.providers.github import GitHubError
+
+    conflict_payload = _pr_payload(
+        7,
+        state="open",
+        merged=False,
+        mergeable=False,
+        mergeable_state="dirty",
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/pulls/7/merge" in req.url.path:
+            return _json({"message": "Pull Request is not mergeable"}, status_code=405)
+        if req.method == "GET" and "/pulls/7" in req.url.path:
+            return _json(conflict_payload)
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+    assert exc.value.status == 405
+    assert "cannot be merged" in exc.value.message
+    assert "dirty" in exc.value.message
+    assert "rebase" in exc.value.message
+    assert "acme#7" in exc.value.message
+
+
+def test_merge_pr_405_unknown_state_raises_conflict_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub returns 405 and the probe GET returns merged=False with
+    mergeable_state=None (unknown).  The provider must raise GitHubError(405)
+    describing 'cannot be merged' and 'unknown' state.
+    """
+    from lib_python_projects.providers.github import GitHubError
+
+    unknown_state_payload = _pr_payload(
+        7,
+        state="open",
+        merged=False,
+        mergeable=None,
+        mergeable_state=None,
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/pulls/7/merge" in req.url.path:
+            return _json({"message": "Pull Request is not mergeable"}, status_code=405)
+        if req.method == "GET" and "/pulls/7" in req.url.path:
+            return _json(unknown_state_payload)
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+    assert exc.value.status == 405
+    assert "cannot be merged" in exc.value.message
+    assert "unknown" in exc.value.message
     assert "acme#7" in exc.value.message
 
 

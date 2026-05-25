@@ -2580,8 +2580,22 @@ class GitHubProvider:
                 _check(r)
             except GitHubError as exc:
                 if exc.status == 405:
+                    # GitHub returns 405 for both "already merged" and
+                    # "merge conflict / not mergeable".  Probe the PR to
+                    # find out which situation we're in.
+                    probe = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
+                    _check(probe)
+                    raw = probe.json()
+                    if raw.get("merged") is True:
+                        raise GitHubError(
+                            405, f"PR '{project.id}#{pr_id}' is already merged"
+                        ) from exc
+                    mergeable_state = raw.get("mergeable_state") or "unknown"
                     raise GitHubError(
-                        405, f"PR '{project.id}#{pr_id}' is already merged"
+                        405,
+                        f"PR '{project.id}#{pr_id}' cannot be merged:"
+                        f" mergeable_state='{mergeable_state}'"
+                        f" — rebase or resolve conflicts and retry",
                     ) from exc
                 raise
             # Re-fetch so the response carries the merged state/timestamp.
