@@ -438,3 +438,43 @@ def test_list_runs_for_commit_found_no_runs(
     )
     assert runs == []
     assert resolved_refs == [sha]
+
+
+# ---------- Ticket #57: PL5 — list_runs_for_branch 301 returns empty ----------
+
+
+def test_list_runs_for_branch_301_returns_empty_not_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the actions/runs endpoint returns 301 (redirect), _list_runs_for_branch
+    must return [] instead of raising GitHubError, so list_runs_for_branch returns
+    the correct ([], [sha]) sentinel rather than leaking '301 Moved Permanently'."""
+    from lib_python_projects.providers.github import GitHubError
+
+    sha = "deadbeef1234"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Branch resolves successfully.
+        if "/branches/master" in path:
+            return _json({"commit": {"sha": sha}})
+        # Actions/runs endpoint returns a redirect.
+        if path.endswith("/actions/runs"):
+            return httpx.Response(
+                status_code=301,
+                headers={"Location": "https://api.github.com/other"},
+                content=b"",
+            )
+        # workflows check — called when runs list is empty.
+        if path.endswith("/actions/workflows"):
+            return _json({"total_count": 1, "workflows": [{}]})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    # Must not raise GitHubError.
+    runs, resolved_refs = GitHubProvider().list_runs_for_branch(
+        _project(), token="t", branch="master",
+    )
+    assert runs == []
+    # branch was found, so resolved_refs must be non-empty.
+    assert sha in resolved_refs

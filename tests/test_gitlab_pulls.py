@@ -1706,3 +1706,27 @@ def test_update_pr_draft_true_title_stripped_in_response(
     # Wire title is "Draft: My feature" but _map_mr must strip it.
     assert pr.title == "My feature"
     assert pr.draft is True
+
+
+# ---------- Ticket #57: P4 — list_prs base.sha is None when diff_refs absent --
+
+
+def test_list_prs_base_sha_is_none_when_diff_refs_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """list_prs must not crash and must return base.sha=None when the MR payload
+    lacks diff_refs (freshly-created MRs before a pipeline run). This is the
+    documented gap noted in _map_mr's docstring."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # MR payload with no diff_refs key at all.
+        payload = _mr_payload(7)
+        payload.pop("diff_refs", None)  # ensure absent
+        return _json([payload])
+
+    _install_mock(monkeypatch, handler)
+    prs, has_more = GitLabProvider().list_prs(
+        _project(), "t", PRFilters(limit=10),
+    )
+    assert len(prs) == 1
+    assert prs[0].base["sha"] is None

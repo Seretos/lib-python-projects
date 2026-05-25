@@ -415,3 +415,33 @@ def test_list_runs_for_commit_found(
     assert len(runs) == 1
     assert runs[0].id == "99"
     assert resolved_refs == [sha]
+
+
+# ---------- Ticket #57: PL10 — GitLabError no double prefix ------------------
+
+
+from lib_python_projects.providers.gitlab import GitLabError
+
+
+def test_gitlab_error_no_double_prefix_when_rewrapped() -> None:
+    """GitLabError raised with str(exc) as the message must not produce a
+    doubled 'GitLab NNN: GitLab NNN:' prefix."""
+    exc = GitLabError(404, "GitLab 404: Not Found")
+    assert str(exc) == "GitLab 404: Not Found"
+    assert exc.message == "Not Found"
+
+
+def test_gitlab_error_clean_message_passthrough() -> None:
+    """A clean message (no prefix) is stored and formatted without change."""
+    exc = GitLabError(404, "Not Found")
+    assert str(exc) == "GitLab 404: Not Found"
+    assert exc.message == "Not Found"
+
+
+def test_gitlab_error_empty_message() -> None:
+    """GitLabError with an empty string message must not crash and must
+    preserve the status code."""
+    exc = GitLabError(404, "")
+    assert exc.status == 404
+    # str form is still well-formed even with an empty message body.
+    assert "404" in str(exc)

@@ -477,3 +477,130 @@ def test_create_pr_non_head_422_propagates_unchanged(
         )
     assert exc.value.status == 422
     assert "push it first" not in exc.value.message
+
+
+# ---------- Ticket #57: C6 — list_comments 404 names ticket -----------------
+
+
+def test_list_comments_404_names_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """list_comments (asc/explicit-page path) on a missing ticket wraps the 404
+    with the resource id so callers see 'ticket not found' rather than raw 404."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().list_comments(
+            _project(), token="t", ticket_id="42", order="asc",
+        )
+    assert exc.value.status == 404
+    assert "ticket 'acme#42' not found" in exc.value.message
+
+
+def test_list_comments_tail_probe_404_names_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """list_comments (desc tail-probe path) on a missing ticket wraps the 404
+    with the resource id."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().list_comments(
+            _project(), token="t", ticket_id="42", order="desc",
+        )
+    assert exc.value.status == 404
+    assert "ticket 'acme#42' not found" in exc.value.message
+
+
+# ---------- Ticket #57: R5 — add_relation 404 names the right resource -------
+
+
+def _minimal_issue_payload(number: int, internal_id: int = 1001) -> dict:
+    """Minimal GitHub issue payload accepted by _fetch_issue_internal_id."""
+    return {
+        "id": internal_id,
+        "number": number,
+        "title": f"Issue {number}",
+        "state": "open",
+        "body": "",
+        "user": {"login": "alice"},
+        "labels": [],
+        "assignees": [],
+        "html_url": f"https://github.com/acme/backend/issues/{number}",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z",
+    }
+
+
+def test_add_relation_bogus_target_names_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation with a missing target issue produces 'target #NN not found'."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # Target fetch (issue/99) → 404
+        if "/issues/99" in req.url.path:
+            return _json({"message": "Not Found"}, status_code=404)
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="child", target="#99",
+        )
+    assert exc.value.status == 404
+    assert "target '#99' not found" in exc.value.message
+
+
+def test_add_relation_bogus_ticket_id_names_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation(kind='parent') with a missing ticket_id produces
+    'ticket acme#1 not found'."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Target (#99) resolves fine
+        if path.endswith("/issues/99"):
+            return _json(_minimal_issue_payload(99, internal_id=9009))
+        # Source ticket (#1) → 404
+        if path.endswith("/issues/1"):
+            return _json({"message": "Not Found"}, status_code=404)
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="parent", target="#99",
+        )
+    assert exc.value.status == 404
+    assert "ticket 'acme#1' not found" in exc.value.message
+
+
+def test_add_relation_blocks_bogus_ticket_id_names_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation(kind='blocks') with a missing ticket_id (source issue)
+    produces 'ticket acme#1 not found'."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Target (#99) resolves fine
+        if path.endswith("/issues/99"):
+            return _json(_minimal_issue_payload(99, internal_id=9009))
+        # Source ticket (#1) → 404
+        if path.endswith("/issues/1"):
+            return _json({"message": "Not Found"}, status_code=404)
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="blocks", target="#99",
+        )
+    assert exc.value.status == 404
+    assert "ticket 'acme#1' not found" in exc.value.message

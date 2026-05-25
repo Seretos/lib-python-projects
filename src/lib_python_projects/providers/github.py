@@ -1892,7 +1892,14 @@ class GitHubProvider:
                 f"{_repo_path(project)}/issues/{ticket_id}/comments",
                 params=params,
             )
-            _check(r)
+            try:
+                _check(r)
+            except GitHubError as exc:
+                if exc.status == 404:
+                    raise GitHubError(
+                        404, f"ticket '{project.id}#{ticket_id}' not found"
+                    ) from exc
+                raise
             rows = [_map_comment(it) for it in r.json()]
             link = r.headers.get("Link", "") or ""
             has_more = 'rel="next"' in link
@@ -1916,7 +1923,14 @@ class GitHubProvider:
         """
         url = f"{_repo_path(project)}/issues/{ticket_id}/comments"
         probe = client.get(url, params={"per_page": per_page, "page": 1})
-        _check(probe)
+        try:
+            _check(probe)
+        except GitHubError as exc:
+            if exc.status == 404:
+                raise GitHubError(
+                    404, f"ticket '{project.id}#{ticket_id}' not found"
+                ) from exc
+            raise
         link = probe.headers.get("Link", "") or ""
         last_page = _parse_link_last_page(link)
         if last_page is None or last_page <= 1:
@@ -2701,17 +2715,32 @@ class GitHubProvider:
         # is still between ticket_id and target_number.
         _assert_not_self_relation(ticket_id, target_number)
         with _client(token) as client:
-            target_internal_id, target_raw = _fetch_issue_internal_id(
-                client, target_repo, target_number,
-            )
+            try:
+                target_internal_id, target_raw = _fetch_issue_internal_id(
+                    client, target_repo, target_number,
+                )
+            except GitHubError as exc:
+                if exc.status == 404:
+                    raise GitHubError(
+                        404, f"target '#{target_number}' not found"
+                    ) from exc
+                raise
             if kind == "parent":
                 # parent(A→B): A's parent is B → POST /issues/B/sub_issues
                 # with sub_issue_id=A. Source/target swap on the wire.
+                try:
+                    _ticket_internal_id = _fetch_issue_internal_id(
+                        client, _repo_path(project), ticket_id,
+                    )[0]
+                except GitHubError as exc:
+                    if exc.status == 404:
+                        raise GitHubError(
+                            404, f"ticket '{project.id}#{ticket_id}' not found"
+                        ) from exc
+                    raise
                 return _github_post_sub_issue(
                     client, target_repo, target_number,
-                    sub_issue_internal_id=_fetch_issue_internal_id(
-                        client, _repo_path(project), ticket_id,
-                    )[0],
+                    sub_issue_internal_id=_ticket_internal_id,
                     relation_kind_for_caller="parent",
                     target_raw=_fetch_issue_payload(
                         client, target_repo, target_number,
@@ -2744,9 +2773,16 @@ class GitHubProvider:
             if kind == "blocks":
                 # blocks(A→B): A blocks B → on B's endpoint, add A as
                 # blocked_by. Swap source/target on the wire.
-                source_internal_id, _ = _fetch_issue_internal_id(
-                    client, _repo_path(project), ticket_id,
-                )
+                try:
+                    source_internal_id, _ = _fetch_issue_internal_id(
+                        client, _repo_path(project), ticket_id,
+                    )
+                except GitHubError as exc:
+                    if exc.status == 404:
+                        raise GitHubError(
+                            404, f"ticket '{project.id}#{ticket_id}' not found"
+                        ) from exc
+                    raise
                 return _github_post_dependency(
                     client, target_repo, target_number,
                     dep_endpoint="blocked_by",
@@ -3273,6 +3309,8 @@ def _list_runs_for_branch(
     params = _runs_params(status, limit)
     params["branch"] = branch
     r = client.get(f"{_repo_path(project)}/actions/runs", params=params)
+    if r.status_code in (301, 302):
+        return []
     _check(r)
     return (r.json() or {}).get("workflow_runs", [])
 

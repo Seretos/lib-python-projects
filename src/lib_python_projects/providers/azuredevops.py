@@ -133,6 +133,7 @@ _NOT_FOUND_TYPE_KEYS: frozenset[str] = frozenset(
         "CommentNotFoundException",
         "WorkItemCommentNotFoundException",
         "ItemNotFoundException",
+        "BuildNotFoundException",
     }
 )
 

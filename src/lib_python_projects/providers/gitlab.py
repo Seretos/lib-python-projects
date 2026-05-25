@@ -79,6 +79,11 @@ DEFAULT_BASE_URL = "https://gitlab.com"
 # duplicates the HTTP status code already in GitLabError.__str__. Strip it.
 _STATUS_PREFIX_RE = re.compile(r"^\d{3}\s+")
 
+# When a GitLabError is re-raised with str(exc) as the message the "GitLab NNN: "
+# prefix ends up duplicated. Strip it from the incoming message so the final
+# __str__ form remains "GitLab NNN: <clean message>".
+_GITLAB_PREFIX_RE = re.compile(r"^GitLab\s+\d+:\s*")
+
 
 class GitLabError(RuntimeError):
     """Raised on any non-success response from the GitLab REST API.
@@ -88,9 +93,12 @@ class GitLabError(RuntimeError):
     """
 
     def __init__(self, status: int, message: str):
-        super().__init__(f"GitLab {status}: {message}")
+        # Strip any leading "GitLab NNN: " prefix to avoid the message ending
+        # up as "GitLab 404: GitLab 404: Not Found" when errors are re-wrapped.
+        cleaned = _GITLAB_PREFIX_RE.sub("", message) if message else message
+        super().__init__(f"GitLab {status}: {cleaned}")
         self.status = status
-        self.message = message
+        self.message = cleaned
 
 
 # ---------- client / request helpers -----------------------------------------
@@ -1915,6 +1923,9 @@ class GitLabProvider(TokenCapabilityProvider):
             _check(r)
             items = r.json()
             has_more = len(items) >= per_page
+            # Note: base.sha may be None for freshly-created MRs because
+            # diff_refs is absent until GitLab runs a pipeline/diff computation.
+            # See _map_mr docstring (the "diff_refs / base.sha" note) for details.
             return [_map_mr(it, project) for it in items], has_more
 
     def get_pr(

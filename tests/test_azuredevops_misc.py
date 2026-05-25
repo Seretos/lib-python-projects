@@ -1101,3 +1101,51 @@ def test_check_invalid_argument_allowed_values_non_state_no_hint(
     with pytest.raises(AzureDevOpsError) as exc:
         AzureDevOpsProvider().get_ticket(_project(), token="t", ticket_id="5")
     assert "list_ticket_statuses" not in str(exc.value)
+
+
+# ---------- Ticket #57: PL4 — BuildNotFoundException 400 → 404 remap ---------
+
+
+def test_get_run_400_build_not_found_type_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADO returns 400 with typeKey='BuildNotFoundException' for a missing build.
+    The _check remap must treat this as 404 so get_run wraps it as
+    'pipeline not found'."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(
+            {
+                "message": "Build 9999 does not exist",
+                "typeKey": "BuildNotFoundException",
+            },
+            status_code=400,
+        )
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().get_run(_project(), token="t", run_id="9999")
+    assert exc.value.status == 404
+    assert "pipeline 'azure-tests#9999' not found" in exc.value.message
+
+
+def test_get_run_400_build_not_found_type_key_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """typeKey='BuildNotFoundException' alone (message has no known fragment) must
+    still trigger the 400→404 remap so the tool layer can add context."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(
+            {
+                "message": "Unrecognized build identifier",
+                "typeKey": "BuildNotFoundException",
+            },
+            status_code=400,
+        )
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().get_run(_project(), token="t", run_id="9999")
+    assert exc.value.status == 404
+    assert "pipeline 'azure-tests#9999' not found" in exc.value.message
