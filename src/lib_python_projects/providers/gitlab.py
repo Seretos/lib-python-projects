@@ -1791,6 +1791,12 @@ class GitLabProvider(TokenCapabilityProvider):
 
         At least one of the two forms must supply the parent iid; a
         bare note id with no `ticket_id` raises `GitLabError(400)`.
+
+        Library-level composite-ID support is intentional and identical to
+        `update_comment` — both route through `_split_composite_comment_id`
+        (ticket #50). Tests: `test_get_comment_composite_key` and
+        `test_get_comment_bare_id_with_ticket_id_works` in
+        `tests/test_gitlab_issues.py`.
         """
         path = _project_path(project)
         issue_iid, note_id = _split_composite_comment_id(
