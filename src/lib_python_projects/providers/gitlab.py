@@ -783,6 +783,11 @@ def _gitlab_mark_duplicate_of(
             relation_kind_for_caller="duplicate_of",
             project=project,
         )
+    except RelationAlreadyExists:
+        # The relates_to link already exists (raised by _gitlab_post_issue_link
+        # on a 409 response). Treat as "already linked" — fall through to
+        # body+close which are idempotent.
+        pass
     except GitLabError as exc:
         if exc.status != 409:
             raise  # Propagate — body / state stay untouched.
@@ -822,8 +827,9 @@ def _gitlab_mark_duplicate_of(
         ticket_id=f"#{target_iid}",
         title=tj.get("title") or "",
         url=target_url,
-        state=tj.get("state") or "",
+        state=_normalise_gl_state(tj.get("state") or ""),
         is_pull_request=False,
+        resolved=True,
     )
 
 
@@ -2658,9 +2664,9 @@ class GitLabProvider(TokenCapabilityProvider):
         """Remove a typed relation. Inverse of `add_relation`.
 
         For `duplicate_of`, removal reopens the source (state_event
-        =reopen) and deletes the auxiliary `relates_to` link, but does
-        NOT strip the `Duplicate of !N` line from the body — body
-        history is preserved deliberately.
+        =reopen), deletes the auxiliary `relates_to` link, and strips
+        the `Duplicate of #N` line from the body so that a subsequent
+        `get_ticket` no longer surfaces the relation.
         """
         if kind == "parent" or kind == "child":
             raise RelationKindUnsupported(
@@ -2685,7 +2691,8 @@ class GitLabProvider(TokenCapabilityProvider):
                 return {"removed": True}
             if kind == "duplicate_of":
                 # Tear down the relates_to link (best-effort) and
-                # reopen. Body content stays.
+                # reopen. Also strip the "Duplicate of #N" body line so
+                # a subsequent get_ticket no longer resurfaces the relation.
                 try:
                     _gitlab_delete_issue_link(
                         client, path, ticket_id,
@@ -2696,9 +2703,34 @@ class GitLabProvider(TokenCapabilityProvider):
                 except (GitLabError, RelationNotFound):
                     # Link may already be gone; reopen anyway.
                     pass
+                # GET current body so we can strip the dup line.
+                src_r = client.get(f"/projects/{path}/issues/{ticket_id}")
+                _check(src_r)
+                src = src_r.json()
+                current_body = src.get("description") or ""
+                current_labels = set(src.get("labels") or [])
+                will_be_ai_generated = AI_GENERATED_LABEL in current_labels
+                # Strip the exact "Duplicate of #<target_iid>" line and
+                # any blank line that immediately follows it. Leave any
+                # other "Duplicate of #M" lines (different target) intact.
+                dup_line = f"Duplicate of #{target_iid}"
+                body_core = strip_leading_ai_marker(current_body)
+                # Remove the dup line plus optional trailing blank line.
+                # (?!\d) is a negative-lookahead that prevents a partial
+                # iid match, e.g. "Duplicate of #7" must not eat the "7"
+                # prefix of "Duplicate of #70".
+                body_core = re.sub(
+                    rf"^{re.escape(dup_line)}(?!\d)\n?(?:\n)?",
+                    "",
+                    body_core,
+                    flags=re.MULTILINE,
+                ).strip("\n")
+                new_body = apply_body_marker(
+                    body_core, will_be_ai_generated=will_be_ai_generated,
+                )
                 pr = client.put(
                     f"/projects/{path}/issues/{ticket_id}",
-                    json={"state_event": "reopen"},
+                    json={"description": new_body, "state_event": "reopen"},
                 )
                 _check(pr)
                 return {"removed": True}
