@@ -1774,8 +1774,12 @@ class GitHubProvider:
             values=["open", "closed:completed", "closed:not_planned"],
             transitions={
                 "open": ["closed:completed", "closed:not_planned"],
-                "closed:completed": ["open"],
-                "closed:not_planned": ["open"],
+                # GitHub allows re-closing a closed issue with a different
+                # state_reason (e.g. completed → not_planned or vice versa)
+                # via a single PATCH call, so both cross-terminal moves are
+                # valid transitions (ticket #50).
+                "closed:completed": ["open", "closed:not_planned"],
+                "closed:not_planned": ["open", "closed:completed"],
             },
             hints={
                 "default_open": "open",
