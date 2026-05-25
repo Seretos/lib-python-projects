@@ -19,7 +19,7 @@ import pytest
 
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import gitlab as gitlab_mod
-from lib_python_projects.providers.gitlab import GitLabProvider
+from lib_python_projects.providers.gitlab import GitLabError, GitLabProvider
 from lib_python_projects.providers.base import (
     RelationAlreadyExists,
     RelationKindUnsupported,
@@ -660,3 +660,428 @@ def test_add_relation_self_relation_gitlab(
     _install_mock(monkeypatch, handler)
     with pytest.raises(ValueError, match="self-relation"):
         GitLabProvider().add_relation(_project(), "t", "5", "relates_to", "#5")
+
+
+# ---------- R1: remove_relation duplicate_of strips body line ----------------
+
+
+def test_remove_relation_duplicate_of_strips_body_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """remove_relation(duplicate_of) must strip the 'Duplicate of #7' line
+    from the issue body on the PUT call; other body content is preserved."""
+    captured_put: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        # GET /links — return the link so delete works.
+        if req.method == "GET" and "/issues/5/links" in url:
+            return _json([{
+                "iid": 7,
+                "issue_link_id": 100,
+                "link_type": "relates_to",
+                "title": "target",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/7",
+                "state": "opened",
+            }])
+        # DELETE /links/100 — succeed.
+        if req.method == "DELETE" and "/links/100" in url:
+            return _json({})
+        # GET /issues/5 — return body with dup line.
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5,
+                "description": "Duplicate of #7\n\nsome content",
+                "labels": [],
+                "state": "closed",
+            })
+        # PUT /issues/5 — capture payload.
+        if req.method == "PUT" and url.endswith("/issues/5"):
+            captured_put["body"] = json.loads(req.content.decode())
+            return _json({"iid": 5, "state": "opened"})
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().remove_relation(_project(), "t", "5", "duplicate_of", "#7")
+
+    assert result == {"removed": True}
+    desc = captured_put["body"]["description"]
+    assert "Duplicate of #7" not in desc
+    assert "some content" in desc
+    assert captured_put["body"]["state_event"] == "reopen"
+
+
+def test_remove_relation_duplicate_of_body_only_dup_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When body is only the dup line, after removal the body is the AI marker only."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and "/issues/5/links" in url:
+            return _json([{
+                "iid": 7, "issue_link_id": 200,
+                "link_type": "relates_to", "title": "", "web_url": "", "state": "opened",
+            }])
+        if req.method == "DELETE" and "/links/200" in url:
+            return _json({})
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5,
+                "description": "Duplicate of #7",
+                "labels": [],
+                "state": "closed",
+            })
+        if req.method == "PUT" and url.endswith("/issues/5"):
+            captured_put["body"] = json.loads(req.content.decode())
+            return _json({"iid": 5, "state": "opened"})
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    captured_put: dict = {}
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().remove_relation(_project(), "t", "5", "duplicate_of", "#7")
+
+    desc = captured_put["body"]["description"]
+    assert "Duplicate of #7" not in desc
+    # Body must at minimum have the AI marker prefix.
+    assert "#ai-" in desc
+
+
+def test_remove_relation_duplicate_of_preserves_ai_generated_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AI-generated label on source → body keeps #ai-generated prefix."""
+    captured_put: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and "/issues/5/links" in url:
+            return _json([{
+                "iid": 7, "issue_link_id": 300,
+                "link_type": "relates_to", "title": "", "web_url": "", "state": "opened",
+            }])
+        if req.method == "DELETE" and "/links/300" in url:
+            return _json({})
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5,
+                "description": "#ai-generated\n\nDuplicate of #7\n\nreal body",
+                "labels": ["ai-generated"],
+                "state": "closed",
+            })
+        if req.method == "PUT" and url.endswith("/issues/5"):
+            captured_put["body"] = json.loads(req.content.decode())
+            return _json({"iid": 5, "state": "opened"})
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().remove_relation(_project(), "t", "5", "duplicate_of", "#7")
+
+    desc = captured_put["body"]["description"]
+    assert "Duplicate of #7" not in desc
+    assert desc.startswith("#ai-generated")
+    assert "real body" in desc
+
+
+def test_remove_relation_duplicate_of_leaves_other_dup_lines_intact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the 'Duplicate of #7' line is stripped; 'Duplicate of #8' stays."""
+    captured_put: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and "/issues/5/links" in url:
+            return _json([{
+                "iid": 7, "issue_link_id": 400,
+                "link_type": "relates_to", "title": "", "web_url": "", "state": "opened",
+            }])
+        if req.method == "DELETE" and "/links/400" in url:
+            return _json({})
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5,
+                "description": "Duplicate of #7\n\nDuplicate of #8\n\nbody text",
+                "labels": [],
+                "state": "closed",
+            })
+        if req.method == "PUT" and url.endswith("/issues/5"):
+            captured_put["body"] = json.loads(req.content.decode())
+            return _json({"iid": 5, "state": "opened"})
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().remove_relation(_project(), "t", "5", "duplicate_of", "#7")
+
+    desc = captured_put["body"]["description"]
+    assert "Duplicate of #7" not in desc
+    assert "Duplicate of #8" in desc
+    assert "body text" in desc
+
+
+def test_remove_relation_duplicate_of_roundtrip_no_relation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After remove_relation, get_ticket on the updated body returns no duplicate_of."""
+    # Simulate the state after removal: body has had dup line stripped.
+    stripped_body = "some content"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("issues/5"):
+            return _json(_issue_with_body(5, body=stripped_body))
+        if "/issues/5/links" in url:
+            return _json([])
+        if "/issues/5/closed_by" in url or "/issues/5/notes" in url:
+            return _json([])
+        return _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    _, _, relations, _ = GitLabProvider().get_ticket(_project(), "t", "5")
+    dup_rels = [r for r in relations if r.kind == "duplicate_of"]
+    assert dup_rels == [], (
+        "After dup line is stripped from body, get_ticket must return no duplicate_of"
+    )
+
+
+# ---------- R2: add_relation duplicate_of when relates_to link already exists --
+
+
+def test_add_relation_duplicate_of_when_relates_to_link_already_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the relates_to link already exists (RelationAlreadyExists from
+    _gitlab_post_issue_link), _gitlab_mark_duplicate_of must NOT raise —
+    it must fall through to body+close and return a Relation."""
+    captured_put: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        # Numeric project-id resolution.
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"id": 42})
+        # GET source issue.
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5,
+                "description": "original body",
+                "labels": [],
+                "state": "opened",
+                "title": "Source",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/5",
+            })
+        # POST /links → 409 (already exists).
+        if req.method == "POST" and "/issues/5/links" in url:
+            return _json(
+                {"message": "Issue(s) already assigned"},
+                status_code=409,
+            )
+        # GET target issue (for the 409-path Relation synthesis).
+        if req.method == "GET" and url.endswith("/issues/7"):
+            return _json({
+                "iid": 7,
+                "title": "Target",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/7",
+                "state": "opened",
+            })
+        # PUT /issues/5 (body + close).
+        if req.method == "PUT" and url.endswith("/issues/5"):
+            captured_put["body"] = json.loads(req.content.decode())
+            return _json({
+                "iid": 5, "state": "closed",
+                "description": captured_put["body"].get("description", ""),
+            })
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    # Must not raise, even though the relates_to link already exists.
+    relation = GitLabProvider().add_relation(_project(), "t", "5", "duplicate_of", "#7")
+
+    assert relation.kind == "duplicate_of"
+    assert relation.ticket_id == "#7"
+    # PUT must have been called with state_event=close.
+    assert captured_put["body"]["state_event"] == "close"
+    # Body must contain the "Duplicate of #7" annotation.
+    assert "Duplicate of #7" in captured_put["body"]["description"]
+
+
+def test_add_relation_duplicate_of_non_409_gitlab_error_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-409 GitLabError (e.g. 422 invalid target) from POST /links
+    must still propagate — the link failure is not silenced."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"id": 42})
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5,
+                "description": "",
+                "labels": [],
+                "state": "opened",
+            })
+        if req.method == "POST" and "/issues/5/links" in url:
+            return _json({"message": "Unprocessable Entity"}, status_code=422)
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "duplicate_of", "#7")
+    assert exc.value.status == 422
+
+
+# ---------- blocking 3: partial iid match edge case --------------------------
+
+
+def test_remove_relation_duplicate_of_partial_iid_not_corrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """remove_relation(duplicate_of, '#7') must NOT corrupt a body that
+    contains 'Duplicate of #70' — the regex must only match the exact iid.
+    Without the (?!\\d) negative-lookahead fix, this body becomes '0\\n...'."""
+    captured_put: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        # GET /links — return the #7 link so the delete step works.
+        if req.method == "GET" and "/issues/5/links" in url:
+            return _json([{
+                "iid": 7,
+                "issue_link_id": 500,
+                "link_type": "relates_to",
+                "title": "target",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/7",
+                "state": "opened",
+            }])
+        # DELETE /links/500 — succeed.
+        if req.method == "DELETE" and "/links/500" in url:
+            return _json({})
+        # GET /issues/5 — body has 'Duplicate of #70' (NOT #7).
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5,
+                "description": "Duplicate of #70\n\nsome content",
+                "labels": [],
+                "state": "closed",
+            })
+        # PUT /issues/5 — capture payload.
+        if req.method == "PUT" and url.endswith("/issues/5"):
+            captured_put["body"] = json.loads(req.content.decode())
+            return _json({"iid": 5, "state": "opened"})
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().remove_relation(_project(), "t", "5", "duplicate_of", "#7")
+
+    desc = captured_put["body"]["description"]
+    # The #70 line must be preserved intact — not truncated to "0\n...".
+    assert "Duplicate of #70" in desc, (
+        f"'Duplicate of #70' was corrupted by partial iid match: {desc!r}"
+    )
+    assert "some content" in desc
+    # There must be no stray "0\n" fragment from the partial match.
+    assert desc.lstrip("#ai-generated\n").lstrip() != "0" and "0\n" not in desc.replace(
+        "Duplicate of #70", ""
+    )
+
+
+# ---------- blocking 4: state normalization on the 409 path ------------------
+
+
+def test_add_relation_duplicate_of_409_path_state_normalised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the relates_to link already exists (409 path), the returned
+    Relation.state must be 'open' (normalised) not 'opened' (raw GitLab)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"id": 42})
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5,
+                "description": "original body",
+                "labels": [],
+                "state": "opened",
+                "title": "Source",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/5",
+            })
+        if req.method == "POST" and "/issues/5/links" in url:
+            return _json(
+                {"message": "Issue(s) already assigned"},
+                status_code=409,
+            )
+        # GET target issue — return raw 'opened' state.
+        if req.method == "GET" and url.endswith("/issues/7"):
+            return _json({
+                "iid": 7,
+                "title": "Target",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/7",
+                "state": "opened",
+            })
+        if req.method == "PUT" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5, "state": "closed",
+                "description": "",
+            })
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    relation = GitLabProvider().add_relation(_project(), "t", "5", "duplicate_of", "#7")
+
+    assert relation.state == "open", (
+        f"expected 'open' (normalised), got {relation.state!r} — "
+        "raw 'opened' from GitLab must be normalised on the 409 synthesis path"
+    )
+
+
+# ---------- blocking 5: resolved=True on the 409 synthesis path ---------------
+
+
+def test_add_relation_duplicate_of_409_path_resolved_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the relates_to link already exists (409 path), the synthesised
+    Relation must carry resolved=True — consistent with the success path."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"id": 42})
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5,
+                "description": "original body",
+                "labels": [],
+                "state": "opened",
+                "title": "Source",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/5",
+            })
+        if req.method == "POST" and "/issues/5/links" in url:
+            return _json(
+                {"message": "Issue(s) already assigned"},
+                status_code=409,
+            )
+        if req.method == "GET" and url.endswith("/issues/7"):
+            return _json({
+                "iid": 7,
+                "title": "Target",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/7",
+                "state": "opened",
+            })
+        if req.method == "PUT" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5, "state": "closed",
+                "description": "",
+            })
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    relation = GitLabProvider().add_relation(_project(), "t", "5", "duplicate_of", "#7")
+
+    assert relation.resolved is True, (
+        f"expected resolved=True on the 409 synthesis path, got {relation.resolved!r}"
+    )
