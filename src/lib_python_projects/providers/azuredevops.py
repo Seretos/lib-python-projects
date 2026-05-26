@@ -2159,6 +2159,47 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
         _check(resp)
         return _map_work_item_comment(resp.json(), project, str(ticket_id))
 
+    def delete_comment(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        comment_id: str,
+        ticket_id: str | None = None,
+    ) -> None:
+        """Delete a work-item comment by its id.
+
+        `ticket_id` is required because ADO comment ids are scoped to a
+        work item. Raises `AzureDevOpsError(400, ...)` when omitted.
+
+        Raises `AzureDevOpsError(404, ...)` when the comment does not
+        exist.  Returns `None` on success.
+        """
+        if not ticket_id:
+            raise AzureDevOpsError(
+                400,
+                "azuredevops.delete_comment requires ticket_id "
+                "(work-item comment ids are scoped to a work item).",
+            )
+        _validate_int32_id(ticket_id, "ticket")
+        _validate_int32_id(comment_id, "comment")
+        path = (
+            f"{_project_scope(project)}/_apis/wit/workItems/"
+            f"{quote(str(ticket_id), safe='')}/comments/{quote(str(comment_id), safe='')}"
+        )
+        with _client(project, token) as c:
+            resp = c.delete(
+                path,
+                params=_api_version_params({"api-version": API_VERSION_COMMENTS}),
+            )
+        try:
+            _check(resp)
+        except AzureDevOpsError as exc:
+            if exc.status == 404:
+                raise AzureDevOpsError(
+                    404, f"comment '{project.id}#{comment_id}' not found"
+                ) from exc
+            raise
+
     # ---------- pull requests — read --------------------------------------
 
     def list_prs(

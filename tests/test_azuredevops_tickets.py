@@ -1281,6 +1281,58 @@ def test_update_comment_404_names_comment(monkeypatch: pytest.MonkeyPatch) -> No
     assert "comment 'azure-tests#99' not found" in exc.value.message
 
 
+# ---------- Ticket #69: delete_comment ---------------------------------------
+
+
+def test_delete_comment_requires_ticket_id() -> None:
+    """delete_comment without ticket_id raises AzureDevOpsError 400 before any HTTP."""
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().delete_comment(
+            _project(), token="t", comment_id="11", ticket_id=None
+        )
+    assert "ticket_id" in str(exc.value)
+
+
+def test_delete_comment_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """delete_comment with a success response returns None and calls the right URL."""
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return _json({}, status_code=200)
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().delete_comment(
+        _project(), token="t", comment_id="11", ticket_id="5",
+    )
+    assert result is None
+    assert len(seen) == 1
+    assert seen[0].method == "DELETE"
+    assert "workItems/5/comments/11" in seen[0].url.path
+
+
+def test_delete_comment_404_names_comment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """delete_comment on a missing comment raises AzureDevOpsError 404 naming the comment."""
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(
+            {"message": "Comment not found.", "typeKey": "CommentNotFoundException"},
+            status_code=400,  # ADO 400-as-404
+        )
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().delete_comment(
+            _project(), token="t", comment_id="11", ticket_id="5",
+        )
+    assert exc.value.status == 404
+    assert "comment 'azure-tests#11' not found" in exc.value.message
+
+
 # ---------- Case 5: invalid-status message format ----------------------------
 
 

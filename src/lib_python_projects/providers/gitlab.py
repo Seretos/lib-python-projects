@@ -1873,6 +1873,36 @@ class GitLabProvider(TokenCapabilityProvider):
             _check(r)
             return _map_note(r.json(), project)
 
+    def delete_comment(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        comment_id: str,
+        ticket_id: str | None = None,
+    ) -> None:
+        """Delete a note by its id.
+
+        Accepts the same two comment-id forms as `get_comment` (ticket
+        #41 addendum B/C): composite `"<iid>/<note_id>"` in `comment_id`,
+        or bare note id in `comment_id` plus parent iid in `ticket_id`.
+
+        Raises `GitLabError(404, ...)` when the note does not exist.
+        Returns `None` on success (GitLab responds with 204 No Content).
+        """
+        path = _project_path(project)
+        issue_iid, note_id = _split_composite_comment_id(
+            comment_id, ticket_id,
+        )
+        with _client(project, token) as client:
+            r = client.delete(
+                f"/projects/{path}/issues/{issue_iid}/notes/{note_id}",
+            )
+            if r.status_code == 404:
+                raise GitLabError(
+                    404, f"comment '{project.id}#{comment_id}' not found"
+                )
+            _check(r)
+
     # ---------- merge requests (PR surface) ----------------------------------
 
     def list_prs(
