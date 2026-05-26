@@ -788,6 +788,22 @@ def test_all_providers_expose_label_methods():
             )
 
 
+# ---------- ticket #69: delete_comment cross-provider parity -----------------
+
+
+def test_all_providers_expose_delete_comment():
+    """All three providers must expose delete_comment as a callable.
+    This is a static structural assertion."""
+    from lib_python_projects.providers.github import GitHubProvider
+    from lib_python_projects.providers.gitlab import GitLabProvider
+    from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+
+    for provider_cls in (GitHubProvider, GitLabProvider, AzureDevOpsProvider):
+        assert callable(getattr(provider_cls, "delete_comment", None)), (
+            f"{provider_cls.__name__} is missing callable 'delete_comment'"
+        )
+
+
 # ---------- ticket #35: Label dataclass and LabelOperationUnsupported --------
 
 

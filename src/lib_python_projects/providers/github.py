@@ -2087,6 +2087,28 @@ class GitHubProvider:
             _check(r)
             return _map_comment(r.json())
 
+    def delete_comment(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        comment_id: str,
+        ticket_id: str | None = None,  # noqa: ARG002 — accepted for cross-provider symmetry
+    ) -> None:
+        """Delete a comment by its id.
+
+        Raises `GitHubError(404, ...)` when the comment does not exist.
+        Returns `None` on success (GitHub responds with 204 No Content).
+        """
+        with _client(token) as client:
+            r = client.delete(
+                f"{_repo_path(project)}/issues/comments/{comment_id}",
+            )
+            if r.status_code == 404:
+                raise GitHubError(
+                    404, f"comment {comment_id!r} not found in {project.id}"
+                )
+            _check(r)
+
     # ---------- pull requests ------------------------------------------------
 
     def list_prs(

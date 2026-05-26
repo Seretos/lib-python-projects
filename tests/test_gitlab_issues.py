@@ -1037,6 +1037,65 @@ def test_update_comment_404_names_comment(monkeypatch: pytest.MonkeyPatch) -> No
     assert "comment 'acme#99' not found" in exc.value.message
 
 
+# ---------- Ticket #69: delete_comment ---------------------------------------
+
+
+def test_delete_comment_happy_path_composite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """delete_comment with a composite comment_id issues DELETE to the right URL
+    and returns None."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(status_code=204, content=b"")
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().delete_comment(
+        _project(), "t", comment_id="5/99",
+    )
+    assert result is None
+    assert len(seen) == 1
+    assert seen[0].method == "DELETE"
+    assert "issues/5/notes/99" in str(seen[0].url)
+
+
+def test_delete_comment_happy_path_bare_with_ticket_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """delete_comment also accepts a bare note id when ticket_id is supplied."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(status_code=204, content=b"")
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().delete_comment(
+        _project(), "t", comment_id="99", ticket_id="5",
+    )
+    assert result is None
+    assert len(seen) == 1
+    assert seen[0].method == "DELETE"
+    assert "issues/5/notes/99" in str(seen[0].url)
+
+
+def test_delete_comment_404_names_comment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """delete_comment on a missing note raises GitLabError 404 naming the comment."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().delete_comment(
+            _project(), "t", comment_id="99", ticket_id="5",
+        )
+    assert exc.value.status == 404
+    assert "comment 'acme#99' not found" in exc.value.message
+
+
 def test_check_no_double_status_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     """GitLab returns {"message": "404 Not Found"}; the error string must NOT
     duplicate the status code (i.e. must not contain '404: 404')."""

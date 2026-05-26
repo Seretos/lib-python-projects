@@ -619,3 +619,35 @@ def test_add_relation_blocks_bogus_ticket_id_names_ticket(
         )
     assert exc.value.status == 404
     assert "ticket 'acme#1' not found" in exc.value.message
+
+
+# ---------- Ticket #69: delete_comment ---------------------------------------
+
+
+def test_delete_comment_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """delete_comment with a 204 response returns None and calls the right URL."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(status_code=204, content=b"")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().delete_comment(_project(), token="t", comment_id="99")
+    assert result is None
+    assert len(seen) == 1
+    assert seen[0].method == "DELETE"
+    assert "/issues/comments/99" in str(seen[0].url)
+
+
+def test_delete_comment_404_names_comment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """delete_comment on a missing comment raises GitHubError 404 naming the comment."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().delete_comment(_project(), token="t", comment_id="99")
+    assert exc.value.status == 404
+    assert "comment '99' not found in acme" in exc.value.message
