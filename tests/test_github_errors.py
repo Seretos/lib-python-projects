@@ -413,6 +413,21 @@ def test_submit_pr_review_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "PR 'acme#7' not found" in exc.value.message
 
 
+def test_update_pr_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """update_pr on a missing PR wraps the 404 with the resource id."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().update_pr(
+            _project(), token="t", pr_id="99999", title="x",
+        )
+    assert exc.value.status == 404
+    assert "PR 'acme#99999' not found" in exc.value.message
+
+
 def test_create_pr_head_branch_missing_422_names_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -553,7 +568,7 @@ def test_add_relation_bogus_target_names_target(
             _project(), token="t", ticket_id="1", kind="child", target="#99",
         )
     assert exc.value.status == 404
-    assert "target '#99' not found" in exc.value.message
+    assert "target issue #99 not found in acme/backend" in exc.value.message
 
 
 def test_add_relation_bogus_ticket_id_names_ticket(
