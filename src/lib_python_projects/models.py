@@ -212,3 +212,34 @@ class ProjectsLoadResult(LoadResult):
     """
 
     projects: list[ProjectConfig] = Field(default_factory=list)
+
+
+class ProjectMatch(BaseModel):
+    """A single project paired with its relevance score.
+
+    `score` is in [0.0, 1.0].  1.0 means an exact token match against one
+    of the scored fields; 0.0 means no similarity at all.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project: ProjectConfig
+    score: float
+
+
+class FindResult(BaseModel):
+    """Result returned by `find_projects`.
+
+    `matches` is sorted descending by score and contains only projects whose
+    best token score is at or above the relevance floor.
+
+    `hint` is set to `"no matches above relevance floor"` when at least one
+    project was scored but every score fell below the floor.  It is `None`
+    when the project list was empty to begin with, or when `matches` is
+    non-empty (good results were found).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    matches: list[ProjectMatch] = Field(default_factory=list)
+    hint: str | None = None

@@ -13,12 +13,15 @@ from __future__ import annotations
 # class — there's no domain-specific subclass.
 from lib_python_config import ConfigError
 
+from lib_python_projects.finder import find_projects
 from lib_python_projects.loader import load_projects, resolve_token
 from lib_python_projects.models import (
     ConfigDocument,
+    FindResult,
     IssuesPermissions,
     Permissions,
     ProjectConfig,
+    ProjectMatch,
     ProjectsLoadResult,
     Provider,
     PullsPermissions,
@@ -39,5 +42,8 @@ __all__ = [
     "ConfigError",
     "load_projects",
     "resolve_token",
+    "find_projects",
+    "FindResult",
+    "ProjectMatch",
     "__version__",
 ]
