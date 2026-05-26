@@ -1863,6 +1863,50 @@ def test_duplicate_of_dedicated_line_is_detected(
     )
 
 
+def test_duplicate_of_relation_has_resolved_false_from_body_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #62: a duplicate_of relation produced by the body
+    scan must have resolved=False, title="", state="", a non-empty url, and the
+    correct ticket_id.  These are the intentional 'not fetched' sentinel values
+    — the target is not independently fetched at read time.
+    """
+    body = "Duplicate of #5\n\nSome additional context."
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/9":
+            return _json(_issue_payload(9, body=body, state="open"))
+        if path == "/repos/acme/backend/issues/9/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/9/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/9/timeline":
+            return _json([])
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="9")
+
+    dup = next((r for r in relations if r.kind == "duplicate_of"), None)
+    assert dup is not None, f"expected a duplicate_of relation; got {relations}"
+    assert dup.ticket_id == "#5", f"expected ticket_id='#5'; got {dup.ticket_id!r}"
+    assert dup.resolved is False, (
+        f"body-scan duplicate_of must have resolved=False; got {dup.resolved!r}"
+    )
+    assert dup.title == "", (
+        f"body-scan duplicate_of must have title=''; got {dup.title!r}"
+    )
+    assert dup.state == "", (
+        f"body-scan duplicate_of must have state=''; got {dup.state!r}"
+    )
+    assert dup.url, f"body-scan duplicate_of must have a non-empty url; got {dup.url!r}"
+
+
 # ---------- Ticket #61: inverse-kind relation de-duplication ------------------
 
 
