@@ -611,7 +611,8 @@ def _github_mark_duplicate_of(
 
     Removal (`remove_relation("duplicate_of")`) strips the
     ``Duplicate of #N`` line from the body (and reopens the issue) so
-    the read path no longer reports the relation.
+    the read path no longer reports the relation.  Stripping IS the
+    intended contract — body history is deliberately not preserved.
     """
     src = _fetch_issue_payload(
         client, _repo_path(project), source_issue_number,
@@ -881,6 +882,10 @@ def _ref_to_relation(
     else:
         ticket_id = f"#{num}"
         url = f"https://github.com/{project.owner}/{project.repo}/issues/{num}"
+    # title="", state="", resolved=False is the intentional "not fetched"
+    # sentinel for all body-scan-derived relations (including duplicate_of).
+    # The target is not independently fetched at read time; callers that need
+    # live data must resolve the relation themselves.
     return Relation(
         kind=kind,
         ticket_id=ticket_id,
@@ -2928,6 +2933,8 @@ class GitHubProvider:
         body is the sole source of truth for this relation kind
         (`_fetch_relations` scans the body regardless of state), so
         stripping the marker is the only reliable way to stop reporting it.
+        Stripping IS the intended contract — body history is deliberately
+        not preserved.
         """
         if kind not in self._SUPPORTED_RELATION_KINDS:
             raise RelationKindUnsupported(

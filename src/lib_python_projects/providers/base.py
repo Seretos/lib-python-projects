@@ -249,6 +249,12 @@ class Relation:
     `"closed"`, `"merged"`, or `""` when the provider didn't report one.
     `is_pull_request` is true when the other side is a PR/MR. `title`
     is best-effort and may be empty if the provider didn't return it.
+
+    When `resolved` is ``False``, the relation was derived from a
+    body/text scan and the target was not independently fetched.
+    In that case `title` and `state` will both be `""`.  This is the
+    canonical "not fetched" sentinel; callers that need live metadata
+    must resolve the relation themselves via the provider API.
     """
 
     kind: str
