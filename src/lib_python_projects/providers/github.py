@@ -536,6 +536,59 @@ def _github_assert_dependency_exists(
     )
 
 
+def _github_dependency_already_exists(
+    client: httpx.Client,
+    repo_path: str,
+    source_issue_number: str,
+    *,
+    target_internal_id: int,
+) -> bool:
+    """Return True if `target_internal_id` is already in the blocked_by list.
+
+    GETs `{repo_path}/issues/{source_issue_number}/dependencies/blocked_by`
+    and checks whether the target appears in the response.  Used as a
+    pre-flight guard to detect inverse-kind duplicates before the POST.
+    The existing 422-based guard in `_github_post_dependency` remains as a
+    race-condition safety net.
+    """
+    r = client.get(
+        f"{repo_path}/issues/{source_issue_number}/dependencies/blocked_by",
+    )
+    _check(r)
+    rows = r.json() or []
+    for row in rows:
+        candidate = row.get("id") or row.get("internal_id")
+        if isinstance(candidate, int) and candidate == target_internal_id:
+            return True
+    return False
+
+
+def _github_sub_issue_already_exists(
+    client: httpx.Client,
+    repo_path: str,
+    parent_number: str,
+    *,
+    sub_issue_internal_id: int,
+) -> bool:
+    """Return True if `sub_issue_internal_id` is already in the sub-issues list.
+
+    GETs `{repo_path}/issues/{parent_number}/sub_issues` and checks whether the
+    sub-issue appears.  Used as a pre-flight guard to detect inverse-kind
+    duplicates before the POST.  The existing 422-based guard in
+    `_github_post_sub_issue` remains as a race-condition safety net.
+    """
+    r = client.get(
+        f"{repo_path}/issues/{parent_number}/sub_issues",
+    )
+    _check(r)
+    rows = r.json() or []
+    for row in rows:
+        candidate = row.get("id") or row.get("internal_id")
+        if isinstance(candidate, int) and candidate == sub_issue_internal_id:
+            return True
+    return False
+
+
 def _github_mark_duplicate_of(
     client: httpx.Client,
     project: ProjectConfig,
@@ -2738,6 +2791,19 @@ class GitHubProvider:
                             404, f"ticket '{project.id}#{ticket_id}' not found"
                         ) from exc
                     raise
+                # Pre-flight: detect inverse-kind duplicates (e.g. a
+                # "child" edge already exists for this pair, which maps
+                # to the same wire endpoint).  The wire parent is
+                # target_number and the wire sub-issue is _ticket_internal_id.
+                if _github_sub_issue_already_exists(
+                    client, target_repo, target_number,
+                    sub_issue_internal_id=_ticket_internal_id,
+                ):
+                    raise RelationAlreadyExists(
+                        kind="parent",
+                        ticket_id=ticket_id,
+                        target=f"#{target_number}",
+                    )
                 return _github_post_sub_issue(
                     client, target_repo, target_number,
                     sub_issue_internal_id=_ticket_internal_id,
@@ -2750,6 +2816,18 @@ class GitHubProvider:
                     caller_target_ref=f"#{target_number}",
                 )
             if kind == "child":
+                # Pre-flight: detect inverse-kind duplicates (e.g. a
+                # "parent" edge already exists for this pair, which maps
+                # to the same wire endpoint).
+                if _github_sub_issue_already_exists(
+                    client, _repo_path(project), ticket_id,
+                    sub_issue_internal_id=target_internal_id,
+                ):
+                    raise RelationAlreadyExists(
+                        kind="child",
+                        ticket_id=ticket_id,
+                        target=f"#{target_number}",
+                    )
                 return _github_post_sub_issue(
                     client, _repo_path(project), ticket_id,
                     sub_issue_internal_id=target_internal_id,
@@ -2760,6 +2838,18 @@ class GitHubProvider:
                     caller_target_ref=f"#{target_number}",
                 )
             if kind == "blocked_by":
+                # Pre-flight: detect inverse-kind duplicates (e.g. a
+                # "blocks" edge already exists from the same pair, which
+                # maps to the same wire endpoint and id).
+                if _github_dependency_already_exists(
+                    client, _repo_path(project), ticket_id,
+                    target_internal_id=target_internal_id,
+                ):
+                    raise RelationAlreadyExists(
+                        kind="blocked_by",
+                        ticket_id=ticket_id,
+                        target=f"#{target_number}",
+                    )
                 return _github_post_dependency(
                     client, _repo_path(project), ticket_id,
                     dep_endpoint="blocked_by",
@@ -2783,6 +2873,20 @@ class GitHubProvider:
                             404, f"ticket '{project.id}#{ticket_id}' not found"
                         ) from exc
                     raise
+                # Pre-flight: detect inverse-kind duplicates (e.g. a
+                # "blocked_by" edge already exists from the same pair,
+                # which maps to the same wire endpoint).  The wire source
+                # for "blocks" is target_number and the wire target is
+                # source_internal_id.
+                if _github_dependency_already_exists(
+                    client, target_repo, target_number,
+                    target_internal_id=source_internal_id,
+                ):
+                    raise RelationAlreadyExists(
+                        kind="blocks",
+                        ticket_id=ticket_id,
+                        target=f"#{target_number}",
+                    )
                 return _github_post_dependency(
                     client, target_repo, target_number,
                     dep_endpoint="blocked_by",
