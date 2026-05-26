@@ -2348,7 +2348,12 @@ class GitHubProvider:
         _validate_label_lists(labels_add, labels_remove)
         with _client(token) as client:
             r0 = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
-            _check(r0)
+            try:
+                _check(r0)
+            except GitHubError as exc:
+                if exc.status == 404:
+                    raise GitHubError(404, f"PR '{project.id}#{pr_id}' not found") from exc
+                raise
             current = r0.json()
             current_labels = {lbl["name"] for lbl in (current.get("labels") or [])}
             current_assignees = {a["login"] for a in (current.get("assignees") or [])}
@@ -2775,7 +2780,8 @@ class GitHubProvider:
             except GitHubError as exc:
                 if exc.status == 404:
                     raise GitHubError(
-                        404, f"target '#{target_number}' not found"
+                        404,
+                        f"target issue #{target_number} not found in {project.owner}/{project.repo}",
                     ) from exc
                 raise
             if kind == "parent":
