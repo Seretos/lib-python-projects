@@ -3223,6 +3223,27 @@ class GitHubProvider:
             )[:limit]
             return [_map_run(r) for r in raws], shas
 
+    def list_runs_recent(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        status: str = "all",
+        limit: int = 10,
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List the most recent Actions workflow runs, unfiltered by ref.
+
+        Returns ``(runs, [])`` — the empty ``resolved_refs`` signals that
+        no ref filter was applied.
+        """
+        _validate_limit(limit)
+        with _client(token) as client:
+            params = _runs_params(status, limit)
+            r = client.get(f"{_repo_path(project)}/actions/runs", params=params)
+            _check(r)
+            raw_runs = (r.json() or {}).get("workflow_runs", [])
+        return [_map_run(run) for run in raw_runs], []
+
     def get_run(
         self,
         project: ProjectConfig,

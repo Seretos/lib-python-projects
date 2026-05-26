@@ -2909,6 +2909,25 @@ class GitLabProvider(TokenCapabilityProvider):
         runs = [_map_pipeline_run(it) for it in collected[:per_page]]
         return runs, resolved_refs
 
+    def list_runs_recent(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        status: str = "all",
+        limit: int = 20,
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List the most recent pipelines, unfiltered by ref.
+
+        Returns ``(runs, [])`` — the empty ``resolved_refs`` signals that
+        no ref filter was applied.
+        """
+        params: dict[str, Any] = {}
+        scope = _gitlab_pipeline_scope(status)
+        if scope:
+            params["scope"] = scope
+        return _list_pipelines(project, token, params, limit), []
+
     def get_run(
         self,
         project: ProjectConfig,

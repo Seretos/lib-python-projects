@@ -788,6 +788,22 @@ def test_all_providers_expose_label_methods():
             )
 
 
+# ---------- ticket #70: list_runs_recent cross-provider parity ---------------
+
+
+def test_all_providers_expose_list_runs_recent():
+    """All three providers must expose list_runs_recent as a callable.
+    This is a static structural assertion."""
+    from lib_python_projects.providers.github import GitHubProvider
+    from lib_python_projects.providers.gitlab import GitLabProvider
+    from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+
+    for provider_cls in (GitHubProvider, GitLabProvider, AzureDevOpsProvider):
+        assert callable(getattr(provider_cls, "list_runs_recent", None)), (
+            f"{provider_cls.__name__} is missing callable 'list_runs_recent'"
+        )
+
+
 # ---------- ticket #69: delete_comment cross-provider parity -----------------
 
 

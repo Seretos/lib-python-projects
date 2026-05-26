@@ -478,3 +478,89 @@ def test_list_runs_for_branch_301_returns_empty_not_error(
     assert runs == []
     # branch was found, so resolved_refs must be non-empty.
     assert sha in resolved_refs
+
+
+# ---------- list_runs_recent -------------------------------------------------
+
+
+def test_list_runs_recent_sends_no_branch_or_head_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unfiltered call sends neither `branch` nor `head_sha`, but does set `per_page`."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(req.url.params)
+        return _json({"workflow_runs": []})
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitHubProvider().list_runs_recent(_project(), token="t")
+    assert "branch" not in captured["params"]
+    assert "head_sha" not in captured["params"]
+    assert "per_page" in captured["params"]
+    assert resolved_refs == []
+    assert runs == []
+
+
+def test_list_runs_recent_status_all_omits_status_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`status='all'` must not send a `status` query param."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(req.url.params)
+        return _json({"workflow_runs": []})
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().list_runs_recent(_project(), token="t", status="all")
+    assert "status" not in captured["params"]
+
+
+def test_list_runs_recent_status_completed_sends_status_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`status='completed'` must send `status=completed` in the query."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(req.url.params)
+        return _json({"workflow_runs": []})
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().list_runs_recent(_project(), token="t", status="completed")
+    assert captured["params"].get("status") == "completed"
+
+
+def test_list_runs_recent_returns_mapped_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returned runs are mapped PipelineRun objects; resolved_refs is []."""
+    run_id = 42
+    sha = "cafe1234"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"workflow_runs": [_run_payload(run_id, sha)]})
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitHubProvider().list_runs_recent(_project(), token="t")
+    assert resolved_refs == []
+    assert len(runs) == 1
+    assert runs[0].id == str(run_id)
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+def test_list_runs_recent_nonpositive_limit_raises_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_limit: int,
+) -> None:
+    """limit <= 0 must raise ValueError without any HTTP call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for limit={bad_limit}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="positive integer"):
+        GitHubProvider().list_runs_recent(
+            _project(), token="t", limit=bad_limit,
+        )
