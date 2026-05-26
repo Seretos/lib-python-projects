@@ -3438,6 +3438,23 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
                 resolved_refs.append(f"build/{bid}")
         return runs, resolved_refs
 
+    def list_runs_recent(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        status: str = "all",
+        limit: int = 20,
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List the most recent builds, unfiltered by ref.
+
+        Returns ``(runs, [])`` — the empty ``resolved_refs`` signals that
+        no ref filter was applied.
+        """
+        _validate_limit(limit)
+        params = _api_version_params({"$top": max(1, limit)})
+        return self._list_builds(project, token, params, status, limit), []
+
     def _list_builds(
         self,
         project: ProjectConfig,

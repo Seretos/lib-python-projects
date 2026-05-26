@@ -445,3 +445,89 @@ def test_gitlab_error_empty_message() -> None:
     assert exc.status == 404
     # str form is still well-formed even with an empty message body.
     assert "404" in str(exc)
+
+
+# ---------- list_runs_recent -------------------------------------------------
+
+
+def test_list_runs_recent_sends_no_ref_or_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unfiltered call has no `ref` or `sha` but sets `per_page`, `order_by`, `sort`."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(req.url.params)
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitLabProvider().list_runs_recent(_project(), token="t")
+    assert "ref" not in captured["params"]
+    assert "sha" not in captured["params"]
+    assert "per_page" in captured["params"]
+    assert "order_by" in captured["params"]
+    assert "sort" in captured["params"]
+    assert resolved_refs == []
+    assert runs == []
+
+
+def test_list_runs_recent_status_all_omits_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`status='all'` must not send a `scope` query param."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(req.url.params)
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().list_runs_recent(_project(), token="t", status="all")
+    assert "scope" not in captured["params"]
+
+
+def test_list_runs_recent_status_in_progress_sends_scope_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`status='in_progress'` maps to `scope=running`."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(req.url.params)
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().list_runs_recent(_project(), token="t", status="in_progress")
+    assert captured["params"].get("scope") == "running"
+
+
+def test_list_runs_recent_returns_mapped_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returned runs are mapped PipelineRun objects; resolved_refs is []."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json([_pipeline(77)])
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitLabProvider().list_runs_recent(_project(), token="t")
+    assert resolved_refs == []
+    assert len(runs) == 1
+    assert runs[0].id == "77"
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+def test_list_runs_recent_nonpositive_limit_raises_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_limit: int,
+) -> None:
+    """limit <= 0 must raise ValueError without any HTTP call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for limit={bad_limit}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="positive integer"):
+        GitLabProvider().list_runs_recent(
+            _project(), token="t", limit=bad_limit,
+        )

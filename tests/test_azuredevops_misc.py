@@ -1149,3 +1149,103 @@ def test_get_run_400_build_not_found_type_key_only(
         AzureDevOpsProvider().get_run(_project(), token="t", run_id="9999")
     assert exc.value.status == 404
     assert "pipeline 'azure-tests#9999' not found" in exc.value.message
+
+
+# ---------- list_runs_recent -------------------------------------------------
+
+
+def test_list_runs_recent_sends_no_branch_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unfiltered call has no `branchName` but does set `$top`."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/builds"):
+            captured["params"] = dict(req.url.params)
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_recent(
+        _project(), token="t"
+    )
+    assert "branchName" not in captured["params"]
+    assert "$top" in captured["params"]
+    assert resolved_refs == []
+    assert runs == []
+
+
+def test_list_runs_recent_status_in_progress_sends_status_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`status='in_progress'` must send a `statusFilter` param."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/builds"):
+            captured["params"] = dict(req.url.params)
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_runs_recent(
+        _project(), token="t", status="in_progress"
+    )
+    assert "statusFilter" in captured["params"]
+    assert captured["params"]["statusFilter"] == "in_progress"
+
+
+def test_list_runs_recent_status_all_omits_status_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`status='all'` must not send a `statusFilter` param."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/builds"):
+            captured["params"] = dict(req.url.params)
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_runs_recent(
+        _project(), token="t", status="all"
+    )
+    assert "statusFilter" not in captured["params"]
+
+
+def test_list_runs_recent_returns_mapped_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returned runs are mapped PipelineRun objects; resolved_refs is []."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": [_build_payload(55)]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_recent(
+        _project(), token="t"
+    )
+    assert resolved_refs == []
+    assert len(runs) == 1
+    assert runs[0].id == "55"
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+def test_list_runs_recent_nonpositive_limit_raises_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_limit: int,
+) -> None:
+    """limit <= 0 must raise ValueError without any HTTP call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no HTTP call expected for limit={bad_limit}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="positive integer"):
+        AzureDevOpsProvider().list_runs_recent(
+            _project(), token="t", limit=bad_limit,
+        )
