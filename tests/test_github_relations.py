@@ -1392,6 +1392,9 @@ def test_add_relation_child_duplicate_sub_issue_422(
         # Target issue resolution (for internal id).
         if path == "/repos/acme/backend/issues/5":
             return _json(_issue_payload(5, id=5001))
+        # Pre-flight GET for inverse-kind guard: empty list so the POST fires.
+        if "/sub_issues" in path and req.method == "GET":
+            return _json([])
         # Sub-issues POST → duplicate 422.
         if "/sub_issues" in path and req.method == "POST":
             return _json(
@@ -1423,6 +1426,9 @@ def test_add_relation_blocked_by_cycle_422(
         path = req.url.path
         if path == "/repos/acme/backend/issues/5":
             return _json(_issue_payload(5, id=5001))
+        # Pre-flight GET for inverse-kind guard: empty list so the POST fires.
+        if "/dependencies/blocked_by" in path and req.method == "GET":
+            return _json([])
         if "/dependencies/blocked_by" in path and req.method == "POST":
             return _json(
                 {
@@ -1458,6 +1464,9 @@ def test_add_relation_child_duplicate_raises_relation_already_exists(
         # Target issue resolution (for internal id).
         if path == "/repos/acme/backend/issues/5":
             return _json(_issue_payload(5, id=5001))
+        # Pre-flight GET for inverse-kind guard: empty list so the POST fires.
+        if "/sub_issues" in path and req.method == "GET":
+            return _json([])
         # Sub-issues POST → duplicate 422.
         if "/sub_issues" in path and req.method == "POST":
             return _json(
@@ -1490,6 +1499,9 @@ def test_add_relation_blocked_by_duplicate_raises_relation_already_exists(
         path = req.url.path
         if path == "/repos/acme/backend/issues/5":
             return _json(_issue_payload(5, id=5001))
+        # Pre-flight GET for inverse-kind guard: empty list so the POST fires.
+        if "/dependencies/blocked_by" in path and req.method == "GET":
+            return _json([])
         if "/dependencies/blocked_by" in path and req.method == "POST":
             return _json(
                 {
@@ -1702,6 +1714,9 @@ def test_add_relation_blocks_duplicate_raises_relation_already_exists_with_calle
         # Resolve caller issue (A = #1) for internal id.
         if path == "/repos/acme/backend/issues/1":
             return _json(_issue_payload(1, id=1001))
+        # Pre-flight GET for inverse-kind guard: empty list so the POST fires.
+        if "/repos/acme/backend/issues/5/dependencies/blocked_by" in path and req.method == "GET":
+            return _json([])
         # Wire POST is to B's endpoint; return duplicate 422.
         if "/repos/acme/backend/issues/5/dependencies/blocked_by" in path and req.method == "POST":
             return _json(
@@ -1742,6 +1757,9 @@ def test_add_relation_parent_duplicate_raises_relation_already_exists_with_calle
         # Resolve caller (child, A = #3) for internal id.
         if path == "/repos/acme/backend/issues/3":
             return _json(_issue_payload(3, id=3001))
+        # Pre-flight GET for inverse-kind guard: empty list so the POST fires.
+        if "/repos/acme/backend/issues/7/sub_issues" in path and req.method == "GET":
+            return _json([])
         # Wire POST is to B's sub_issues endpoint; return duplicate 422.
         if "/repos/acme/backend/issues/7/sub_issues" in path and req.method == "POST":
             return _json(
@@ -1843,3 +1861,221 @@ def test_duplicate_of_dedicated_line_is_detected(
     assert any(r.kind == "duplicate_of" and r.ticket_id == "#1" for r in relations), (
         f"dedicated marker line must yield duplicate_of #1; got {relations}"
     )
+
+
+# ---------- Ticket #61: inverse-kind relation de-duplication ------------------
+
+
+def test_add_relation_blocks_after_blocked_by_raises_already_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation('blocks', A→B) when B already has A in its blocked_by list
+    (i.e. the inverse 'blocked_by' edge was added first) must raise
+    RelationAlreadyExists with kind='blocks'."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Resolve target (B = #5) for internal id.
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        # Resolve caller (A = #1) for internal id.
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, id=1001))
+        # Pre-flight GET: B's blocked_by list already contains A (id=1001).
+        if path == "/repos/acme/backend/issues/5/dependencies/blocked_by" and req.method == "GET":
+            return _json([{"id": 1001, "number": 1, "title": "Issue 1", "state": "open"}])
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationAlreadyExists) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="blocks", target="#5"
+        )
+    assert exc.value.kind == "blocks"
+    assert exc.value.ticket_id == "1"
+    assert "#5" in exc.value.target
+    assert isinstance(exc.value, ValueError)
+
+
+def test_add_relation_blocked_by_after_blocks_raises_already_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation('blocked_by', A→B) when A already has B in its blocked_by list
+    (i.e. the inverse 'blocks' edge was added first) must raise
+    RelationAlreadyExists with kind='blocked_by'."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Resolve target (B = #5) for internal id.
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        # Pre-flight GET: A's (#1) blocked_by list already contains B (id=5001).
+        if path == "/repos/acme/backend/issues/1/dependencies/blocked_by" and req.method == "GET":
+            return _json([{"id": 5001, "number": 5, "title": "Issue 5", "state": "open"}])
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationAlreadyExists) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="blocked_by", target="#5"
+        )
+    assert exc.value.kind == "blocked_by"
+    assert exc.value.ticket_id == "1"
+    assert "#5" in exc.value.target
+    assert isinstance(exc.value, ValueError)
+
+
+def test_add_relation_parent_after_child_raises_already_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation('parent', A→B) when B already has A in its sub-issues list
+    (i.e. the inverse 'child' edge was added first) must raise
+    RelationAlreadyExists with kind='parent'."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Resolve target (B = #7, the intended parent) for internal id.
+        if path == "/repos/acme/backend/issues/7":
+            return _json(_issue_payload(7, id=7001))
+        # Resolve caller (A = #3) for internal id.
+        if path == "/repos/acme/backend/issues/3":
+            return _json(_issue_payload(3, id=3001))
+        # Pre-flight GET: B's sub-issues list already contains A (id=3001).
+        if path == "/repos/acme/backend/issues/7/sub_issues" and req.method == "GET":
+            return _json([{"id": 3001, "number": 3, "title": "Issue 3", "state": "open"}])
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationAlreadyExists) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="3", kind="parent", target="#7"
+        )
+    assert exc.value.kind == "parent"
+    assert exc.value.ticket_id == "3"
+    assert "#7" in exc.value.target
+    assert isinstance(exc.value, ValueError)
+
+
+def test_add_relation_child_after_parent_raises_already_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation('child', A→B) when A already has B in its sub-issues list
+    (i.e. the inverse 'parent' edge was added first) must raise
+    RelationAlreadyExists with kind='child'."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Resolve target (B = #5, the intended child) for internal id.
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        # Pre-flight GET: A's (#1) sub-issues list already contains B (id=5001).
+        if path == "/repos/acme/backend/issues/1/sub_issues" and req.method == "GET":
+            return _json([{"id": 5001, "number": 5, "title": "Issue 5", "state": "open"}])
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationAlreadyExists) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="child", target="#5"
+        )
+    assert exc.value.kind == "child"
+    assert exc.value.ticket_id == "1"
+    assert "#5" in exc.value.target
+    assert isinstance(exc.value, ValueError)
+
+
+def test_add_relation_blocks_no_existing_link_proceeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation('blocks') when the pre-flight GET returns an empty blocked_by
+    list must still issue the POST (no false positive suppression)."""
+
+    post_called: list[bool] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Resolve target (B = #5).
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        # Resolve caller (A = #1).
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, id=1001))
+        # Pre-flight GET: empty list — no existing link.
+        if path == "/repos/acme/backend/issues/5/dependencies/blocked_by" and req.method == "GET":
+            return _json([])
+        # The POST must still be issued.
+        if path == "/repos/acme/backend/issues/5/dependencies/blocked_by" and req.method == "POST":
+            post_called.append(True)
+            return _json({"id": 1001, "number": 1, "title": "Issue 1", "state": "open"})
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().add_relation(
+        _project(), token="t", ticket_id="1", kind="blocks", target="#5"
+    )
+    assert post_called, "POST to dependencies/blocked_by must be issued when list is empty"
+
+
+def test_add_relation_child_no_existing_link_proceeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation('child') when the pre-flight GET returns an empty sub-issues
+    list must still issue the POST (no false positive suppression)."""
+
+    post_called: list[bool] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Resolve target (B = #5, the intended child).
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        # Pre-flight GET: empty list — no existing link.
+        if path == "/repos/acme/backend/issues/1/sub_issues" and req.method == "GET":
+            return _json([])
+        # The POST must still be issued.
+        if path == "/repos/acme/backend/issues/1/sub_issues" and req.method == "POST":
+            post_called.append(True)
+            return _json({"id": 5001, "number": 5, "title": "Issue 5", "state": "open"})
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().add_relation(
+        _project(), token="t", ticket_id="1", kind="child", target="#5"
+    )
+    assert post_called, "POST to sub_issues must be issued when list is empty"
+
+
+def test_add_relation_blocks_inverse_raises_carries_caller_ticket_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: when add_relation('blocks', A→B) raises RelationAlreadyExists
+    due to an inverse-kind duplicate, the exception must carry the *caller's*
+    logical source id (A), not the wire source (B).
+
+    This mirrors the existing test for the 422-path
+    (test_add_relation_blocks_duplicate_raises_relation_already_exists_with_caller_id)
+    but exercises the pre-flight GET path instead.
+    """
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # B = #5 (target), A = #2 (caller / logical source).
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        if path == "/repos/acme/backend/issues/2":
+            return _json(_issue_payload(2, id=2001))
+        # Pre-flight: B's blocked_by list already contains A (id=2001).
+        if path == "/repos/acme/backend/issues/5/dependencies/blocked_by" and req.method == "GET":
+            return _json([{"id": 2001, "number": 2, "title": "Issue 2", "state": "open"}])
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationAlreadyExists) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="2", kind="blocks", target="#5"
+        )
+    # ticket_id must be A ("2"), not the wire source B ("5").
+    assert exc.value.ticket_id == "2", (
+        f"expected ticket_id='2' (caller's A), got {exc.value.ticket_id!r}"
+    )
+    assert exc.value.kind == "blocks"
+    assert "#5" in exc.value.target
