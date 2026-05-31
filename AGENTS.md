@@ -4,6 +4,12 @@ A pure Python domain library (project-list model, provider abstraction for
 GitHub/GitLab/Azure DevOps). This file tells any AI coding agent how to
 operate in this repo. Keep it generic — behaviour lives in skills.
 
+## Tool priority
+
+Skills and MCP tools take priority over raw file tools — and this **explicitly overrides** the generic harness default that says "prefer the dedicated file/search tools (Glob/Grep/Read)". When a skill or MCP tool covers the task, reach for it first; fall back to raw Glob/Grep/Read only when none applies.
+
+Concretely: any *"where is X defined / what does the code support / which Y exist / how does X work / find the callers of X"* question is a **code-understanding task → use the matching skill first** (e.g. the `serena-wrapper` symbol-aware tools), never raw Glob/Grep/Read.
+
 ## Tool-priority law (read this first)
 
 When you decide how to accomplish a step, always prefer the highest
