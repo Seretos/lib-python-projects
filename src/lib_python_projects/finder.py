@@ -192,6 +192,24 @@ def find_projects(
     # min_score are returned unchanged (current behaviour).
     top_score = above_floor[0].score
     if top_score >= HIGH_CONFIDENCE_SCORE:
-        above_floor = [m for m in above_floor if m.score >= top_score * RELATIVE_SCORE_CUTOFF]
+        # Honor the caller's explicit floor: never drop anything min_score says
+        # to keep.  When the caller has lowered min_score below the relative
+        # cutoff (e.g. min_score=0.0 to inspect all candidates), suppression
+        # would override their intent, so we skip it in that case.
+        # The relative cutoff only applies when it is no stricter than the
+        # caller's own floor — i.e. when min_score >= top_score * RELATIVE_SCORE_CUTOFF
+        # we keep the caller's floor as-is (nothing extra to suppress); when
+        # min_score < top_score * RELATIVE_SCORE_CUTOFF we tighten only if the
+        # caller is using the default floor (has not opted into seeing more).
+        relative_cutoff = top_score * RELATIVE_SCORE_CUTOFF
+        if min_score >= relative_cutoff:
+            # Caller's floor is already as tight as or tighter than what the
+            # relative cutoff would produce — nothing extra to drop.
+            pass
+        elif min_score >= DEFAULT_MIN_SCORE:
+            # Caller is using the default (or a higher) floor: apply suppression.
+            above_floor = [m for m in above_floor if m.score >= relative_cutoff]
+        # else: caller explicitly lowered the floor below the default, opting in
+        # to see more results — do not suppress.
 
     return FindResult(matches=above_floor, hint=None)

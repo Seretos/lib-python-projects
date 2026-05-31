@@ -241,21 +241,57 @@ class TestDominantMatchNoiseSuppression:
         """When no match clears HIGH_CONFIDENCE_SCORE, all results above
         the floor are returned (gating must not fire).
 
-        Both "project-alpha" and "project-beta" share "project" with the
-        query.  The top score (~0.5) is below HIGH_CONFIDENCE_SCORE (0.7)
-        so neither is suppressed.
+        Uses a query and ids whose top F1 is reliably well below
+        HIGH_CONFIDENCE_SCORE (0.7), giving a clear margin so the test
+        does not flip if the scorer's exact values shift slightly.
+        We explicitly assert the measured top score is below the threshold
+        before asserting both results survive.
         """
-        # query "project": 1 query token, each id has 2 tokens.
-        # precision = 1/1 = 1.0, recall = 1/2 = 0.5 → F1 = 2/3 ≈ 0.667
-        # 0.667 < HIGH_CONFIDENCE_SCORE (0.7) → gating must NOT fire
-        p1 = _make_project(id="project-alpha", path="acme/project-alpha")
-        p2 = _make_project(id="project-beta", path="acme/project-beta")
+        # query "foo": 1 token.  Each id has 4+ tokens → recall is low.
+        # "alpha-foo-service-one": precision=1.0, recall=1/4=0.25, F1=0.4
+        # "beta-foo-platform-two": precision=1.0, recall=1/4=0.25, F1=0.4
+        # Both well below HIGH_CONFIDENCE_SCORE (0.7) — gating must NOT fire.
+        p1 = _make_project(id="alpha-foo-service-one", path="acme/alpha-foo-service-one")
+        p2 = _make_project(id="beta-foo-platform-two", path="acme/beta-foo-platform-two")
 
-        result = find_projects([p1, p2], query="project", fields="id")
-        # Both must survive because top score does not clear the threshold
+        result = find_projects([p1, p2], query="foo", fields="id")
+        # Guard: confirm the top score is below the gate threshold.
+        assert len(result.matches) >= 1
+        top = result.matches[0].score
+        assert top < HIGH_CONFIDENCE_SCORE, (
+            f"test fixture assumption violated: top score {top:.3f} >= "
+            f"HIGH_CONFIDENCE_SCORE {HIGH_CONFIDENCE_SCORE}; adjust the fixture"
+        )
+        # Both must survive because top score does not clear the threshold.
         ids = {m.project.id for m in result.matches}
-        assert "project-alpha" in ids
-        assert "project-beta" in ids
+        assert "alpha-foo-service-one" in ids
+        assert "beta-foo-platform-two" in ids
+
+    def test_min_score_zero_overrides_relative_cutoff(self) -> None:
+        """Regression (blocking 1): min_score=0.0 must return ALL scored
+        projects, even when the top hit is high-confidence and the noise
+        project would normally be suppressed by the relative cutoff.
+
+        This must fail before the blocking-1 fix (cutoff ignores min_score)
+        and pass after (cutoff = max(min_score, top*RELATIVE_SCORE_CUTOFF)).
+        """
+        # Exact match (score 1.0) + noise (score well below 0.5)
+        p_exact = _make_project(id="agent-project-issues", path="Seretos/agent-project-issues")
+        p_noise = _make_project(id="some-issues-tracker", path="acme/tracker")
+
+        result = find_projects(
+            [p_exact, p_noise],
+            query="agent-project-issues",
+            fields="id",
+            min_score=0.0,  # caller explicitly wants everything above 0.0
+        )
+        # The noise project's score is > 0.0 so min_score=0.0 says keep it.
+        ids = {m.project.id for m in result.matches}
+        assert "agent-project-issues" in ids
+        assert "some-issues-tracker" in ids, (
+            "min_score=0.0 must override the relative cutoff and return "
+            "all projects that scored above 0.0"
+        )
 
     def test_two_equal_high_confidence_matches_both_survive(self) -> None:
         """Two projects each scoring F1 = 1.0 must both appear in results.
