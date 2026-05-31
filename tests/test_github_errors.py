@@ -651,3 +651,44 @@ def test_delete_comment_404_names_comment(monkeypatch: pytest.MonkeyPatch) -> No
         GitHubProvider().delete_comment(_project(), token="t", comment_id="99")
     assert exc.value.status == 404
     assert "comment '99' not found in acme" in exc.value.message
+
+
+# ---------- Ticket #74: create_ticket blank-title guard (GitHub) --------------
+
+
+class TestCreateTicketBlankTitle:
+    """create_ticket must raise ValueError before any HTTP call when title is blank."""
+
+    def test_empty_string_title_raises_value_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """title="" must raise ValueError(blank) with no HTTP request made."""
+        seen: list[httpx.Request] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.append(req)
+            return _json({}, status_code=201)
+
+        _install_mock(monkeypatch, handler)
+        with pytest.raises(ValueError, match="blank"):
+            GitHubProvider().create_ticket(
+                _project(), token="t", title="", body="body", labels=[], assignees=[],
+            )
+        assert seen == [], "no HTTP request should have been made"
+
+    def test_whitespace_only_title_raises_value_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """title='   ' must raise ValueError(blank) with no HTTP request made."""
+        seen: list[httpx.Request] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.append(req)
+            return _json({}, status_code=201)
+
+        _install_mock(monkeypatch, handler)
+        with pytest.raises(ValueError, match="blank"):
+            GitHubProvider().create_ticket(
+                _project(), token="t", title="   ", body="body", labels=[], assignees=[],
+            )
+        assert seen == [], "no HTTP request should have been made"

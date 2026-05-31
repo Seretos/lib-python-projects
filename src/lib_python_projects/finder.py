@@ -40,6 +40,17 @@ from lib_python_projects.models import FindResult, ProjectConfig, ProjectMatch
 
 DEFAULT_MIN_SCORE: float = 0.3
 
+# When the best match clears this threshold we treat it as a high-confidence
+# hit and drop any result scoring below `top_score * RELATIVE_SCORE_CUTOFF`.
+# 0.7 sits above moderate fuzzy hits (a single-token partial match against a
+# multi-token id scores ~0.4–0.5 F1) but below a full exact-id match (1.0).
+HIGH_CONFIDENCE_SCORE: float = 0.7
+
+# When the dominant hit clears HIGH_CONFIDENCE_SCORE, results scoring below
+# this fraction of the top score are suppressed.  0.5 keeps a strong second
+# match (e.g. 0.85 vs 0.70) while removing incidental low-score noise.
+RELATIVE_SCORE_CUTOFF: float = 0.5
+
 _TOKEN_SPLIT = re.compile(r"[-_/\s]+")
 
 # SequenceMatcher ratio threshold at which two individual tokens are
@@ -172,4 +183,15 @@ def find_projects(
         return FindResult(matches=[], hint="no matches above relevance floor")
 
     above_floor.sort(key=lambda m: m.score, reverse=True)
+
+    # Noise suppression: when the top score is a high-confidence hit,
+    # drop results that score below half of the top score.  This prevents
+    # incidental token-overlap hits from cluttering a result where one
+    # project is clearly the best match.  When the top score does not
+    # clear HIGH_CONFIDENCE_SCORE (ambiguous query), all results above
+    # min_score are returned unchanged (current behaviour).
+    top_score = above_floor[0].score
+    if top_score >= HIGH_CONFIDENCE_SCORE:
+        above_floor = [m for m in above_floor if m.score >= top_score * RELATIVE_SCORE_CUTOFF]
+
     return FindResult(matches=above_floor, hint=None)

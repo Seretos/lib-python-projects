@@ -1471,6 +1471,8 @@ class GitLabProvider(TokenCapabilityProvider):
         performed up-front (`_status_to_state_event`) so an invalid
         value rejects before the POST.
         """
+        if not title or not title.strip():
+            raise ValueError("title must not be blank")
         # Validate `status` up-front. Pass None through; raise on
         # unknown values before POST commits an issue.
         state_event: str | None = None

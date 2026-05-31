@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from lib_python_projects import FindResult, ProjectConfig, ProjectMatch, find_projects
-from lib_python_projects.finder import DEFAULT_MIN_SCORE
+from lib_python_projects.finder import DEFAULT_MIN_SCORE, HIGH_CONFIDENCE_SCORE, RELATIVE_SCORE_CUTOFF
 
 
 # ---------------------------------------------------------------------------
@@ -199,3 +199,109 @@ class TestPublicApiExports:
     def test_project_match_is_pydantic_model(self) -> None:
         from pydantic import BaseModel
         assert issubclass(ProjectMatch, BaseModel)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests — dominant-match noise suppression (ticket #74)
+# ---------------------------------------------------------------------------
+
+
+class TestDominantMatchNoiseSuppression:
+    """When the top match clears HIGH_CONFIDENCE_SCORE, low-scoring noise
+    must be suppressed.  When the top score is below the threshold, all
+    results above the floor are returned unchanged.
+    """
+
+    def test_exact_id_match_suppresses_low_scoring_noise(self) -> None:
+        """Exact-id query (score 1.0) suppresses incidental lower-scoring hits.
+
+        Regression for the reported symptom: querying "agent-project-issues"
+        should return only the project whose id is "agent-project-issues"
+        (score 1.0), not also "some-issues-tracker" or "project-management"
+        whose incidental token overlaps score ~0.3–0.45.
+        """
+        # "agent-project-issues" matches id exactly → F1 = 1.0
+        p_exact = _make_project(id="agent-project-issues", path="Seretos/agent-project-issues")
+        # "some-issues-tracker" shares "issues" token with query but is far
+        # from a full match.  Expected F1 ~ 0.35 (well below 1.0 * 0.5).
+        p_noise1 = _make_project(id="some-issues-tracker", path="acme/tracker")
+        # "project-management" shares "project" token.
+        p_noise2 = _make_project(id="project-management", path="acme/pm")
+
+        result = find_projects(
+            [p_exact, p_noise1, p_noise2],
+            query="agent-project-issues",
+            fields="id",
+        )
+        assert len(result.matches) == 1
+        assert result.matches[0].project.id == "agent-project-issues"
+        assert result.matches[0].score == pytest.approx(1.0)
+
+    def test_no_dominant_hit_preserves_all_above_floor(self) -> None:
+        """When no match clears HIGH_CONFIDENCE_SCORE, all results above
+        the floor are returned (gating must not fire).
+
+        Both "project-alpha" and "project-beta" share "project" with the
+        query.  The top score (~0.5) is below HIGH_CONFIDENCE_SCORE (0.7)
+        so neither is suppressed.
+        """
+        # query "project": 1 query token, each id has 2 tokens.
+        # precision = 1/1 = 1.0, recall = 1/2 = 0.5 → F1 = 2/3 ≈ 0.667
+        # 0.667 < HIGH_CONFIDENCE_SCORE (0.7) → gating must NOT fire
+        p1 = _make_project(id="project-alpha", path="acme/project-alpha")
+        p2 = _make_project(id="project-beta", path="acme/project-beta")
+
+        result = find_projects([p1, p2], query="project", fields="id")
+        # Both must survive because top score does not clear the threshold
+        ids = {m.project.id for m in result.matches}
+        assert "project-alpha" in ids
+        assert "project-beta" in ids
+
+    def test_two_equal_high_confidence_matches_both_survive(self) -> None:
+        """Two projects each scoring F1 = 1.0 must both appear in results.
+
+        When top_score >= HIGH_CONFIDENCE_SCORE and the second match also
+        equals top_score, the relative cutoff (top*0.5) keeps both.
+        """
+        p1 = _make_project(id="config", path="acme/config")
+        p2 = _make_project(id="config", path="other/config")
+        # Two distinct ProjectConfig objects with same id both score 1.0
+        # for query "config"; both should survive the cutoff.
+        result = find_projects([p1, p2], query="config", fields="id")
+        assert len(result.matches) == 2
+        for m in result.matches:
+            assert m.score == pytest.approx(1.0)
+
+    def test_moderate_top_score_no_suppression(self) -> None:
+        """When top_score < HIGH_CONFIDENCE_SCORE, the relative cutoff is
+        NOT applied, even if a second result scores much lower.
+
+        query "agent" against ids ["agent-project-issues", "project-management"]:
+        - "agent-project-issues": precision=1.0, recall=1/3≈0.333 → F1≈0.5
+        - "project-management":  "agent" hits "management"? No (low ratio).
+          Actually recall = 0, so F1 = 0.  But to make this test meaningful
+          we need a second project that IS above the floor.
+        Use query "tracker" against "issue-tracker" (F1≈0.5) and
+        "bug-tracker-pro" (F1 slightly lower but still above floor).
+        """
+        # query "tracker": 1 token
+        # "issue-tracker" has tokens ["issue","tracker"]: precision=1/1=1.0,
+        #   recall=1/2=0.5, F1=2/3≈0.667 — below HIGH_CONFIDENCE_SCORE
+        # "bug-tracker-pro" has tokens ["bug","tracker","pro"]: precision=1.0,
+        #   recall=1/3≈0.333, F1=0.5 — above DEFAULT_MIN_SCORE (0.3)
+        p1 = _make_project(id="issue-tracker", path="acme/issue-tracker")
+        p2 = _make_project(id="bug-tracker-pro", path="acme/bug-tracker-pro")
+
+        result = find_projects([p1, p2], query="tracker", fields="id")
+        ids = {m.project.id for m in result.matches}
+        # top score ~0.667 < HIGH_CONFIDENCE_SCORE (0.7): no suppression
+        assert "issue-tracker" in ids
+        assert "bug-tracker-pro" in ids
+
+    def test_high_confidence_constants_exported(self) -> None:
+        """HIGH_CONFIDENCE_SCORE and RELATIVE_SCORE_CUTOFF must be importable
+        from lib_python_projects.finder and have values in (0, 1)."""
+        assert isinstance(HIGH_CONFIDENCE_SCORE, float)
+        assert 0.0 < HIGH_CONFIDENCE_SCORE < 1.0
+        assert isinstance(RELATIVE_SCORE_CUTOFF, float)
+        assert 0.0 < RELATIVE_SCORE_CUTOFF < 1.0

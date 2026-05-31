@@ -1508,3 +1508,42 @@ def test_list_statuses_both_terminals_populated_when_both_categories_present(
     spec = AzureDevOpsProvider().list_statuses(p, token="t")
     assert spec.hints["terminal_completed"] == "Closed"
     assert spec.hints["terminal_declined"] == "Removed"
+
+
+# ---------- Ticket #74: create_ticket blank-title guard (Azure DevOps) --------
+
+
+class TestCreateTicketBlankTitleAzureDevOps:
+    """create_ticket must raise ValueError before any HTTP call when title is blank."""
+
+    def test_empty_string_title_raises_value_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """title="" must raise ValueError(blank) with no HTTP request made."""
+        seen = _install_mock(monkeypatch, lambda req: _json({}))
+        with pytest.raises(ValueError, match="blank"):
+            AzureDevOpsProvider().create_ticket(
+                _project(default_type="Issue"),
+                token="t",
+                title="",
+                body="body",
+                labels=[],
+                assignees=[],
+            )
+        assert seen == [], "no HTTP request should have been made"
+
+    def test_whitespace_only_title_raises_value_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """title='   ' must raise ValueError(blank) with no HTTP request made."""
+        seen = _install_mock(monkeypatch, lambda req: _json({}))
+        with pytest.raises(ValueError, match="blank"):
+            AzureDevOpsProvider().create_ticket(
+                _project(default_type="Issue"),
+                token="t",
+                title="   ",
+                body="body",
+                labels=[],
+                assignees=[],
+            )
+        assert seen == [], "no HTTP request should have been made"
