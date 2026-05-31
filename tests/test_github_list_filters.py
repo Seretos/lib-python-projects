@@ -20,7 +20,7 @@ import pytest
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import github as github_provider
 from lib_python_projects.providers.base import TicketFilters
-from lib_python_projects.providers.github import GitHubProvider
+from lib_python_projects.providers.github import GitHubError, GitHubProvider
 
 
 # ---------- helpers ----------------------------------------------------------
@@ -404,3 +404,68 @@ def test_list_tickets_pr_filtered_returns_full_limit(
     # Page 2 had exactly per_page=2 items, so has_more should be True
     # (we cannot tell whether more pages exist — the page was full).
     assert has_more is True
+
+
+# ---------- Regression: bogus-assignee 422 (ticket #74) ----------------------
+
+
+class TestListTicketsBogusAssignee:
+    """GitHub returns 422 for unknown assignee on the /repos/.../issues path.
+
+    The expected behaviour is: return ([], False) rather than raising
+    GitHubError.  This mirrors the search endpoint which silently returns
+    zero results for unknown assignees.
+    """
+
+    def test_bogus_assignee_422_returns_empty_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """list_tickets with an unknown assignee must return ([], False) not raise."""
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            # Only the /issues paginating path (not /search) is exercised here.
+            assert "/repos/" in str(req.url)
+            return _json(
+                {
+                    "message": "Validation Failed",
+                    "errors": [
+                        {
+                            "resource": "Issue",
+                            "field": "assignee",
+                            "code": "invalid",
+                        }
+                    ],
+                },
+                status_code=422,
+            )
+
+        _install_mock(monkeypatch, handler)
+        provider = GitHubProvider()
+        tickets, has_more = provider.list_tickets(
+            _project(),
+            token="t",
+            filters=TicketFilters(assignee="ghost-user-xyz"),
+        )
+        assert tickets == []
+        assert has_more is False
+
+    def test_422_without_assignee_filter_still_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 422 not caused by an assignee filter must still propagate as GitHubError."""
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            return _json(
+                {"message": "Validation Failed", "errors": []},
+                status_code=422,
+            )
+
+        _install_mock(monkeypatch, handler)
+        provider = GitHubProvider()
+        with pytest.raises(GitHubError) as exc:
+            provider.list_tickets(
+                _project(),
+                token="t",
+                filters=TicketFilters(),  # no assignee filter
+            )
+        assert exc.value.status == 422

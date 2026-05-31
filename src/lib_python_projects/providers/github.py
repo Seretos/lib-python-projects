@@ -1618,7 +1618,16 @@ class GitHubProvider:
                 while len(collected) < filters.limit:
                     params = {**base_params, "page": page}
                     r = client.get(f"{_repo_path(project)}/issues", params=params)
-                    _check(r)
+                    try:
+                        _check(r)
+                    except GitHubError as exc:
+                        # GitHub returns 422 when the assignee filter value is
+                        # not a valid user.  Treat this as "no matching issues"
+                        # rather than a hard error, mirroring the search path
+                        # which returns empty results for unknown assignees.
+                        if exc.status == 422 and filters.assignee:
+                            return [], False
+                        raise
                     raw_page = r.json()
                     last_raw_page_full = len(raw_page) >= per_page
                     # The /issues endpoint includes PRs; skip them.
@@ -1704,6 +1713,8 @@ class GitHubProvider:
         landed via a follow-up PATCH inside this method — the agent
         sees one logical call.
         """
+        if not title or not title.strip():
+            raise ValueError("title must not be blank")
         # Deduplicate while preserving order, ensure ai-generated is present.
         merged = list(dict.fromkeys([*labels, AI_GENERATED_LABEL]))
         prefixed_body = ensure_body_prefix(body)

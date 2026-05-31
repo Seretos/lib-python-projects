@@ -1780,6 +1780,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
 
         When ``status`` is ``None``, behavior is unchanged: a single POST.
         """
+        if not title or not title.strip():
+            raise ValueError("title must not be blank")
         wi_type = self._default_work_item_type(project, token)
 
         # Pre-validate the requested status before the POST so the caller
