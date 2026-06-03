@@ -564,3 +564,322 @@ def test_list_runs_recent_nonpositive_limit_raises_before_http(
         GitHubProvider().list_runs_recent(
             _project(), token="t", limit=bad_limit,
         )
+
+
+# ---------- _extract_log_excerpt pure-function tests (ticket #76) ------------
+
+
+def _make_log(*sections: str) -> str:
+    """Join log sections with newlines."""
+    return "\n".join(sections)
+
+
+def test_extract_log_excerpt_step_named_run_prefix_matches() -> None:
+    """Regression test for ticket #76.
+
+    The GitHub Jobs API returns step names like ``"Run python -m pytest tests -v"``
+    while the log group header is ``"##[group]Run python -m pytest tests -v"``.
+    Previously the target was compared as-is, producing
+    ``"run python -m pytest tests -v"`` vs the captured group name
+    ``"python -m pytest tests -v"`` — a mismatch that caused the function to
+    fall through to the head-of-log fallback.
+
+    After the fix, the leading ``"Run "`` prefix is stripped from the
+    casefolded target before comparison, so the group is found correctly
+    and the excerpt contains the error line.
+    """
+    from lib_python_projects.providers.github import _extract_log_excerpt
+
+    log = _make_log(
+        "2024-01-01T00:00:00.000Z ##[group]Set up job",
+        "2024-01-01T00:00:01.000Z Setting up runner",
+        "2024-01-01T00:00:02.000Z ##[endgroup]",
+        "2024-01-01T00:00:03.000Z ##[group]Run python -m pytest tests -v",
+        "2024-01-01T00:00:04.000Z /usr/bin/python: No module named pytest",
+        "2024-01-01T00:00:05.000Z ##[endgroup]",
+        "2024-01-01T00:00:06.000Z Post step cleanup",
+    )
+    result = _extract_log_excerpt(log, failed_step="Run python -m pytest tests -v")
+    assert "No module named pytest" in result
+
+
+def test_extract_log_excerpt_step_name_without_run_prefix() -> None:
+    """A step name without the ``"Run "`` prefix also finds the group."""
+    from lib_python_projects.providers.github import _extract_log_excerpt
+
+    log = _make_log(
+        "2024-01-01T00:00:03.000Z ##[group]Run python -m pytest tests -v",
+        "2024-01-01T00:00:04.000Z /usr/bin/python: No module named pytest",
+        "2024-01-01T00:00:05.000Z ##[endgroup]",
+    )
+    result = _extract_log_excerpt(log, failed_step="python -m pytest tests -v")
+    assert "No module named pytest" in result
+
+
+def test_extract_log_excerpt_step_casefold() -> None:
+    """Matching is case-insensitive for both the step name and the group name."""
+    from lib_python_projects.providers.github import _extract_log_excerpt
+
+    log = _make_log(
+        "##[group]Run Python -m Pytest Tests -v",
+        "Error: something went wrong",
+        "##[endgroup]",
+    )
+    result = _extract_log_excerpt(log, failed_step="RUN PYTHON -M PYTEST TESTS -V")
+    assert "Error: something went wrong" in result
+
+
+def test_extract_log_excerpt_error_marker_preferred_over_generic() -> None:
+    """The two-pass scan must prefer ``##[error]`` over a generic ``error`` match.
+
+    A generic ``error`` keyword appears in a setup section (after the first
+    group opens) and a ``##[error]`` line appears later.  The excerpt must
+    be anchored at the ``##[error]`` line, not the earlier generic match.
+    """
+    from lib_python_projects.providers.github import _extract_log_excerpt
+
+    log = _make_log(
+        "##[group]Set up job",
+        "echo error suppressed",           # generic 'error' in setup — should be skipped
+        "##[endgroup]",
+        "Running tests",
+        "##[error]Process completed with exit code 1",   # specific marker — should win
+        "Post step",
+    )
+    # No failed_step so we fall through to the substring scan.
+    result = _extract_log_excerpt(log)
+    assert "##[error]Process completed with exit code 1" in result
+    # The generic 'echo error suppressed' line must NOT be the anchor.
+    # If it were, the excerpt would start at or before line 2 and the
+    # ##[error] line would also happen to be included only by coincidence;
+    # we verify the marker line IS present (two-pass chose it as anchor).
+    assert "##[error]" in result
+    # Explicitly assert the generic line is NOT what drove the excerpt anchor:
+    # the excerpt must not start at (or before) the generic-match line.
+    # We check this by confirming "echo error suppressed" is absent from the
+    # result — the two-pass logic skips it in favour of ##[error].
+    assert "echo error suppressed" not in result
+
+
+def test_extract_log_excerpt_tail_fallback_returns_tail_not_head() -> None:
+    """When no groups and no error keywords exist, the fallback must return
+    the TAIL of the log, not the head."""
+    from lib_python_projects.providers.github import _extract_log_excerpt
+
+    # 40 lines, none containing 'error'/'failed'/groups.
+    lines = [f"line-{i:02d}" for i in range(40)]
+    log = "\n".join(lines)
+    result = _extract_log_excerpt(log, max_lines=10)
+    result_lines = result.splitlines()
+    # First returned line must NOT be the very first log line.
+    assert result_lines[0] != "line-00"
+    # The last log line must be present (tail).
+    assert "line-39" in result
+
+
+def test_extract_log_excerpt_empty_log_returns_empty_string() -> None:
+    """Empty string input returns an empty string without raising."""
+    from lib_python_projects.providers.github import _extract_log_excerpt
+
+    assert _extract_log_excerpt("") == ""
+
+
+# ---------- HTTP-level tests for get_run / tail_lines (ticket #76) -----------
+
+
+def _failed_run_payload(run_id: int, head_sha: str) -> dict:
+    """A completed failed workflow_run payload."""
+    return {
+        "id": run_id,
+        "name": "CI",
+        "head_sha": head_sha,
+        "head_branch": "main",
+        "event": "push",
+        "status": "completed",
+        "conclusion": "failure",
+        "html_url": f"https://github.com/acme/backend/actions/runs/{run_id}",
+        "created_at": "2024-01-02T00:00:00Z",
+        "updated_at": "2024-01-02T01:00:00Z",
+        "run_attempt": 1,
+        "display_title": "CI run",
+    }
+
+
+def _jobs_payload(job_id: int, job_name: str = "test", failed_step_name: str = "Run pytest") -> dict:
+    """A /jobs response with one failed job."""
+    return {
+        "jobs": [
+            {
+                "id": job_id,
+                "name": job_name,
+                "conclusion": "failure",
+                "html_url": f"https://github.com/acme/backend/actions/runs/1/jobs/{job_id}",
+                "check_run_url": None,
+                "steps": [
+                    {
+                        "name": failed_step_name,
+                        "conclusion": "failure",
+                        "number": 1,
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def test_get_run_tail_lines_overrides_excerpt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_run(..., tail_lines=5) on a failed run must set log_excerpt to the
+    last 5 lines of the job log, ignoring the smart-excerpt heuristics."""
+    run_id = 12345
+    job_id = 99
+    head_sha = "abc123"
+
+    # Build a 20-line job log whose last 5 lines are distinct sentinel values.
+    log_lines = [f"setup-line-{i}" for i in range(15)] + [
+        "TAIL-LINE-A",
+        "TAIL-LINE-B",
+        "TAIL-LINE-C",
+        "TAIL-LINE-D",
+        "TAIL-LINE-E",
+    ]
+    log_text = "\n".join(log_lines)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == f"/repos/acme/backend/actions/runs/{run_id}":
+            return _json(_failed_run_payload(run_id, head_sha))
+        if path == f"/repos/acme/backend/actions/runs/{run_id}/jobs":
+            return _json(_jobs_payload(job_id))
+        raise AssertionError(f"unexpected JSON request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+
+    # Patch _fetch_job_log to avoid a real HTTP call (it uses its own client).
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log",
+        lambda token, url, *, max_bytes=256 * 1024: log_text,
+    )
+
+    run = GitHubProvider().get_run(
+        _project(), token="t", run_id=str(run_id), tail_lines=5
+    )
+    assert run.failure is not None
+    assert len(run.failure.failing_jobs) == 1
+    excerpt = run.failure.failing_jobs[0].log_excerpt
+    assert excerpt is not None
+    excerpt_lines = excerpt.splitlines()
+    assert excerpt_lines == ["TAIL-LINE-A", "TAIL-LINE-B", "TAIL-LINE-C", "TAIL-LINE-D", "TAIL-LINE-E"]
+
+
+def test_get_run_tail_lines_bypasses_256kb_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_run(..., tail_lines=N) must return the true last N lines of the full
+    log, even when the log exceeds 256 KB.
+
+    The default _fetch_job_log caps the response body at 256 KB.  When
+    tail_lines is set the cap must be removed so that the sentinel lines
+    sitting beyond the 256 KB boundary are reachable.
+    """
+    run_id = 22222
+    job_id = 88
+    head_sha = "cafe1234"
+
+    # Build a log whose total byte size exceeds 256 KB.
+    # Pad the front with lines that fill > 256 KB, then append 3 distinct
+    # sentinel lines at the very end.
+    padding_line = "x" * 200          # 200 bytes + newline = 201 bytes each
+    # 1400 lines × 201 bytes ≈ 281 KB — safely over the 256 KB boundary.
+    padding_lines = [padding_line] * 1400
+    tail_sentinels = ["OVER-CAP-LINE-1", "OVER-CAP-LINE-2", "OVER-CAP-LINE-3"]
+    all_lines = padding_lines + tail_sentinels
+    full_log_text = "\n".join(all_lines)
+    # Sanity-check: the full log is indeed larger than 256 KB.
+    assert len(full_log_text.encode("utf-8")) > 256 * 1024
+
+    # Track which max_bytes value _fetch_job_log was called with.
+    called_max_bytes: list = []
+
+    def fake_fetch(token: str | None, url: str, *, max_bytes: int | None = 256 * 1024) -> str:
+        called_max_bytes.append(max_bytes)
+        # Honour the cap so we can verify the UNCAPPED path returns sentinels.
+        if max_bytes is not None:
+            return full_log_text.encode("utf-8")[:max_bytes].decode("utf-8", errors="replace")
+        return full_log_text
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == f"/repos/acme/backend/actions/runs/{run_id}":
+            return _json(_failed_run_payload(run_id, head_sha))
+        if path == f"/repos/acme/backend/actions/runs/{run_id}/jobs":
+            return _json(_jobs_payload(job_id))
+        raise AssertionError(f"unexpected JSON request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log",
+        fake_fetch,
+    )
+
+    run = GitHubProvider().get_run(
+        _project(), token="t", run_id=str(run_id), tail_lines=3
+    )
+    assert run.failure is not None
+    assert len(run.failure.failing_jobs) == 1
+    excerpt = run.failure.failing_jobs[0].log_excerpt
+    assert excerpt is not None
+
+    # The excerpt must be the true last 3 lines — sitting beyond 256 KB.
+    excerpt_lines = excerpt.splitlines()
+    assert excerpt_lines == tail_sentinels, (
+        f"Expected tail sentinels {tail_sentinels!r}, got {excerpt_lines!r}. "
+        "This means the 256 KB cap was NOT bypassed for the tail_lines path."
+    )
+    # Confirm _fetch_job_log was called with max_bytes=None (cap removed).
+    assert called_max_bytes == [None], (
+        f"Expected _fetch_job_log to be called with max_bytes=None, got {called_max_bytes!r}"
+    )
+
+
+def test_get_run_failure_excerpt_no_module_pytest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end test mirroring the ticket scenario.
+
+    A failed run whose job log has a ``##[group]Run python -m pytest tests -v``
+    block containing ``No module named pytest`` on stderr; the step name in the
+    Jobs API response is ``"Run python -m pytest tests -v"``.  After the fix,
+    ``log_excerpt`` must contain the error line rather than the log head.
+    """
+    run_id = 56789
+    job_id = 77
+    head_sha = "deadbeef"
+    failed_step = "Run python -m pytest tests -v"
+
+    log_text = "\n".join([
+        "2024-01-02T00:00:00.000Z ##[group]Set up job",
+        "2024-01-02T00:00:01.000Z Initializing runner",
+        "2024-01-02T00:00:02.000Z ##[endgroup]",
+        f"2024-01-02T00:00:03.000Z ##[group]Run python -m pytest tests -v",
+        "2024-01-02T00:00:04.000Z /usr/bin/python: No module named pytest",
+        "2024-01-02T00:00:05.000Z ##[endgroup]",
+        "2024-01-02T00:00:06.000Z ##[error]Process completed with exit code 1",
+        "2024-01-02T00:00:07.000Z Post step: Set up job",
+    ])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == f"/repos/acme/backend/actions/runs/{run_id}":
+            return _json(_failed_run_payload(run_id, head_sha))
+        if path == f"/repos/acme/backend/actions/runs/{run_id}/jobs":
+            return _json(_jobs_payload(job_id, failed_step_name=failed_step))
+        raise AssertionError(f"unexpected JSON request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log",
+        lambda token, url, *, max_bytes=256 * 1024: log_text,
+    )
+
+    run = GitHubProvider().get_run(_project(), token="t", run_id=str(run_id))
+    assert run.failure is not None
+    assert len(run.failure.failing_jobs) == 1
+    job = run.failure.failing_jobs[0]
+    assert job.log_excerpt is not None
+    assert "No module named pytest" in job.log_excerpt
