@@ -1,11 +1,20 @@
 name: open-dep-ticket
 
-# Manual recovery workflow: re-open the dependency-update ticket in one
-# or more downstream consumer repos when the automatic step in release.yml
-# was skipped or failed (e.g. missing PROJECTS_TICKET_TOKEN at release time).
+# Manual recovery workflow: re-open the dependency-update ticket in both
+# downstream consumer repos (Seretos/agent-project-issues and
+# Seretos/workboard) when the automatic steps in release.yml were skipped
+# or failed (e.g. missing token at release time).
 #
-# Unlike the release.yml step this workflow does NOT set continue-on-error
-# so that failures are immediately visible to the operator.
+# Design: independence + failure visibility.
+#   - The semver validation step runs first with no continue-on-error; an
+#     invalid version halts the job before any ticket is filed.
+#   - Each consumer step carries continue-on-error: true so a broken token
+#     for one consumer never prevents the other from attempting.
+#   - A final "Report consumer failures" step (if: always()) inspects both
+#     outcomes and exits non-zero if either failed, turning the job red and
+#     naming exactly which token needs attention. This means the workflow
+#     run summary will show a failure whenever ticket creation broke for
+#     any consumer, while still guaranteeing both consumers always attempt.
 on:
   workflow_dispatch:
     inputs:
@@ -13,11 +22,6 @@ on:
         description: "lib-python-projects version to reference (semver, no leading v) e.g. 0.2.0"
         required: true
         type: string
-      consumers:
-        description: "Space-separated list of consumer repos (owner/repo) to file tickets in"
-        required: false
-        type: string
-        default: "Seretos/agent-project-issues"
 
 permissions:
   contents: read
@@ -28,7 +32,19 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Open dependency-update ticket in each consumer
+      - name: Validate version is semver
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
+            echo "ERROR: version must be semver without a leading 'v' (e.g. 0.2.0), got: $VERSION"
+            exit 1
+          fi
+
+      - name: Open dependency-update ticket in agent-project-issues
+        id: file_projects
+        continue-on-error: true
         shell: bash
         # TITLE/BODY live in env (not a run-block heredoc): a heredoc body at
         # column 0 dedents out of the YAML block scalar and breaks the file.
@@ -36,8 +52,6 @@ jobs:
         # expands. Bash just references "$TITLE"/"$BODY".
         env:
           GH_TOKEN: ${{ secrets.PROJECTS_TICKET_TOKEN }}
-          CONSUMERS: ${{ inputs.consumers }}
-          VERSION: ${{ inputs.version }}
           TITLE: "chore(deps): bump lib-python-projects to v${{ inputs.version }}"
           BODY: |
             ## Dependency update
@@ -54,24 +68,15 @@ jobs:
             3. Run `pwsh scripts/build.ps1` to confirm the build succeeds.
             4. Commit and open a PR.
         run: |
-          # Validate version is semver without a leading 'v'.
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
-            echo "ERROR: version must be semver without a leading 'v' (e.g. 0.2.0), got: $VERSION"
-            exit 1
-          fi
+          CONSUMER="Seretos/agent-project-issues"
 
-          for CONSUMER in $CONSUMERS; do
-            echo "Processing consumer: ${CONSUMER}"
-
-            # Idempotency: skip if an open issue with this exact title already exists.
-            # --paginate follows all pages; jq filter excludes pull requests.
-            EXISTING=$(gh api --paginate "repos/${CONSUMER}/issues?state=open&per_page=100" \
-              --jq 'map(select(.pull_request|not)) | .[].title' 2>/dev/null || true)
-            if echo "$EXISTING" | grep -qxF "$TITLE"; then
-              echo "Issue already exists in ${CONSUMER}, skipping."
-              continue
-            fi
-
+          # Idempotency: skip if an open issue with this exact title already exists.
+          # --paginate follows all pages; jq filter excludes pull requests.
+          EXISTING=$(gh api --paginate "repos/${CONSUMER}/issues?state=open&per_page=100" \
+            --jq 'map(select(.pull_request|not)) | .[].title' 2>/dev/null || true)
+          if echo "$EXISTING" | grep -qxF "$TITLE"; then
+            echo "Issue already exists in ${CONSUMER}, skipping."
+          else
             # Attempt creation with the 'dependencies' label; fall back
             # without it if the label does not exist in the consumer repo.
             gh issue create \
@@ -83,6 +88,69 @@ jobs:
               --repo "$CONSUMER" \
               --title "$TITLE" \
               --body "$BODY"
-
             echo "Ticket opened in ${CONSUMER}."
-          done
+          fi
+
+      - name: Open dependency-update ticket in workboard
+        id: file_workboard
+        continue-on-error: true
+        shell: bash
+        # TITLE/BODY live in env (not a run-block heredoc): a heredoc body at
+        # column 0 dedents out of the YAML block scalar and breaks the file.
+        # A YAML block scalar holds the markdown verbatim and ${{ }} still
+        # expands. Bash just references "$TITLE"/"$BODY".
+        env:
+          GH_TOKEN: ${{ secrets.WORKBOARD_TICKET_TOKEN }}
+          TITLE: "chore(deps): bump lib-python-projects to v${{ inputs.version }}"
+          BODY: |
+            ## Dependency update
+
+            A new release of **lib-python-projects** has been published: `v${{ inputs.version }}`.
+
+            ### Action required
+
+            1. Update the pin in `pyproject.toml` to:
+               ```
+               lib-python-projects @ git+https://github.com/Seretos/lib-python-projects@v${{ inputs.version }}
+               ```
+            2. Run `pwsh scripts/test.ps1` to verify the test suite passes.
+            3. Run `pwsh scripts/build.ps1` to confirm the build succeeds.
+            4. Commit and open a PR.
+        run: |
+          CONSUMER="Seretos/workboard"
+
+          # Idempotency: skip if an open issue with this exact title already exists.
+          # --paginate follows all pages; jq filter excludes pull requests.
+          EXISTING=$(gh api --paginate "repos/${CONSUMER}/issues?state=open&per_page=100" \
+            --jq 'map(select(.pull_request|not)) | .[].title' 2>/dev/null || true)
+          if echo "$EXISTING" | grep -qxF "$TITLE"; then
+            echo "Issue already exists in ${CONSUMER}, skipping."
+          else
+            # Attempt creation with the 'dependencies' label; fall back
+            # without it if the label does not exist in the consumer repo.
+            gh issue create \
+              --repo "$CONSUMER" \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label dependencies \
+            || gh issue create \
+              --repo "$CONSUMER" \
+              --title "$TITLE" \
+              --body "$BODY"
+            echo "Ticket opened in ${CONSUMER}."
+          fi
+
+      - name: Report consumer failures
+        if: always()
+        shell: bash
+        run: |
+          failed=0
+          if [ "${{ steps.file_projects.outcome }}" = "failure" ]; then
+            echo "::error::Filing in Seretos/agent-project-issues failed (check PROJECTS_TICKET_TOKEN)."
+            failed=1
+          fi
+          if [ "${{ steps.file_workboard.outcome }}" = "failure" ]; then
+            echo "::error::Filing in Seretos/workboard failed (check WORKBOARD_TICKET_TOKEN)."
+            failed=1
+          fi
+          exit $failed
