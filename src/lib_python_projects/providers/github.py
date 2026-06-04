@@ -3261,6 +3261,8 @@ class GitHubProvider:
         token: str | None,
         run_id: str,
         include_failure_excerpt: bool = True,
+        *,
+        tail_lines: int | None = None,
     ) -> PipelineRun:
         """Fetch a single workflow run, optionally with failure context.
 
@@ -3268,6 +3270,11 @@ class GitHubProvider:
         failed, populates `run.failure` with per-failing-job annotations
         and a small log excerpt. In-progress runs (`conclusion=None`)
         never trigger the failure-context fetch.
+
+        ``tail_lines``, when a positive int, overrides the smart excerpt
+        logic and returns the last *tail_lines* lines of each failing
+        job's log verbatim.  Use this as a deterministic escape hatch
+        when the automatic anchor heuristics are not sufficient.
         """
         if not str(run_id).strip().isdigit():
             raise GitHubError(
@@ -3294,7 +3301,9 @@ class GitHubProvider:
                 and run.conclusion == "failure"
                 and run.status == "completed"
             ):
-                run.failure = _get_failure_excerpt(client, project, token, run_id)
+                run.failure = _get_failure_excerpt(
+                    client, project, token, run_id, tail_lines=tail_lines
+                )
             return run
 
     # ---------- label management ---------------------------------------------
@@ -3788,6 +3797,12 @@ def _extract_log_excerpt(
 
     if failed_step:
         target = failed_step.strip().casefold()
+        # GitHub log group headers use ``##[group]Run <command>`` but the
+        # Jobs API exposes the step name as ``"Run <command>"`` (or just
+        # ``"<command>"`` for named steps).  Strip a leading ``"run "``
+        # prefix so both representations match the captured group name.
+        if target.startswith("run "):
+            target = target[4:].strip()
         for start_idx, name, end_idx in groups:
             if name.casefold() == target:
                 return _clamp(start_idx, end_idx)
@@ -3810,21 +3825,30 @@ def _extract_log_excerpt(
             return "\n".join(lines[start:end])
 
     # --- 3) Substring scan, but only AFTER the first group header -----------
-    pattern = re.compile(r"(error|failed|##\[error\])", re.IGNORECASE)
+    # Two-pass: prefer the more specific ``##[error]`` marker first; only
+    # fall back to the generic ``error|failed`` pattern when none is found.
     scan_offset = 0
     if groups:
         scan_offset = groups[0][0] + 1
-    for idx in range(scan_offset, len(lines)):
-        if pattern.search(lines[idx]):
-            start = max(scan_offset, idx - 2)
-            end = min(len(lines), idx + max_lines)
-            return "\n".join(lines[start:end])
+    error_marker_pattern = re.compile(r"##\[error\]", re.IGNORECASE)
+    generic_pattern = re.compile(r"(error|failed)", re.IGNORECASE)
+    for pass_pattern in (error_marker_pattern, generic_pattern):
+        for idx in range(scan_offset, len(lines)):
+            if pass_pattern.search(lines[idx]):
+                start = max(scan_offset, idx - 2)
+                end = min(len(lines), idx + max_lines)
+                return "\n".join(lines[start:end])
 
     # --- 4) Tail fallback ----------------------------------------------------
     return "\n".join(lines[-max_lines:])
 
 
-def _fetch_job_log(token: str | None, log_url: str) -> str | None:
+def _fetch_job_log(
+    token: str | None,
+    log_url: str,
+    *,
+    max_bytes: int | None = 256 * 1024,
+) -> str | None:
     """Fetch a job log via the 302-redirect signed-URL flow.
 
     GitHub responds with a 302 to a short-lived signed URL on a
@@ -3835,6 +3859,11 @@ def _fetch_job_log(token: str | None, log_url: str) -> str | None:
 
     Uses `follow_redirects=True` ONLY for this call (the default `_client`
     leaves it False, which is correct for the JSON API calls).
+
+    ``max_bytes`` caps the number of bytes read from the response body.
+    Pass ``None`` to read the full log without any cap (needed when the
+    caller requires the true tail, e.g. for the ``tail_lines`` escape
+    hatch).  The default of 256 KB is preserved for all ordinary callers.
     """
     headers = {
         "Accept": ACCEPT,
@@ -3854,8 +3883,10 @@ def _fetch_job_log(token: str | None, log_url: str) -> str | None:
             return None
         if not r.is_success:
             return None
-        # Cap the read to ~256 KB so a runaway log doesn't blow memory.
-        content = r.content[: 256 * 1024]
+        # Cap the read to avoid blowing memory on runaway logs.
+        # When max_bytes is None the full body is returned (used by the
+        # tail_lines path which needs the real end of the log).
+        content = r.content if max_bytes is None else r.content[:max_bytes]
         try:
             return content.decode("utf-8", errors="replace")
         except Exception:
@@ -3867,6 +3898,8 @@ def _get_failure_excerpt(
     project: ProjectConfig,
     token: str | None,
     run_id: str,
+    *,
+    tail_lines: int | None = None,
 ) -> PipelineFailure:
     """Build a `PipelineFailure` for a failed run.
 
@@ -3912,17 +3945,25 @@ def _get_failure_excerpt(
         log_excerpt: str | None = None
         job_id = job.get("id")
         if job_id is not None:
+            # When tail_lines is set we need the real end of the log, so we
+            # bypass the default 256 KB cap by passing max_bytes=None.
+            fetch_max = None if (tail_lines is not None and tail_lines > 0) else 256 * 1024
             log_text = _fetch_job_log(
-                token, f"{_repo_path(project)}/actions/jobs/{job_id}/logs"
+                token,
+                f"{_repo_path(project)}/actions/jobs/{job_id}/logs",
+                max_bytes=fetch_max,
             )
             if log_text is None:
                 logs_missing = True
             else:
-                log_excerpt = _extract_log_excerpt(
-                    log_text,
-                    failed_step=failed_step or None,
-                    annotations=annotations,
-                )
+                if tail_lines is not None and tail_lines > 0:
+                    log_excerpt = "\n".join(log_text.splitlines()[-tail_lines:])
+                else:
+                    log_excerpt = _extract_log_excerpt(
+                        log_text,
+                        failed_step=failed_step or None,
+                        annotations=annotations,
+                    )
 
         failing.append(
             FailingJob(
