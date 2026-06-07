@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validat
 from lib_python_config import LoadResult
 
 Provider = Literal["github", "gitlab", "azuredevops"]
-Source = Literal["config", "git-remote"]
+Source = Literal["config", "git-remote", "token-discovery"]
 
 
 class IssuesPermissions(BaseModel):

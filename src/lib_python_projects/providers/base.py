@@ -605,3 +605,95 @@ class TokenCapabilityProvider:
         self, project, token: str
     ) -> TokenCapabilities:
         raise NotImplementedError
+
+
+# ---------- token project discovery (ticket #80) ----------
+
+
+@dataclass
+class DiscoveredProject:
+    """A single project/repository found via token-driven discovery.
+
+    Fields
+    ------
+    provider
+        Matches the ``Provider`` literal values: ``"github"``,
+        ``"gitlab"``, or ``"azuredevops"``.
+    path
+        Provider-native path identifier, e.g. ``"owner/repo"`` for
+        GitHub, ``"namespace/project"`` for GitLab, or
+        ``"org/project/repo"`` for Azure DevOps.
+    permissions
+        The token's effective capabilities against this project, as
+        returned by ``probe_token_capabilities``.
+    description
+        Human-readable description of the project (empty string when
+        the provider does not supply one).
+    default_work_item_type
+        Provider-specific default work-item type label (e.g.
+        ``"Issue"``); ``None`` when not applicable or not returned.
+    base_url
+        Self-hosted base URL for the provider instance; ``None`` for
+        cloud-hosted (github.com / gitlab.com / dev.azure.com).
+    """
+
+    provider: str
+    path: str
+    permissions: TokenCapabilities
+    description: str = ""
+    default_work_item_type: str | None = None
+    base_url: str | None = None
+
+
+@dataclass
+class ProjectDiscoveryResult:
+    """Aggregate result returned by ``TokenProjectDiscoveryProvider.discover_projects``.
+
+    Contract
+    --------
+    *   On the happy path ``reason`` is ``None`` and ``projects`` may
+        contain zero or more entries.
+    *   On failure ``projects`` MUST be empty and ``reason`` MUST be
+        set to one of the taxonomy values below.
+    *   ``truncated=True`` means the provider hit ``limit`` before
+        exhausting all visible repositories; it is NOT a failure —
+        ``projects`` will be non-empty and ``reason`` will be ``None``.
+
+    Reason taxonomy (mirrors ``TokenCapabilities.reason``)
+    -------------------------------------------------------
+    ``"bad_credentials"``
+        HTTP 401 from the provider.
+    ``"network_error"``
+        Transport-level failure (DNS, connection refused, timeout, …).
+    ``"http_<code>"``
+        Unexpected HTTP error, e.g. ``"http_403"`` or ``"http_500"``.
+    ``"repo_invisible_to_token"``
+        HTTP 404; the token has no visibility into the resource.
+    ``"permissions_field_missing"``
+        Request succeeded but the provider omitted the ``permissions``
+        block (classic PAT / unexpected payload shape).
+    ``"insufficient_scope"``
+        GitLab-specific: the token lacks the ``read_api`` or
+        ``api`` OAuth scope required to enumerate projects.
+    """
+
+    projects: list[DiscoveredProject]
+    truncated: bool = False
+    reason: str | None = None
+
+
+class TokenProjectDiscoveryProvider:
+    """Mixin/interface: providers that can enumerate projects visible to
+    a token implement this method.
+
+    Implementations MUST NOT raise on expected failure modes (401, 404,
+    network error, missing field, insufficient scope) — they must return
+    an empty ``ProjectDiscoveryResult`` with ``reason`` set so the
+    caller can degrade gracefully. Only programming errors (e.g. bad
+    argument types) should propagate as exceptions.
+    """
+
+    def discover_projects(
+        self, token: str, *, limit: int
+    ) -> ProjectDiscoveryResult:
+        raise NotImplementedError
