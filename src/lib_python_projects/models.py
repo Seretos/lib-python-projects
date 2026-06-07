@@ -212,6 +212,7 @@ class ProjectsLoadResult(LoadResult):
     """
 
     projects: list[ProjectConfig] = Field(default_factory=list)
+    discovery_truncated: bool = False
 
 
 class ProjectMatch(BaseModel):
