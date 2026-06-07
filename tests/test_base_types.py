@@ -254,3 +254,14 @@ class TestTokenProjectDiscoveryProvider:
         stub = _Stub()
         with pytest.raises(TypeError):
             stub.discover_projects("tok", 50)  # type: ignore[misc]
+
+
+# ---------- AzureDevOpsProvider implements TokenProjectDiscoveryProvider -----
+
+
+def test_azuredevops_provider_implements_token_discovery():
+    """AzureDevOpsProvider must be a subclass of TokenProjectDiscoveryProvider."""
+    from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+    from lib_python_projects.providers.base import TokenProjectDiscoveryProvider
+
+    assert issubclass(AzureDevOpsProvider, TokenProjectDiscoveryProvider)
