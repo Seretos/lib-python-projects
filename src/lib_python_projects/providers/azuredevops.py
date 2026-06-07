@@ -54,12 +54,14 @@ from lib_python_projects.markers import (
 )
 from lib_python_projects.providers.base import (
     Comment,
+    DiscoveredProject,
     FailingJob,
     Label,
     LabelOperationUnsupported,
     PRFilters,
     PipelineFailure,
     PipelineRun,
+    ProjectDiscoveryResult,
     PullRequest,
     Relation,
     RelationAlreadyExists,
@@ -73,6 +75,7 @@ from lib_python_projects.providers.base import (
     TicketFilters,
     TokenCapabilities,
     TokenCapabilityProvider,
+    TokenProjectDiscoveryProvider,
     WRITABLE_RELATION_KINDS,
     normalize_timestamp,
     _assert_not_self_relation,
@@ -107,11 +110,18 @@ def _basic_auth_header(token: str) -> str:
     return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
-def _client(project: ProjectConfig, token: str | None) -> httpx.Client:
+def _client(
+    project: ProjectConfig,
+    token: str | None,
+    *,
+    base_url: str | None = None,
+) -> httpx.Client:
     """Build an httpx.Client targeted at the ADO REST root.
 
-    Base URL is `project.base_url` if set (covers self-hosted Azure
-    DevOps Server installations), otherwise `https://dev.azure.com`.
+    Base URL resolution order:
+    1. ``base_url`` kwarg (used by discovery calls to VSSPS).
+    2. ``project.base_url`` (covers self-hosted Azure DevOps Server).
+    3. ``https://dev.azure.com`` (cloud default).
     """
     headers = {
         "Accept": "application/json",
@@ -119,8 +129,101 @@ def _client(project: ProjectConfig, token: str | None) -> httpx.Client:
     }
     if token:
         headers["Authorization"] = _basic_auth_header(token)
-    base = (project.base_url or "https://dev.azure.com").rstrip("/")
+    base = (base_url or project.base_url or "https://dev.azure.com").rstrip("/")
     return httpx.Client(base_url=base, headers=headers, timeout=30.0)
+
+
+# ---------- discovery sentinel + helpers ------------------------------------
+
+# A throwaway ProjectConfig used solely as the first argument to `_client`
+# for discovery calls. ADO validation requires exactly 2 slashes and no
+# empty segments in the path, so we use three non-empty dummy segments.
+_DISCOVERY_PROJECT_SENTINEL = None  # populated after ProjectConfig is imported
+
+
+def _get_discovery_sentinel() -> "ProjectConfig":
+    """Return (and lazily create) the module-level discovery sentinel."""
+    global _DISCOVERY_PROJECT_SENTINEL
+    if _DISCOVERY_PROJECT_SENTINEL is None:
+        from lib_python_projects.models import ProjectConfig as _PC
+        _DISCOVERY_PROJECT_SENTINEL = _PC(
+            id="_disc",
+            provider="azuredevops",
+            path="_disc/_disc/_disc",
+        )
+    return _DISCOVERY_PROJECT_SENTINEL
+
+
+def _org_hint(base_url: str | None) -> str | None:
+    """Return an organisation name from *base_url* or the environment.
+
+    Resolution order:
+    1. Parse *base_url*: strip scheme + host, take the first non-empty
+       path segment when a real org path is present beyond the bare
+       ``https://dev.azure.com`` host (e.g. ``https://dev.azure.com/myorg``
+       → ``"myorg"``).
+    2. ``AZURE_DEVOPS_ORG`` environment variable.
+
+    Returns ``None`` when neither source yields a value.
+    """
+    if base_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(base_url)
+        segments = [s for s in parsed.path.split("/") if s]
+        if segments:
+            return segments[0]
+    return os.environ.get("AZURE_DEVOPS_ORG") or None
+
+
+def _discover_orgs_via_api(
+    token: str,
+) -> tuple[list[str], str | None]:
+    """Discover ADO organisations accessible to *token* via the VSSPS API.
+
+    Returns ``(org_names, reason_or_none)``.  On any failure the org list
+    is empty and ``reason`` carries one of the taxonomy strings defined on
+    ``ProjectDiscoveryResult``.
+    """
+    sentinel = _get_discovery_sentinel()
+    vssps = "https://app.vssps.visualstudio.com"
+    try:
+        with _client(sentinel, token, base_url=vssps) as c:
+            profile_resp = c.get(
+                "/_apis/profile/profiles/me",
+                params={"api-version": "7.1"},
+            )
+    except httpx.HTTPError:
+        return [], "network_error"
+
+    if profile_resp.status_code == 401:
+        return [], "bad_credentials"
+    if not profile_resp.is_success:
+        return [], f"http_{profile_resp.status_code}"
+
+    member_id = profile_resp.json().get("id", "")
+
+    try:
+        with _client(sentinel, token, base_url=vssps) as c:
+            accounts_resp = c.get(
+                "/_apis/accounts",
+                params={"memberId": member_id, "api-version": "7.1"},
+            )
+    except httpx.HTTPError:
+        return [], "network_error"
+
+    if accounts_resp.status_code == 401:
+        return [], "bad_credentials"
+    if not accounts_resp.is_success:
+        return [], f"http_{accounts_resp.status_code}"
+
+    orgs = [
+        entry["accountName"]
+        for entry in accounts_resp.json().get("value", [])
+        if entry.get("accountName")
+    ]
+    if not orgs:
+        return [], "repo_invisible_to_token"
+    return orgs, None
 
 
 _NOT_FOUND_TYPE_KEYS: frozenset[str] = frozenset(
@@ -1265,7 +1368,7 @@ def _resolve_ado_branch(
 # ---------- the provider class ----------------------------------------------
 
 
-class AzureDevOpsProvider(TokenCapabilityProvider):
+class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
     """Azure DevOps provider.
 
     Implements the same surface as `GitHubProvider` and `GitLabProvider`
@@ -3593,6 +3696,187 @@ class AzureDevOpsProvider(TokenCapabilityProvider):
             pulls_modify=True,
             pulls_merge=True,
         )
+
+    # ---------- token project discovery --------------------------------------
+
+    def discover_projects(
+        self, token: str, *, limit: int
+    ) -> ProjectDiscoveryResult:
+        """Enumerate all ADO repositories visible to *token*.
+
+        Org resolution: if ``AZURE_DEVOPS_ORG`` is set, only that org is
+        queried; otherwise the VSSPS accounts API is used to discover all
+        orgs.  For each org every ADO project and its git repositories are
+        fetched.  Collection stops at *limit* repos; when the cap is hit
+        ``truncated=True`` is set on the result.
+
+        This method MUST NOT raise on expected failure modes — all errors
+        are captured and returned as ``reason`` strings.
+        """
+        if not token:
+            return ProjectDiscoveryResult(projects=[], reason="bad_credentials")
+        if limit <= 0:
+            return ProjectDiscoveryResult(projects=[], truncated=False)
+
+        # --- org resolution -------------------------------------------------
+        hint = _org_hint(base_url=None)
+        if hint:
+            orgs: list[str] = [hint]
+        else:
+            orgs, discovery_reason = _discover_orgs_via_api(token)
+            if discovery_reason:
+                return ProjectDiscoveryResult(
+                    projects=[], reason=discovery_reason
+                )
+
+        # --- collection loop ------------------------------------------------
+        # We collect up to ``limit + 1`` raw tuples so we can distinguish
+        # "hit the cap with items remaining" (truncated) from "naturally
+        # exhausted all repos" (not truncated).  The extra entry is removed
+        # before the capability probe stage.
+        #
+        # Each entry: (org, ado_project_name, repo_name, description)
+        fetch_cap = limit + 1  # collect one extra to detect overflow
+        collected: list[tuple[str, str, str, str]] = []
+
+        # Track org-level enumeration success so we can distinguish
+        # "zero repos found" from "every org's projects call failed".
+        # Rule: if at least one org was successfully enumerated (its
+        # /_apis/projects call returned a 2xx), the overall result is a
+        # success even if that org had zero repos.  Only when NOTHING was
+        # successfully enumerated do we surface a failure reason.
+        orgs_succeeded = 0
+        last_org_failure_reason: str | None = None
+
+        outer_done = False
+        for org in orgs:
+            if outer_done:
+                break
+            # Build a per-org sentinel for _client (base URL = dev.azure.com)
+            try:
+                from lib_python_projects.models import ProjectConfig as _PC
+                org_sentinel = _PC(
+                    id="_disc",
+                    provider="azuredevops",
+                    path=f"{org}/_p/_r",
+                )
+            except Exception:
+                # Org name fails validation — skip this org
+                log.warning("discover_projects: org %r failed sentinel creation", org)
+                last_org_failure_reason = "network_error"
+                continue
+
+            # Fetch ADO projects for the org
+            try:
+                with _client(org_sentinel, token) as c:
+                    projects_resp = c.get(
+                        f"/{org}/_apis/projects",
+                        params={"api-version": "7.1"},
+                    )
+            except httpx.HTTPError:
+                log.warning(
+                    "discover_projects: network error fetching projects for org %r",
+                    org,
+                )
+                last_org_failure_reason = "network_error"
+                continue
+
+            if not projects_resp.is_success:
+                log.warning(
+                    "discover_projects: HTTP %s fetching projects for org %r",
+                    projects_resp.status_code,
+                    org,
+                )
+                last_org_failure_reason = f"http_{projects_resp.status_code}"
+                continue
+
+            orgs_succeeded += 1
+            ado_projects = projects_resp.json().get("value", [])
+
+            for ado_proj in ado_projects:
+                if outer_done:
+                    break
+                proj_name = ado_proj.get("name", "")
+                if not proj_name:
+                    continue
+
+                # Fetch git repositories for this ADO project
+                try:
+                    with _client(org_sentinel, token) as c:
+                        repos_resp = c.get(
+                            f"/{org}/{proj_name}/_apis/git/repositories",
+                            params={"api-version": "7.1"},
+                        )
+                except httpx.HTTPError:
+                    log.warning(
+                        "discover_projects: network error fetching repos for "
+                        "%r/%r",
+                        org,
+                        proj_name,
+                    )
+                    continue
+
+                if not repos_resp.is_success:
+                    log.warning(
+                        "discover_projects: HTTP %s fetching repos for %r/%r",
+                        repos_resp.status_code,
+                        org,
+                        proj_name,
+                    )
+                    continue
+
+                for repo in repos_resp.json().get("value", []):
+                    repo_name = repo.get("name", "")
+                    if not repo_name:
+                        continue
+                    description = repo.get("remoteUrl", "")
+                    collected.append((org, proj_name, repo_name, description))
+                    if len(collected) >= fetch_cap:
+                        outer_done = True
+                        break
+
+        # Determine truncation: we fetched one extra to detect overflow.
+        truncated = len(collected) > limit
+        if truncated:
+            collected = collected[:limit]
+
+        # Contract enforcement: if nothing was collected AND no org was
+        # successfully enumerated, surface the failure reason so the caller
+        # can distinguish "token sees zero repos" from "every org errored".
+        if not collected and orgs_succeeded == 0 and last_org_failure_reason:
+            return ProjectDiscoveryResult(
+                projects=[], reason=last_org_failure_reason
+            )
+
+        # --- capability probe -----------------------------------------------
+        discovered: list[DiscoveredProject] = []
+        for org, proj_name, repo_name, description in collected:
+            path = f"{org}/{proj_name}/{repo_name}"
+            try:
+                from lib_python_projects.models import ProjectConfig as _PC
+                cfg = _PC(
+                    id="_disc",
+                    provider="azuredevops",
+                    path=path,
+                )
+            except Exception:
+                log.warning(
+                    "discover_projects: path %r failed ProjectConfig validation",
+                    path,
+                )
+                continue
+
+            caps = self.probe_token_capabilities(cfg, token)
+            discovered.append(
+                DiscoveredProject(
+                    provider="azuredevops",
+                    path=path,
+                    permissions=caps,
+                    description=description,
+                )
+            )
+
+        return ProjectDiscoveryResult(projects=discovered, truncated=truncated)
 
     # ---------- label management ---------------------------------------------
 

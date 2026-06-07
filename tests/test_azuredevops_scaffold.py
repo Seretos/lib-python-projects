@@ -163,6 +163,26 @@ def test_client_base_url_overridden_for_self_hosted() -> None:
         client.close()
 
 
+def test_client_base_url_kwarg_overrides_project() -> None:
+    """The ``base_url`` keyword argument takes priority over project.base_url."""
+    project = _project(base_url="https://devops.example.com")
+    client = _client(project, token=None, base_url="https://app.vssps.visualstudio.com")
+    try:
+        assert str(client.base_url).rstrip("/") == "https://app.vssps.visualstudio.com"
+    finally:
+        client.close()
+
+
+def test_client_base_url_kwarg_none_falls_back_to_project() -> None:
+    """When ``base_url`` kwarg is None, project.base_url is used."""
+    project = _project(base_url="https://devops.example.com")
+    client = _client(project, token=None, base_url=None)
+    try:
+        assert str(client.base_url).rstrip("/") == "https://devops.example.com"
+    finally:
+        client.close()
+
+
 # ---------- scope helpers ----------------------------------------------------
 
 
