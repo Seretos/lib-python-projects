@@ -8,6 +8,15 @@ CWD-repo auto-discovered entry when applicable.
 
 Diagnostic provenance (config_file / git_config / searched_paths / state)
 flows through `ProjectsLoadResult` unchanged.
+
+No-config fallback modes (tried in order when no config file is found):
+  1. CWD git-remote auto-discovery (always attempted).
+  2. Token-driven provider discovery: for each provider whose token env var
+     is set in the environment, `provider.discover_projects(token, limit=cap)`
+     is called and results are merged (deduplicating against the git-remote
+     entry). `ProjectsLoadResult.discovery_truncated` is ``True`` when any
+     provider hit the per-call cap before exhausting all visible repos.
+  3. If neither yields any project, state is ``"no_config"``.
 """
 from __future__ import annotations
 
@@ -31,9 +40,20 @@ from lib_python_config import (
 from lib_python_projects.autodiscover import _autodiscover_from_git
 from lib_python_projects.models import (
     ConfigDocument,
+    IssuesPermissions,
+    Permissions,
     ProjectConfig,
     ProjectsLoadResult,
+    PullsPermissions,
 )
+from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+from lib_python_projects.providers.base import (
+    DiscoveredProject,
+    TokenCapabilities,
+    TokenProjectDiscoveryProvider,
+)
+from lib_python_projects.providers.github import GitHubProvider
+from lib_python_projects.providers.gitlab import GitLabProvider
 
 log = logging.getLogger("lib_python_projects.loader")
 
@@ -41,6 +61,66 @@ log = logging.getLogger("lib_python_projects.loader")
 # helper at `lib_python_projects.loader._find_git_repo_root`. The loader
 # itself uses the module-attribute lookup so the patch is honored.
 _find_git_repo_root = find_git_repo_root
+
+# Maximum number of projects requested from each provider during
+# token-driven discovery.  Keeps the fallback fast and bounded.
+_DISCOVERY_CAP = 50
+
+# Registry of (env_var, provider_name, provider_class) tuples for the three
+# supported providers.  Each entry is consulted when no config file is found.
+# Tests may monkey-patch this list on `lib_python_projects.loader`.
+_TOKEN_PROVIDERS: list[tuple[str, str, type]] = [
+    ("GITHUB_TOKEN", "github", GitHubProvider),
+    ("GITLAB_TOKEN", "gitlab", GitLabProvider),
+    ("AZURE_DEVOPS_TOKEN", "azuredevops", AzureDevOpsProvider),
+]
+
+
+def _capabilities_to_permissions(caps: TokenCapabilities) -> Permissions:
+    """Map ``TokenCapabilities`` booleans to the nested ``Permissions`` model."""
+    return Permissions(
+        issues=IssuesPermissions(
+            create=caps.issues_create,
+            modify=caps.issues_modify,
+        ),
+        pulls=PullsPermissions(
+            create=caps.pulls_create,
+            modify=caps.pulls_modify,
+            merge=caps.pulls_merge,
+        ),
+    )
+
+
+def _discovered_to_project_config(
+    dp: DiscoveredProject, token_env: str
+) -> ProjectConfig | None:
+    """Convert a ``DiscoveredProject`` to a ``ProjectConfig``.
+
+    Returns ``None`` when the discovered path fails ``ProjectConfig``
+    validation (e.g. wrong segment count for azuredevops) — the caller
+    should skip those entries after logging a warning.
+    """
+    project_id = f"{dp.provider}:{dp.path.lower()}"
+    try:
+        return ProjectConfig(
+            id=project_id,
+            description=dp.description,
+            provider=dp.provider,  # type: ignore[arg-type]
+            path=dp.path,
+            base_url=dp.base_url,
+            token_env=token_env,
+            permissions=_capabilities_to_permissions(dp.permissions),
+            default_work_item_type=dp.default_work_item_type,
+            source="token-discovery",
+        )
+    except ValidationError as exc:
+        log.warning(
+            "token-discovery: skipping malformed project %r from %s: %s",
+            dp.path,
+            dp.provider,
+            exc,
+        )
+        return None
 
 
 # Defaults baked into the resolver shim below. These match the
@@ -151,6 +231,20 @@ def load_projects(
     if not already in the winning config. The strict whitelist still
     applies to every other repo.
 
+    When no config file is found, three fallback modes are tried in order:
+
+    1. **CWD git-remote auto-discovery** — always attempted; appends a
+       ``source="git-remote"`` entry when the CWD is inside a GitHub,
+       GitLab, or Azure DevOps repository.
+    2. **Token-driven provider discovery** — for each provider in
+       ``_TOKEN_PROVIDERS`` whose token env var is present, calls
+       ``provider.discover_projects(token, limit=_DISCOVERY_CAP)`` and
+       maps results to ``source="token-discovery"`` ``ProjectConfig``
+       entries, deduplicating against the git-remote entry (if any).
+       ``ProjectsLoadResult.discovery_truncated`` is set when any provider
+       hit the cap before exhausting all visible repos.
+    3. If neither fallback yields any project, ``state`` is ``"no_config"``.
+
     Defaults match the `agent-project-issues` plugin so the plugin's
     refactor is minimal-invasive. Pass overrides for other consumers.
     """
@@ -218,12 +312,59 @@ def load_projects(
             )
             projects.append(auto)
 
+    # Token-driven provider discovery (only when no config file was found).
+    # Iterates _TOKEN_PROVIDERS and calls discover_projects for each provider
+    # whose token env var is set.  Results are merged with dedup against the
+    # existing (provider, path) set — which already contains the git-remote
+    # entry if one was found above.
+    _any_truncated = False
+    if not config_path:
+        existing_keys = {(p.provider, (p.path or "").lower()) for p in projects}
+        for env_var, _provider_name, provider_cls in _TOKEN_PROVIDERS:
+            token = os.environ.get(env_var)
+            if not token:
+                continue
+            provider = provider_cls()
+            if not isinstance(provider, TokenProjectDiscoveryProvider):
+                log.debug(
+                    "token-discovery: %s does not implement TokenProjectDiscoveryProvider — skipping",
+                    provider_cls.__name__,
+                )
+                continue
+            try:
+                result = provider.discover_projects(token, limit=_DISCOVERY_CAP)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "token-discovery: unexpected error from %s — skipping: %s",
+                    provider_cls.__name__,
+                    exc,
+                )
+                continue
+            if result.reason is not None:
+                log.info(
+                    "token-discovery: %s returned reason %r — skipping provider",
+                    provider_cls.__name__,
+                    result.reason,
+                )
+                continue
+            if result.truncated:
+                _any_truncated = True
+            for dp in result.projects:
+                key = (dp.provider, dp.path.lower())
+                if key in existing_keys:
+                    continue
+                pc = _discovered_to_project_config(dp, env_var)
+                if pc is not None:
+                    projects.append(pc)
+                    existing_keys.add(key)
+
     if projects:
         state: Literal["ok", "config_empty", "no_config", "config_error"] = "ok"
     elif config_path:
         state = "config_empty"
     else:
-        log.info("no config and no usable git remote in %s", cwd)
+        # No config file, no git remote, and no token-discovered projects.
+        log.info("no config, no usable git remote, and no token-discovered projects in %s", cwd)
         state = "no_config"
 
     return ProjectsLoadResult(
@@ -233,6 +374,7 @@ def load_projects(
         git_config=str(git_path) if git_path else None,
         search_root=str(cwd),
         searched_paths=searched_strs,
+        discovery_truncated=_any_truncated,
     )
 
 
