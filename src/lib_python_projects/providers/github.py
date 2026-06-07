@@ -23,12 +23,14 @@ from lib_python_projects.markers import (
 )
 from lib_python_projects.providers.base import (
     Comment,
+    DiscoveredProject,
     FailingJob,
     Label,
     normalize_timestamp,
     PipelineFailure,
     PipelineRun,
     PRFilters,
+    ProjectDiscoveryResult,
     PullRequest,
     Relation,
     RelationAlreadyExists,
@@ -41,6 +43,7 @@ from lib_python_projects.providers.base import (
     Ticket,
     TicketFilters,
     TokenCapabilities,
+    TokenProjectDiscoveryProvider,
     _assert_not_self_relation,
     _validate_label_lists,
     _validate_limit,
@@ -787,6 +790,25 @@ def _has_next_link(link_header: str | None) -> bool:
         if 'rel="next"' in part.replace("'", '"'):
             return True
     return False
+
+
+def _next_link_url(link_header: str | None) -> str | None:
+    """Extract the URL of the ``rel="next"`` page from an HTTP ``Link`` header.
+
+    Returns ``None`` when the header is absent or contains no ``rel="next"``
+    entry.  The URL is the bare string between ``<`` and ``>`` in the entry.
+    """
+    if not _has_next_link(link_header):
+        return None
+    for part in link_header.split(","):  # type: ignore[union-attr]
+        normalised = part.replace("'", '"')
+        if 'rel="next"' in normalised:
+            # Each part looks like: <https://...>; rel="next"
+            start = normalised.find("<")
+            end = normalised.find(">")
+            if start != -1 and end != -1 and end > start:
+                return normalised[start + 1 : end].strip()
+    return None
 
 
 # ---------- ref / closing-keyword scanning ---------------------------------
@@ -1547,7 +1569,7 @@ def _map_permissions_to_capabilities(perms: dict) -> TokenCapabilities:
     )
 
 
-class GitHubProvider:
+class GitHubProvider(TokenProjectDiscoveryProvider):
     def probe_token_capabilities(
         self, project: ProjectConfig, token: str
     ) -> TokenCapabilities:
@@ -3445,6 +3467,83 @@ class GitHubProvider:
                 raise GitHubError(404, f"label {name!r} not found in {project.id}")
             _check(r)
         return None
+
+    def discover_projects(
+        self, token: str, *, limit: int
+    ) -> ProjectDiscoveryResult:
+        """Enumerate repositories visible to *token* via ``GET /user/repos``.
+
+        Paginates through all pages (100 repos per page), maps each repo to a
+        :class:`DiscoveredProject`, and stops once *limit* entries have been
+        collected.  Returns a structured :class:`ProjectDiscoveryResult` rather
+        than raising on expected failure modes (401, network error, unexpected
+        HTTP status).
+        """
+        _validate_limit(limit)
+        projects: list[DiscoveredProject] = []
+        truncated = False
+        url: str | None = "/user/repos"
+        params: dict | None = {
+            "affiliation": "owner,collaborator,organization_member",
+            "per_page": 100,
+        }
+
+        try:
+            with _client(token) as client:
+                while url is not None:
+                    r = client.get(url, params=params)
+                    # After the first request, subsequent ones use the full
+                    # next-page URL from the Link header (no extra params).
+                    params = None
+
+                    if r.status_code == 401:
+                        return ProjectDiscoveryResult(
+                            projects=[], reason="bad_credentials"
+                        )
+                    if not r.is_success:
+                        return ProjectDiscoveryResult(
+                            projects=[], reason=f"http_{r.status_code}"
+                        )
+
+                    page_repos: list[dict] = r.json()
+                    for repo in page_repos:
+                        if len(projects) >= limit:
+                            # We still have repos to consume — the limit was hit
+                            # mid-page.
+                            truncated = True
+                            break
+                        projects.append(
+                            DiscoveredProject(
+                                provider="github",
+                                path=repo["full_name"],
+                                description=repo.get("description") or "",
+                                permissions=_map_permissions_to_capabilities(
+                                    repo.get("permissions") or {}
+                                ),
+                            )
+                        )
+
+                    if truncated:
+                        break
+
+                    next_url = _next_link_url(r.headers.get("link"))
+                    if next_url is not None:
+                        if len(projects) >= limit:
+                            # Hit the limit exactly at a page boundary; more
+                            # pages exist.
+                            truncated = True
+                            break
+                        url = next_url
+                    else:
+                        # No more pages.
+                        url = None
+
+        except httpx.HTTPError:
+            return ProjectDiscoveryResult(projects=[], reason="network_error")
+
+        return ProjectDiscoveryResult(
+            projects=projects, truncated=truncated, reason=None
+        )
 
 
 # ---------- pipeline helpers (module-level so providers can reuse) ----------
