@@ -46,12 +46,14 @@ from lib_python_projects.markers import (
 )
 from lib_python_projects.providers.base import (
     Comment,
+    DiscoveredProject,
     FailingJob,
     Label,
     normalize_timestamp,
     PipelineFailure,
     PipelineRun,
     PRFilters,
+    ProjectDiscoveryResult,
     PullRequest,
     Relation,
     RelationAlreadyExists,
@@ -65,6 +67,7 @@ from lib_python_projects.providers.base import (
     TicketFilters,
     TokenCapabilities,
     TokenCapabilityProvider,
+    TokenProjectDiscoveryProvider,
     _assert_not_self_relation,
     _validate_label_lists,
     _validate_limit,
@@ -132,6 +135,71 @@ def _client(project: ProjectConfig, token: str | None) -> httpx.Client:
         headers=headers,
         timeout=30.0,
     )
+
+
+def _discovery_client(base_url: str, token: str) -> httpx.Client:
+    """Build a configured httpx client for token-driven project discovery.
+
+    Parallel to `_client` but accepts a raw base URL string instead of a
+    `ProjectConfig`. Used by `GitLabProvider.discover_projects`.
+    """
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+        "PRIVATE-TOKEN": token,
+    }
+    return httpx.Client(
+        base_url=base_url,
+        headers=headers,
+        timeout=30.0,
+    )
+
+
+def _extract_access_level(permissions: dict) -> int | None:
+    """Extract the effective access level from a GitLab project permissions dict.
+
+    GitLab returns both ``project_access`` and ``group_access``; we take the
+    maximum of whichever values are present so an inherited group role is not
+    silently lost.
+
+    Returns ``None`` when both fields are absent or null.
+    """
+    pa = (permissions.get("project_access") or {}).get("access_level")
+    ga = (permissions.get("group_access") or {}).get("access_level")
+    values = [v for v in (pa, ga) if isinstance(v, int)]
+    return max(values) if values else None
+
+
+def _capabilities_from_access_level(level: int | None) -> TokenCapabilities:
+    """Map a GitLab numeric access level to ``TokenCapabilities``.
+
+    GitLab access-level constants:
+      - Owner / Maintainer: >= 40  → full write access
+      - Developer: 30              → issues + MR create, no edit/merge
+      - Reporter / Guest: < 30     → read-only
+      - None (field missing)       → unknown, all False
+    """
+    if level is None:
+        return TokenCapabilities(reason="permissions_field_missing")
+    if level >= 40:
+        return TokenCapabilities(
+            issues_create=True,
+            issues_modify=True,
+            pulls_create=True,
+            pulls_modify=True,
+            pulls_merge=True,
+            reason=None,
+        )
+    if level >= 30:
+        return TokenCapabilities(
+            issues_create=True,
+            issues_modify=True,
+            pulls_create=True,
+            pulls_modify=False,
+            pulls_merge=False,
+            reason=None,
+        )
+    return TokenCapabilities(reason="insufficient_scope")
 
 
 def _check(resp: httpx.Response) -> None:
@@ -1273,7 +1341,7 @@ def _fetch_pipeline_failure(
 # ---------- provider ---------------------------------------------------------
 
 
-class GitLabProvider(TokenCapabilityProvider):
+class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
     """GitLab REST v4 provider.
 
     Method bodies are filled in incrementally — see the task list in
@@ -1330,6 +1398,72 @@ class GitLabProvider(TokenCapabilityProvider):
                 reason=None,
             )
         return TokenCapabilities(reason="insufficient_scope")
+
+    # ---------- project discovery (TokenProjectDiscoveryProvider) -------------
+
+    def discover_projects(
+        self, token: str, *, limit: int
+    ) -> ProjectDiscoveryResult:
+        """Enumerate GitLab projects the token is a member of.
+
+        Calls ``GET /api/v4/projects?membership=true&per_page=100`` and
+        paginates via the ``X-Next-Page`` response header until *limit*
+        projects have been collected or all pages are exhausted.
+
+        Never raises on expected failure modes (401, non-2xx, network
+        error); returns an empty ``ProjectDiscoveryResult`` with ``reason``
+        set instead.
+        """
+        _validate_limit(limit)
+        collected: list[DiscoveredProject] = []
+        params: dict = {"membership": "true", "per_page": 100}
+        truncated = False
+
+        try:
+            with _discovery_client(DEFAULT_BASE_URL, token) as client:
+                while True:
+                    r = client.get("/api/v4/projects", params=params)
+
+                    if r.status_code == 401:
+                        return ProjectDiscoveryResult(
+                            projects=[], reason="bad_credentials"
+                        )
+                    if not r.is_success:
+                        return ProjectDiscoveryResult(
+                            projects=[], reason=f"http_{r.status_code}"
+                        )
+
+                    page_items = r.json()
+                    budget = limit - len(collected)
+                    for item in page_items[:budget]:
+                        collected.append(
+                            DiscoveredProject(
+                                provider="gitlab",
+                                path=item["path_with_namespace"],
+                                description=item.get("description") or "",
+                                permissions=_capabilities_from_access_level(
+                                    _extract_access_level(
+                                        item.get("permissions") or {}
+                                    )
+                                ),
+                            )
+                        )
+
+                    next_page = (r.headers.get("X-Next-Page") or "").strip()
+                    if len(collected) >= limit:
+                        truncated = bool(next_page)
+                        break
+                    if not next_page:
+                        break
+                    params = {"membership": "true", "per_page": 100, "page": next_page}
+        except httpx.HTTPError:
+            return ProjectDiscoveryResult(projects=[], reason="network_error")
+
+        return ProjectDiscoveryResult(
+            projects=collected,
+            truncated=truncated,
+            reason=None,
+        )
 
     # ---------- issues -------------------------------------------------------
 
