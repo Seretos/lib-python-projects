@@ -63,8 +63,9 @@ log = logging.getLogger("lib_python_projects.loader")
 _find_git_repo_root = find_git_repo_root
 
 # Maximum number of projects requested from each provider during
-# token-driven discovery.  Keeps the fallback fast and bounded.
-_DISCOVERY_CAP = 50
+# token-driven discovery.  Acts as a safety ceiling against runaway
+# pagination; typical accounts will exhaust all pages well below this.
+_DISCOVERY_CAP = 10_000
 
 # Registry of (env_var, provider_name, provider_class) tuples for the three
 # supported providers.  Each entry is consulted when no config file is found.
@@ -241,8 +242,10 @@ def load_projects(
        ``provider.discover_projects(token, limit=_DISCOVERY_CAP)`` and
        maps results to ``source="token-discovery"`` ``ProjectConfig``
        entries, deduplicating against the git-remote entry (if any).
-       ``ProjectsLoadResult.discovery_truncated`` is set when any provider
-       hit the cap before exhausting all visible repos.
+       ``ProjectsLoadResult.discovery_truncated`` is set only when a
+       provider signals that it hit the cap before exhausting all visible
+       repos (i.e. the provider returned more results than the safety
+       ceiling allows).
     3. If neither fallback yields any project, ``state`` is ``"no_config"``.
 
     Defaults match the `agent-project-issues` plugin so the plugin's

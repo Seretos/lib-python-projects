@@ -518,3 +518,21 @@ class TestTokenDiscoveryFallback:
 
         assert result.state == "no_config"
         assert result.projects == []
+
+    def test_loader_passes_discovery_cap_to_provider(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """load_projects must forward _DISCOVERY_CAP (not a stale 50) to the provider.
+
+        Regression test for #90: _DISCOVERY_CAP was 50, silently dropping repos
+        that sort alphabetically past index 50 when a token has more visible repos.
+        """
+        stub_cls = self._make_stub_provider([])
+        self._patch_registry(monkeypatch, [("GITHUB_TOKEN", "github", stub_cls)])
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_fake")
+        monkeypatch.setattr(_loader_mod, "_DISCOVERY_CAP", 9999)
+
+        load_projects(cwd=tmp_path)
+
+        assert len(stub_cls.call_log) == 1  # type: ignore[attr-defined]
+        assert stub_cls.call_log[0]["limit"] == 9999  # type: ignore[attr-defined]
