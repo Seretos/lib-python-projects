@@ -48,6 +48,7 @@ from lib_python_projects.providers.base import (
     Comment,
     DiscoveredProject,
     FailingJob,
+    FieldSpec,
     Label,
     normalize_timestamp,
     PipelineFailure,
@@ -1769,6 +1770,21 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 "terminal_declined": "closed",
             },
         )
+
+    def list_fields(
+        self,
+        project: ProjectConfig,  # noqa: ARG002 — kept for provider-agnostic signature
+        token: str | None,         # noqa: ARG002 — same
+        *,
+        work_item_type: str | None = None,  # noqa: ARG002 — same
+    ) -> list[FieldSpec]:
+        """Return an empty list — GitLab issues have no structured field schema.
+
+        GitLab does not expose a discoverable field vocabulary for issues.
+        This stub satisfies the provider-agnostic surface so callers can
+        iterate over all providers without special-casing GitLab.
+        """
+        return []
 
     # ---------- comments / notes --------------------------------------------
 

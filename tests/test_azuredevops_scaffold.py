@@ -39,7 +39,7 @@ from lib_python_projects.providers.azuredevops import (
     _org_scope,
     _project_scope,
 )
-from lib_python_projects.providers.base import Comment, StatusSpec, Ticket
+from lib_python_projects.providers.base import Comment, FieldSpec, StatusSpec, Ticket
 
 
 def _project(
@@ -585,3 +585,177 @@ def test_list_statuses_agile_template(monkeypatch: pytest.MonkeyPatch) -> None:
     assert spec.hints["terminal_declined"] == "Removed"
     assert spec.hints["default_open"] == "New"
     assert set(spec.hints["terminal"]) == {"Closed", "Removed"}
+
+
+# ---------- list_fields ------------------------------------------------------
+
+
+def _fields_handler_with_type(
+    work_item_type: str,
+    fields_payload: list[dict],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Build a mock handler that returns the given fields for a specific type."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        fields_path = f"/_apis/wit/workitemtypes/{work_item_type}/fields"
+        if path.endswith(fields_path):
+            return _json({"value": fields_payload})
+        raise AssertionError(f"unexpected path {path}")
+    return handler
+
+
+def test_list_fields_picklist_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A field with allowedValues maps to FieldSpec.allowed_values list."""
+    fields = [
+        {
+            "referenceName": "Custom.Status",
+            "name": "Status",
+            "type": "picklistString",
+            "allowedValues": ["Open", "Closed"],
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, _fields_handler_with_type("Issue", fields))
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    assert len(result) == 1
+    spec = result[0]
+    assert isinstance(spec, FieldSpec)
+    assert spec.reference_name == "Custom.Status"
+    assert spec.display_name == "Status"
+    assert spec.type == "picklistString"
+    assert spec.allowed_values == ["Open", "Closed"]
+    assert spec.read_only is False
+
+
+def test_list_fields_plain_string_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A field with no allowedValues key maps to allowed_values=None."""
+    fields = [
+        {
+            "referenceName": "System.Title",
+            "name": "Title",
+            "type": "string",
+            "isReadOnly": False,
+            "alwaysRequired": True,
+        }
+    ]
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, _fields_handler_with_type("Issue", fields))
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    assert len(result) == 1
+    assert result[0].allowed_values is None
+
+
+def test_list_fields_default_work_item_type_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When work_item_type is None the provider resolves via /workitemtypes first."""
+    fields = [
+        {
+            "referenceName": "System.State",
+            "name": "State",
+            "type": "string",
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
+            return _json({"value": fields})
+        raise AssertionError(f"unexpected path {path}")
+
+    _install_mock(monkeypatch, handler)
+    # project has no default_work_item_type — forces the two-step resolution
+    result = AzureDevOpsProvider().list_fields(_project(), token="t")
+    assert len(result) == 1
+    assert result[0].reference_name == "System.State"
+
+
+def test_list_fields_explicit_work_item_type_skips_type_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing work_item_type='Task' must not hit the /workitemtypes endpoint."""
+    fields = [
+        {
+            "referenceName": "System.Title",
+            "name": "Title",
+            "type": "string",
+            "isReadOnly": False,
+            "alwaysRequired": True,
+        }
+    ]
+    seen: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        seen.append(path)
+        if path.endswith("/_apis/wit/workitemtypes/Task/fields"):
+            return _json({"value": fields})
+        raise AssertionError(f"unexpected path {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_fields(_project(), token="t", work_item_type="Task")
+    assert len(result) == 1
+    # /workitemtypes (no trailing type segment) must never appear
+    assert not any(p.endswith("/_apis/wit/workitemtypes") for p in seen), (
+        "list_fields called /workitemtypes discovery even though work_item_type was explicit"
+    )
+
+
+def test_list_fields_result_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second call with the same type must not hit the HTTP endpoint again."""
+    fields = [
+        {
+            "referenceName": "System.Title",
+            "name": "Title",
+            "type": "string",
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+    hit_count: list[int] = [0]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
+            hit_count[0] += 1
+            return _json({"value": fields})
+        raise AssertionError(f"unexpected path {path}")
+
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, handler)
+    provider = AzureDevOpsProvider()
+    provider.list_fields(p, token="t")
+    provider.list_fields(p, token="t")
+    assert hit_count[0] == 1, (
+        f"Expected the fields endpoint to be called once, got {hit_count[0]}"
+    )
+
+
+def test_list_fields_read_only_and_always_required_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """isReadOnly and alwaysRequired flags are faithfully mapped."""
+    fields = [
+        {
+            "referenceName": "System.Id",
+            "name": "ID",
+            "type": "integer",
+            "isReadOnly": True,
+            "alwaysRequired": True,
+        }
+    ]
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, _fields_handler_with_type("Issue", fields))
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    assert len(result) == 1
+    spec = result[0]
+    assert spec.read_only is True
+    assert spec.always_required is True

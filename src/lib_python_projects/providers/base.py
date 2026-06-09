@@ -485,6 +485,28 @@ class StatusSpec:
 
 
 @dataclass
+class FieldSpec:
+    """Result of `list_fields` — discovery payload for a single work-item field.
+
+    `reference_name` is the provider-native field identifier (e.g.
+    ``"System.State"``). `display_name` is the human-readable label
+    (e.g. ``"State"``). `type` is the field type string returned by the
+    provider (e.g. ``"string"``, ``"integer"``, ``"picklistString"``).
+    `allowed_values` lists the accepted values for picklist fields;
+    ``None`` when the field is free-form or the provider does not
+    enumerate values. `read_only` and `always_required` mirror the
+    provider's field-level metadata flags.
+    """
+
+    reference_name: str
+    display_name: str
+    type: str
+    allowed_values: list[str] | None
+    read_only: bool
+    always_required: bool
+
+
+@dataclass
 class PRFilters:
     status: PRListStatus = "open"
     labels: list[str] = field(default_factory=list)
