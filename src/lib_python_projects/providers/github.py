@@ -5,6 +5,7 @@ import dataclasses
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import httpx
@@ -32,7 +33,9 @@ from lib_python_projects.providers.base import (
     PipelineRun,
     PRFilters,
     ProjectDiscoveryResult,
+    ProviderError,
     PullRequest,
+    RateLimitError,
     Relation,
     RelationAlreadyExists,
     RelationKindUnsupported,
@@ -60,12 +63,12 @@ API_BASE = "https://api.github.com"
 _GITHUB_SUFFIX_RE = re.compile(r"\s*\(GitHub\s+\d+\)\s*$")
 
 
-class GitHubError(RuntimeError):
+class GitHubError(ProviderError):
     def __init__(self, status: int, message: str):
         # Strip any trailing "(GitHub NNN)" parenthetical to avoid the message
         # ending up as "GitHub 404: … (GitHub 404)" when errors are re-wrapped.
         cleaned = _GITHUB_SUFFIX_RE.sub("", message)
-        super().__init__(f"GitHub {status}: {cleaned}")
+        RuntimeError.__init__(self, f"GitHub {status}: {cleaned}")
         self.status = status
         self.message = cleaned
 
@@ -126,8 +129,14 @@ def _check(resp: httpx.Response) -> None:
     except Exception:
         msg = resp.reason_phrase or "request failed"
     if resp.status_code == 403 and resp.headers.get("x-ratelimit-remaining") == "0":
-        reset = resp.headers.get("x-ratelimit-reset", "?")
-        msg = f"rate-limited (reset unix={reset}); {msg}"
+        reset_hdr = resp.headers.get("x-ratelimit-reset")
+        retry_after: int | None = None
+        if reset_hdr is not None:
+            try:
+                retry_after = max(0, int(reset_hdr) - int(time.time()))
+            except (ValueError, TypeError):
+                retry_after = None
+        raise RateLimitError(403, msg, retry_after=retry_after)
     raise GitHubError(resp.status_code, msg)
 
 
@@ -135,8 +144,8 @@ def _check_side_step(resp: httpx.Response) -> str | None:
     """Like `_check`, but treats a 422 response as a non-fatal warning.
 
     Returns ``None`` on success, a warning string on 422, and raises
-    ``GitHubError`` for any other failure status — identical behaviour to
-    ``_check`` for those cases.
+    ``GitHubError`` (or ``RateLimitError``) for any other failure status —
+    identical behaviour to ``_check`` for those cases.
     """
     if resp.is_success:
         return None
@@ -151,8 +160,14 @@ def _check_side_step(resp: httpx.Response) -> str | None:
     if resp.status_code == 422:
         return f"side-step 422: {msg}"
     if resp.status_code == 403 and resp.headers.get("x-ratelimit-remaining") == "0":
-        reset = resp.headers.get("x-ratelimit-reset", "?")
-        msg = f"rate-limited (reset unix={reset}); {msg}"
+        reset_hdr = resp.headers.get("x-ratelimit-reset")
+        retry_after: int | None = None
+        if reset_hdr is not None:
+            try:
+                retry_after = max(0, int(reset_hdr) - int(time.time()))
+            except (ValueError, TypeError):
+                retry_after = None
+        raise RateLimitError(403, msg, retry_after=retry_after)
     raise GitHubError(resp.status_code, msg)
 
 

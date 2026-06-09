@@ -63,7 +63,9 @@ from lib_python_projects.providers.base import (
     PipelineFailure,
     PipelineRun,
     ProjectDiscoveryResult,
+    ProviderError,
     PullRequest,
+    RateLimitError,
     Relation,
     RelationAlreadyExists,
     RelationKindUnsupported,
@@ -96,9 +98,9 @@ API_VERSION_COMMENTS = "7.1-preview.4"
 # ---------- error type -------------------------------------------------------
 
 
-class AzureDevOpsError(RuntimeError):
+class AzureDevOpsError(ProviderError):
     def __init__(self, status: int, message: str):
-        super().__init__(f"Azure DevOps {status}: {message}")
+        RuntimeError.__init__(self, f"Azure DevOps {status}: {message}")
         self.status = status
         self.message = message
 
@@ -315,6 +317,17 @@ def _check(resp: httpx.Response) -> None:
 
     status = resp.status_code
     msg_lower = (msg or "").lower()
+
+    # 429 rate-limit: raise RateLimitError before any status remapping.
+    if status == 429:
+        retry_after: int | None = None
+        retry_after_hdr = resp.headers.get("Retry-After")
+        if retry_after_hdr is not None:
+            try:
+                retry_after = int(retry_after_hdr)
+            except (ValueError, TypeError):
+                retry_after = None
+        raise RateLimitError(429, msg, retry_after=retry_after)
 
     # 400-but-actually-404 normalization.
     if status == 400 and (

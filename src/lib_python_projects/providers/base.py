@@ -108,6 +108,34 @@ READ_ONLY_RELATION_KINDS: tuple[str, ...] = (
 )
 
 
+
+
+class ProviderError(RuntimeError):
+    """Shared base for all provider-specific HTTP errors.
+
+    Guarantees `.status` (int HTTP status code) and `.message` (cleaned
+    human-readable text) on every concrete subclass.
+    """
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class RateLimitError(ProviderError):
+    """Raised when a provider returns a rate-limit response (403/429).
+
+    Carries an optional `retry_after` (seconds until the limit resets,
+    or ``None`` when the provider does not supply that header).
+    """
+
+    def __init__(
+        self, status: int, message: str, retry_after: int | None = None
+    ) -> None:
+        super().__init__(status, message)
+        self.retry_after = retry_after
+
 class RelationNotFound(LookupError):
     """Raised when `remove_relation` is called for a link that does not exist.
 
