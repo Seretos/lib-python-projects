@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -55,7 +56,9 @@ from lib_python_projects.providers.base import (
     PipelineRun,
     PRFilters,
     ProjectDiscoveryResult,
+    ProviderError,
     PullRequest,
+    RateLimitError,
     Relation,
     RelationAlreadyExists,
     RelationKindUnsupported,
@@ -89,7 +92,7 @@ _STATUS_PREFIX_RE = re.compile(r"^\d{3}\s+")
 _GITLAB_PREFIX_RE = re.compile(r"^GitLab\s+\d+:\s*")
 
 
-class GitLabError(RuntimeError):
+class GitLabError(ProviderError):
     """Raised on any non-success response from the GitLab REST API.
 
     Mirrors `GitHubError` so `tools/_providers.py::_safe` can translate
@@ -100,7 +103,7 @@ class GitLabError(RuntimeError):
         # Strip any leading "GitLab NNN: " prefix to avoid the message ending
         # up as "GitLab 404: GitLab 404: Not Found" when errors are re-wrapped.
         cleaned = _GITLAB_PREFIX_RE.sub("", message) if message else message
-        super().__init__(f"GitLab {status}: {cleaned}")
+        RuntimeError.__init__(self, f"GitLab {status}: {cleaned}")
         self.status = status
         self.message = cleaned
 
@@ -204,7 +207,7 @@ def _capabilities_from_access_level(level: int | None) -> TokenCapabilities:
 
 
 def _check(resp: httpx.Response) -> None:
-    """Raise `GitLabError` for any non-2xx response.
+    """Raise `GitLabError` (or `RateLimitError`) for any non-2xx response.
 
     GitLab error payloads come in three shapes:
       - `{"message": "..."}` for most errors
@@ -238,6 +241,22 @@ def _check(resp: httpx.Response) -> None:
             msg = resp.reason_phrase or "request failed"
     except Exception:
         msg = resp.reason_phrase or "request failed"
+    if resp.status_code == 429:
+        retry_after: int | None = None
+        retry_after_hdr = resp.headers.get("Retry-After")
+        if retry_after_hdr is not None:
+            try:
+                retry_after = int(retry_after_hdr)
+            except (ValueError, TypeError):
+                retry_after = None
+        if retry_after is None:
+            reset_hdr = resp.headers.get("RateLimit-Reset")
+            if reset_hdr is not None:
+                try:
+                    retry_after = max(0, int(reset_hdr) - int(time.time()))
+                except (ValueError, TypeError):
+                    retry_after = None
+        raise RateLimitError(429, msg, retry_after=retry_after)
     raise GitLabError(resp.status_code, msg)
 
 

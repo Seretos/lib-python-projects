@@ -17,8 +17,11 @@ from typing import Callable
 import httpx
 import pytest
 
+import time
+
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import github as github_mod
+from lib_python_projects.providers.base import ProviderError, RateLimitError
 from lib_python_projects.providers.github import GitHubError, GitHubProvider
 
 
@@ -692,3 +695,89 @@ class TestCreateTicketBlankTitle:
                 _project(), token="t", title="   ", body="body", labels=[], assignees=[],
             )
         assert seen == [], "no HTTP request should have been made"
+
+
+# ---------- Ticket #96: RateLimitError and ProviderError hierarchy -----------
+
+
+def test_github_rate_limit_raises_rate_limit_error() -> None:
+    """403 + x-ratelimit-remaining=0 + reset header raises RateLimitError with retry_after."""
+    reset_ts = int(time.time()) + 60
+    resp = httpx.Response(
+        status_code=403,
+        content=b'{"message":"API rate limit exceeded"}',
+        headers={
+            "Content-Type": "application/json",
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": str(reset_ts),
+        },
+    )
+    from lib_python_projects.providers.github import _check
+    with pytest.raises(RateLimitError) as exc:
+        _check(resp)
+    assert exc.value.status == 403
+    assert exc.value.retry_after is not None
+    assert abs(exc.value.retry_after - 60) <= 2
+
+
+def test_github_rate_limit_no_reset_header_retry_after_none() -> None:
+    """403 + x-ratelimit-remaining=0 but no reset header → retry_after is None."""
+    resp = httpx.Response(
+        status_code=403,
+        content=b'{"message":"API rate limit exceeded"}',
+        headers={
+            "Content-Type": "application/json",
+            "x-ratelimit-remaining": "0",
+        },
+    )
+    from lib_python_projects.providers.github import _check
+    with pytest.raises(RateLimitError) as exc:
+        _check(resp)
+    assert exc.value.retry_after is None
+
+
+def test_github_403_without_ratelimit_header_raises_github_error() -> None:
+    """403 WITHOUT x-ratelimit-remaining=0 must raise GitHubError, not RateLimitError."""
+    resp = httpx.Response(
+        status_code=403,
+        content=b'{"message":"Forbidden"}',
+        headers={"Content-Type": "application/json"},
+    )
+    from lib_python_projects.providers.github import _check
+    with pytest.raises(GitHubError):
+        _check(resp)
+
+
+def test_github_error_is_instance_of_provider_error() -> None:
+    """GitHubError must be an instance of ProviderError."""
+    err = GitHubError(404, "not found")
+    assert isinstance(err, ProviderError)
+    assert isinstance(err, RuntimeError)
+
+
+def test_github_error_str_contract() -> None:
+    """str(GitHubError) must keep the 'GitHub NNN: <message>' format."""
+    err = GitHubError(404, "not found")
+    assert str(err) == "GitHub 404: not found"
+    assert err.status == 404
+    assert err.message == "not found"
+
+
+def test_check_side_step_raises_rate_limit_error() -> None:
+    """_check_side_step on 403 + x-ratelimit-remaining=0 must raise RateLimitError."""
+    from lib_python_projects.providers.github import _check_side_step
+    reset_ts = int(time.time()) + 60
+    resp = httpx.Response(
+        status_code=403,
+        content=b'{"message":"API rate limit exceeded"}',
+        headers={
+            "Content-Type": "application/json",
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": str(reset_ts),
+        },
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check_side_step(resp)
+    assert exc.value.status == 403
+    assert exc.value.retry_after is not None
+    assert abs(exc.value.retry_after - 60) <= 2
