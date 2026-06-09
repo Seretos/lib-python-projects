@@ -858,3 +858,31 @@ def test_label_operation_unsupported_is_not_implemented_error():
     from lib_python_projects.providers.base import LabelOperationUnsupported
 
     assert issubclass(LabelOperationUnsupported, NotImplementedError)
+
+
+# ---------- ticket #94: list_fields cross-provider parity --------------------
+
+
+def test_all_providers_expose_list_fields():
+    """All three providers must expose list_fields as a callable.
+    This is a static structural assertion (mirrors test_all_providers_expose_label_methods)."""
+    from lib_python_projects.providers.github import GitHubProvider
+    from lib_python_projects.providers.gitlab import GitLabProvider
+    from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+
+    for provider_cls in (GitHubProvider, GitLabProvider, AzureDevOpsProvider):
+        assert callable(getattr(provider_cls, "list_fields", None)), (
+            f"{provider_cls.__name__} is missing callable 'list_fields'"
+        )
+
+
+def test_github_list_fields_returns_empty():
+    """GitHubProvider.list_fields returns [] without raising."""
+    result = GitHubProvider().list_fields(_github_project(), None)
+    assert result == []
+
+
+def test_gitlab_list_fields_returns_empty():
+    """GitLabProvider.list_fields returns [] without raising."""
+    result = GitLabProvider().list_fields(_gitlab_project(), None)
+    assert result == []

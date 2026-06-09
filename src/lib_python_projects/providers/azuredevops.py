@@ -56,6 +56,7 @@ from lib_python_projects.providers.base import (
     Comment,
     DiscoveredProject,
     FailingJob,
+    FieldSpec,
     Label,
     LabelOperationUnsupported,
     PRFilters,
@@ -408,6 +409,7 @@ _CACHE_TTL_SECONDS = 60 * 60  # 1 hour, matching tools/tickets list_ticket_statu
 _cache_lock = threading.Lock()
 _repo_id_cache: dict[tuple[str, str, str], tuple[float, str]] = {}
 _state_cache: dict[tuple[str, str, str], tuple[float, list[dict]]] = {}
+_field_cache: dict[tuple[str, str, str], tuple[float, list[dict]]] = {}
 _default_type_cache: dict[tuple[str, str], tuple[float, str]] = {}
 
 
@@ -434,6 +436,7 @@ def _cache_clear_all() -> None:
     with _cache_lock:
         _repo_id_cache.clear()
         _state_cache.clear()
+        _field_cache.clear()
         _default_type_cache.clear()
 
 
@@ -1450,6 +1453,37 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         _cache_put(_state_cache, key, states)
         return states
 
+    def _fields_for_type(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        work_item_type: str,
+    ) -> list[dict]:
+        """List the field descriptors for a work-item type.
+
+        Each entry is the raw ADO field dict with at least `referenceName`,
+        `name`, `type`, `isReadOnly`, `alwaysRequired`, and optionally
+        `allowedValues` (a list of strings for picklist fields).
+        Results are cached per `(org, project, work_item_type)` for 1 hour.
+        """
+        key = (project.organization or "", project.ado_project or "", work_item_type)
+        cached = _cache_get(_field_cache, key)
+        if cached is not None:
+            return cached
+        path = (
+            f"{_project_scope(project)}/_apis/wit/workitemtypes/"
+            f"{quote(work_item_type, safe='')}/fields"
+        )
+        with _client(project, token) as c:
+            resp = c.get(
+                path,
+                params={**_api_version_params(), "$expand": "allowedValues"},
+            )
+        _check(resp)
+        fields = list((resp.json().get("value") or []))
+        _cache_put(_field_cache, key, fields)
+        return fields
+
     def _resolve_repository_id(
         self,
         project: ProjectConfig,
@@ -1525,6 +1559,47 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             "terminal_declined": terminal_declined[0] if terminal_declined else None,
         }
         return StatusSpec(values=values, transitions=transitions, hints=hints)
+
+    # ---------- list_fields -----------------------------------------------
+
+    def list_fields(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        work_item_type: str | None = None,
+    ) -> list[FieldSpec]:
+        """Return the field descriptors for a work-item type.
+
+        Each `FieldSpec` describes one field accepted by the given
+        work-item type: its reference name, display name, data type,
+        optional picklist of allowed values, and read-only /
+        always-required flags.
+
+        When `work_item_type` is ``None`` the default work-item type for
+        the project is resolved via `_default_work_item_type` (the same
+        resolution used by `create_ticket` and `list_statuses`). Pass an
+        explicit value to skip that lookup and avoid the extra HTTP call.
+        """
+        wi_type = work_item_type or self._default_work_item_type(project, token)
+        raw_fields = self._fields_for_type(project, token, wi_type)
+        result: list[FieldSpec] = []
+        for f in raw_fields:
+            raw_allowed = f.get("allowedValues")
+            allowed: list[str] | None = (
+                list(raw_allowed) if raw_allowed else None
+            )
+            result.append(
+                FieldSpec(
+                    reference_name=f.get("referenceName") or "",
+                    display_name=f.get("name") or "",
+                    type=f.get("type") or "",
+                    allowed_values=allowed,
+                    read_only=bool(f.get("isReadOnly")),
+                    always_required=bool(f.get("alwaysRequired")),
+                )
+            )
+        return result
 
     # ---------- tickets — read --------------------------------------------
 
