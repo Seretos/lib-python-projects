@@ -1510,6 +1510,91 @@ def test_list_statuses_both_terminals_populated_when_both_categories_present(
     assert spec.hints["terminal_declined"] == "Removed"
 
 
+def test_update_ticket_custom_fields_emitted_in_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """custom_fields entries appear as add-ops in the PATCH payload."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/5"):
+            return _json(_work_item_payload(5))
+        if req.method == "PATCH" and path.endswith("/workitems/5"):
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(5))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().update_ticket(
+        _project(),
+        token="t",
+        ticket_id="5",
+        custom_fields={"Custom.ProcessState": "50 - testen"},
+    )
+    ops = {op["path"]: op for op in captured["patch"]}
+    assert "/fields/Custom.ProcessState" in ops
+    assert ops["/fields/Custom.ProcessState"]["op"] == "add"
+    assert ops["/fields/Custom.ProcessState"]["value"] == "50 - testen"
+
+
+def test_update_ticket_custom_fields_none_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """custom_fields=None and custom_fields={} must not issue a PATCH request."""
+    patch_hit: list[bool] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/5"):
+            return _json(_work_item_payload(5))
+        if req.method == "PATCH" and path.endswith("/workitems/5"):
+            patch_hit.append(True)
+            return _json(_work_item_payload(5))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().update_ticket(
+        _project(), token="t", ticket_id="5", custom_fields=None
+    )
+    assert patch_hit == [], "PATCH should not be issued when custom_fields=None"
+
+    AzureDevOpsProvider().update_ticket(
+        _project(), token="t", ticket_id="5", custom_fields={}
+    )
+    assert patch_hit == [], "PATCH should not be issued when custom_fields={}"
+
+
+def test_update_ticket_custom_fields_combined_with_standard_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both standard and custom fields appear in the same PATCH payload."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/5"):
+            return _json(_work_item_payload(5))
+        if req.method == "PATCH" and path.endswith("/workitems/5"):
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(5, **{"System.Title": "new"}))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().update_ticket(
+        _project(),
+        token="t",
+        ticket_id="5",
+        title="new",
+        custom_fields={"Custom.ProcessState": "Done"},
+    )
+    ops = {op["path"]: op for op in captured["patch"]}
+    assert "/fields/System.Title" in ops, "standard title field must appear"
+    assert ops["/fields/System.Title"]["value"] == "new"
+    assert "/fields/Custom.ProcessState" in ops, "custom field must appear"
+    assert ops["/fields/Custom.ProcessState"]["value"] == "Done"
+
+
 # ---------- Ticket #74: create_ticket blank-title guard (Azure DevOps) --------
 
 

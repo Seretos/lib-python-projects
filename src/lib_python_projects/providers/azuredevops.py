@@ -1964,6 +1964,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         labels_remove: list[str] | None = None,
         assignees_add: list[str] | None = None,
         assignees_remove: list[str] | None = None,
+        custom_fields: dict[str, Any] | None = None,
     ) -> Ticket:
         _validate_label_lists(labels_add, labels_remove)
         _validate_int32_id(ticket_id, "ticket")
@@ -2039,6 +2040,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                         "op": "remove",
                         "path": "/fields/System.AssignedTo",
                     })
+
+        for field_ref, field_value in (custom_fields or {}).items():
+            patch.append({"op": "add", "path": f"/fields/{field_ref}", "value": field_value})
 
         if not patch:
             return _map_work_item(current, project)
