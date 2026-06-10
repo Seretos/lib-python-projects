@@ -1632,3 +1632,111 @@ class TestCreateTicketBlankTitleAzureDevOps:
                 assignees=[],
             )
         assert seen == [], "no HTTP request should have been made"
+
+
+# ---------- HTML serialisation integration -----------------------------------
+
+
+def test_update_comment_serializes_html_in_patch_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_comment must send rendered HTML in the PATCH body's ``text`` field."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and "/workItems/5/comments/3" in path:
+            # Return a comment with no AI marker so apply_body_marker adds one.
+            return _json(
+                {
+                    "id": 3,
+                    "createdBy": {"displayName": "Alice"},
+                    "text": "<p>original</p>",
+                    "createdDate": "2026-05-18T10:00:00Z",
+                }
+            )
+        if req.method == "PATCH" and "/workItems/5/comments/3" in path:
+            captured["body"] = json.loads(req.content.decode("utf-8"))
+            return _json(
+                {
+                    "id": 3,
+                    "createdBy": {"displayName": "Alice"},
+                    "text": captured["body"]["text"],
+                    "createdDate": "2026-05-18T10:00:00Z",
+                }
+            )
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().update_comment(
+        _project(), token="t", ticket_id="5", comment_id="3", body="**bold** text"
+    )
+    sent_text = captured["body"]["text"]
+    assert "<strong>bold</strong>" in sent_text, repr(sent_text)
+    assert "text" in sent_text
+
+
+def test_create_ticket_description_html_contains_rendered_markdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_ticket must send rendered HTML for the description field.
+
+    A body containing a heading, list item, and inline code must appear
+    as the corresponding HTML tags in the ``System.Description`` patch op.
+    """
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(8))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(),
+        token="t",
+        title="HTML test",
+        body="## Heading\n\n- list item\n\nUse `code` here.",
+        labels=[],
+        assignees=[],
+    )
+    desc_op = next(
+        op for op in captured["patch"] if op["path"] == "/fields/System.Description"
+    )
+    desc = desc_op["value"]
+    assert "<h2>" in desc, repr(desc)
+    assert "<li>" in desc, repr(desc)
+    assert "<code>code</code>" in desc, repr(desc)
+
+
+def test_update_ticket_body_html_contains_rendered_markdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_ticket must send rendered HTML when a body is supplied."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/5"):
+            return _json(_work_item_payload(5))
+        if req.method == "PATCH" and path.endswith("/workitems/5"):
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(5))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().update_ticket(
+        _project(),
+        token="t",
+        ticket_id="5",
+        body="## Title\n\n- item\n\nParagraph with `snippet`.",
+    )
+    ops = {op["path"]: op for op in captured["patch"]}
+    desc = ops["/fields/System.Description"]["value"]
+    assert "<h2>" in desc, repr(desc)
+    assert "<li>" in desc, repr(desc)
+    assert "<code>snippet</code>" in desc, repr(desc)
