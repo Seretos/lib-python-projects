@@ -380,6 +380,73 @@ def test_html_to_markdown_strips_trailing_per_line_whitespace() -> None:
     assert "#ai-generated" in md
 
 
+def test_inline_md_special_chars_in_bold_not_double_escaped() -> None:
+    """REGRESSION: _markdown_to_html must not double-escape HTML entities inside
+    bold/italic/link spans.
+
+    Before the fix, the sentinel-based substitution in _inline_md placed
+    already-escaped content (e.g. ``&amp;``) inside the sentinel markers, then
+    applied html_escape() to the whole string — turning ``&amp;`` into
+    ``&amp;amp;``.  The rendered HTML must contain exactly one level of escaping.
+    """
+    html = _markdown_to_html("**a & b**")
+    assert "&amp;" in html, f"& should be HTML-escaped; got: {html!r}"
+    assert "&amp;amp;" not in html, f"double-escape detected; got: {html!r}"
+
+
+def test_blockquote_round_trip() -> None:
+    """> quoted text round-trips through MD→HTML→MD."""
+    md_in = "> quoted text"
+    html = _markdown_to_html(md_in)
+    assert "<blockquote>" in html
+    md_back = _html_to_markdown(html)
+    assert "quoted text" in md_back
+
+
+def test_link_round_trip() -> None:
+    """[label](https://x.io) → HTML with <a href=…> → back, label and url survive."""
+    md_in = "[label](https://x.io)"
+    html = _markdown_to_html(md_in)
+    assert '<a href="https://x.io">' in html
+    assert "label" in html
+    md_back = _html_to_markdown(html)
+    assert "label" in md_back
+    assert "https://x.io" in md_back
+
+
+def test_italic_round_trip() -> None:
+    """*italic* → <em>italic</em> → back."""
+    md_in = "*italic*"
+    html = _markdown_to_html(md_in)
+    assert "<em>italic</em>" in html
+    md_back = _html_to_markdown(html)
+    assert "italic" in md_back
+
+
+def test_composite_body_round_trip() -> None:
+    """A body mixing heading, list, fenced code, and paragraph round-trips sensibly."""
+    md_in = (
+        "## Section\n"
+        "\n"
+        "- item one\n"
+        "- item two\n"
+        "\n"
+        "```python\nprint('hi')\n```\n"
+        "\n"
+        "Closing paragraph."
+    )
+    html = _markdown_to_html(md_in)
+    assert "<h2>" in html
+    assert "<ul>" in html
+    assert "<li>" in html
+    assert "<pre>" in html
+    md_back = _html_to_markdown(html)
+    assert "Section" in md_back
+    assert "item one" in md_back
+    assert "item two" in md_back
+    assert "Closing paragraph" in md_back
+
+
 # ---------- mappers ----------------------------------------------------------
 
 

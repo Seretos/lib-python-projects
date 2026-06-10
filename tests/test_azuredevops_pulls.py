@@ -1662,3 +1662,42 @@ def test_map_thread_comment_populates_updated_at(
     assert len(comments) >= 1
     pr_comments = [c for c in comments if hasattr(c, "updated_at")]
     assert pr_comments[0].updated_at == "2026-05-21T14:00:00Z"
+
+
+# ---------- HTML serialisation integration -----------------------------------
+
+
+def test_add_pr_comment_converts_markdown_to_html(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_pr_comment must send rendered HTML in the thread's ``content`` field."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if req.method == "POST" and req.url.path.endswith("/pullrequests/7/threads"):
+            captured["body"] = json.loads(req.content.decode("utf-8"))
+            content = captured["body"]["comments"][0]["content"]
+            return _json({
+                "id": 55,
+                "threadContext": None,
+                "comments": [
+                    {
+                        "id": 1,
+                        "author": {"displayName": "AI"},
+                        "content": content,
+                        "commentType": "text",
+                        "publishedDate": "2026-05-18T10:00:00Z",
+                    }
+                ],
+            })
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().add_pr_comment(
+        _project(), token="t", pr_id="7", body="**bold**"
+    )
+    content = captured["body"]["comments"][0]["content"]
+    assert "<strong>bold</strong>" in content, repr(content)

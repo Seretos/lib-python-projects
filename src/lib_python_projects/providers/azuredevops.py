@@ -654,18 +654,39 @@ def _inline_md(text: str) -> str:
         pos = m.end()
     rest = text[pos:]
 
-    # Now run the rest through link → bold → italic on the *escaped* form,
-    # using sentinels so the angle brackets we emit aren't double-escaped.
+    # Now run the rest through link → bold → italic, using sentinels so the
+    # angle brackets we emit aren't double-escaped.
+    # IMPORTANT: do NOT html_escape inside the lambdas — the outer pass below
+    # escapes only the literal (non-sentinel) regions, so span content must
+    # remain unescaped here to avoid double-escaping (e.g. & → &amp; → &amp;amp;).
     rest = _LINK_RE.sub(
-        lambda mm: f"\x01A\x01{html_escape(mm.group(2))}\x01B\x01"
-        f"{html_escape(mm.group(1))}\x01C\x01",
+        lambda mm: f"\x01A\x01{mm.group(2)}\x01B\x01{mm.group(1)}\x01C\x01",
         rest,
     )
-    rest = _BOLD_RE.sub(lambda mm: f"\x01D\x01{html_escape(mm.group(1))}\x01E\x01", rest)
-    rest = _ITALIC_RE.sub(lambda mm: f"\x01F\x01{html_escape(mm.group(1))}\x01G\x01", rest)
-    # Whatever survives is literal text that still needs escaping.
+    rest = _BOLD_RE.sub(lambda mm: f"\x01D\x01{mm.group(1)}\x01E\x01", rest)
+    rest = _ITALIC_RE.sub(lambda mm: f"\x01F\x01{mm.group(1)}\x01G\x01", rest)
+
+    # Escape only the literal text regions between sentinel-wrapped spans.
+    # Split on the sentinel characters (\x01); odd-indexed tokens are span
+    # bodies (already to be rendered as HTML content), even-indexed tokens are
+    # literal text that needs escaping.
+    _SENTINEL = "\x01"
+    tokens = rest.split(_SENTINEL)
+    # tokens[0], tokens[2], tokens[4], … are literal text (escape them).
+    # tokens[1], tokens[3], tokens[5], … are span-type markers or content.
+    escaped_tokens: list[str] = []
+    for idx, tok in enumerate(tokens):
+        if idx % 2 == 0:
+            escaped_tokens.append(html_escape(tok))
+        else:
+            # This is inside a sentinel pair — it's either a marker letter
+            # (e.g. "A", "D") or the raw content between two sentinels.
+            # Content between an opening marker (e.g. "A\x01...") and a
+            # closing marker must be HTML-escaped too (it's raw MD text).
+            escaped_tokens.append(html_escape(tok))
+
     rest = (
-        html_escape(rest)
+        _SENTINEL.join(escaped_tokens)
         .replace("\x01A\x01", '<a href="')
         .replace("\x01B\x01", '">')
         .replace("\x01C\x01", "</a>")
