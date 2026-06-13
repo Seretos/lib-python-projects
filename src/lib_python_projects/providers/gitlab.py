@@ -76,6 +76,7 @@ from lib_python_projects.providers.base import (
     _validate_label_lists,
     _validate_limit,
 )
+from lib_python_projects.providers._http_cache import make_cached_transport
 
 log = logging.getLogger("project-issues.gitlab")
 
@@ -138,6 +139,7 @@ def _client(project: ProjectConfig, token: str | None) -> httpx.Client:
         base_url=_base_url(project),
         headers=headers,
         timeout=30.0,
+        transport=make_cached_transport(),
     )
 
 
@@ -156,6 +158,7 @@ def _discovery_client(base_url: str, token: str) -> httpx.Client:
         base_url=base_url,
         headers=headers,
         timeout=30.0,
+        transport=make_cached_transport(),
     )
 
 
@@ -217,6 +220,8 @@ def _check(resp: httpx.Response) -> None:
     We collapse all three into one string so the caller gets a single
     consistent message.
     """
+    if resp.status_code == 304:
+        return
     if resp.is_success:
         return
     msg: str
@@ -254,6 +259,13 @@ def _check(resp: httpx.Response) -> None:
             if reset_hdr is not None:
                 try:
                     retry_after = max(0, int(reset_hdr) - int(time.time()))
+                except (ValueError, TypeError):
+                    retry_after = None
+        if retry_after is None:
+            reset_time_hdr = resp.headers.get("RateLimit-ResetTime")
+            if reset_time_hdr is not None:
+                try:
+                    retry_after = max(0, int(reset_time_hdr) - int(time.time()))
                 except (ValueError, TypeError):
                     retry_after = None
         raise RateLimitError(429, msg, retry_after=retry_after)
