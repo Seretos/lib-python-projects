@@ -104,3 +104,72 @@ def test_rate_limit_error_is_provider_error() -> None:
     with pytest.raises(ProviderError) as exc:
         _check(resp)
     assert isinstance(exc.value, RateLimitError)
+
+
+# ---------- Ticket #100: 503 handling and 429 X-RateLimit-Reset fallback -----
+
+
+def test_azuredevops_503_with_retry_after_raises_rate_limit_error() -> None:
+    """503 + Retry-After header must raise RateLimitError(503, ..., retry_after=N)."""
+    import time
+    resp = _resp(
+        503,
+        {"message": "Service Unavailable"},
+        {"Retry-After": "120"},
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check(resp)
+    assert exc.value.status == 503
+    assert exc.value.retry_after == 120
+
+
+def test_azuredevops_503_without_retry_after_raises_azure_error() -> None:
+    """503 WITHOUT Retry-After must raise AzureDevOpsError (not RateLimitError)."""
+    resp = _resp(503, {"message": "Service Unavailable"})
+    with pytest.raises(AzureDevOpsError) as exc:
+        _check(resp)
+    assert exc.value.status == 503
+    assert not isinstance(exc.value, RateLimitError)
+
+
+def test_azuredevops_503_is_not_rate_limit_error_without_header() -> None:
+    """Confirm 503 without header raises AzureDevOpsError, not RateLimitError."""
+    resp = _resp(503, {"message": "Gateway Timeout"})
+    exc_raised: Exception | None = None
+    try:
+        _check(resp)
+    except Exception as e:
+        exc_raised = e
+    assert exc_raised is not None
+    assert isinstance(exc_raised, AzureDevOpsError)
+    assert not isinstance(exc_raised, RateLimitError)
+
+
+def test_azuredevops_429_x_ratelimit_reset_fallback() -> None:
+    """429 with only X-RateLimit-Reset (no Retry-After) must compute retry_after."""
+    import time
+    reset_ts = int(time.time()) + 75
+    resp = _resp(
+        429,
+        {"message": "Too many requests"},
+        {"X-RateLimit-Reset": str(reset_ts)},
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check(resp)
+    assert exc.value.status == 429
+    assert exc.value.retry_after is not None
+    assert abs(exc.value.retry_after - 75) <= 2
+
+
+def test_azuredevops_429_retry_after_takes_priority_over_x_ratelimit_reset() -> None:
+    """429 with both Retry-After and X-RateLimit-Reset: Retry-After wins."""
+    import time
+    reset_ts = int(time.time()) + 999
+    resp = _resp(
+        429,
+        {"message": "Too many requests"},
+        {"Retry-After": "30", "X-RateLimit-Reset": str(reset_ts)},
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check(resp)
+    assert exc.value.retry_after == 30

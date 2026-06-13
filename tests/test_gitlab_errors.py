@@ -117,3 +117,51 @@ def test_rate_limit_error_is_instance_of_provider_error() -> None:
     with pytest.raises(ProviderError) as exc:
         _check(resp)
     assert isinstance(exc.value, RateLimitError)
+
+
+# ---------- Ticket #100: RateLimit-ResetTime fallback ------------------------
+
+
+def test_gitlab_429_ratelimit_resettime_fallback() -> None:
+    """429 + RateLimit-ResetTime (epoch) fallback when Retry-After and
+    RateLimit-Reset are both absent."""
+    reset_ts = int(time.time()) + 120
+    resp = _resp(
+        429,
+        {"message": "Too Many Requests"},
+        {"RateLimit-ResetTime": str(reset_ts)},
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check(resp)
+    assert exc.value.status == 429
+    assert exc.value.retry_after is not None
+    assert abs(exc.value.retry_after - 120) <= 2
+
+
+def test_gitlab_429_retry_after_priority_over_resettime() -> None:
+    """When Retry-After is present, it takes priority over RateLimit-ResetTime."""
+    reset_ts = int(time.time()) + 999
+    resp = _resp(
+        429,
+        {"message": "Too Many Requests"},
+        {"Retry-After": "25", "RateLimit-ResetTime": str(reset_ts)},
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check(resp)
+    assert exc.value.retry_after == 25
+
+
+def test_gitlab_429_ratelimit_reset_priority_over_resettime() -> None:
+    """When RateLimit-Reset is present (no Retry-After), it takes priority over
+    RateLimit-ResetTime."""
+    reset_ts = int(time.time()) + 60
+    reset_time_ts = int(time.time()) + 999
+    resp = _resp(
+        429,
+        {"message": "Too Many Requests"},
+        {"RateLimit-Reset": str(reset_ts), "RateLimit-ResetTime": str(reset_time_ts)},
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check(resp)
+    assert exc.value.retry_after is not None
+    assert abs(exc.value.retry_after - 60) <= 2

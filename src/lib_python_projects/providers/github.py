@@ -52,6 +52,7 @@ from lib_python_projects.providers.base import (
     _validate_label_lists,
     _validate_limit,
 )
+from lib_python_projects.providers._http_cache import make_cached_transport
 
 log = logging.getLogger("project-issues.github")
 
@@ -81,7 +82,12 @@ def _client(token: str | None) -> httpx.Client:
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    return httpx.Client(base_url=API_BASE, headers=headers, timeout=30.0)
+    return httpx.Client(
+        base_url=API_BASE,
+        headers=headers,
+        timeout=30.0,
+        transport=make_cached_transport(),
+    )
 
 
 def _format_github_validation_errors(errs: list) -> str:
@@ -118,6 +124,8 @@ def _format_github_validation_errors(errs: list) -> str:
 
 
 def _check(resp: httpx.Response) -> None:
+    if resp.status_code == 304:
+        return
     if resp.is_success:
         return
     try:
@@ -128,15 +136,31 @@ def _check(resp: httpx.Response) -> None:
             msg = f"{msg}: {_format_github_validation_errors(errs)}"
     except Exception:
         msg = resp.reason_phrase or "request failed"
-    if resp.status_code == 403 and resp.headers.get("x-ratelimit-remaining") == "0":
-        reset_hdr = resp.headers.get("x-ratelimit-reset")
+    if resp.status_code == 429:
         retry_after: int | None = None
-        if reset_hdr is not None:
+        ra_hdr = resp.headers.get("Retry-After")
+        if ra_hdr is not None:
             try:
-                retry_after = max(0, int(reset_hdr) - int(time.time()))
+                retry_after = int(ra_hdr)
             except (ValueError, TypeError):
                 retry_after = None
-        raise RateLimitError(403, msg, retry_after=retry_after)
+        if retry_after is None:
+            reset_hdr = resp.headers.get("x-ratelimit-reset")
+            if reset_hdr is not None:
+                try:
+                    retry_after = max(0, int(reset_hdr) - int(time.time()))
+                except (ValueError, TypeError):
+                    retry_after = None
+        raise RateLimitError(429, msg, retry_after=retry_after)
+    if resp.status_code == 403 and resp.headers.get("x-ratelimit-remaining") == "0":
+        reset_hdr = resp.headers.get("x-ratelimit-reset")
+        retry_after_403: int | None = None
+        if reset_hdr is not None:
+            try:
+                retry_after_403 = max(0, int(reset_hdr) - int(time.time()))
+            except (ValueError, TypeError):
+                retry_after_403 = None
+        raise RateLimitError(403, msg, retry_after=retry_after_403)
     raise GitHubError(resp.status_code, msg)
 
 
@@ -147,6 +171,8 @@ def _check_side_step(resp: httpx.Response) -> str | None:
     ``GitHubError`` (or ``RateLimitError``) for any other failure status —
     identical behaviour to ``_check`` for those cases.
     """
+    if resp.status_code == 304:
+        return None
     if resp.is_success:
         return None
     try:
@@ -159,15 +185,31 @@ def _check_side_step(resp: httpx.Response) -> str | None:
         msg = resp.reason_phrase or "request failed"
     if resp.status_code == 422:
         return f"side-step 422: {msg}"
-    if resp.status_code == 403 and resp.headers.get("x-ratelimit-remaining") == "0":
-        reset_hdr = resp.headers.get("x-ratelimit-reset")
+    if resp.status_code == 429:
         retry_after: int | None = None
-        if reset_hdr is not None:
+        ra_hdr = resp.headers.get("Retry-After")
+        if ra_hdr is not None:
             try:
-                retry_after = max(0, int(reset_hdr) - int(time.time()))
+                retry_after = int(ra_hdr)
             except (ValueError, TypeError):
                 retry_after = None
-        raise RateLimitError(403, msg, retry_after=retry_after)
+        if retry_after is None:
+            reset_hdr = resp.headers.get("x-ratelimit-reset")
+            if reset_hdr is not None:
+                try:
+                    retry_after = max(0, int(reset_hdr) - int(time.time()))
+                except (ValueError, TypeError):
+                    retry_after = None
+        raise RateLimitError(429, msg, retry_after=retry_after)
+    if resp.status_code == 403 and resp.headers.get("x-ratelimit-remaining") == "0":
+        reset_hdr = resp.headers.get("x-ratelimit-reset")
+        retry_after_403: int | None = None
+        if reset_hdr is not None:
+            try:
+                retry_after_403 = max(0, int(reset_hdr) - int(time.time()))
+            except (ValueError, TypeError):
+                retry_after_403 = None
+        raise RateLimitError(403, msg, retry_after=retry_after_403)
     raise GitHubError(resp.status_code, msg)
 
 

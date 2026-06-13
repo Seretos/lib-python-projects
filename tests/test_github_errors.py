@@ -781,3 +781,97 @@ def test_check_side_step_raises_rate_limit_error() -> None:
     assert exc.value.status == 403
     assert exc.value.retry_after is not None
     assert abs(exc.value.retry_after - 60) <= 2
+
+
+# ---------- Ticket #100: GitHub 429 handling ---------------------------------
+
+
+def test_github_429_raises_rate_limit_error() -> None:
+    """HTTP 429 in _check must raise RateLimitError(429, ...)."""
+    from lib_python_projects.providers.github import _check
+    resp = httpx.Response(
+        status_code=429,
+        content=b'{"message":"Too Many Requests"}',
+        headers={"Content-Type": "application/json", "Retry-After": "45"},
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check(resp)
+    assert exc.value.status == 429
+    assert exc.value.retry_after == 45
+
+
+def test_github_429_retry_after_header_used() -> None:
+    """429 + Retry-After header → retry_after taken from Retry-After."""
+    from lib_python_projects.providers.github import _check
+    resp = httpx.Response(
+        status_code=429,
+        content=b'{"message":"rate limited"}',
+        headers={"Content-Type": "application/json", "Retry-After": "30"},
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check(resp)
+    assert exc.value.retry_after == 30
+
+
+def test_github_429_x_ratelimit_reset_fallback() -> None:
+    """429 with no Retry-After but x-ratelimit-reset → retry_after computed from reset epoch."""
+    from lib_python_projects.providers.github import _check
+    reset_ts = int(time.time()) + 90
+    resp = httpx.Response(
+        status_code=429,
+        content=b'{"message":"rate limited"}',
+        headers={
+            "Content-Type": "application/json",
+            "x-ratelimit-reset": str(reset_ts),
+        },
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check(resp)
+    assert exc.value.retry_after is not None
+    assert abs(exc.value.retry_after - 90) <= 2
+
+
+def test_github_429_no_headers_retry_after_none() -> None:
+    """429 with no rate-limit headers → retry_after is None."""
+    from lib_python_projects.providers.github import _check
+    resp = httpx.Response(
+        status_code=429,
+        content=b'{"message":"rate limited"}',
+        headers={"Content-Type": "application/json"},
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check(resp)
+    assert exc.value.status == 429
+    assert exc.value.retry_after is None
+
+
+def test_github_429_raises_rate_limit_error_check_side_step() -> None:
+    """HTTP 429 in _check_side_step must raise RateLimitError(429, ...)."""
+    from lib_python_projects.providers.github import _check_side_step
+    resp = httpx.Response(
+        status_code=429,
+        content=b'{"message":"Too Many Requests"}',
+        headers={"Content-Type": "application/json", "Retry-After": "20"},
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check_side_step(resp)
+    assert exc.value.status == 429
+    assert exc.value.retry_after == 20
+
+
+def test_github_429_check_side_step_x_ratelimit_reset_fallback() -> None:
+    """429 in _check_side_step with only x-ratelimit-reset → retry_after computed."""
+    from lib_python_projects.providers.github import _check_side_step
+    reset_ts = int(time.time()) + 50
+    resp = httpx.Response(
+        status_code=429,
+        content=b'{"message":"rate limited"}',
+        headers={
+            "Content-Type": "application/json",
+            "x-ratelimit-reset": str(reset_ts),
+        },
+    )
+    with pytest.raises(RateLimitError) as exc:
+        _check_side_step(resp)
+    assert exc.value.retry_after is not None
+    assert abs(exc.value.retry_after - 50) <= 2

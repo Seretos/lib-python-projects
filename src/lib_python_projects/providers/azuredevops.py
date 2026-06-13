@@ -85,6 +85,7 @@ from lib_python_projects.providers.base import (
     _validate_label_lists,
     _validate_limit,
 )
+from lib_python_projects.providers._http_cache import make_cached_transport
 
 log = logging.getLogger("project-issues.azuredevops")
 
@@ -133,7 +134,12 @@ def _client(
     if token:
         headers["Authorization"] = _basic_auth_header(token)
     base = (base_url or project.base_url or "https://dev.azure.com").rstrip("/")
-    return httpx.Client(base_url=base, headers=headers, timeout=30.0)
+    return httpx.Client(
+        base_url=base,
+        headers=headers,
+        timeout=30.0,
+        transport=make_cached_transport(),
+    )
 
 
 # ---------- discovery sentinel + helpers ------------------------------------
@@ -298,6 +304,8 @@ def _check(resp: httpx.Response) -> None:
       - Work-item state-transition 400s get a hint pointing at
         `list_ticket_statuses`, mirroring the GitHub/GitLab providers.
     """
+    if resp.status_code == 304:
+        return
     if resp.is_success:
         return
     type_key: str = ""
@@ -327,7 +335,26 @@ def _check(resp: httpx.Response) -> None:
                 retry_after = int(retry_after_hdr)
             except (ValueError, TypeError):
                 retry_after = None
+        if retry_after is None:
+            reset_hdr = resp.headers.get("X-RateLimit-Reset")
+            if reset_hdr is not None:
+                try:
+                    retry_after = max(0, int(reset_hdr) - int(time.time()))
+                except (ValueError, TypeError):
+                    retry_after = None
         raise RateLimitError(429, msg, retry_after=retry_after)
+
+    # 503 with Retry-After → rate limit; 503 without → plain server error.
+    if status == 503:
+        retry_after_hdr_503 = resp.headers.get("Retry-After")
+        if retry_after_hdr_503 is not None:
+            retry_after_503: int | None = None
+            try:
+                retry_after_503 = int(retry_after_hdr_503)
+            except (ValueError, TypeError):
+                retry_after_503 = None
+            raise RateLimitError(503, msg, retry_after=retry_after_503)
+        raise AzureDevOpsError(503, msg)
 
     # 400-but-actually-404 normalization.
     if status == 400 and (
