@@ -60,12 +60,14 @@ jobs:
 
             ### Action required
 
-            1. Update the pin in `pyproject.toml` to:
+            1. Locate where `lib-python-projects` is pinned in this repository
+               (e.g. `pyproject.toml`, `requirements.txt`, `backend/requirements.txt`, `setup.cfg`)
+               and update the pin to:
                ```
                lib-python-projects @ git+https://github.com/Seretos/lib-python-projects@v${{ inputs.version }}
                ```
-            2. Run `pwsh scripts/test.ps1` to verify the test suite passes.
-            3. Run `pwsh scripts/build.ps1` to confirm the build succeeds.
+            2. Run the project's own test suite to verify nothing is broken.
+            3. If the project has a build step, confirm the build succeeds.
             4. Commit and open a PR.
         run: |
           CONSUMER="Seretos/agent-project-issues"
@@ -109,12 +111,14 @@ jobs:
 
             ### Action required
 
-            1. Update the pin in `pyproject.toml` to:
+            1. Locate where `lib-python-projects` is pinned in this repository
+               (e.g. `pyproject.toml`, `requirements.txt`, `backend/requirements.txt`, `setup.cfg`)
+               and update the pin to:
                ```
                lib-python-projects @ git+https://github.com/Seretos/lib-python-projects@v${{ inputs.version }}
                ```
-            2. Run `pwsh scripts/test.ps1` to verify the test suite passes.
-            3. Run `pwsh scripts/build.ps1` to confirm the build succeeds.
+            2. Run the project's own test suite to verify nothing is broken.
+            3. If the project has a build step, confirm the build succeeds.
             4. Commit and open a PR.
         run: |
           CONSUMER="Seretos/workboard"
