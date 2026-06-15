@@ -137,7 +137,7 @@ def _make_pr_node(
         "baseRefOid": base_sha,
         "merged": merged,
         "mergedAt": merged_at,
-        "requestedReviewers": {"nodes": [{"login": r} for r in (requested_reviewers or [])]},
+        "reviewRequests": {"nodes": [{"requestedReviewer": {"login": r}} for r in (requested_reviewers or [])]},
         "createdAt": created_at,
         "updatedAt": updated_at,
     }
@@ -796,3 +796,127 @@ def test_500_raises_github_error(monkeypatch: pytest.MonkeyPatch) -> None:
         fetch_open_board([_project()], token="tok")
 
     assert exc.value.status == 500
+
+
+# ---------------------------------------------------------------------------
+# Regression: reviewRequests field (fix for ticket #106)
+# ---------------------------------------------------------------------------
+
+
+def test_requested_reviewers_extracted_from_review_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: reviewRequests GraphQL field maps to requested_reviewers correctly.
+
+    Previously the query used the non-existent field 'requestedReviewers', which
+    caused GitHub to return a GraphQL error and fail all GitHub projects in a batch.
+    The fix switches to 'reviewRequests(first:20){nodes{requestedReviewer{...on User{login}}}}'.
+    This test uses the corrected two-level structure and asserts only User-type
+    reviewers (those with a login) appear in requested_reviewers.
+    """
+    project = _project()
+    # Mix: two User reviewers and one non-User (Team), which the ...on User fragment
+    # causes to produce an empty requestedReviewer object (no login key).
+    pr_node = _make_pr_node(number=55, requested_reviewers=["alice", "bob"])
+    # Manually inject a non-User reviewer node (Team: requestedReviewer has no login)
+    pr_node["reviewRequests"]["nodes"].append({"requestedReviewer": {}})
+
+    body = _make_graphql_body({
+        "r0": {
+            "issues": {"nodes": []},
+            "pullRequests": {"nodes": [pr_node]},
+        }
+    })
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json_resp(body)
+
+    _install_mock(monkeypatch, handler)
+    results = fetch_open_board([project], token="tok")
+
+    pr = results[0].pull_requests[0]
+    assert pr.requested_reviewers == ["alice", "bob"]
+
+
+def test_non_user_reviewer_types_are_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-User reviewer types (Team, Mannequin) are silently excluded.
+
+    When ...on User does not match, requestedReviewer is an empty object with
+    no login key.  The parser must skip those nodes rather than raising KeyError
+    or producing None/empty-string entries.
+    """
+    project = _project()
+    # Build a PR node manually with only non-User reviewer entries
+    pr_node = _make_pr_node(number=77, requested_reviewers=[])
+    pr_node["reviewRequests"]["nodes"] = [
+        {"requestedReviewer": {}},           # Team (no login)
+        {"requestedReviewer": {}},           # Mannequin (no login)
+    ]
+
+    body = _make_graphql_body({
+        "r0": {
+            "issues": {"nodes": []},
+            "pullRequests": {"nodes": [pr_node]},
+        }
+    })
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json_resp(body)
+
+    _install_mock(monkeypatch, handler)
+    results = fetch_open_board([project], token="tok")
+
+    pr = results[0].pull_requests[0]
+    assert pr.requested_reviewers == []
+
+
+def test_review_requests_key_absent_yields_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If reviewRequests key is missing entirely, requested_reviewers defaults to []."""
+    project = _project()
+    pr_node = _make_pr_node(number=88)
+    # Remove the reviewRequests key to simulate an absent field
+    del pr_node["reviewRequests"]
+
+    body = _make_graphql_body({
+        "r0": {
+            "issues": {"nodes": []},
+            "pullRequests": {"nodes": [pr_node]},
+        }
+    })
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json_resp(body)
+
+    _install_mock(monkeypatch, handler)
+    results = fetch_open_board([project], token="tok")
+
+    pr = results[0].pull_requests[0]
+    assert pr.requested_reviewers == []
+
+
+def test_review_requests_nodes_empty_yields_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If reviewRequests.nodes is empty, requested_reviewers is []."""
+    project = _project()
+    pr_node = _make_pr_node(number=99, requested_reviewers=[])
+
+    body = _make_graphql_body({
+        "r0": {
+            "issues": {"nodes": []},
+            "pullRequests": {"nodes": [pr_node]},
+        }
+    })
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json_resp(body)
+
+    _install_mock(monkeypatch, handler)
+    results = fetch_open_board([project], token="tok")
+
+    pr = results[0].pull_requests[0]
+    assert pr.requested_reviewers == []
