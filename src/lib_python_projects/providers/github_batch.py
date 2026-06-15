@@ -147,7 +147,7 @@ _PR_FIELDS = """
     headRefName headRefOid headRepository { nameWithOwner }
     baseRefName baseRefOid
     merged mergedAt
-    requestedReviewers(first: 20) { nodes { ... on User { login } } }
+    reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
 """.strip()
 
 
@@ -246,7 +246,8 @@ def _map_graphql_pr(node: dict, project: ProjectConfig) -> PullRequest:
     - ``baseRefName`` / ``baseRefOid`` → ``base`` dict with keys
       ``ref``, ``sha``.
     - ``merged`` / ``mergedAt`` → ``merged`` bool and ``status``.
-    - ``requestedReviewers.nodes[].login`` → ``requested_reviewers``.
+    - ``reviewRequests.nodes[].requestedReviewer.login`` → ``requested_reviewers``
+      (``... on User`` inline fragment means non-User types yield no ``login``).
     """
     state = (node.get("state") or "OPEN").upper()
     merged = bool(node.get("merged") or node.get("mergedAt"))
@@ -276,9 +277,10 @@ def _map_graphql_pr(node: dict, project: ProjectConfig) -> PullRequest:
     ]
 
     requested_reviewers = [
-        n["login"]
-        for n in (node.get("requestedReviewers") or {}).get("nodes", [])
-        if n.get("login")
+        login
+        for item in (node.get("reviewRequests") or {}).get("nodes", [])
+        for login in [(item.get("requestedReviewer") or {}).get("login")]
+        if login
     ]
 
     number = node.get("number") or 0
