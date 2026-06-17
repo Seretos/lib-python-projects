@@ -6,6 +6,7 @@ fixture so the module-level store starts empty.
 """
 from __future__ import annotations
 
+import gzip
 import threading
 from typing import Callable
 
@@ -43,6 +44,12 @@ def _get(transport: ETagTransport, url: str, **kwargs) -> httpx.Response:
 def _post(transport: ETagTransport, url: str, **kwargs) -> httpx.Response:
     """Send a POST request through the transport directly."""
     request = httpx.Request("POST", url, **kwargs)
+    return transport.handle_request(request)
+
+
+def _patch(transport: ETagTransport, url: str, **kwargs) -> httpx.Response:
+    """Send a PATCH request through the transport directly."""
+    request = httpx.Request("PATCH", url, **kwargs)
     return transport.handle_request(request)
 
 
@@ -335,3 +342,42 @@ def test_concurrent_304_requests_do_not_corrupt_store() -> None:
     for idx, resp in enumerate(results):
         assert resp.status_code == 200, f"thread {idx} got status {resp.status_code}"
         assert resp.content == body, f"thread {idx} got corrupted body"
+
+
+# ---------- PATCH gzip regression (ticket #108) --------------------------------
+
+
+def test_patch_gzip_response_decoded_without_error() -> None:
+    """REGRESSION (#108): PATCH responses with Content-Encoding: gzip must be
+    decoded exactly once and returned without error.
+
+    Before the fix, handle_request returned the raw (unread) response for
+    non-GET methods.  With a real streaming transport (WSGITransport), the
+    body is NOT materialised until response.read() is called, so accessing
+    response.content on the unread response raises httpx.ResponseNotRead.
+    The fix calls response.read() before returning, which also triggers
+    httpx's Content-Encoding decode path — giving us the plaintext body.
+
+    This test uses WSGITransport (not MockTransport) so that the failure is
+    genuine: MockTransport pre-materialises _content and masks the bug.
+    """
+    raw_body = b'{"id": 42, "title": "updated"}'
+    compressed_body = gzip.compress(raw_body)
+
+    def wsgi_app(environ, start_response):
+        start_response("200 OK", [
+            ("Content-Type", "application/json"),
+            ("Content-Encoding", "gzip"),
+            ("Content-Length", str(len(compressed_body))),
+        ])
+        return [compressed_body]
+
+    transport = ETagTransport(httpx.WSGITransport(wsgi_app))
+    response = _patch(transport, "http://testserver/item/42", content=b'{"title": "updated"}')
+
+    assert response.status_code == 200
+    # The body must equal the original pre-compression bytes — decoded exactly once.
+    assert response.content == raw_body, (
+        "PATCH response body must be gzip-decoded exactly once; "
+        f"got {response.content!r}"
+    )

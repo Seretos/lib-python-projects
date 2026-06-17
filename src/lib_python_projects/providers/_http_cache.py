@@ -40,6 +40,10 @@ class _ETagEntry:
 _etag_store: dict[str, _ETagEntry] = {}
 _etag_lock = threading.Lock()
 
+# Headers that encode the transfer representation (not the content itself) and
+# must be stripped before caching so a 304-replay does not double-decode.
+_STRIP_HEADERS: frozenset[str] = frozenset({"content-encoding", "transfer-encoding"})
+
 
 def _cache_key(request: httpx.Request) -> str:
     """Return a stable string key for a GET request URL.
@@ -88,7 +92,9 @@ class ETagTransport(httpx.BaseTransport):
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         if request.method != "GET":
-            return self._wrapped.handle_request(request)
+            response = self._wrapped.handle_request(request)
+            response.read()
+            return response
 
         key = _cache_key(request)
 
@@ -133,11 +139,16 @@ class ETagTransport(httpx.BaseTransport):
                 or response.headers.get("last-modified")
             )
             if etag or last_modified:
+                filtered_headers = httpx.Headers({
+                    k: v
+                    for k, v in response.headers.multi_items()
+                    if k.lower() not in _STRIP_HEADERS
+                })
                 new_entry = _ETagEntry(
                     etag=etag,
                     last_modified=last_modified,
                     body=response.content,
-                    headers=response.headers,
+                    headers=filtered_headers,
                 )
                 with _etag_lock:
                     _etag_store[key] = new_entry
