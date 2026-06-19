@@ -536,3 +536,44 @@ class TestTokenDiscoveryFallback:
 
         assert len(stub_cls.call_log) == 1  # type: ignore[attr-defined]
         assert stub_cls.call_log[0]["limit"] == 9999  # type: ignore[attr-defined]
+
+
+class TestDefaultBranchField:
+    """`default_branch` round-trips through the YAML loader (new in v0.2.0)."""
+
+    def test_default_branch_loaded_from_yaml(self, tmp_path: Path) -> None:
+        """YAML entry with `default_branch: master` is preserved on load."""
+        _make_git_repo(tmp_path)
+        cfg = tmp_path / ".seretos" / "project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: a
+                provider: github
+                path: acme/backend
+                default_branch: master
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        configured = [p for p in result.projects if p.source == "config"]
+        assert len(configured) == 1
+        assert configured[0].default_branch == "master"
+
+    def test_default_branch_defaults_to_main_when_omitted(
+        self, tmp_path: Path
+    ) -> None:
+        """YAML entry without `default_branch` gets the "main" default (backward compat)."""
+        _make_git_repo(tmp_path)
+        cfg = tmp_path / ".seretos" / "project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: a
+                provider: github
+                path: acme/backend
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        configured = [p for p in result.projects if p.source == "config"]
+        assert len(configured) == 1
+        assert configured[0].default_branch == "main"

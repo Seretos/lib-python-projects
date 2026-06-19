@@ -69,6 +69,35 @@ class TestLocalPathField:
         assert d["local_path"] == "/tmp/x"
 
 
+class TestDefaultBranchField:
+    """`default_branch` is new in v0.2.0 — optional str, defaults to "main",
+    accepted for all providers so downstream consumers stop hard-coding the
+    base branch.
+    """
+
+    def test_default_branch_defaults_to_main(self) -> None:
+        p = _make_project()
+        assert p.default_branch == "main"
+
+    def test_default_branch_round_trips_when_provided(self) -> None:
+        p = _make_project(default_branch="master")
+        assert p.default_branch == "master"
+
+    def test_default_branch_accepts_custom_value(self) -> None:
+        p = _make_project(default_branch="develop")
+        assert p.default_branch == "develop"
+
+    def test_default_branch_appears_in_model_dump(self) -> None:
+        p = _make_project(default_branch="release")
+        d = p.model_dump()
+        assert d["default_branch"] == "release"
+
+    def test_default_branch_default_appears_in_model_dump(self) -> None:
+        p = _make_project()
+        d = p.model_dump()
+        assert d["default_branch"] == "main"
+
+
 class TestProjectsLoadResult:
     """Subclass of `lib_python_config.LoadResult` plus a `projects` field."""
 
