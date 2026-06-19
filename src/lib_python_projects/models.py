@@ -91,6 +91,10 @@ class ProjectConfig(BaseModel):
     # default once per project (Issue → Bug → User Story → Product
     # Backlog Item → Requirement). Ignored by github/gitlab.
     default_work_item_type: str | None = None
+    # Default branch for this project. Consumers use this as the base
+    # branch for PRs and comparisons. Defaults to "main" for backward
+    # compatibility.
+    default_branch: str = "main"
     # On-disk checkout path, when known. Optional for both config- and
     # git-remote-sourced projects; populated by the loader for the
     # auto-discovered CWD repo.
