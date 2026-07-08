@@ -446,11 +446,17 @@ def _api_version_params(extra: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 _CACHE_TTL_SECONDS = 60 * 60  # 1 hour, matching tools/tickets list_ticket_statuses cache
+# Depth passed to the classification-nodes API's $depth param. Comfortably
+# deeper than any realistic Area/Iteration tree so the full hierarchy comes
+# back in a single call.
+_CLASSIFICATION_DEPTH = 20
 _cache_lock = threading.Lock()
 _repo_id_cache: dict[tuple[str, str, str], tuple[float, str]] = {}
 _state_cache: dict[tuple[str, str, str], tuple[float, list[dict]]] = {}
 _field_cache: dict[tuple[str, str, str], tuple[float, list[dict]]] = {}
 _default_type_cache: dict[tuple[str, str], tuple[float, str]] = {}
+_classification_cache: dict[tuple[str, str, str], tuple[float, list[str]]] = {}
+_field_values_cache: dict[tuple[str, str, str, str], tuple[float, list[str] | None]] = {}
 
 
 def _cache_get(store: dict, key: tuple) -> Any | None:
@@ -478,6 +484,8 @@ def _cache_clear_all() -> None:
         _state_cache.clear()
         _field_cache.clear()
         _default_type_cache.clear()
+        _classification_cache.clear()
+        _field_values_cache.clear()
 
 
 # ---------- Markdown <-> HTML (minimal, stdlib-only) ------------------------
@@ -1545,6 +1553,89 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         _cache_put(_field_cache, key, fields)
         return fields
 
+    def _classification_node_paths(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        structure: str,
+    ) -> list[str]:
+        """Return every Area/Iteration path in *structure*'s classification tree.
+
+        ``structure`` is ``"Areas"`` or ``"Iterations"``. Each returned entry
+        is the node's `path` with the leading backslash stripped (e.g.
+        ``MyProject\\Team\\SubArea``), matching the value ADO accepts for
+        `System.AreaPath` / `System.IterationPath`. The root project node is
+        included — it is itself a valid area/iteration path. Results are
+        cached per `(org, project, structure)` for 1 hour.
+        """
+        key = (project.organization or "", project.ado_project or "", structure)
+        cached = _cache_get(_classification_cache, key)
+        if cached is not None:
+            return cached
+        path = (
+            f"{_project_scope(project)}/_apis/wit/classificationnodes/"
+            f"{quote(structure, safe='')}"
+        )
+        with _client(project, token) as c:
+            resp = c.get(
+                path,
+                params=_api_version_params({"$depth": _CLASSIFICATION_DEPTH}),
+            )
+        _check(resp)
+        root = resp.json()
+
+        paths: list[str] = []
+
+        def _walk(node: dict) -> None:
+            raw_path = node.get("path") or ""
+            paths.append(raw_path.lstrip("\\"))
+            for child in node.get("children") or []:
+                _walk(child)
+
+        _walk(root)
+        _cache_put(_classification_cache, key, paths)
+        return paths
+
+    def _field_allowed_values(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        work_item_type: str,
+        reference_name: str,
+    ) -> list[str] | None:
+        """Fetch `allowedValues` for a single field via the per-field endpoint.
+
+        Some picklist fields come back without `allowedValues` from the bulk
+        `.../fields?$expand=allowedValues` call; fetching the field
+        individually with the same `$expand` fills them in. Returns `None`
+        when the field has no allowed values. Cached per
+        `(org, project, work_item_type, reference_name)` for 1 hour.
+        """
+        key = (
+            project.organization or "",
+            project.ado_project or "",
+            work_item_type,
+            reference_name,
+        )
+        cached = _cache_get(_field_values_cache, key)
+        if cached is not None:
+            return cached
+        path = (
+            f"{_project_scope(project)}/_apis/wit/workitemtypes/"
+            f"{quote(work_item_type, safe='')}/fields/"
+            f"{quote(reference_name, safe='')}"
+        )
+        with _client(project, token) as c:
+            resp = c.get(
+                path,
+                params={**_api_version_params(), "$expand": "allowedValues"},
+            )
+        _check(resp)
+        raw_allowed = resp.json().get("allowedValues")
+        allowed = list(raw_allowed) if raw_allowed else None
+        _cache_put(_field_values_cache, key, allowed)
+        return allowed
+
     def _resolve_repository_id(
         self,
         project: ProjectConfig,
@@ -1646,15 +1737,27 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         raw_fields = self._fields_for_type(project, token, wi_type)
         result: list[FieldSpec] = []
         for f in raw_fields:
+            reference_name = f.get("referenceName") or ""
+            field_type = f.get("type") or ""
             raw_allowed = f.get("allowedValues")
             allowed: list[str] | None = (
                 list(raw_allowed) if raw_allowed else None
             )
+            if reference_name == "System.AreaPath":
+                allowed = self._classification_node_paths(project, token, "Areas")
+            elif reference_name == "System.IterationPath":
+                allowed = self._classification_node_paths(
+                    project, token, "Iterations"
+                )
+            elif allowed is None and field_type.startswith("picklist"):
+                allowed = self._field_allowed_values(
+                    project, token, wi_type, reference_name
+                )
             result.append(
                 FieldSpec(
-                    reference_name=f.get("referenceName") or "",
+                    reference_name=reference_name,
                     display_name=f.get("name") or "",
-                    type=f.get("type") or "",
+                    type=field_type,
                     allowed_values=allowed,
                     read_only=bool(f.get("isReadOnly")),
                     always_required=bool(f.get("alwaysRequired")),

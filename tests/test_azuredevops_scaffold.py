@@ -826,3 +826,191 @@ def test_list_fields_read_only_and_always_required_flags(
     spec = result[0]
     assert spec.read_only is True
     assert spec.always_required is True
+
+
+def test_list_fields_area_path_populated_from_classification_nodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """System.AreaPath has no inline allowedValues but gets them from the
+    classification-node tree, as full backslash paths with the leading
+    slash stripped."""
+    fields = [
+        {
+            "referenceName": "System.AreaPath",
+            "name": "Area Path",
+            "type": "treePath",
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+    tree = {
+        "path": "\\Proj",
+        "children": [
+            {
+                "path": "\\Proj\\Team",
+                "children": [
+                    {"path": "\\Proj\\Team\\Sub", "children": []},
+                ],
+            },
+        ],
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
+            return _json({"value": fields})
+        if path.endswith("/_apis/wit/classificationnodes/Areas"):
+            return _json(tree)
+        raise AssertionError(f"unexpected path {path}")
+
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    assert len(result) == 1
+    assert result[0].allowed_values == ["Proj", "Proj\\Team", "Proj\\Team\\Sub"]
+
+
+def test_list_fields_iteration_path_populated_from_classification_nodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """System.IterationPath is populated from the Iterations classification tree."""
+    fields = [
+        {
+            "referenceName": "System.IterationPath",
+            "name": "Iteration Path",
+            "type": "treePath",
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+    tree = {
+        "path": "\\Proj",
+        "children": [
+            {"path": "\\Proj\\Sprint 1", "children": []},
+            {"path": "\\Proj\\Sprint 2", "children": []},
+        ],
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
+            return _json({"value": fields})
+        if path.endswith("/_apis/wit/classificationnodes/Iterations"):
+            return _json(tree)
+        raise AssertionError(f"unexpected path {path}")
+
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    assert len(result) == 1
+    assert result[0].allowed_values == ["Proj", "Proj\\Sprint 1", "Proj\\Sprint 2"]
+
+
+def test_list_fields_picklist_falls_back_to_per_field_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A picklist field missing allowedValues in the bulk payload gets them
+    from the per-field endpoint instead."""
+    fields = [
+        {
+            "referenceName": "Custom.Priority",
+            "name": "Priority",
+            "type": "picklistString",
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
+            return _json({"value": fields})
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields/Custom.Priority"):
+            return _json(
+                {
+                    "referenceName": "Custom.Priority",
+                    "name": "Priority",
+                    "allowedValues": ["Low", "Medium", "High"],
+                }
+            )
+        raise AssertionError(f"unexpected path {path}")
+
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    assert len(result) == 1
+    assert result[0].allowed_values == ["Low", "Medium", "High"]
+
+
+def test_list_fields_inline_picklist_not_refetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A picklist field that already carries bulk allowedValues must not
+    trigger the per-field fallback call."""
+    fields = [
+        {
+            "referenceName": "Custom.Priority",
+            "name": "Priority",
+            "type": "picklistString",
+            "allowedValues": ["Low", "High"],
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+    seen: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        seen.append(path)
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
+            return _json({"value": fields})
+        raise AssertionError(f"unexpected path {path}")
+
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    assert result[0].allowed_values == ["Low", "High"]
+    assert not any("fields/Custom.Priority" in p for p in seen), (
+        "per-field endpoint must not be hit when bulk allowedValues is present"
+    )
+
+
+def test_list_fields_classification_nodes_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two list_fields calls for the same project only hit the
+    classification-nodes endpoint once."""
+    fields = [
+        {
+            "referenceName": "System.AreaPath",
+            "name": "Area Path",
+            "type": "treePath",
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+    tree = {"path": "\\Proj", "children": []}
+    hit_count: list[int] = [0]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
+            return _json({"value": fields})
+        if path.endswith("/_apis/wit/classificationnodes/Areas"):
+            hit_count[0] += 1
+            return _json(tree)
+        raise AssertionError(f"unexpected path {path}")
+
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, handler)
+    provider = AzureDevOpsProvider()
+    provider.list_fields(p, token="t")
+    provider.list_fields(p, token="t")
+    assert hit_count[0] == 1, (
+        f"Expected classificationnodes endpoint to be called once, got {hit_count[0]}"
+    )
