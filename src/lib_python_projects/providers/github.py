@@ -1729,6 +1729,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         ticket_id: str,
         *,
         include_relations: bool = True,
+        include_custom_fields: bool = False,
     ) -> tuple[Ticket, list[Comment], list[Relation] | None, bool | None]:
         """Fetch a single ticket with its comments and (optionally) relations.
 
@@ -1737,6 +1738,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         calls and returns `([], None)` for the relation fields.
         `truncated=None` signals "skipped"; `truncated=False` signals
         "fetched but empty".  `relations` is always a list (never `None`).
+
+        `include_custom_fields` is accepted for cross-provider signature
+        parity with Azure DevOps but is a no-op here: GitHub has no
+        provider-native raw-field map, so `ticket.custom_fields` stays
+        `None` regardless of this flag. Cross-provider support is
+        deferred to ticket #123.
         """
         with _client(token) as client:
             r = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
@@ -1774,6 +1781,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         assignees: list[str],
         *,
         status: Status | None = None,
+        custom_fields: dict[str, Any] | None = None,
     ) -> Ticket:
         """Create an issue with the `ai-generated` AI-attribution marker.
 
@@ -1792,9 +1800,20 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         always creates in `open` state, so non-`open` requests are
         landed via a follow-up PATCH inside this method — the agent
         sees one logical call.
+
+        `custom_fields` is accepted for cross-provider signature parity
+        with Azure DevOps, but GitHub has no provider-native raw-field
+        write path yet: a non-empty dict raises `ValueError` (cross-provider
+        support is deferred to ticket #123). `None`/`{}` is a silent no-op
+        so existing callers are unaffected.
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
+        if custom_fields:
+            raise ValueError(
+                "custom_fields is not supported on GitHub yet — "
+                "cross-provider support is deferred to ticket #123"
+            )
         # Deduplicate while preserving order, ensure ai-generated is present.
         merged = list(dict.fromkeys([*labels, AI_GENERATED_LABEL]))
         prefixed_body = ensure_body_prefix(body)

@@ -886,3 +886,154 @@ def test_gitlab_list_fields_returns_empty():
     """GitLabProvider.list_fields returns [] without raising."""
     result = GitLabProvider().list_fields(_gitlab_project(), None)
     assert result == []
+
+
+# ---------- ticket #114: custom_fields cross-provider guards (GitHub/GitLab) -
+
+
+def test_github_create_ticket_custom_fields_nonempty_raises(monkeypatch):
+    """GitHub has no provider-native field-write path yet; a non-empty
+    custom_fields must raise ValueError referencing the #123 deferral
+    before any HTTP call."""
+    def handler(req):
+        raise AssertionError("no HTTP call expected when custom_fields is rejected")
+
+    _install_github_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="#123"):
+        GitHubProvider().create_ticket(
+            _github_project(), "t", title="hi", body="b", labels=[], assignees=[],
+            custom_fields={"some.field": "x"},
+        )
+
+
+def test_github_create_ticket_custom_fields_none_or_empty_is_noop(monkeypatch):
+    """custom_fields=None/{} is a silent no-op — POST payload unchanged."""
+    captured: list[dict] = []
+
+    def handler(req):
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            captured.append(json.loads(req.content.decode()))
+            return _resp({
+                "number": 5, "title": "hi", "body": "b", "state": "open",
+                "user": {"login": "a"}, "assignees": [],
+                "labels": [{"name": "ai-generated"}],
+                "html_url": "https://github.com/acme/backend/issues/5",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        if "/labels" in path:
+            return _resp({"name": "ai-generated", "color": "0075ca"})
+        return _resp({})
+
+    _install_github_mock(monkeypatch, handler)
+    for cf in (None, {}):
+        GitHubProvider().create_ticket(
+            _github_project(), "t", title="hi", body="b", labels=[], assignees=[],
+            custom_fields=cf,
+        )
+    assert len(captured) == 2
+    for payload in captured:
+        assert "custom_fields" not in payload
+        assert payload["title"] == "hi"
+
+
+def test_github_get_ticket_include_custom_fields_returns_none(monkeypatch):
+    """GitHub has no raw-field map: include_custom_fields=True still leaves
+    ticket.custom_fields None, with no extra HTTP request."""
+    seen: list = []
+
+    def handler(req):
+        seen.append(req)
+        path = req.url.path
+        if path.endswith("/issues/3/comments"):
+            return _resp([])
+        if path.endswith("/issues/3"):
+            return _resp({
+                "number": 3, "title": "T", "body": "", "state": "open",
+                "user": {"login": "a"}, "assignees": [], "labels": [],
+                "html_url": "https://github.com/acme/backend/issues/3",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        return _resp([])
+
+    _install_github_mock(monkeypatch, handler)
+    p = ProjectConfig(id="acme", provider="github", path="acme/backend")
+    ticket, _c, _r, _t = GitHubProvider().get_ticket(
+        p, "t", "3", include_relations=False, include_custom_fields=True,
+    )
+    assert ticket.custom_fields is None
+    assert len(seen) == 2, "no extra HTTP request beyond issue GET + comments GET"
+
+
+def test_gitlab_create_ticket_custom_fields_nonempty_raises(monkeypatch):
+    """GitLab has no provider-native field-write path yet; a non-empty
+    custom_fields must raise ValueError referencing the #123 deferral
+    before any HTTP call."""
+    def handler(req):
+        raise AssertionError("no HTTP call expected when custom_fields is rejected")
+
+    _install_gitlab_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="#123"):
+        GitLabProvider().create_ticket(
+            _gitlab_project(), "t", title="hi", body="b", labels=[], assignees=[],
+            custom_fields={"some_field": "x"},
+        )
+
+
+def test_gitlab_create_ticket_custom_fields_none_or_empty_is_noop(monkeypatch):
+    """custom_fields=None/{} is a silent no-op — POST payload unchanged."""
+    captured: list[dict] = []
+
+    def handler(req):
+        if req.method == "POST" and req.url.path.endswith("/issues"):
+            captured.append(json.loads(req.content.decode()))
+            return _resp({
+                "iid": 5, "title": "hi", "description": "b", "state": "opened",
+                "author": {"username": "a"}, "assignees": [],
+                "labels": ["ai-generated"],
+                "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/5",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        return _resp([])
+
+    _install_gitlab_mock(monkeypatch, handler)
+    for cf in (None, {}):
+        GitLabProvider().create_ticket(
+            _gitlab_project(), "t", title="hi", body="b", labels=[], assignees=[],
+            custom_fields=cf,
+        )
+    assert len(captured) == 2
+    for payload in captured:
+        assert "custom_fields" not in payload
+        assert payload["title"] == "hi"
+
+
+def test_gitlab_get_ticket_include_custom_fields_returns_none(monkeypatch):
+    """GitLab has no raw-field map: include_custom_fields=True still leaves
+    ticket.custom_fields None, with no extra HTTP request."""
+    seen: list = []
+
+    def handler(req):
+        seen.append(req)
+        path = req.url.path
+        if path.endswith("/issues/5/notes"):
+            return _resp([])
+        if path.endswith("/issues/5"):
+            return _resp({
+                "iid": 5, "title": "T", "description": "", "state": "opened",
+                "author": {"username": "a"}, "assignees": [], "labels": [],
+                "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/5",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        return _resp({}, 404)
+
+    _install_gitlab_mock(monkeypatch, handler)
+    ticket, _c, _r, _t = GitLabProvider().get_ticket(
+        _gitlab_project(), "t", "5", include_relations=False, include_custom_fields=True,
+    )
+    assert ticket.custom_fields is None
+    assert len(seen) == 2, "no extra HTTP request beyond issue GET + notes GET"
