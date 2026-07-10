@@ -1018,6 +1018,9 @@ def _map_work_item(raw: dict, project: ProjectConfig) -> Ticket:
         id=str(raw_id),
         title=fields.get("System.Title") or "",
         body=_html_to_markdown(fields.get("System.Description")),
+        acceptance_criteria=_html_to_markdown(
+            fields.get("Microsoft.VSTS.Common.AcceptanceCriteria")
+        ),
         status=state,
         author=_identity_display_name(fields.get("System.CreatedBy")),
         assignees=assignees,

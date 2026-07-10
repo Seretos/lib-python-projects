@@ -56,6 +56,11 @@ class Ticket:
     url: str
     created_at: str       # ISO-8601 string
     updated_at: str
+    # Azure DevOps `Microsoft.VSTS.Common.AcceptanceCriteria`, HTML-normalised
+    # the same way `body` is. Empty string for providers without an
+    # equivalent field (GitHub/GitLab) or when ADO omits the field. Rich
+    # HTML (inline images, tables) is flattened to plain text, same as body.
+    acceptance_criteria: str = ""
 
 
 @dataclass
