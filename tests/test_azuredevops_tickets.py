@@ -1447,6 +1447,64 @@ def test_map_work_item_comment_populates_updated_at(
     assert comments[0].updated_at == "2026-05-19T12:30:00Z"
 
 
+# ---------- ticket #113: surface Microsoft.VSTS.Common.AcceptanceCriteria ----
+
+
+def test_map_work_item_populates_acceptance_criteria_html_normalised() -> None:
+    """`_map_work_item` must map AcceptanceCriteria through the same HTML ->
+    markdown normalisation used for `body`."""
+    raw = _work_item_payload(
+        5, **{"Microsoft.VSTS.Common.AcceptanceCriteria": "<div>Must handle <b>X</b></div>"}
+    )
+    ticket = azure_mod._map_work_item(raw, _project())
+    assert ticket.acceptance_criteria == "Must handle **X**"
+
+
+def test_map_work_item_acceptance_criteria_defaults_empty_when_absent() -> None:
+    """When ADO omits the AcceptanceCriteria field entirely, the ticket must
+    surface an empty string rather than crashing or returning None."""
+    raw = _work_item_payload(5)
+    assert "Microsoft.VSTS.Common.AcceptanceCriteria" not in raw["fields"]
+    ticket = azure_mod._map_work_item(raw, _project())
+    assert ticket.acceptance_criteria == ""
+
+
+def test_get_ticket_includes_acceptance_criteria(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AcceptanceCriteria round-trips from the work-item payload through
+    `get_ticket` to the returned `Ticket`."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitems/8"):
+            return _json(
+                _work_item_payload(
+                    8,
+                    **{
+                        "Microsoft.VSTS.Common.AcceptanceCriteria": (
+                            "<ul><li>Given X</li><li>Then Y</li></ul>"
+                        )
+                    },
+                )
+            )
+        if path.endswith("/_apis/wit/workItems/8/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    ticket, _comments, _rels, _trunc = AzureDevOpsProvider().get_ticket(
+        _project(default_type="Issue"), token="t", ticket_id="8",
+        include_relations=False,
+    )
+    assert "Given X" in ticket.acceptance_criteria
+    assert "Then Y" in ticket.acceptance_criteria
+
+
 def test_list_statuses_terminal_declined_none_when_no_removed_category(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -305,6 +305,9 @@ def test_get_ticket_basic(monkeypatch: pytest.MonkeyPatch) -> None:
     assert [c.id for c in comments] == ["100", "102"]
     assert relations == []
     assert truncated is False
+    # GitLab has no AcceptanceCriteria equivalent — locks in the defaulted
+    # `Ticket.acceptance_criteria` contract (#113).
+    assert ticket.acceptance_criteria == ""
 
 
 def test_get_ticket_skips_relations_when_disabled(
