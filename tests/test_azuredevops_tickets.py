@@ -1653,6 +1653,355 @@ def test_update_ticket_custom_fields_combined_with_standard_fields(
     assert ops["/fields/Custom.ProcessState"]["value"] == "Done"
 
 
+# ---------- Ticket #114: custom_fields on create_ticket + read opt-in --------
+
+
+def test_create_ticket_custom_fields_emitted_in_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """custom_fields entries appear as add-ops in the create PATCH payload."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/$Issue" in path and req.method == "POST":
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(20))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = AzureDevOpsProvider().create_ticket(
+        _project(default_type="Issue"),
+        token="t",
+        title="hello",
+        body="world",
+        labels=[],
+        assignees=[],
+        custom_fields={"Custom.ProcessState": "50 - testen"},
+    )
+    assert ticket.id == "20"
+    ops = {op["path"]: op for op in captured["patch"]}
+    assert "/fields/Custom.ProcessState" in ops
+    assert ops["/fields/Custom.ProcessState"]["op"] == "add"
+    assert ops["/fields/Custom.ProcessState"]["value"] == "50 - testen"
+
+
+def test_create_ticket_custom_fields_none_and_empty_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """custom_fields=None and={} must not add any extra patch ops — existing
+    create behavior (Title/Description/Tags only, no labels/assignees) is
+    unchanged."""
+    captured: list[list[dict]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/$Issue" in path and req.method == "POST":
+            captured.append(json.loads(req.content.decode("utf-8")))
+            return _json(_work_item_payload(21))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    for cf in (None, {}):
+        AzureDevOpsProvider().create_ticket(
+            _project(default_type="Issue"),
+            token="t",
+            title="hello",
+            body="world",
+            labels=[],
+            assignees=[],
+            custom_fields=cf,
+        )
+    assert len(captured) == 2
+    for patch in captured:
+        paths = {op["path"] for op in patch}
+        assert paths == {
+            "/fields/System.Title",
+            "/fields/System.Description",
+            "/fields/System.Tags",
+        }
+
+
+def test_create_ticket_custom_fields_precedence_over_title_arg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """custom_fields={'System.Title': 'X'} alongside a `title` arg — the
+    custom_fields entry wins because its add-op is appended last."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/$Issue" in path and req.method == "POST":
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(22, **{"System.Title": "custom-wins"}))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(default_type="Issue"),
+        token="t",
+        title="arg-title",
+        body="world",
+        labels=[],
+        assignees=[],
+        custom_fields={"System.Title": "custom-wins"},
+    )
+    title_ops = [op for op in captured["patch"] if op["path"] == "/fields/System.Title"]
+    assert len(title_ops) == 2, "both the standard and custom_fields title op must appear"
+    assert title_ops[0]["value"] == "arg-title"
+    assert title_ops[-1]["value"] == "custom-wins", "custom_fields op must be last (wins)"
+
+
+def test_create_ticket_custom_fields_work_item_type_canonical_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """custom_fields={'System.WorkItemType': 'Bug'} overrides the POST type,
+    is not emitted as a /fields/... op, and _default_work_item_type is not
+    consulted."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            raise AssertionError(
+                "_default_work_item_type must not be consulted when overridden"
+            )
+        if "/_apis/wit/workitems/$" in path and req.method == "POST":
+            captured["path"] = path
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(23, **{"System.WorkItemType": "Bug"}))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(),  # no default_type configured — override must short-circuit discovery
+        token="t",
+        title="hello",
+        body="world",
+        labels=[],
+        assignees=[],
+        custom_fields={"System.WorkItemType": "Bug"},
+    )
+    assert "/_apis/wit/workitems/$Bug" in captured["path"]
+    ops = {op["path"] for op in captured["patch"]}
+    assert "/fields/System.WorkItemType" not in ops
+
+
+def test_create_ticket_custom_fields_work_item_type_alias_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The short alias 'WorkItemType' has the same override behavior as the
+    canonical 'System.WorkItemType' ref."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            raise AssertionError(
+                "_default_work_item_type must not be consulted when overridden"
+            )
+        if "/_apis/wit/workitems/$" in path and req.method == "POST":
+            captured["path"] = path
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(23, **{"System.WorkItemType": "Task"}))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(),
+        token="t",
+        title="hello",
+        body="world",
+        labels=[],
+        assignees=[],
+        custom_fields={"WorkItemType": "Task"},
+    )
+    assert "/_apis/wit/workitems/$Task" in captured["path"]
+    ops = {op["path"] for op in captured["patch"]}
+    assert "/fields/WorkItemType" not in ops
+    assert "/fields/System.WorkItemType" not in ops
+
+
+def test_create_ticket_custom_fields_work_item_type_feeds_status_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With both `status` and a System.WorkItemType override, `_states_for_type`
+    is queried for the overridden type, not the default."""
+    states_calls: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            raise AssertionError(
+                "_default_work_item_type must not be consulted when overridden"
+            )
+        if path.endswith("/_apis/wit/workitemtypes/Issue/states"):
+            raise AssertionError(
+                "states must be checked against the overridden type, not Issue"
+            )
+        if path.endswith("/_apis/wit/workitemtypes/Bug/states"):
+            states_calls.append("Bug")
+            return _json({
+                "value": [
+                    {"name": "To Do", "category": "Proposed"},
+                    {"name": "Done", "category": "Completed"},
+                ]
+            })
+        if "/_apis/wit/workitems/$Bug" in path and req.method == "POST":
+            return _json(_work_item_payload(
+                24, **{"System.WorkItemType": "Bug", "System.State": "To Do"}
+            ))
+        if req.method == "GET" and path.endswith("/_apis/wit/workitems/24"):
+            return _json(_work_item_payload(
+                24, **{"System.WorkItemType": "Bug", "System.State": "To Do"}
+            ))
+        if req.method == "PATCH" and path.endswith("/_apis/wit/workitems/24"):
+            return _json(_work_item_payload(
+                24, **{"System.WorkItemType": "Bug", "System.State": "Done"}
+            ))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = AzureDevOpsProvider().create_ticket(
+        _project(),
+        token="t",
+        title="hello",
+        body="world",
+        labels=[],
+        assignees=[],
+        status="Done",
+        custom_fields={"System.WorkItemType": "Bug"},
+    )
+    assert states_calls == ["Bug"]
+    assert ticket.status == "Done"
+
+
+def test_create_ticket_custom_fields_non_string_values_roundtrip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-string custom field values (int/bool) pass through the patch
+    verbatim — no stringification."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/$Issue" in path and req.method == "POST":
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(25))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(default_type="Issue"),
+        token="t",
+        title="hello",
+        body="world",
+        labels=[],
+        assignees=[],
+        custom_fields={"Custom.Priority": 2, "Custom.IsBlocked": True},
+    )
+    ops = {op["path"]: op for op in captured["patch"]}
+    assert ops["/fields/Custom.Priority"]["value"] == 2
+    assert ops["/fields/Custom.IsBlocked"]["value"] is True
+
+
+def test_create_ticket_custom_fields_arbitrary_ref_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown/arbitrary field ref is emitted untouched — the provider
+    does not validate custom field references against any schema."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/$Issue" in path and req.method == "POST":
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(26))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(default_type="Issue"),
+        token="t",
+        title="hello",
+        body="world",
+        labels=[],
+        assignees=[],
+        custom_fields={"Vendor.Custom.ArbitraryRef": "whatever"},
+    )
+    ops = {op["path"]: op for op in captured["patch"]}
+    assert ops["/fields/Vendor.Custom.ArbitraryRef"]["value"] == "whatever"
+
+
+def test_get_ticket_include_custom_fields_populates_raw_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """include_custom_fields=True populates ticket.custom_fields with the
+    full raw fields dict — a known custom ref + a System.* ref both
+    present — and issues no extra HTTP request beyond the existing
+    work-item GET + comments GET."""
+    requests_seen: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        requests_seen.append(path)
+        if path.endswith("/_apis/wit/workitems/9") and "comments" not in path:
+            return _json(_work_item_payload(9, **{"Custom.ProcessState": "50 - testen"}))
+        if path.endswith("/_apis/wit/workItems/9/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _comments, _rels, _trunc = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="9",
+        include_relations=False, include_custom_fields=True,
+    )
+    assert ticket.custom_fields is not None
+    assert ticket.custom_fields["Custom.ProcessState"] == "50 - testen"
+    assert ticket.custom_fields["System.Title"] == "Item 9"
+    assert len(requests_seen) == 2, "no extra HTTP request beyond item GET + comments GET"
+
+
+def test_get_ticket_include_custom_fields_default_false_leaves_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting include_custom_fields (default False) leaves custom_fields None."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitems/9") and "comments" not in path:
+            return _json(_work_item_payload(9))
+        if path.endswith("/_apis/wit/workItems/9/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, _r, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="9", include_relations=False,
+    )
+    assert ticket.custom_fields is None
+
+
+def test_get_ticket_include_custom_fields_empty_fields_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the work-item payload carries no `fields` key at all, opting in
+    yields an empty dict rather than None."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitems/9") and "comments" not in path:
+            return _json({"id": 9})  # no "fields" key
+        if path.endswith("/_apis/wit/workItems/9/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, _r, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="9",
+        include_relations=False, include_custom_fields=True,
+    )
+    assert ticket.custom_fields == {}
+
+
 # ---------- Ticket #74: create_ticket blank-title guard (Azure DevOps) --------
 
 

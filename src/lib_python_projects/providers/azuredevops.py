@@ -1909,7 +1909,17 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         token: str | None,
         ticket_id: str,
         include_relations: bool = True,
+        include_custom_fields: bool = False,
     ) -> tuple[Ticket, list[Comment], list[Relation] | None, bool | None]:
+        """Fetch a single work item with its comments and (optionally) relations.
+
+        When ``include_custom_fields`` is ``True``, ``ticket.custom_fields``
+        is populated with the entire raw ``fields`` dict from the work-item
+        payload already fetched for this call (no extra HTTP request) —
+        every ``System.*`` field plus any custom field references, with
+        provider-native keys and values. Defaults to ``False``, in which
+        case ``ticket.custom_fields`` stays ``None``.
+        """
         _validate_int32_id(ticket_id, "ticket")
         params = _api_version_params({"$expand": "Relations"})
         path = f"{_project_scope(project)}/_apis/wit/workitems/{quote(str(ticket_id), safe='')}"
@@ -1918,6 +1928,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         _check(resp)
         raw = resp.json()
         ticket = _map_work_item(raw, project)
+        if include_custom_fields:
+            ticket.custom_fields = raw.get("fields") or {}
 
         # Comments are a separate endpoint.
         comments = self._list_work_item_comments(
@@ -2109,6 +2121,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         labels: list[str],
         assignees: list[str],
         status: Status | None = None,
+        custom_fields: dict[str, Any] | None = None,
     ) -> Ticket:
         """Create an ADO work item.
 
@@ -2124,10 +2137,33 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         back; the caller can delete it explicitly if needed.
 
         When ``status`` is ``None``, behavior is unchanged: a single POST.
+
+        ``custom_fields`` mirrors ``update_ticket.custom_fields``: each
+        remaining entry is emitted as a ``/fields/{ref}`` JSON-Patch "add"
+        op, appended *after* the standard Title/Description/Tags/AssignedTo
+        ops — so an explicit ``System.Title`` (or other standard field) in
+        ``custom_fields`` wins over the same-named argument above.
+        ``None``/``{}`` is a no-op.
+
+        Special case: if ``custom_fields`` carries ``System.WorkItemType``
+        (the canonical ref) or the short alias ``WorkItemType``, that value
+        is used as the work-item type for the POST instead of the
+        project's configured/discovered default (``System.WorkItemType``
+        wins if both are given), and neither key becomes a ``/fields/...``
+        op. This is resolved before status validation so states are
+        checked against the overridden type.
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
-        wi_type = self._default_work_item_type(project, token)
+
+        remaining_custom_fields = dict(custom_fields or {})
+        canonical_type_override = remaining_custom_fields.pop("System.WorkItemType", None)
+        alias_type_override = remaining_custom_fields.pop("WorkItemType", None)
+        wi_type_override = canonical_type_override or alias_type_override
+        if wi_type_override:
+            wi_type = wi_type_override
+        else:
+            wi_type = self._default_work_item_type(project, token)
 
         # Pre-validate the requested status before the POST so the caller
         # gets a clean ValueError for an unknown state name rather than a
@@ -2166,6 +2202,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         # Note: System.State is intentionally NOT added here. ADO only
         # accepts initial-states on create; terminal states must be reached
         # through the state machine via a follow-up update_ticket below.
+
+        for field_ref, field_value in remaining_custom_fields.items():
+            patch.append({"op": "add", "path": f"/fields/{field_ref}", "value": field_value})
 
         path = f"{_project_scope(project)}/_apis/wit/workitems/${quote(wi_type, safe='')}"
         with _client(project, token) as c:

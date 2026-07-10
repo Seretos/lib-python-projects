@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 
 _TIMESTAMP_FRACTION_RE = re.compile(
@@ -61,6 +61,13 @@ class Ticket:
     # equivalent field (GitHub/GitLab) or when ADO omits the field. Rich
     # HTML (inline images, tables) is flattened to plain text, same as body.
     acceptance_criteria: str = ""
+    # Opt-in raw provider-native field map, populated by `get_ticket` only
+    # when the caller passes `include_custom_fields=True`. `None` means
+    # "not requested" (the default) or "not applicable to this provider" —
+    # never an empty-vs-populated signal. When populated, keys/values are
+    # exactly as returned by the provider (e.g. ADO's `fields` dict:
+    # `System.*` plus any custom field references), unmapped and untyped.
+    custom_fields: dict[str, Any] | None = None
 
 
 @dataclass

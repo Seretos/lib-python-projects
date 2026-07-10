@@ -1568,6 +1568,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         ticket_id: str,
         *,
         include_relations: bool = True,
+        include_custom_fields: bool = False,
     ) -> tuple[Ticket, list[Comment], list[Relation] | None, bool | None]:
         """Fetch a single issue plus its non-system notes.
 
@@ -1579,6 +1580,12 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
 
         System notes (state changes, label edits) are filtered out —
         they're not user-facing comments.
+
+        `include_custom_fields` is accepted for cross-provider signature
+        parity with Azure DevOps but is a no-op here: GitLab has no
+        provider-native raw-field map, so `ticket.custom_fields` stays
+        `None` regardless of this flag. Cross-provider support is
+        deferred to ticket #123.
         """
         path = _project_path(project)
         with _client(project, token) as client:
@@ -1615,6 +1622,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         assignees: list[str],
         *,
         status: Status | None = None,
+        custom_fields: dict[str, Any] | None = None,
     ) -> Ticket:
         """Create a GitLab issue with the AI-generated marker.
 
@@ -1636,9 +1644,20 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         a follow-up PUT with `state_event=close`. Validation is
         performed up-front (`_status_to_state_event`) so an invalid
         value rejects before the POST.
+
+        `custom_fields` is accepted for cross-provider signature parity
+        with Azure DevOps, but GitLab has no provider-native raw-field
+        write path yet: a non-empty dict raises `ValueError` (cross-provider
+        support is deferred to ticket #123). `None`/`{}` is a silent no-op
+        so existing callers are unaffected.
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
+        if custom_fields:
+            raise ValueError(
+                "custom_fields is not supported on GitLab yet — "
+                "cross-provider support is deferred to ticket #123"
+            )
         # Validate `status` up-front. Pass None through; raise on
         # unknown values before POST commits an issue.
         state_event: str | None = None
