@@ -26,7 +26,11 @@ from lib_python_projects.providers.base import (
 )
 from lib_python_projects.providers.github import GitHubProvider
 from lib_python_projects.providers.gitlab import GitLabProvider, _canonical_url
-from lib_python_projects.providers.azuredevops import AzureDevOpsProvider, _basic_auth_header
+from lib_python_projects.providers.azuredevops import (
+    AzureDevOpsProvider,
+    _basic_auth_header,
+    _cache_clear_all,
+)
 
 
 def _github_project(path: str = "Seretos/agent-project-issues") -> ProjectConfig:
@@ -1118,3 +1122,170 @@ def test_gitlab_get_ticket_include_custom_fields_returns_labels_and_milestone(
     )
     assert ticket.custom_fields == {"labels": ["bug"], "milestone": "v2.0"}
     assert len(seen) == 2, "no extra HTTP request beyond issue GET + notes GET"
+
+
+# ---------- ticket #136: Review shape contract + relation resolution -------
+
+
+def _azuredevops_project() -> ProjectConfig:
+    return ProjectConfig(
+        id="azure-parity-tests",
+        provider="azuredevops",
+        path="seredos/azure-tests/azure-tests",
+        token_env="AZURE_TOKEN",
+    )
+
+
+def _install_azuredevops_mock(monkeypatch, handler):
+    def wrapped(req):
+        return handler(req)
+    transport = httpx.MockTransport(wrapped)
+
+    def fake_client(project, token):
+        base = (project.base_url or "https://dev.azure.com").rstrip("/")
+        return httpx.Client(
+            base_url=base, headers={"Accept": "application/json"}, transport=transport,
+        )
+    monkeypatch.setattr(azuredevops_provider, "_client", fake_client)
+
+
+def test_review_author_truthy_body_url_str_or_none_across_providers(monkeypatch):
+    """`Review` shape contract (ticket #136): `author` is a truthy, non-empty
+    string for a known actor on every provider. `body`/`url` are `str | None`
+    everywhere, but only GitLab may legitimately emit `None` on a bare
+    approve (no note posted) — GitHub and Azure DevOps must still emit
+    `str` (falling back to `""`) for the same case, so existing consumers
+    that don't expect `None` from those two providers keep working."""
+
+    # --- GitHub: bare approve, no body -> author/body/url stay str ---
+    def gh_handler(req):
+        if req.method == "POST" and req.url.path.endswith("/reviews"):
+            return _resp({
+                "id": 1,
+                "user": {"login": "octocat"},
+                "body": None,
+                "html_url": "https://github.com/acme/backend/pull/7#pullrequestreview-1",
+                "submitted_at": "2024-01-01T00:00:00Z",
+            })
+        return _resp({}, 404)
+
+    _install_github_mock(monkeypatch, gh_handler)
+    gh_review = GitHubProvider().submit_pr_review(
+        _github_project(), token="t", pr_id="7", state="approve",
+    )
+    assert gh_review.author == "octocat" and gh_review.author
+    assert isinstance(gh_review.body, str)
+    assert isinstance(gh_review.url, str) and gh_review.url
+
+    # --- GitLab: bare approve, no body -> body/url are None; author is
+    # still populated (via GET /user), not the empty-string bug from #136.
+    def gl_handler(req):
+        if req.method == "POST" and req.url.path.endswith("/approve"):
+            return _resp({"iid": 7, "web_url": "u", "updated_at": "2024-01-01T00:00:00Z"})
+        if req.method == "GET" and req.url.path.endswith("/user"):
+            return _resp({"id": 1, "username": "gitlab-actor"})
+        return _resp({}, 404)
+
+    _install_gitlab_mock(monkeypatch, gl_handler)
+    gl_review = GitLabProvider().submit_pr_review(
+        _gitlab_project(), "t", "7", state="approve",
+    )
+    assert gl_review.author == "gitlab-actor" and gl_review.author
+    assert gl_review.body is None
+    assert gl_review.url is None
+
+    # --- Azure DevOps: bare approve, no body -> author/body/url stay str ---
+    _cache_clear_all()
+    repo_id = "da0d7da0-6a8c-4958-aad3-be17cbf806eb"
+
+    def ado_handler(req):
+        path = req.url.path
+        if path.endswith("/_apis/git/repositories") and req.method == "GET":
+            return _resp({"value": [{"id": repo_id, "name": "azure-tests"}]})
+        if path.endswith("/_apis/connectionData"):
+            return _resp({
+                "authenticatedUser": {"id": "user-guid", "displayName": "Azure Actor"},
+            })
+        if req.method == "PUT" and "/reviewers/user-guid" in path:
+            return _resp({"id": "user-guid", "displayName": "Azure Actor", "vote": 10})
+        return _resp({}, 404)
+
+    _install_azuredevops_mock(monkeypatch, ado_handler)
+    ado_review = AzureDevOpsProvider().submit_pr_review(
+        _azuredevops_project(), token="t", pr_id="7", state="approve",
+    )
+    assert ado_review.author == "Azure Actor" and ado_review.author
+    assert isinstance(ado_review.body, str)
+    assert isinstance(ado_review.url, str) and ado_review.url
+
+
+def test_resolvable_duplicate_of_never_emitted_with_unresolved_sentinel(monkeypatch):
+    """Ticket #136: when a `duplicate_of` target is independently resolvable
+    (GitHub timeline / GitLab issue-links both already fetched its real
+    metadata), the surviving relation must not be the unresolved sentinel
+    (`resolved=False`, empty title/state) on either provider — the real
+    metadata must not be discarded in favor of an earlier body-scan stub."""
+
+    # --- GitHub ---
+    def gh_handler(req):
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/42":
+            return _resp({
+                "number": 42, "title": "Issue 42", "body": "Duplicate of #9",
+                "state": "open", "user": {"login": "alice"}, "assignees": [],
+                "labels": [], "html_url": "https://github.com/acme/backend/issues/42",
+                "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-02T00:00:00Z",
+            })
+        if path == "/repos/acme/backend/issues/42/comments":
+            return _resp([])
+        if path == "/repos/acme/backend/issues/42/sub_issues":
+            return _resp([])
+        if path == "/repos/acme/backend/issues/42/timeline":
+            canonical = {
+                "number": 9, "title": "Canonical", "state": "open",
+                "html_url": "https://github.com/acme/backend/issues/9",
+                "repository": {"full_name": "acme/backend"},
+            }
+            return _resp([{
+                "event": "marked_as_duplicate",
+                "canonical": canonical,
+                "dupe": {"number": 42},
+            }])
+        if "/dependencies/" in path:
+            return _resp([])
+        return _resp({}, 404)
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_github_mock(monkeypatch, gh_handler)
+    _, _, gh_relations, _ = GitHubProvider().get_ticket(
+        _github_project("acme/backend"), token="t", ticket_id="42",
+    )
+    gh_dup = next(r for r in gh_relations if r.kind == "duplicate_of" and r.ticket_id == "#9")
+    assert gh_dup.resolved is True
+    assert gh_dup.title and gh_dup.state
+
+    # --- GitLab ---
+    def gl_handler(req):
+        url = str(req.url)
+        if url.endswith("issues/5"):
+            return _resp({
+                "iid": 5, "title": "Issue 5", "description": "Duplicate of #1",
+                "state": "opened", "author": {"username": "a"}, "assignees": [],
+                "labels": [], "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/5",
+                "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-02T00:00:00Z",
+            })
+        if "/issues/5/links" in url:
+            return _resp([{
+                "iid": 1, "link_type": "relates_to", "title": "Real target",
+                "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/1",
+                "state": "opened", "references": {"relative": "#1"},
+            }])
+        if "/issues/5/closed_by" in url or "/issues/5/notes" in url:
+            return _resp([])
+        return _resp([], 404)
+
+    _install_gitlab_mock(monkeypatch, gl_handler)
+    _, _, gl_relations, _ = GitLabProvider().get_ticket(_gitlab_project(), "t", "5")
+    gl_dup = next(r for r in gl_relations if r.kind == "duplicate_of" and r.ticket_id == "#1")
+    assert gl_dup.resolved is True
+    assert gl_dup.title and gl_dup.state

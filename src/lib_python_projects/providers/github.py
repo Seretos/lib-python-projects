@@ -1916,7 +1916,14 @@ def _fetch_comments_for_scan(
 def _dedupe_relations(rels: list[Relation]) -> list[Relation]:
     """Collapse duplicates and drop weakened labels.
 
-    1. Drop exact (kind, ticket_id) duplicates — first occurrence wins.
+    1. Collapse exact (kind, ticket_id) duplicates. A `resolved=True`
+       entry supersedes an earlier `resolved=False` one for the same
+       key (upgrade in place, keeping the original slot's position) —
+       otherwise an unresolved body-scan stub (e.g. `duplicate_of` with
+       empty `title`/`state`) can beat a later, fully-resolved timeline
+       entry for the same real target and its metadata gets discarded
+       (ticket #136). Among entries of equal resolution, the first
+       occurrence wins.
     2. When a target has a stronger label, drop the generic
        `mentioned_by` / `mentions` for that same target.
     """
@@ -1925,6 +1932,9 @@ def _dedupe_relations(rels: list[Relation]) -> list[Relation]:
     for r in rels:
         key = (r.kind, r.ticket_id)
         if key in seen:
+            existing = seen[key]
+            if r.resolved and not existing.resolved:
+                seen[key] = r
             continue
         seen[key] = r
         if r.kind in {
