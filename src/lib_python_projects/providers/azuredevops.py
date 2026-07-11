@@ -989,6 +989,25 @@ def _closed_state_categories() -> frozenset[str]:
     return frozenset({"Completed", "Removed"})
 
 
+def _default_open_state(states: list[dict]) -> str:
+    """Pick the state name to use when a ticket should be (re)opened.
+
+    Picks the first state whose ``category`` is one of the "still open"
+    categories (`_open_state_categories`); if none qualify, falls back
+    to the first state's name; if the work-item type has no states at
+    all, falls back to the literal `"New"` (ADO's universal starting
+    state). Shared by `list_statuses`'s `default_open` hint and
+    `remove_relation`'s duplicate_of reopen so the two call sites can't
+    drift apart.
+    """
+    for s in states:
+        if s.get("category") in _open_state_categories():
+            return s.get("name") or "New"
+    if states:
+        return states[0].get("name") or "New"
+    return "New"
+
+
 def _build_work_item_url(project: ProjectConfig, work_item_id: int | str) -> str:
     base = (project.base_url or "https://dev.azure.com").rstrip("/")
     org, proj = project.organization, project.ado_project
@@ -1786,9 +1805,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         transitions = {v: [other for other in values if other != v] for v in values}
 
         # default_open: first non-terminal state, falling back to the
-        # first value if every state is terminal.
-        opens = [s.get("name") for s in states if s.get("category") in _open_state_categories()]
-        default_open = opens[0] if opens else (values[0] if values else "")
+        # first value if every state is terminal (see `_default_open_state`).
+        default_open = _default_open_state(states)
 
         # Process templates without a "Removed" category (notably Basic)
         # don't have a distinct declined state — surface that honestly as
@@ -3899,7 +3917,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         with _client(project, token) as c:
             resp = c.get(path, params=params)
         _check(resp)
-        relations = (resp.json() or {}).get("relations") or []
+        work_item = resp.json() or {}
+        relations = work_item.get("relations") or []
         index = None
         for i, rel in enumerate(relations):
             if rel.get("rel") == rel_name and target_url_marker in (rel.get("url") or ""):
@@ -3921,6 +3940,69 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 json=patch,
             )
         _check(resp)
+
+        # For duplicate_of: strip the "Duplicate of #N" body line and
+        # reopen the source work item — inverse of add_relation's
+        # prepend + close. Unconditional (not gated on the ticket
+        # currently being in a "Completed" category), matching GitHub
+        # (`state: "open"`) and GitLab (`state_event: "reopen"`).
+        # The relations-array PATCH above fires FIRST (most likely to
+        # fail) so any error surfaces before we mutate body or state.
+        if kind == "duplicate_of":
+            fields = work_item.get("fields") or {}
+            current_html = fields.get("System.Description") or ""
+            current_markdown = _html_to_markdown(current_html)
+            wi_type = fields.get("System.WorkItemType") or ""
+            already_ai = has_ai_generated_marker(current_markdown)
+
+            # Strip the exact "Duplicate of #<target_id>" line (and a
+            # trailing blank line, mirroring add_relation's prepend
+            # format). (?!\d) guards against a partial-id match, e.g.
+            # removing "#9" must not also eat "#90".
+            dup_line = f"Duplicate of #{target_id}"
+            body_core = strip_leading_ai_marker(current_markdown)
+            body_core = re.sub(
+                rf"^{re.escape(dup_line)}(?!\d)\n?(?:\n)?",
+                "",
+                body_core,
+                flags=re.MULTILINE,
+            )
+            body_core = re.sub(r"\n{3,}", "\n\n", body_core).strip()
+            new_body = apply_body_marker(body_core, will_be_ai_generated=already_ai)
+
+            # Resolve the open state to reopen into. Tolerate a failed
+            # states lookup (e.g. unknown work-item type) and fall back
+            # to "New" rather than raising — the relation removal has
+            # already succeeded at this point.
+            open_state = "New"
+            if wi_type:
+                try:
+                    states = self._states_for_type(project, token, wi_type)
+                    open_state = _default_open_state(states)
+                except Exception:  # noqa: BLE001
+                    pass  # fall through to "New" fallback
+
+            reopen_patch = [
+                {
+                    "op": "replace",
+                    "path": "/fields/System.Description",
+                    "value": _markdown_to_html(new_body),
+                },
+                {
+                    "op": "replace",
+                    "path": "/fields/System.State",
+                    "value": open_state,
+                },
+            ]
+            with _client(project, token) as c:
+                ro_resp = c.patch(
+                    path,
+                    params=_api_version_params(),
+                    headers={"Content-Type": "application/json-patch+json"},
+                    json=reopen_patch,
+                )
+            _check(ro_resp)
+
         return {"removed": True}
 
     # ---------- pipelines -------------------------------------------------

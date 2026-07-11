@@ -28,7 +28,11 @@ from lib_python_projects.providers.azuredevops import (
     _ado_rel_to_kind,
     _basic_auth_header,
     _cache_clear_all,
+    _default_open_state,
+    _html_to_markdown,
+    _markdown_to_html,
 )
+from lib_python_projects.markers import apply_body_marker, has_ai_generated_marker
 from lib_python_projects.providers.base import (
     RelationAlreadyExists,
     RelationKindUnsupported,
@@ -250,6 +254,273 @@ def test_remove_relation_not_found_raises_lookup_error(
     assert "child" in msg
     assert "#5" in msg
     assert "#9" in msg
+
+
+# ---------- remove_relation duplicate_of (ticket #146) ----------------------
+
+
+def test_remove_relation_duplicate_of_strips_body_and_reopens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """remove_relation(kind='duplicate_of') must:
+    1. Issue the relations-array remove PATCH first.
+    2. Strip the 'Duplicate of #9' line from System.Description.
+    3. Issue a second PATCH setting System.State to the resolved open
+       state and System.Description to the stripped body.
+    4. Return {'removed': True}.
+    """
+    html = _markdown_to_html("Duplicate of #9\n\nOriginal body")
+    patches: list[list[dict]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and "/workitems/5" in path and "workitemtypes" not in path:
+            return _json({
+                "id": 5,
+                "relations": [
+                    {
+                        "rel": "System.LinkTypes.Duplicate-Forward",
+                        "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
+                    },
+                ],
+                "fields": {
+                    "System.Description": html,
+                    "System.WorkItemType": "Bug",
+                },
+            })
+        if req.method == "GET" and "workitemtypes/Bug/states" in path:
+            return _json({"value": [
+                {"name": "New", "category": "Proposed"},
+                {"name": "Active", "category": "InProgress"},
+                {"name": "Closed", "category": "Completed"},
+            ]})
+        if req.method == "PATCH" and "/workitems/5" in path:
+            patches.append(json.loads(req.content.decode("utf-8")))
+            return _json({"id": 5})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().remove_relation(
+        _project(), token="t", ticket_id="5", kind="duplicate_of", target="9"
+    )
+    assert result == {"removed": True}
+    assert len(patches) == 2, "expected relations-remove PATCH + body/state PATCH"
+
+    remove_patch, reopen_patch = patches
+    assert remove_patch[0]["op"] == "remove"
+    assert remove_patch[0]["path"] == "/relations/0"
+
+    state_ops = [op for op in reopen_patch if op.get("path") == "/fields/System.State"]
+    desc_ops = [op for op in reopen_patch if op.get("path") == "/fields/System.Description"]
+    assert state_ops and state_ops[0]["value"] == "New"
+    assert desc_ops
+    new_markdown = _html_to_markdown(desc_ops[0]["value"])
+    assert "Duplicate of #9" not in new_markdown
+    assert "Original body" in new_markdown
+
+
+def test_remove_relation_duplicate_of_partial_id_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing 'Duplicate of #9' must not also eat a 'Duplicate of #90' line."""
+    html = _markdown_to_html("Duplicate of #9\n\nDuplicate of #90\n\nBody")
+
+    captured_desc: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and "/workitems/5" in path and "workitemtypes" not in path:
+            return _json({
+                "id": 5,
+                "relations": [
+                    {
+                        "rel": "System.LinkTypes.Duplicate-Forward",
+                        "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
+                    },
+                ],
+                "fields": {
+                    "System.Description": html,
+                    "System.WorkItemType": "Bug",
+                },
+            })
+        if req.method == "GET" and "workitemtypes/Bug/states" in path:
+            return _json({"value": [{"name": "New", "category": "Proposed"}]})
+        if req.method == "PATCH" and "/workitems/5" in path:
+            body = json.loads(req.content.decode("utf-8"))
+            for op in body:
+                if op.get("path") == "/fields/System.Description":
+                    captured_desc.append(op["value"])
+            return _json({"id": 5})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().remove_relation(
+        _project(), token="t", ticket_id="5", kind="duplicate_of", target="9"
+    )
+    assert result == {"removed": True}
+    assert captured_desc, "System.Description PATCH op missing"
+    new_markdown = _html_to_markdown(captured_desc[0])
+    lines = new_markdown.splitlines()
+    assert "Duplicate of #9" not in lines
+    assert "Duplicate of #90" in lines
+    assert "Body" in new_markdown
+
+
+def test_remove_relation_duplicate_of_preserves_ai_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AI-generated bodies stay ai-generated after strip+reopen; a
+    non-AI body stays non-AI (re-stamped as ai-modified, never
+    ai-generated)."""
+
+    def _run(markdown_body: str) -> str:
+        html = _markdown_to_html(markdown_body)
+        captured: dict = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            path = req.url.path
+            if req.method == "GET" and "/workitems/5" in path and "workitemtypes" not in path:
+                return _json({
+                    "id": 5,
+                    "relations": [
+                        {
+                            "rel": "System.LinkTypes.Duplicate-Forward",
+                            "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
+                        },
+                    ],
+                    "fields": {
+                        "System.Description": html,
+                        "System.WorkItemType": "Bug",
+                    },
+                })
+            if req.method == "GET" and "workitemtypes/Bug/states" in path:
+                return _json({"value": [{"name": "New", "category": "Proposed"}]})
+            if req.method == "PATCH" and "/workitems/5" in path:
+                body = json.loads(req.content.decode("utf-8"))
+                for op in body:
+                    if op.get("path") == "/fields/System.Description":
+                        captured["desc"] = op["value"]
+                return _json({"id": 5})
+            raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+        _install_mock(monkeypatch, handler)
+        AzureDevOpsProvider().remove_relation(
+            _project(), token="t", ticket_id="5", kind="duplicate_of", target="9"
+        )
+        _cache_clear_all()
+        return _html_to_markdown(captured["desc"])
+
+    ai_body = apply_body_marker(
+        "Duplicate of #9\n\nOriginal body", will_be_ai_generated=True
+    )
+    new_ai_markdown = _run(ai_body)
+    assert has_ai_generated_marker(new_ai_markdown)
+
+    non_ai_body = "Duplicate of #9\n\nOriginal body"
+    new_non_ai_markdown = _run(non_ai_body)
+    assert not has_ai_generated_marker(new_non_ai_markdown)
+
+
+def test_remove_relation_duplicate_of_states_fetch_failure_falls_back_to_new(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing states lookup must not block the reopen — fall back to 'New'."""
+    html = _markdown_to_html("Duplicate of #9\n\nOriginal body")
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and "/workitems/5" in path and "workitemtypes" not in path:
+            return _json({
+                "id": 5,
+                "relations": [
+                    {
+                        "rel": "System.LinkTypes.Duplicate-Forward",
+                        "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
+                    },
+                ],
+                "fields": {
+                    "System.Description": html,
+                    "System.WorkItemType": "Bug",
+                },
+            })
+        if req.method == "GET" and "workitemtypes/Bug/states" in path:
+            return _json({"message": "boom"}, status_code=500)
+        if req.method == "PATCH" and "/workitems/5" in path:
+            body = json.loads(req.content.decode("utf-8"))
+            captured["patch"] = body
+            return _json({"id": 5})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().remove_relation(
+        _project(), token="t", ticket_id="5", kind="duplicate_of", target="9"
+    )
+    assert result == {"removed": True}
+    state_ops = [op for op in captured["patch"] if op.get("path") == "/fields/System.State"]
+    assert state_ops and state_ops[0]["value"] == "New"
+
+
+def test_remove_relation_non_duplicate_kind_has_no_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """kind='child' must only issue the relations-array remove PATCH —
+    no states GET, no body/state PATCH."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and "/workitems/5" in req.url.path:
+            return _json({
+                "id": 5,
+                "relations": [
+                    {
+                        "rel": "System.LinkTypes.Hierarchy-Forward",
+                        "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
+                    },
+                ],
+                "fields": {
+                    "System.Description": "<p>Duplicate of #9</p>",
+                    "System.WorkItemType": "Bug",
+                },
+            })
+        if req.method == "PATCH" and "/workitems/5" in req.url.path:
+            return _json({"id": 5})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().remove_relation(
+        _project(), token="t", ticket_id="5", kind="child", target="9"
+    )
+    assert result == {"removed": True}
+    # Exactly one GET (relations lookup) and one PATCH (relations remove).
+    gets = [r for r in seen if r.method == "GET"]
+    patches = [r for r in seen if r.method == "PATCH"]
+    assert len(gets) == 1
+    assert len(patches) == 1
+    assert not any("workitemtypes" in r.url.path for r in seen)
+
+
+# ---------- _default_open_state ----------------------------------------------
+
+
+def test_default_open_state_picks_first_open_category() -> None:
+    states = [
+        {"name": "New", "category": "Proposed"},
+        {"name": "Active", "category": "InProgress"},
+        {"name": "Closed", "category": "Completed"},
+    ]
+    assert _default_open_state(states) == "New"
+
+
+def test_default_open_state_falls_back_to_first_state_when_all_terminal() -> None:
+    states = [
+        {"name": "Closed", "category": "Completed"},
+        {"name": "Removed", "category": "Removed"},
+    ]
+    assert _default_open_state(states) == "Closed"
+
+
+def test_default_open_state_falls_back_to_new_when_states_empty() -> None:
+    assert _default_open_state([]) == "New"
 
 
 # ---------- add_relation duplicate guard (Issue 5) --------------------------
