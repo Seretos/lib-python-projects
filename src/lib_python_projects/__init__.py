@@ -16,8 +16,12 @@ from lib_python_config import ConfigError
 from lib_python_projects.finder import find_projects
 from lib_python_projects.loader import load_projects, resolve_token
 from lib_python_projects.models import (
+    AzureBoardsBinding,
+    Board,
+    BoardBinding,
     ConfigDocument,
     FindResult,
+    GithubProjectsV2Binding,
     IssuesPermissions,
     Permissions,
     ProjectConfig,
@@ -35,6 +39,10 @@ __all__ = [
     "Permissions",
     "IssuesPermissions",
     "PullsPermissions",
+    "Board",
+    "BoardBinding",
+    "GithubProjectsV2Binding",
+    "AzureBoardsBinding",
     "ConfigDocument",
     "ProjectsLoadResult",
     "Provider",

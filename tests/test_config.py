@@ -585,3 +585,107 @@ class TestAdditiveAutoDiscovery:
         result = load_projects(cwd=tmp_path)
         assert result.state == "no_config"
         assert result.projects == []
+
+
+# ---------- Optional `board` block (ticket #117) ----------------------------
+
+
+class TestBoardBlock:
+    """Loader-level coverage for the optional `board` block. Nested
+    validation errors are expected to surface through the existing
+    ValidationError -> ConfigError -> state="config_error" path with no
+    loader changes required.
+    """
+
+    def test_board_block_loads_ok(self, tmp_path: Path):
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+                board:
+                  columns: [Todo, Doing, Done]
+                  binding:
+                    kind: github-projects-v2
+                    map:
+                      Todo: Backlog
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        p = result.projects[0]
+        assert p.board is not None
+        assert p.board.columns == ["Todo", "Doing", "Done"]
+        assert p.board.binding.kind == "github-projects-v2"
+        assert p.board.binding.map == {"Todo": "Backlog"}
+
+    def test_board_less_yaml_still_loads_ok(self, tmp_path: Path):
+        """Backward-compat: omitting `board` entirely stays valid."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        assert result.projects[0].board is None
+
+    def test_unknown_key_nested_under_board_rejected(self, tmp_path: Path):
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+                board:
+                  columns: [Todo]
+                  binding:
+                    kind: github-projects-v2
+                  bogus_key: nope
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "config_error"
+        assert "bogus_key" in (result.error or "")
+
+    def test_unknown_key_nested_under_binding_rejected(self, tmp_path: Path):
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+                board:
+                  columns: [Todo]
+                  binding:
+                    kind: github-projects-v2
+                    owner: acme
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "config_error"
+        assert "owner" in (result.error or "")
+
+    def test_omitted_map_resolves_to_identity_end_to_end(self, tmp_path: Path):
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: azuredevops
+                path: org/proj/repo
+                board:
+                  columns: [Todo, Doing, Done]
+                  binding:
+                    kind: azure-boards
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        board = result.projects[0].board
+        assert board is not None
+        assert board.binding.map is None
+        assert board.resolve("Todo") == "Todo"
