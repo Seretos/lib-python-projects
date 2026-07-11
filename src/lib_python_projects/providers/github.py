@@ -406,6 +406,52 @@ def _split_github_status(
     )
 
 
+def _github_states_pairs(states: list[str]) -> list[tuple[str, str | None]]:
+    """Validate `TicketFilters.states` against the GitHub-native
+    vocabulary and return `(api_state, state_reason)` pairs.
+
+    Reuses `_split_github_status` verbatim for validation, so an
+    unrecognised value raises the exact same `ValueError` (with the
+    "use list_ticket_statuses" hint) that the write paths already raise.
+    """
+    pairs: list[tuple[str, str | None]] = []
+    for value in states:
+        state, reason = _split_github_status(value)  # type: ignore[arg-type]
+        assert state is not None  # value is never None here
+        pairs.append((state, reason))
+    return pairs
+
+
+def _github_coarse_state(pairs: list[tuple[str, str | None]]) -> str:
+    """Derive the coarse `open`/`closed`/`all` API state param from the
+    validated `states` pairs (GitHub Search / `/issues` can't express
+    `state_reason` set-membership directly, only the coarse `state`).
+    """
+    distinct = {state for state, _ in pairs}
+    if distinct == {"open"}:
+        return "open"
+    if distinct == {"closed"}:
+        return "closed"
+    return "all"
+
+
+def _github_item_matches_states(
+    item: dict, pairs: list[tuple[str, str | None]],
+) -> bool:
+    """Client-side predicate: does a raw issue item match any requested
+    `states` pair, exact-match on `(state, state_reason)`?
+    """
+    item_state = item.get("state", "open")
+    item_reason = item.get("state_reason")
+    for state, reason in pairs:
+        if state == "open":
+            if item_state == "open":
+                return True
+        elif item_state == "closed" and item_reason == reason:
+            return True
+    return False
+
+
 def _parse_relation_target(
     target: str, project: ProjectConfig,
 ) -> tuple[str, str]:
@@ -1568,7 +1614,14 @@ def _list_via_search(
         f"repo:{project.owner}/{project.repo}",
     ]
     # state qualifier: search supports `open`/`closed` only — omit for "any".
-    if filters.status in ("open", "closed"):
+    # `states`, when non-empty, takes precedence over `status` entirely —
+    # translate to the coarse open/closed/all state and let the caller
+    # filter the returned items client-side for exact state_reason match.
+    if filters.states:
+        coarse = _github_coarse_state(_github_states_pairs(filters.states))
+        if coarse in ("open", "closed"):
+            qual_parts.append(f"state:{coarse}")
+    elif filters.status in ("open", "closed"):
         qual_parts.append(f"state:{filters.status}")
     if filters.assignee:
         qual_parts.append(f"assignee:{filters.assignee}")
@@ -1669,20 +1722,44 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         token: str | None,
         filters: TicketFilters,
     ) -> tuple[list[Ticket], bool]:
+        """List issues for a repository.
+
+        `filters.states`, when non-empty, takes precedence over
+        `filters.status` entirely (including `status == "any"`): the
+        coarse open/closed/all API state is derived from the requested
+        native values (since GitHub Search / `/issues` can't express
+        `state_reason` set-membership directly) and returned items are
+        further filtered client-side on exact `(state, state_reason)`
+        match. Unknown values raise `ValueError` (via
+        `_split_github_status`) pointing back to `list_ticket_statuses`.
+        """
         _validate_limit(filters.limit)
         per_page = min(max(1, filters.limit), 100)
         # Normalize `not_labels=[]` (truthy-but-empty containers) to "not set".
         if not filters.not_labels:
             filters.not_labels = []
+        # Validate up front — even on the cheap `/issues` path — so an
+        # unrecognised native value raises before any HTTP call.
+        state_pairs = _github_states_pairs(filters.states) if filters.states else None
         with _client(token) as client:
             if filters.search or _requires_search(filters):
                 items = _list_via_search(client, project, filters)
                 has_more = len(items) >= per_page
-                return [_map_issue(it) for it in items if "pull_request" not in it], has_more
+                filtered = [it for it in items if "pull_request" not in it]
+                if state_pairs is not None:
+                    filtered = [
+                        it for it in filtered
+                        if _github_item_matches_states(it, state_pairs)
+                    ]
+                return [_map_issue(it) for it in filtered], has_more
             else:
+                if state_pairs is not None:
+                    state_param = _github_coarse_state(state_pairs)
+                else:
+                    state_param = filters.status if filters.status in ("open", "closed") else "all"
                 base_params: dict[str, Any] = {
                     "per_page": per_page,
-                    "state": filters.status if filters.status in ("open", "closed") else "all",
+                    "state": state_param,
                     "sort": filters.sort_by,
                     "direction": filters.sort_order,
                 }
@@ -1713,6 +1790,8 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     # The /issues endpoint includes PRs; skip them.
                     for it in raw_page:
                         if "pull_request" not in it:
+                            if state_pairs is not None and not _github_item_matches_states(it, state_pairs):
+                                continue
                             collected.append(it)
                             if len(collected) >= filters.limit:
                                 break

@@ -232,6 +232,210 @@ def test_list_tickets_status_any_omits_state_filter(
     assert "[System.State]" not in captured["wiql"]
 
 
+# ---------- list_tickets: states (ticket #115) --------------------------------
+
+
+def _agile_template_handler() -> Callable[[httpx.Request], httpx.Response | None]:
+    """A reusable handler shard exposing an Agile-like discovery set
+    (New/Approved/Active/Closed/Removed) so `states` tests can request
+    values the Basic template doesn't have.
+    """
+    def inner(req: httpx.Request) -> httpx.Response | None:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}, {"name": "Task"}]})
+        if path.endswith("/_apis/wit/workitemtypes/Issue/states"):
+            return _json({
+                "value": [
+                    {"name": "New", "category": "Proposed"},
+                    {"name": "Approved", "category": "Proposed"},
+                    {"name": "Active", "category": "InProgress"},
+                    {"name": "Closed", "category": "Completed"},
+                    {"name": "Removed", "category": "Removed"},
+                ]
+            })
+        return None
+
+    return inner
+
+
+def test_list_tickets_states_emits_in_clause(monkeypatch: pytest.MonkeyPatch) -> None:
+    bt = _agile_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(states=["Approved", "Active"]),
+    )
+    assert "[System.State] IN ('Approved', 'Active')" in captured["wiql"]
+
+
+def test_list_tickets_states_takes_precedence_over_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`states` overrides `status` entirely — no category-based clause."""
+    bt = _agile_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(status="closed", states=["Active"]),
+    )
+    wiql = captured["wiql"]
+    assert "[System.State] IN ('Active')" in wiql
+    # The closed-category fallback clause must not also be emitted.
+    assert "'Closed'" not in wiql
+    assert "'Removed'" not in wiql
+
+
+def test_list_tickets_states_any_status_still_applies_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`status="any"` plus non-empty `states` still applies the state filter."""
+    bt = _agile_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(status="any", states=["New"]),
+    )
+    assert "[System.State] IN ('New')" in captured["wiql"]
+
+
+def test_list_tickets_states_invalid_value_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _agile_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="use list_ticket_statuses to discover valid values"):
+        AzureDevOpsProvider().list_tickets(
+            _project(default_type="Issue"),
+            token="t",
+            filters=TicketFilters(states=["Bogus"]),
+        )
+
+
+def test_list_tickets_states_empty_list_unchanged_status_behaviour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`states=[]` must leave `status`-driven behaviour untouched."""
+    bt = _agile_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(status="open", states=[]),
+    )
+    wiql = captured["wiql"]
+    assert "'New'" in wiql and "'Approved'" in wiql and "'Active'" in wiql
+    assert "'Closed'" not in wiql and "'Removed'" not in wiql
+
+
+def test_list_tickets_states_single_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    bt = _agile_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(states=["New"]),
+    )
+    assert "[System.State] IN ('New')" in captured["wiql"]
+
+
+def test_list_tickets_states_apostrophe_is_escaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A state value containing an apostrophe must be escaped via
+    `_escape_wiql` — same as any other WIQL string literal.
+    """
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if path.endswith("/_apis/wit/workitemtypes/Issue/states"):
+            return _json({
+                "value": [
+                    {"name": "Won't Fix", "category": "Removed"},
+                    {"name": "New", "category": "Proposed"},
+                ]
+            })
+        if path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {path}")
+
+    captured: dict = {}
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(states=["Won't Fix"]),
+    )
+    assert "[System.State] IN ('Won''t Fix')" in captured["wiql"]
+
+
 def test_list_tickets_honours_sort_and_order(monkeypatch: pytest.MonkeyPatch) -> None:
     bt = _basic_template_handler()
     captured: dict = {}

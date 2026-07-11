@@ -318,6 +318,19 @@ SortOrder = Literal["asc", "desc"]
 @dataclass
 class TicketFilters:
     status: ListStatus = "open"
+    states: list[str] = field(default_factory=list)
+    """Provider-native state values, exactly as returned by
+    `list_ticket_statuses` / `StatusSpec.values` (e.g. Azure DevOps
+    `"Approved"`, GitHub `"closed:not_planned"`, GitLab `"closed"`).
+
+    Matching is exact — no fuzzy/case normalization. When non-empty,
+    `states` takes precedence over `status` entirely (including when
+    `status == "any"`): the normalized `status` translation is skipped
+    and only the requested native states are applied. Each provider
+    validates the requested values against its own vocabulary and
+    raises `ValueError` (pointing back to `list_ticket_statuses`) for
+    any value it doesn't recognise.
+    """
     labels: list[str] = field(default_factory=list)
     assignee: str | None = None
     search: str | None = None

@@ -469,3 +469,149 @@ class TestListTicketsBogusAssignee:
                 filters=TicketFilters(),  # no assignee filter
             )
         assert exc.value.status == 422
+
+
+# ---------- list_tickets: states (ticket #115) --------------------------------
+
+
+class TestListTicketsStates:
+    """`states` overrides `status` entirely on both the search and cheap
+    `/issues` paths — coarse `state` is derived from the requested native
+    values and returned items are filtered client-side on exact
+    `(state, state_reason)` match.
+    """
+
+    def test_states_closed_not_planned_on_search_path(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`author` forces the search route; `states` drives its `state:`
+        qualifier and filters the returned items by exact state_reason.
+        """
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.url.path == "/search/issues"
+            q = req.url.params["q"]
+            assert "state:closed" in q
+            return _json({
+                "items": [
+                    _issue_payload(1, state="closed", state_reason="not_planned"),
+                    _issue_payload(2, state="closed", state_reason="completed"),
+                ],
+            })
+
+        _install_mock(monkeypatch, handler)
+        tickets, _ = GitHubProvider().list_tickets(
+            _project(),
+            token="t",
+            filters=TicketFilters(states=["closed:not_planned"], author="bob"),
+        )
+        assert [t.id for t in tickets] == ["1"]
+
+    def test_states_closed_not_planned_on_cheap_path(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With no other Plan-7 filter set, `states` alone stays on the
+        cheap `/issues` endpoint but still derives `state=` and filters.
+        """
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.url.path == "/repos/acme/backend/issues"
+            assert req.url.params.get("state") == "closed"
+            return _json([
+                _issue_payload(1, state="closed", state_reason="not_planned"),
+                _issue_payload(2, state="closed", state_reason="completed"),
+            ])
+
+        _install_mock(monkeypatch, handler)
+        tickets, _ = GitHubProvider().list_tickets(
+            _project(),
+            token="t",
+            filters=TicketFilters(states=["closed:not_planned"]),
+        )
+        assert [t.id for t in tickets] == ["1"]
+
+    def test_states_multi_value_both_reasons_retained(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.url.params.get("state") == "closed"
+            return _json([
+                _issue_payload(1, state="closed", state_reason="completed"),
+                _issue_payload(2, state="closed", state_reason="not_planned"),
+            ])
+
+        _install_mock(monkeypatch, handler)
+        tickets, _ = GitHubProvider().list_tickets(
+            _project(),
+            token="t",
+            filters=TicketFilters(states=["closed:completed", "closed:not_planned"]),
+        )
+        assert sorted(t.id for t in tickets) == ["1", "2"]
+
+    def test_states_spanning_open_and_closed_is_coarse_all(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.url.params.get("state") == "all"
+            return _json([
+                _issue_payload(1, state="open"),
+                _issue_payload(2, state="closed", state_reason="completed"),
+                _issue_payload(3, state="closed", state_reason="not_planned"),
+            ])
+
+        _install_mock(monkeypatch, handler)
+        tickets, _ = GitHubProvider().list_tickets(
+            _project(),
+            token="t",
+            filters=TicketFilters(states=["open", "closed:completed"]),
+        )
+        # not_planned (id 3) must be excluded — only open + completed requested.
+        assert sorted(t.id for t in tickets) == ["1", "2"]
+
+    def test_states_invalid_value_raises_before_http(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            raise AssertionError("no HTTP call expected for an invalid states value")
+
+        _install_mock(monkeypatch, handler)
+        with pytest.raises(
+            ValueError,
+            match="use list_ticket_statuses to discover valid values",
+        ):
+            GitHubProvider().list_tickets(
+                _project(),
+                token="t",
+                filters=TicketFilters(states=["bogus"]),
+            )
+
+    def test_states_empty_list_unchanged_behaviour_cheap_path(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.url.path == "/repos/acme/backend/issues"
+            assert req.url.params.get("state") == "open"
+            return _json([_issue_payload(1)])
+
+        _install_mock(monkeypatch, handler)
+        tickets, _ = GitHubProvider().list_tickets(
+            _project(),
+            token="t",
+            filters=TicketFilters(states=[]),
+        )
+        assert [t.id for t in tickets] == ["1"]
+
+    def test_states_empty_list_unchanged_behaviour_search_path(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.url.path == "/search/issues"
+            q = req.url.params["q"]
+            assert "state:open" in q
+            return _json({"items": [_issue_payload(1)]})
+
+        _install_mock(monkeypatch, handler)
+        tickets, _ = GitHubProvider().list_tickets(
+            _project(),
+            token="t",
+            filters=TicketFilters(states=[], status="open", author="bob"),
+        )
+        assert [t.id for t in tickets] == ["1"]

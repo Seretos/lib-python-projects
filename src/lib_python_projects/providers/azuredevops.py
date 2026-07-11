@@ -1777,10 +1777,27 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         filters: TicketFilters,
     ) -> str:
         clauses: list[str] = ["[System.TeamProject] = @project"]
-        # Map ListStatus to state-category sets discovered for the default
-        # work-item type. We can't filter by category in WIQL directly,
-        # but we can enumerate the states.
-        if filters.status != "any":
+        if filters.states:
+            # Provider-native state values take precedence over `status`
+            # entirely (including `status == "any"`) — validate each
+            # requested value against the discovery vocabulary and emit
+            # an exact-match IN clause. No casing/whitespace normalization.
+            wi_type = self._default_work_item_type(project, token)
+            states = self._states_for_type(project, token, wi_type)
+            valid_names = [s.get("name") for s in states if s.get("name")]
+            for value in filters.states:
+                if value not in valid_names:
+                    raise ValueError(
+                        f"unsupported status {value!r} for Azure DevOps — "
+                        f"use list_ticket_statuses to discover valid values. "
+                        f"Accepted: {valid_names}."
+                    )
+            in_list = ", ".join(f"'{_escape_wiql(v)}'" for v in filters.states)
+            clauses.append(f"[System.State] IN ({in_list})")
+        elif filters.status != "any":
+            # Map ListStatus to state-category sets discovered for the
+            # default work-item type. We can't filter by category in
+            # WIQL directly, but we can enumerate the states.
             try:
                 wi_type = self._default_work_item_type(project, token)
                 states = self._states_for_type(project, token, wi_type)
@@ -1847,6 +1864,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         token: str | None,
         filters: TicketFilters,
     ) -> tuple[list[Ticket], bool]:
+        """List work items for a project.
+
+        `filters.states`, when non-empty, is matched exact-verbatim
+        against `[System.State]` and takes precedence over `filters.status`
+        entirely (including `status == "any"`) — see `_build_wiql`.
+        Unknown values raise `ValueError` pointing back to
+        `list_ticket_statuses`.
+        """
         _validate_limit(filters.limit)
         wiql = self._build_wiql(project, token, filters)
         with _client(project, token) as c:
