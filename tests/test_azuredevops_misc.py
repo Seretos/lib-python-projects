@@ -687,12 +687,17 @@ def test_list_runs_for_tag_returns_tuple(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_list_runs_for_tag_empty_returns_empty_refs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No builds → no resolved_refs (tool layer triggers the hint)."""
+    """No builds AND the tag-existence probe reports the tag doesn't
+    exist → no resolved_refs (tool layer triggers the hint)."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         if req.url.path.endswith("/_apis/build/builds"):
             return _json({"value": []})
-        raise AssertionError
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in req.url.path:
+            return _json({"count": 0, "value": []})
+        raise AssertionError(f"unexpected {req.url.path}")
 
     _install_mock(monkeypatch, handler)
     runs, resolved_refs = AzureDevOpsProvider().list_runs_for_tag(
@@ -700,6 +705,54 @@ def test_list_runs_for_tag_empty_returns_empty_refs(
     )
     assert runs == []
     assert resolved_refs == []
+
+
+def test_list_runs_for_tag_exists_but_no_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No builds reference the tag, but the tag itself exists (refs probe
+    finds it) → ([], [tag]) so callers can tell "tag found, nothing
+    linked" apart from "tag not found"."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": []})
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in req.url.path:
+            assert req.url.params.get("filter") == "tags/v1.0"
+            return _json({"count": 1, "value": [{"name": "refs/tags/v1.0"}]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_for_tag(
+        _project(), token="t", tag="v1.0", limit=5
+    )
+    assert runs == []
+    assert resolved_refs == ["v1.0"]
+
+
+def test_list_runs_for_tag_found_skips_existence_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When builds already match the tag's branchName filter, the
+    tag-existence probe (and repo-id resolution) must NOT be called."""
+    requested_paths: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        requested_paths.append(req.url.path)
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": [_build_payload(101)]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_for_tag(
+        _project(), token="t", tag="v1.0", limit=5
+    )
+    assert len(runs) == 1
+    assert resolved_refs == ["v1.0"]
+    assert not any(p.endswith("/_apis/git/repositories") for p in requested_paths)
+    assert not any("/refs" in p for p in requested_paths)
 
 
 def test_list_runs_for_ticket_returns_tuple(
@@ -1040,7 +1093,9 @@ def test_list_runs_for_branch_branch_not_found(
 def test_list_runs_for_commit_no_matching_builds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No build has the requested sourceVersion → resolved_refs == []."""
+    """No build has the requested sourceVersion AND the commit-existence
+    probe reports the commit doesn't exist → resolved_refs == []
+    (issue #135: commit-not-found vs. commit-exists-no-builds)."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         if req.url.path.endswith("/_apis/build/builds"):
@@ -1050,6 +1105,10 @@ def test_list_runs_for_commit_no_matching_builds(
                     _build_payload(11, sourceVersion="bbbb"),
                 ]
             })
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if req.url.path.endswith("/_apis/git/repositories/repo-guid/commits/cccc"):
+            return _json({"message": "Not Found"}, status_code=404)
         raise AssertionError(f"unexpected {req.url.path}")
 
     _install_mock(monkeypatch, handler)
@@ -1058,6 +1117,59 @@ def test_list_runs_for_commit_no_matching_builds(
     )
     assert runs == []
     assert resolved_refs == []
+
+
+def test_list_runs_for_commit_exists_but_no_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commit exists (probe succeeds) but no build references it →
+    ([], [sha]) so callers can tell "commit found, nothing linked" apart
+    from "commit not found"."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": [_build_payload(10, sourceVersion="aaaa")]})
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if req.url.path.endswith("/_apis/git/repositories/repo-guid/commits/cccc"):
+            return _json({"commitId": "cccc"})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_for_commit(
+        _project(), token="t", sha="cccc", limit=10
+    )
+    assert runs == []
+    assert resolved_refs == ["cccc"]
+
+
+def test_list_runs_for_commit_found_skips_existence_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When filtered builds already match, the commit-existence probe
+    (and repo-id resolution) must NOT be called — a match already proves
+    the commit exists."""
+    requested_paths: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        requested_paths.append(req.url.path)
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({
+                "value": [
+                    _build_payload(1, sourceVersion="abc"),
+                    _build_payload(2, sourceVersion="def"),
+                ]
+            })
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_for_commit(
+        _project(), token="t", sha="abc", limit=10
+    )
+    assert [r.id for r in runs] == ["1"]
+    assert resolved_refs == ["abc"]
+    assert not any("/repositories" in p and p.endswith("/commits/abc") for p in requested_paths)
+    assert not any(p.endswith("/_apis/git/repositories") for p in requested_paths)
 
 
 @pytest.mark.parametrize("bad_limit", [0, -1, -100])

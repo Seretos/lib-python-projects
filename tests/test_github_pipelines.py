@@ -233,6 +233,50 @@ def test_issue_ticket_skips_pr_early_bail(monkeypatch: pytest.MonkeyPatch) -> No
     assert "/repos/acme/backend/pulls/42" not in requested_paths
 
 
+def test_ticket_not_found_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A genuine 404 on the initial issue fetch must raise `GitHubError`,
+    not collapse into the same `([], [])` result as "ticket exists but
+    nothing linked" (issue #135)."""
+    from lib_python_projects.providers.github import GitHubError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/999999":
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    with pytest.raises(GitHubError) as exc:
+        provider.list_runs_for_ticket(_project(), token="t", ticket_id="999999")
+    assert exc.value.status == 404
+
+
+def test_ticket_is_pr_but_pr_fetch_fails_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The PR early-bail branch must keep returning `[]` (not raise) when
+    the ticket resolves fine (issue fetch succeeds, `pull_request` key is
+    present) but the follow-up `/pulls/{id}` fetch fails — this is a
+    "no resolvable head sha" case, distinct from "ticket missing"."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/42":
+            return _json(_pr_issue_payload(42))
+        if path == "/repos/acme/backend/pulls/42":
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    runs, resolved_refs = provider.list_runs_for_ticket(
+        _project(), token="t", ticket_id="42"
+    )
+    assert resolved_refs == []
+    assert runs == []
+
+
 # ---------- Issue #17: get_run 404 naming ------------------------------------
 
 
