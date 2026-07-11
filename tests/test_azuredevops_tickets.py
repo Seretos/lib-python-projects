@@ -119,20 +119,20 @@ def _work_item_payload(work_item_id: int, **fields_override) -> dict:
 # ---------- list_tickets -----------------------------------------------------
 
 
-def test_list_tickets_board_column_raises_valueerror(
+def test_list_tickets_board_column_without_board_raises_valueerror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """board_column is a GitHub Projects v2 concept — Azure DevOps must
-    fail fast rather than silently ignoring it (Azure Boards column
-    support is the separate sibling ticket #119)."""
+    """board_column requires `project.board` context (ticket #119) — Azure
+    DevOps must fail fast rather than silently ignoring it when no board
+    is configured. Azure-Boards-specific coverage (team/board binding,
+    WIQL clauses, split-column handling) lives in
+    tests/test_azuredevops_board.py."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         raise AssertionError("no HTTP call expected when board_column is set")
 
     _install_mock(monkeypatch, handler)
-    with pytest.raises(
-        ValueError, match="board_column is not supported on Azure DevOps"
-    ):
+    with pytest.raises(ValueError, match="no 'board' configuration"):
         AzureDevOpsProvider().list_tickets(
             _project(), token="t", filters=TicketFilters(board_column="Review"),
         )
