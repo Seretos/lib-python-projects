@@ -653,6 +653,8 @@ class TestBoardBlock:
         assert "bogus_key" in (result.error or "")
 
     def test_unknown_key_nested_under_binding_rejected(self, tmp_path: Path):
+        """`owner` is now a real field (ticket #118) — use a genuinely
+        unknown key to exercise the nested `extra="forbid"` rejection."""
         cfg = tmp_path / ".seretos/project-issues.yml"
         _write(cfg, """
             version: 1
@@ -664,11 +666,39 @@ class TestBoardBlock:
                   columns: [Todo]
                   binding:
                     kind: github-projects-v2
-                    owner: acme
+                    bogus_binding_key: acme
         """)
         result = load_projects(cwd=tmp_path)
         assert result.state == "config_error"
-        assert "owner" in (result.error or "")
+        assert "bogus_binding_key" in (result.error or "")
+
+    def test_owner_project_number_status_field_load_ok(self, tmp_path: Path):
+        """Ticket #118: the GitHub-provider fields on the binding load
+        correctly from YAML."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+                board:
+                  columns: [Todo, Doing, Done]
+                  binding:
+                    kind: github-projects-v2
+                    owner: acme-org
+                    project_number: 12
+                    status_field: Workflow
+                    map:
+                      Todo: Backlog
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        binding = result.projects[0].board.binding
+        assert binding.owner == "acme-org"
+        assert binding.project_number == 12
+        assert binding.status_field == "Workflow"
+        assert binding.map == {"Todo": "Backlog"}
 
     def test_omitted_map_resolves_to_identity_end_to_end(self, tmp_path: Path):
         cfg = tmp_path / ".seretos/project-issues.yml"

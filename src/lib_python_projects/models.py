@@ -66,7 +66,27 @@ class BoardBinding(BaseModel):
 
 
 class GithubProjectsV2Binding(BoardBinding):
+    """GitHub Projects v2 board binding.
+
+    `owner` and `project_number` locate the project: GitHub Projects v2
+    are org- or user-scoped (not repo-bound), addressed via
+    `organization(login:).projectV2(number:)` or
+    `user(login:).projectV2(number:)`. Both are optional here so the
+    schema stays valid without them (e.g. a `board:` block declared
+    before the owning project/number is known); the GitHub provider
+    raises `ValueError` at call time if either is missing when it
+    actually needs to resolve the live board. Which of org/user `owner`
+    resolves to is auto-detected at runtime by the provider — there is
+    deliberately no `owner_type` field to configure.
+
+    `status_field` names the single-select field whose options are the
+    board's columns — conventionally `"Status"`, hence the default.
+    """
+
     kind: Literal["github-projects-v2"]
+    owner: str | None = None
+    project_number: int | None = None
+    status_field: str = "Status"
 
 
 class AzureBoardsBinding(BoardBinding):
@@ -179,7 +199,9 @@ class ProjectConfig(BaseModel):
     local_path: str | None = None
     # Optional board configuration: an ordered list of logical columns plus
     # a provider-specific binding. Resolution logic (turning this into
-    # actual provider board calls) is out of scope here — see #118/#119.
+    # actual provider board calls) is implemented per-provider: GitHub
+    # Projects v2 support landed in #118 (`GitHubProvider.list_board_columns`
+    # / `TicketFilters.board_column`); Azure Boards support is #119.
     board: Board | None = None
 
     @model_validator(mode="after")

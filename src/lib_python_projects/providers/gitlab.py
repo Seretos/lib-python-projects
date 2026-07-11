@@ -1531,6 +1531,11 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 "area_path is not supported on GitLab — it is an Azure DevOps "
                 "System.AreaPath filter"
             )
+        if filters and filters.board_column:
+            raise ValueError(
+                "board_column is not supported on GitLab — it is a GitHub "
+                "Projects v2 board filter"
+            )
         _validate_limit(filters.limit)
         per_page = min(max(1, filters.limit), 100)
         sort_by_map = {

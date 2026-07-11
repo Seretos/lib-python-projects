@@ -358,6 +358,23 @@ class TicketFilters:
     updated_before: str | None = None
     sort_by: SortBy = "created"
     sort_order: SortOrder = "desc"
+    board_column: str | None = None
+    """GitHub-Projects-v2-scoped filter: a *logical* board column name
+    (one of `project.board.columns`). Resolved against `project.board`
+    via `Board.resolve()` — `map` wins, else case-insensitive identity
+    fallback — then matched against the live board's single-select
+    status field.
+
+    Requires `project.board` to be set with a `kind="github-projects-v2"`
+    binding; raises `ValueError` when there's no board, the binding is a
+    different kind, or the column isn't one of `board.columns`. Cannot be
+    combined with `search` or `area_path` (raises `ValueError`) — the
+    board-column path runs a single dedicated Projects-v2 GraphQL query
+    rather than the search/`/issues` REST paths. GitLab and Azure DevOps
+    have no equivalent concept yet (Azure Boards support is ticket #119)
+    and raise `ValueError` when this is set, rather than silently
+    ignoring it and returning over-broad (unfiltered) results.
+    """
 
 
 def _validate_limit(limit: int, name: str = "limit") -> None:
@@ -572,6 +589,23 @@ class FieldSpec:
     allowed_values: list[str] | None
     read_only: bool
     always_required: bool
+
+
+@dataclass
+class BoardColumnSpec:
+    """Result of `list_board_columns` — a single resolved board column.
+
+    `logical` is the column name as declared in `project.board.columns`.
+    `native` is what it resolves to via `Board.resolve()` (the `map`
+    entry, or `logical` itself under case-insensitive identity
+    fallback). `option_id` is the provider-native id of that option on
+    the live board (e.g. a GitHub Projects v2 single-select option id) —
+    the value a write path would need to move an item onto this column.
+    """
+
+    logical: str
+    native: str
+    option_id: str
 
 
 @dataclass
