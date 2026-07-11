@@ -87,8 +87,52 @@ tickets, has_more = provider.list_tickets(
 with `owner` and `project_number` set (the org/user login and project number
 GitHub Projects v2 are scoped under — auto-detected as org vs user at call
 time, not configured). It raises `ValueError` when combined with `search` or
-`area_path`, and on GitLab / Azure DevOps (Azure Boards support is the
-separate sibling ticket #119).
+`area_path`, and on GitLab (no equivalent concept).
+
+Azure Boards support (ticket #119) is implemented on `AzureDevOpsProvider`.
+An Azure Boards board is bound to a **team + backlog level** (not the
+project alone), so the binding needs `team` and `board`:
+
+```yaml
+projects:
+  - id: acme
+    provider: azuredevops
+    path: acme-org/acme-project/acme-repo
+    board:
+      columns: [Todo, Doing, Done]
+      binding:
+        kind: azure-boards
+        team: "Acme Team"
+        board: Stories
+        # Doing/Done split columns (System.BoardColumnDone) have no
+        # dedicated field — mark the "done" half via provider_extras:
+        provider_extras:
+          split_done_column: Done
+```
+
+```python
+provider = AzureDevOpsProvider()
+
+# Discover the live board's columns (logical name, resolved native column
+# name, that column's id, its System.State stateMappings, and whether it's
+# a Doing/Done split column):
+columns = provider.list_board_columns(project, token)
+
+# List only the work items currently sitting in one logical column. The
+# column is resolved against `project.board` via `Board.resolve()` and
+# filtered on `System.BoardColumn`; when the column is the "done" half of
+# a split column, `System.BoardColumnDone` is constrained too.
+tickets, has_more = provider.list_tickets(
+    project, token, TicketFilters(board_column="Done"),
+)
+```
+
+`board_column` raises `ValueError` when `project.board` is unset, the
+binding isn't `kind="azure-boards"`, the binding is missing `team`/`board`,
+or the column isn't one of `board.columns` — never silently ignored or
+falling back to an unfiltered result. When board context isn't configured,
+use `status` / `states` (matching `System.State` directly) as a manual
+fallback filter instead.
 
 ## Usage
 

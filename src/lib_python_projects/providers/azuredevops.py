@@ -53,6 +53,7 @@ from lib_python_projects.markers import (
     strip_leading_ai_marker,
 )
 from lib_python_projects.providers.base import (
+    BoardColumnSpec,
     Comment,
     DiscoveredProject,
     FailingJob,
@@ -1853,6 +1854,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             else:
                 clauses.append(f"[System.AreaPath] = '{_escape_wiql(filters.area_path)}'")
 
+        if filters.board_column:
+            clauses.extend(_board_column_wiql_clauses(project, filters.board_column))
+
         sort_field = {
             "created": "System.CreatedDate",
             "updated": "System.ChangedDate",
@@ -1880,16 +1884,17 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         Unknown values raise `ValueError` pointing back to
         `list_ticket_statuses`.
 
-        `filters.board_column` is a GitHub-Projects-v2-only concept and
-        raises `ValueError` on this provider rather than being silently
-        ignored. Azure Boards column support is tracked separately as
-        the sibling ticket #119 and is out of scope here.
+        `filters.board_column` (ticket #119) filters on `System.BoardColumn`
+        for the Azure Boards board bound to `project.board`. It requires a
+        `kind="azure-boards"` binding with `team` and `board` set — Azure
+        Boards boards are bound to a team + backlog level, and column
+        config is team-scoped. Raises `ValueError` when that context is
+        missing (no `project.board`, wrong binding kind, or missing
+        `team`/`board`) or when the requested column isn't one of
+        `project.board.columns` — never silently ignored. When board
+        context isn't configured, use `status` / `states` (matching
+        `System.State` directly) as a manual fallback filter instead.
         """
-        if filters and filters.board_column:
-            raise ValueError(
-                "board_column is not supported on Azure DevOps — it is a "
-                "GitHub Projects v2 board filter"
-            )
         _validate_limit(filters.limit)
         wiql = self._build_wiql(project, token, filters)
         with _client(project, token) as c:
@@ -1908,6 +1913,81 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             return [], False
         has_more = len(ids) >= filters.limit
         return self._fetch_work_items_batch(project, token, ids), has_more
+
+    def list_board_columns(
+        self, project: ProjectConfig, token: str | None,
+    ) -> list[BoardColumnSpec]:
+        """Resolve `project.board.columns` against the live Azure Boards
+        columns for the bound team + backlog board (ticket #119).
+
+        Azure Boards boards are bound to a **team + backlog level**, not
+        the project alone, so this reads
+        `GET {team}/_apis/work/boards/{board}/columns` and pairs each
+        logical column with its resolved native column name
+        (`Board.resolve()`: explicit `map` wins, else case-insensitive
+        identity fallback), that live column's `id` (as `option_id`), the
+        `System.State` names from its `stateMappings` (as `.states`), and
+        whether it's a Doing/Done split column (`.is_split`).
+
+        Raises `ValueError` when: `project.board` is unset; the binding
+        isn't `kind="azure-boards"`; the binding is missing `team`/`board`;
+        or a resolved native column isn't present among the live board's
+        columns.
+        """
+        board = project.board
+        if board is None:
+            raise ValueError(
+                f"project {project.id!r} has no 'board' configuration — "
+                f"add one to projects.yml before calling list_board_columns"
+            )
+        binding = board.binding
+        if binding.kind != "azure-boards":
+            raise ValueError(
+                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"not 'azure-boards' — list_board_columns is "
+                f"Azure-Boards-only"
+            )
+        if not binding.team or not binding.board:
+            raise ValueError(
+                f"project {project.id!r} azure-boards binding is missing "
+                f"'team' and/or 'board' — both are required to resolve a "
+                f"live Azure Boards board (Azure Boards boards are bound "
+                f"to a team + backlog level)"
+            )
+        path = (
+            f"{_project_scope(project)}/{quote(binding.team, safe='')}"
+            f"/_apis/work/boards/{quote(binding.board, safe='')}/columns"
+        )
+        with _client(project, token) as c:
+            resp = c.get(path, params=_api_version_params())
+        _check(resp)
+        live_columns = resp.json().get("value") or []
+        by_lower_name = {
+            str(col.get("name") or "").lower(): col for col in live_columns
+        }
+        result: list[BoardColumnSpec] = []
+        for col in board.columns:
+            native = board.resolve(col)
+            live = by_lower_name.get(native.lower())
+            if live is None:
+                available = sorted(str(c.get("name") or "") for c in live_columns)
+                raise ValueError(
+                    f"board column {col!r} resolves to native column "
+                    f"{native!r}, which is not present on the live Azure "
+                    f"Boards board (available columns: {available})"
+                )
+            state_mappings = live.get("stateMappings") or {}
+            states = tuple(dict.fromkeys(state_mappings.values()))
+            result.append(
+                BoardColumnSpec(
+                    logical=col,
+                    native=native,
+                    option_id=str(live.get("id") or ""),
+                    states=states,
+                    is_split=bool(live.get("isSplit")),
+                )
+            )
+        return result
 
     def _fetch_work_items_batch(
         self,
@@ -4290,6 +4370,69 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
 def _escape_wiql(value: str) -> str:
     """Escape a single quote in a WIQL string literal."""
     return value.replace("'", "''")
+
+
+def _board_column_wiql_clauses(
+    project: ProjectConfig, board_column: str,
+) -> list[str]:
+    """Build the WIQL clause(s) for `TicketFilters.board_column` (#119).
+
+    Config-driven — no live board API round-trip (mirrors the
+    `area_path` "no validation round-trip" pattern in `_build_wiql`).
+    Validates `project.board` context per design decision D3 and raises
+    `ValueError` when it's missing rather than silently ignoring the
+    filter.
+
+    Always emits `[System.BoardColumn] = '<native>'`. Additionally
+    applies the Doing/Done split (D2), inferred purely from the binding's
+    `map` + `provider_extras["split_done_column"]`:
+      - the logical column named in `split_done_column` (the "done" half)
+        gets `AND [System.BoardColumnDone] = true`.
+      - a sibling logical column that resolves to the same native column
+        name (the "doing" half) gets `AND [System.BoardColumnDone] = false`.
+      - a column that uniquely owns its native value (non-split) gets no
+        `BoardColumnDone` clause at all.
+    """
+    board = project.board
+    if board is None:
+        raise ValueError(
+            f"project {project.id!r} has no 'board' configuration — "
+            f"board_column requires one (use 'status'/'states' matching "
+            f"System.State as a fallback filter instead)"
+        )
+    binding = board.binding
+    if binding.kind != "azure-boards":
+        raise ValueError(
+            f"project {project.id!r} board binding is {binding.kind!r}, "
+            f"not 'azure-boards' — board_column filtering on Azure DevOps "
+            f"requires an azure-boards binding (use 'status'/'states' "
+            f"matching System.State as a fallback filter instead)"
+        )
+    if not binding.team or not binding.board:
+        raise ValueError(
+            f"project {project.id!r} azure-boards binding is missing "
+            f"'team' and/or 'board' — both are required to filter by "
+            f"board_column (use 'status'/'states' matching System.State "
+            f"as a fallback filter instead)"
+        )
+    columns_lower = {c.lower() for c in board.columns}
+    if board_column.lower() not in columns_lower:
+        raise ValueError(
+            f"board_column {board_column!r} is not one of this project's "
+            f"board columns {board.columns!r}"
+        )
+    native_column = board.resolve(board_column)
+    clauses = [f"[System.BoardColumn] = '{_escape_wiql(native_column)}'"]
+
+    split_done_column = binding.provider_extras.get("split_done_column")
+    if split_done_column:
+        if board_column.lower() == str(split_done_column).lower():
+            clauses.append("[System.BoardColumnDone] = true")
+        else:
+            split_native = board.resolve(str(split_done_column))
+            if split_native == native_column:
+                clauses.append("[System.BoardColumnDone] = false")
+    return clauses
 
 
 def _build_workitem_api_url(project: ProjectConfig, work_item_id: str) -> str:

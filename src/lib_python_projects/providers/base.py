@@ -359,21 +359,36 @@ class TicketFilters:
     sort_by: SortBy = "created"
     sort_order: SortOrder = "desc"
     board_column: str | None = None
-    """GitHub-Projects-v2-scoped filter: a *logical* board column name
-    (one of `project.board.columns`). Resolved against `project.board`
-    via `Board.resolve()` — `map` wins, else case-insensitive identity
-    fallback — then matched against the live board's single-select
-    status field.
+    """A *logical* board column name (one of `project.board.columns`).
+    Resolved against `project.board` via `Board.resolve()` — `map` wins,
+    else case-insensitive identity fallback.
 
-    Requires `project.board` to be set with a `kind="github-projects-v2"`
-    binding; raises `ValueError` when there's no board, the binding is a
-    different kind, or the column isn't one of `board.columns`. Cannot be
-    combined with `search` or `area_path` (raises `ValueError`) — the
-    board-column path runs a single dedicated Projects-v2 GraphQL query
-    rather than the search/`/issues` REST paths. GitLab and Azure DevOps
-    have no equivalent concept yet (Azure Boards support is ticket #119)
-    and raise `ValueError` when this is set, rather than silently
-    ignoring it and returning over-broad (unfiltered) results.
+    On GitHub, this is a Projects-v2-scoped filter matched against the
+    live board's single-select status field. Requires `project.board` to
+    be set with a `kind="github-projects-v2"` binding; raises `ValueError`
+    when there's no board, the binding is a different kind, or the column
+    isn't one of `board.columns`. Cannot be combined with `search` or
+    `area_path` (raises `ValueError`) — the board-column path runs a
+    single dedicated Projects-v2 GraphQL query rather than the
+    search/`/issues` REST paths.
+
+    On Azure DevOps (ticket #119), this filters on `System.BoardColumn`
+    (Azure Boards) and requires `project.board` to carry a
+    `kind="azure-boards"` binding with `team` and `board` set — an Azure
+    Boards board is bound to a team + backlog level, and column config is
+    team-scoped. When the requested column is the "done" half of a
+    Doing/Done split column (see `AzureBoardsBinding.provider_extras`'s
+    `split_done_column`), the filter also constrains
+    `System.BoardColumnDone`. Raises `ValueError` when there's no board,
+    the binding is a different kind, `team`/`board` is missing on the
+    binding, or the column isn't one of `board.columns` — never silently
+    ignored or fallen back. When board context isn't configured, use
+    `status` / `states` (matching `System.State` directly) as a manual
+    fallback filter instead.
+
+    GitLab has no equivalent concept yet and raises `ValueError` when
+    this is set, rather than silently ignoring it and returning
+    over-broad (unfiltered) results.
     """
 
 
@@ -599,13 +614,23 @@ class BoardColumnSpec:
     `native` is what it resolves to via `Board.resolve()` (the `map`
     entry, or `logical` itself under case-insensitive identity
     fallback). `option_id` is the provider-native id of that option on
-    the live board (e.g. a GitHub Projects v2 single-select option id) —
-    the value a write path would need to move an item onto this column.
+    the live board (e.g. a GitHub Projects v2 single-select option id, or
+    an Azure Boards column id) — the value a write path would need to move
+    an item onto this column.
+
+    `states` and `is_split` are Azure-Boards-specific (ticket #119) and
+    default to empty/`False` on providers without the concept (GitHub):
+    `states` lists the `System.State` names mapped onto this column (from
+    the live column's `stateMappings`); `is_split` is `True` for a
+    Doing/Done split column (see `AzureBoardsBinding.provider_extras`'s
+    `split_done_column`).
     """
 
     logical: str
     native: str
     option_id: str
+    states: tuple[str, ...] = ()
+    is_split: bool = False
 
 
 @dataclass

@@ -90,7 +90,25 @@ class GithubProjectsV2Binding(BoardBinding):
 
 
 class AzureBoardsBinding(BoardBinding):
+    """Azure Boards board binding.
+
+    An Azure Boards board is bound to a **team + backlog level**, not the
+    project alone — `team` and `board` locate it (e.g. team name and one of
+    `"Stories"`, `"Epics"`, `"Features"`, or a custom board name). Both are
+    optional here so the schema stays valid without them; the Azure DevOps
+    provider raises `ValueError` at call time if either is missing when it
+    actually needs to resolve the live board.
+
+    The Doing/Done split-column marker (Azure Boards' `System.BoardColumnDone`
+    boolean) has no dedicated field: set `provider_extras["split_done_column"]`
+    to the logical column name (from `Board.columns`) that represents the
+    "done" half of a split column. Its sibling "doing" half is inferred as
+    the other logical column that resolves to the same native column name.
+    """
+
     kind: Literal["azure-boards"]
+    team: str | None = None
+    board: str | None = None
 
 
 class Board(BaseModel):
@@ -200,8 +218,8 @@ class ProjectConfig(BaseModel):
     # Optional board configuration: an ordered list of logical columns plus
     # a provider-specific binding. Resolution logic (turning this into
     # actual provider board calls) is implemented per-provider: GitHub
-    # Projects v2 support landed in #118 (`GitHubProvider.list_board_columns`
-    # / `TicketFilters.board_column`); Azure Boards support is #119.
+    # Projects v2 support landed in #118, Azure Boards support in #119
+    # (both via `<Provider>.list_board_columns` / `TicketFilters.board_column`).
     board: Board | None = None
 
     @model_validator(mode="after")
