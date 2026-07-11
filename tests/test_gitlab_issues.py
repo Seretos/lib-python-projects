@@ -268,6 +268,88 @@ def test_list_tickets_propagates_error(monkeypatch: pytest.MonkeyPatch) -> None:
     assert exc.value.status == 404
 
 
+# ---------- list_tickets: states (ticket #115) -------------------------------
+
+
+def test_list_tickets_states_closed_maps_to_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.params.get("state") == "closed"
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().list_tickets(
+        _project(), "t", TicketFilters(states=["closed"]),
+    )
+
+
+def test_list_tickets_states_open_maps_to_opened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.params.get("state") == "opened"
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().list_tickets(
+        _project(), "t", TicketFilters(states=["open"]),
+    )
+
+
+def test_list_tickets_states_both_maps_to_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.params.get("state") == "all"
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().list_tickets(
+        _project(), "t", TicketFilters(states=["open", "closed"]),
+    )
+
+
+def test_list_tickets_states_takes_precedence_over_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.params.get("state") == "closed"
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().list_tickets(
+        _project(), "t", TicketFilters(status="open", states=["closed"]),
+    )
+
+
+def test_list_tickets_states_invalid_value_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for an invalid states value")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="Accepted: open, closed") as exc:
+        GitLabProvider().list_tickets(
+            _project(), "t", TicketFilters(states=["in progress"]),
+        )
+    assert "use list_ticket_statuses to discover valid values" in str(exc.value)
+
+
+def test_list_tickets_states_empty_list_unchanged_status_behaviour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.params.get("state") == "opened"
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().list_tickets(
+        _project(), "t", TicketFilters(status="open", states=[]),
+    )
+
+
 # ---------- get_ticket -------------------------------------------------------
 
 

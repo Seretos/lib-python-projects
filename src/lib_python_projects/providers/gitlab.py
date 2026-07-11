@@ -1509,6 +1509,12 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
 
         Filter mapping (GitLab REST `/projects/:id/issues`):
           - `status`: `open`→`opened`, `closed`→`closed`, `any`→`all`.
+          - `states`: provider-native values (`"open"`/`"closed"`, exactly
+            `list_statuses().values`), non-empty takes precedence over
+            `status` entirely (including `status == "any"`). Validated
+            up front; unknown values raise `ValueError` pointing back to
+            `list_ticket_statuses`. Translated to a single `state` param:
+            `{"open"}`→`opened`, `{"closed"}`→`closed`, both→`all`.
           - `labels`: comma-joined `labels=` param. `not_labels` → `not[labels]`.
           - `assignee` → `assignee_username`. `author` → `author_username`.
           - `created_after/before` / `updated_after/before` pass through.
@@ -1525,9 +1531,27 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             "comments": "user_notes_count",
         }
         state_map = {"open": "opened", "closed": "closed", "any": "all"}
+        if filters.states:
+            valid_states = {"open", "closed"}
+            for value in filters.states:
+                if value not in valid_states:
+                    raise ValueError(
+                        f"unsupported status {value!r} for GitLab — "
+                        f"use list_ticket_statuses to discover valid values. "
+                        f"Accepted: open, closed."
+                    )
+            requested = set(filters.states)
+            if requested == {"open"}:
+                state_param = "opened"
+            elif requested == {"closed"}:
+                state_param = "closed"
+            else:
+                state_param = "all"
+        else:
+            state_param = state_map.get(filters.status, "opened")
         params: dict[str, Any] = {
             "per_page": per_page,
-            "state": state_map.get(filters.status, "opened"),
+            "state": state_param,
             "order_by": sort_by_map.get(filters.sort_by, "created_at"),
             "sort": filters.sort_order,
         }
