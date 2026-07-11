@@ -4636,11 +4636,11 @@ def _resolved_refs_for_ticket(
     seen: set[str] = set()
     out: list[str] = []
 
-    # Fetch the ticket once to read its body (for the `branch:foo` hint)
-    # and to bail early on a 404.
+    # Fetch the ticket once to read its body (for the `branch:foo` hint).
+    # A genuine 404 here means the ticket itself doesn't exist, which is
+    # distinct from "ticket exists but has nothing linked" — raise instead
+    # of silently returning `[]` so callers can tell the two apart.
     issue_r = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
-    if issue_r.status_code == 404:
-        return []
     _check(issue_r)
 
     # Early bail: if the ticket is itself a PR, use its own head.sha directly.
