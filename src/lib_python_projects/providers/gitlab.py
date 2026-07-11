@@ -1522,7 +1522,15 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
           - `sort_by`: `created`→`created_at`, `updated`→`updated_at`,
             `comments`→`user_notes_count`. `sort_order` → `sort`.
           - `limit` is `per_page`, capped at 100. Single page only.
+          - `area_path` is an Azure-DevOps-only concept (`System.AreaPath`)
+            and raises `ValueError` on this provider rather than being
+            silently ignored.
         """
+        if filters and filters.area_path:
+            raise ValueError(
+                "area_path is not supported on GitLab — it is an Azure DevOps "
+                "System.AreaPath filter"
+            )
         _validate_limit(filters.limit)
         per_page = min(max(1, filters.limit), 100)
         sort_by_map = {

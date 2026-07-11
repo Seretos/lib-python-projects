@@ -1732,7 +1732,16 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         further filtered client-side on exact `(state, state_reason)`
         match. Unknown values raise `ValueError` (via
         `_split_github_status`) pointing back to `list_ticket_statuses`.
+
+        `filters.area_path` is an Azure-DevOps-only concept (`System.AreaPath`)
+        and raises `ValueError` on this provider rather than being silently
+        ignored.
         """
+        if filters and filters.area_path:
+            raise ValueError(
+                "area_path is not supported on GitHub — it is an Azure DevOps "
+                "System.AreaPath filter"
+            )
         _validate_limit(filters.limit)
         per_page = min(max(1, filters.limit), 100)
         # Normalize `not_labels=[]` (truthy-but-empty containers) to "not set".

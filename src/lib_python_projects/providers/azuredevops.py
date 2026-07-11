@@ -1844,6 +1844,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             clauses.append(f"[System.ChangedDate] >= '{_escape_wiql(filters.updated_after)}'")
         if filters.updated_before:
             clauses.append(f"[System.ChangedDate] <= '{_escape_wiql(filters.updated_before)}'")
+        if filters.area_path:
+            # No validation against classification nodes here — that would
+            # require an extra API round-trip and is out of scope; an
+            # invalid area path simply yields zero matching work items.
+            if filters.area_path_recursive:
+                clauses.append(f"[System.AreaPath] UNDER '{_escape_wiql(filters.area_path)}'")
+            else:
+                clauses.append(f"[System.AreaPath] = '{_escape_wiql(filters.area_path)}'")
 
         sort_field = {
             "created": "System.CreatedDate",

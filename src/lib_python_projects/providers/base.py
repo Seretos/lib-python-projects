@@ -331,6 +331,21 @@ class TicketFilters:
     raises `ValueError` (pointing back to `list_ticket_statuses`) for
     any value it doesn't recognise.
     """
+    area_path: str | None = None
+    area_path_recursive: bool = True
+    """Azure-DevOps-scoped filter on `System.AreaPath`. `area_path` is the
+    area path to scope the query to (e.g. `"MyProj\\Team A"`).
+
+    `area_path_recursive` controls the WIQL operator used:
+    - `True` (default)  → `UNDER`, includes sub-areas.
+    - `False`           → `=`, exact match only.
+
+    The default is deliberately `True` because an exact match silently
+    drops work items filed under sub-areas, which is rarely what callers
+    want. GitHub and GitLab have no equivalent concept and raise
+    `ValueError` when `area_path` is set, rather than silently ignoring
+    it and returning over-broad (unfiltered) results.
+    """
     labels: list[str] = field(default_factory=list)
     assignee: str | None = None
     search: str | None = None
