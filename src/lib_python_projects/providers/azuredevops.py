@@ -455,6 +455,7 @@ _cache_lock = threading.Lock()
 _repo_id_cache: dict[tuple[str, str, str], tuple[float, str]] = {}
 _state_cache: dict[tuple[str, str, str], tuple[float, list[dict]]] = {}
 _field_cache: dict[tuple[str, str, str], tuple[float, list[dict]]] = {}
+_field_type_cache: dict[tuple[str, str], tuple[float, dict[str, str]]] = {}
 _default_type_cache: dict[tuple[str, str], tuple[float, str]] = {}
 _classification_cache: dict[tuple[str, str, str], tuple[float, list[str]]] = {}
 _field_values_cache: dict[tuple[str, str, str, str], tuple[float, list[str] | None]] = {}
@@ -484,6 +485,7 @@ def _cache_clear_all() -> None:
         _repo_id_cache.clear()
         _state_cache.clear()
         _field_cache.clear()
+        _field_type_cache.clear()
         _default_type_cache.clear()
         _classification_cache.clear()
         _field_values_cache.clear()
@@ -1535,9 +1537,12 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         """List the field descriptors for a work-item type.
 
         Each entry is the raw ADO field dict with at least `referenceName`,
-        `name`, `type`, `isReadOnly`, `alwaysRequired`, and optionally
-        `allowedValues` (a list of strings for picklist fields).
-        Results are cached per `(org, project, work_item_type)` for 1 hour.
+        `name`, `isReadOnly`, `alwaysRequired`, and optionally
+        `allowedValues` (a list of strings for picklist fields). Despite
+        what the ADO docs imply, this endpoint's response model does NOT
+        include a `type` key — field types must be sourced separately via
+        `_field_types_for_project`. Results are cached per
+        `(org, project, work_item_type)` for 1 hour.
         """
         key = (project.organization or "", project.ado_project or "", work_item_type)
         cached = _cache_get(_field_cache, key)
@@ -1556,6 +1561,39 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         fields = list((resp.json().get("value") or []))
         _cache_put(_field_cache, key, fields)
         return fields
+
+    def _field_types_for_project(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+    ) -> dict[str, str]:
+        """Return a `referenceName -> type` map for every field ADO knows
+        about in this project.
+
+        The bulk `.../workitemtypes/{type}/fields` endpoint used by
+        `_fields_for_type` never includes a `type` key in its response
+        model, so field types must be sourced separately from the global
+        "Fields - List" endpoint (`.../_apis/wit/fields`). Project-scoped
+        (not org-scoped) so project-level custom fields are included.
+        A field missing from the registry simply has no entry — callers
+        should treat that as "unknown" (empty string) rather than an
+        error. Results are cached per `(org, project)` for 1 hour.
+        """
+        key = (project.organization or "", project.ado_project or "")
+        cached = _cache_get(_field_type_cache, key)
+        if cached is not None:
+            return cached
+        path = f"{_project_scope(project)}/_apis/wit/fields"
+        with _client(project, token) as c:
+            resp = c.get(path, params=_api_version_params())
+        _check(resp)
+        types: dict[str, str] = {}
+        for f in resp.json().get("value") or []:
+            reference_name = f.get("referenceName")
+            if reference_name:
+                types[reference_name] = f.get("type") or ""
+        _cache_put(_field_type_cache, key, types)
+        return types
 
     def _classification_node_paths(
         self,
@@ -1739,10 +1777,11 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         """
         wi_type = work_item_type or self._default_work_item_type(project, token)
         raw_fields = self._fields_for_type(project, token, wi_type)
+        type_map = self._field_types_for_project(project, token)
         result: list[FieldSpec] = []
         for f in raw_fields:
             reference_name = f.get("referenceName") or ""
-            field_type = f.get("type") or ""
+            field_type = f.get("type") or type_map.get(reference_name, "")
             raw_allowed = f.get("allowedValues")
             allowed: list[str] | None = (
                 list(raw_allowed) if raw_allowed else None

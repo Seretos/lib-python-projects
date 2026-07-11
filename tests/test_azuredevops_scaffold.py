@@ -660,32 +660,39 @@ def test_list_statuses_agile_template(monkeypatch: pytest.MonkeyPatch) -> None:
 def _fields_handler_with_type(
     work_item_type: str,
     fields_payload: list[dict],
+    registry_payload: list[dict] | None = None,
 ) -> Callable[[httpx.Request], httpx.Response]:
-    """Build a mock handler that returns the given fields for a specific type."""
+    """Build a mock handler that returns the given fields for a specific
+    type, plus the global field-type registry (`/_apis/wit/fields`) that
+    `list_fields` joins in to populate `FieldSpec.type`."""
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
         fields_path = f"/_apis/wit/workitemtypes/{work_item_type}/fields"
         if path.endswith(fields_path):
             return _json({"value": fields_payload})
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry_payload or []})
         raise AssertionError(f"unexpected path {path}")
     return handler
 
 
 def test_list_fields_picklist_field(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A field with allowedValues maps to FieldSpec.allowed_values list."""
+    """A field with allowedValues maps to FieldSpec.allowed_values list, and
+    its type is resolved from the global field-type registry (the bulk
+    per-type endpoint never includes a `type` key in the real API)."""
     fields = [
         {
             "referenceName": "Custom.Status",
             "name": "Status",
-            "type": "picklistString",
             "allowedValues": ["Open", "Closed"],
             "isReadOnly": False,
             "alwaysRequired": False,
         }
     ]
+    registry = [{"referenceName": "Custom.Status", "type": "picklistString"}]
     p = _project()
     p.default_work_item_type = "Issue"  # type: ignore[misc]
-    _install_mock(monkeypatch, _fields_handler_with_type("Issue", fields))
+    _install_mock(monkeypatch, _fields_handler_with_type("Issue", fields, registry))
     result = AzureDevOpsProvider().list_fields(p, token="t")
     assert len(result) == 1
     spec = result[0]
@@ -698,22 +705,24 @@ def test_list_fields_picklist_field(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_list_fields_plain_string_field(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A field with no allowedValues key maps to allowed_values=None."""
+    """A field with no allowedValues key maps to allowed_values=None, and
+    its type is resolved from the global field-type registry."""
     fields = [
         {
             "referenceName": "System.Title",
             "name": "Title",
-            "type": "string",
             "isReadOnly": False,
             "alwaysRequired": True,
         }
     ]
+    registry = [{"referenceName": "System.Title", "type": "string"}]
     p = _project()
     p.default_work_item_type = "Issue"  # type: ignore[misc]
-    _install_mock(monkeypatch, _fields_handler_with_type("Issue", fields))
+    _install_mock(monkeypatch, _fields_handler_with_type("Issue", fields, registry))
     result = AzureDevOpsProvider().list_fields(p, token="t")
     assert len(result) == 1
     assert result[0].allowed_values is None
+    assert result[0].type == "string"
 
 
 def test_list_fields_default_work_item_type_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -722,11 +731,11 @@ def test_list_fields_default_work_item_type_resolution(monkeypatch: pytest.Monke
         {
             "referenceName": "System.State",
             "name": "State",
-            "type": "string",
             "isReadOnly": False,
             "alwaysRequired": False,
         }
     ]
+    registry = [{"referenceName": "System.State", "type": "string"}]
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
@@ -734,6 +743,8 @@ def test_list_fields_default_work_item_type_resolution(monkeypatch: pytest.Monke
             return _json({"value": [{"name": "Issue"}]})
         if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
             return _json({"value": fields})
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry})
         raise AssertionError(f"unexpected path {path}")
 
     _install_mock(monkeypatch, handler)
@@ -741,6 +752,7 @@ def test_list_fields_default_work_item_type_resolution(monkeypatch: pytest.Monke
     result = AzureDevOpsProvider().list_fields(_project(), token="t")
     assert len(result) == 1
     assert result[0].reference_name == "System.State"
+    assert result[0].type == "string"
 
 
 def test_list_fields_explicit_work_item_type_skips_type_lookup(
@@ -751,11 +763,11 @@ def test_list_fields_explicit_work_item_type_skips_type_lookup(
         {
             "referenceName": "System.Title",
             "name": "Title",
-            "type": "string",
             "isReadOnly": False,
             "alwaysRequired": True,
         }
     ]
+    registry = [{"referenceName": "System.Title", "type": "string"}]
     seen: list[str] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -763,6 +775,8 @@ def test_list_fields_explicit_work_item_type_skips_type_lookup(
         seen.append(path)
         if path.endswith("/_apis/wit/workitemtypes/Task/fields"):
             return _json({"value": fields})
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry})
         raise AssertionError(f"unexpected path {path}")
 
     _install_mock(monkeypatch, handler)
@@ -780,11 +794,11 @@ def test_list_fields_result_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
         {
             "referenceName": "System.Title",
             "name": "Title",
-            "type": "string",
             "isReadOnly": False,
             "alwaysRequired": False,
         }
     ]
+    registry = [{"referenceName": "System.Title", "type": "string"}]
     hit_count: list[int] = [0]
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -792,6 +806,8 @@ def test_list_fields_result_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
         if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
             hit_count[0] += 1
             return _json({"value": fields})
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry})
         raise AssertionError(f"unexpected path {path}")
 
     p = _project()
@@ -813,19 +829,20 @@ def test_list_fields_read_only_and_always_required_flags(
         {
             "referenceName": "System.Id",
             "name": "ID",
-            "type": "integer",
             "isReadOnly": True,
             "alwaysRequired": True,
         }
     ]
+    registry = [{"referenceName": "System.Id", "type": "integer"}]
     p = _project()
     p.default_work_item_type = "Issue"  # type: ignore[misc]
-    _install_mock(monkeypatch, _fields_handler_with_type("Issue", fields))
+    _install_mock(monkeypatch, _fields_handler_with_type("Issue", fields, registry))
     result = AzureDevOpsProvider().list_fields(p, token="t")
     assert len(result) == 1
     spec = result[0]
     assert spec.read_only is True
     assert spec.always_required is True
+    assert spec.type == "integer"
 
 
 def test_list_fields_area_path_populated_from_classification_nodes(
@@ -833,16 +850,17 @@ def test_list_fields_area_path_populated_from_classification_nodes(
 ) -> None:
     """System.AreaPath has no inline allowedValues but gets them from the
     classification-node tree, as full backslash paths with the leading
-    slash stripped."""
+    slash stripped. Its type ("treePath") comes from the global field
+    registry, since the bulk per-type endpoint never returns `type`."""
     fields = [
         {
             "referenceName": "System.AreaPath",
             "name": "Area Path",
-            "type": "treePath",
             "isReadOnly": False,
             "alwaysRequired": False,
         }
     ]
+    registry = [{"referenceName": "System.AreaPath", "type": "treePath"}]
     tree = {
         "path": "\\Proj",
         "children": [
@@ -861,6 +879,8 @@ def test_list_fields_area_path_populated_from_classification_nodes(
             return _json({"value": fields})
         if path.endswith("/_apis/wit/classificationnodes/Areas"):
             return _json(tree)
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry})
         raise AssertionError(f"unexpected path {path}")
 
     p = _project()
@@ -869,21 +889,23 @@ def test_list_fields_area_path_populated_from_classification_nodes(
     result = AzureDevOpsProvider().list_fields(p, token="t")
     assert len(result) == 1
     assert result[0].allowed_values == ["Proj", "Proj\\Team", "Proj\\Team\\Sub"]
+    assert result[0].type == "treePath"
 
 
 def test_list_fields_iteration_path_populated_from_classification_nodes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """System.IterationPath is populated from the Iterations classification tree."""
+    """System.IterationPath is populated from the Iterations classification
+    tree. Its type ("treePath") comes from the global field registry."""
     fields = [
         {
             "referenceName": "System.IterationPath",
             "name": "Iteration Path",
-            "type": "treePath",
             "isReadOnly": False,
             "alwaysRequired": False,
         }
     ]
+    registry = [{"referenceName": "System.IterationPath", "type": "treePath"}]
     tree = {
         "path": "\\Proj",
         "children": [
@@ -898,6 +920,8 @@ def test_list_fields_iteration_path_populated_from_classification_nodes(
             return _json({"value": fields})
         if path.endswith("/_apis/wit/classificationnodes/Iterations"):
             return _json(tree)
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry})
         raise AssertionError(f"unexpected path {path}")
 
     p = _project()
@@ -906,22 +930,27 @@ def test_list_fields_iteration_path_populated_from_classification_nodes(
     result = AzureDevOpsProvider().list_fields(p, token="t")
     assert len(result) == 1
     assert result[0].allowed_values == ["Proj", "Proj\\Sprint 1", "Proj\\Sprint 2"]
+    assert result[0].type == "treePath"
 
 
 def test_list_fields_picklist_falls_back_to_per_field_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A picklist field missing allowedValues in the bulk payload gets them
-    from the per-field endpoint instead."""
+    from the per-field endpoint instead. The bulk payload never carries a
+    `type` key in production, so the picklist fallback only fires because
+    the type is resolved from the global field registry first — this
+    locks in that ordering (registry lookup before the picklist-fallback
+    check)."""
     fields = [
         {
             "referenceName": "Custom.Priority",
             "name": "Priority",
-            "type": "picklistString",
             "isReadOnly": False,
             "alwaysRequired": False,
         }
     ]
+    registry = [{"referenceName": "Custom.Priority", "type": "picklistString"}]
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
@@ -935,6 +964,8 @@ def test_list_fields_picklist_falls_back_to_per_field_endpoint(
                     "allowedValues": ["Low", "Medium", "High"],
                 }
             )
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry})
         raise AssertionError(f"unexpected path {path}")
 
     p = _project()
@@ -943,6 +974,7 @@ def test_list_fields_picklist_falls_back_to_per_field_endpoint(
     result = AzureDevOpsProvider().list_fields(p, token="t")
     assert len(result) == 1
     assert result[0].allowed_values == ["Low", "Medium", "High"]
+    assert result[0].type == "picklistString"
 
 
 def test_list_fields_inline_picklist_not_refetched(
@@ -954,12 +986,12 @@ def test_list_fields_inline_picklist_not_refetched(
         {
             "referenceName": "Custom.Priority",
             "name": "Priority",
-            "type": "picklistString",
             "allowedValues": ["Low", "High"],
             "isReadOnly": False,
             "alwaysRequired": False,
         }
     ]
+    registry = [{"referenceName": "Custom.Priority", "type": "picklistString"}]
     seen: list[str] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -967,6 +999,8 @@ def test_list_fields_inline_picklist_not_refetched(
         seen.append(path)
         if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
             return _json({"value": fields})
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry})
         raise AssertionError(f"unexpected path {path}")
 
     p = _project()
@@ -988,11 +1022,11 @@ def test_list_fields_classification_nodes_cached(
         {
             "referenceName": "System.AreaPath",
             "name": "Area Path",
-            "type": "treePath",
             "isReadOnly": False,
             "alwaysRequired": False,
         }
     ]
+    registry = [{"referenceName": "System.AreaPath", "type": "treePath"}]
     tree = {"path": "\\Proj", "children": []}
     hit_count: list[int] = [0]
 
@@ -1003,6 +1037,8 @@ def test_list_fields_classification_nodes_cached(
         if path.endswith("/_apis/wit/classificationnodes/Areas"):
             hit_count[0] += 1
             return _json(tree)
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry})
         raise AssertionError(f"unexpected path {path}")
 
     p = _project()
@@ -1013,4 +1049,137 @@ def test_list_fields_classification_nodes_cached(
     provider.list_fields(p, token="t")
     assert hit_count[0] == 1, (
         f"Expected classificationnodes endpoint to be called once, got {hit_count[0]}"
+    )
+
+
+# ---------- list_fields — global field-type registry (ticket #134) ----------
+
+
+def test_list_fields_type_populated_from_global_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for ticket #134: `list_fields` always returned
+    `type == ""` for every field because the bulk
+    `/workitemtypes/{type}/fields` endpoint's response model never
+    includes a `type` key in production — mirrored here by omitting
+    `type` from the bulk payload entirely (unlike the pre-fix tests,
+    which incorrectly faked a `type` key that doesn't exist in the real
+    API). Types must instead come from the global field registry
+    (`/_apis/wit/fields`), joined by `referenceName`. Exercises the exact
+    E2E triple from the ticket: System.Title (string), System.State
+    (picklistString), System.CreatedDate (dateTime)."""
+    fields = [
+        {
+            "referenceName": "System.Title",
+            "name": "Title",
+            "isReadOnly": False,
+            "alwaysRequired": True,
+        },
+        {
+            "referenceName": "System.State",
+            "name": "State",
+            # allowedValues present inline (as the real bulk endpoint
+            # usually returns for picklist fields via $expand), so this
+            # regression test isolates the `type` bug without also
+            # exercising the per-field picklist fallback.
+            "allowedValues": ["New", "Active", "Closed"],
+            "isReadOnly": False,
+            "alwaysRequired": True,
+        },
+        {
+            "referenceName": "System.CreatedDate",
+            "name": "Created Date",
+            "isReadOnly": True,
+            "alwaysRequired": False,
+        },
+    ]
+    registry = [
+        {"referenceName": "System.Title", "type": "string"},
+        {"referenceName": "System.State", "type": "picklistString"},
+        {"referenceName": "System.CreatedDate", "type": "dateTime"},
+    ]
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, _fields_handler_with_type("Issue", fields, registry))
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    by_ref = {spec.reference_name: spec for spec in result}
+    assert by_ref["System.Title"].type == "string"
+    assert by_ref["System.State"].type == "picklistString"
+    assert by_ref["System.CreatedDate"].type == "dateTime"
+
+
+def test_list_fields_type_missing_from_registry_defaults_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A field present in the per-type list but absent from the global
+    registry degrades gracefully to type=="" rather than raising."""
+    fields = [
+        {
+            "referenceName": "Custom.Unregistered",
+            "name": "Unregistered",
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+    registry = [{"referenceName": "System.Title", "type": "string"}]
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, _fields_handler_with_type("Issue", fields, registry))
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    assert len(result) == 1
+    assert result[0].type == ""
+
+
+def test_list_fields_empty_registry_no_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty/missing registry `value` array degrades every field's type
+    to "" without raising."""
+    fields = [
+        {
+            "referenceName": "System.Title",
+            "name": "Title",
+            "isReadOnly": False,
+            "alwaysRequired": True,
+        }
+    ]
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, _fields_handler_with_type("Issue", fields, []))
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    assert len(result) == 1
+    assert result[0].type == ""
+
+
+def test_list_fields_field_registry_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two list_fields calls for the same project only hit the global
+    field-type registry endpoint once."""
+    fields = [
+        {
+            "referenceName": "System.Title",
+            "name": "Title",
+            "isReadOnly": False,
+            "alwaysRequired": True,
+        }
+    ]
+    registry = [{"referenceName": "System.Title", "type": "string"}]
+    hit_count: list[int] = [0]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
+            return _json({"value": fields})
+        if path.endswith("/_apis/wit/fields"):
+            hit_count[0] += 1
+            return _json({"value": registry})
+        raise AssertionError(f"unexpected path {path}")
+
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, handler)
+    provider = AzureDevOpsProvider()
+    provider.list_fields(p, token="t")
+    provider.list_fields(p, token="t")
+    assert hit_count[0] == 1, (
+        f"Expected the field-registry endpoint to be called once, got {hit_count[0]}"
     )
