@@ -1258,16 +1258,38 @@ def _fetch_relations(
         relations.append(_make_relation(kind="mentions", ref=ref, resolved=False))
 
     # Dedup: the native issue-link written by _gitlab_mark_duplicate_of
-    # comes back from the links API as "relates_to", while the body scan
-    # above also emits "duplicate_of" for the same target — one target,
-    # two relations.  Drop any "relates_to" whose ticket_id already has a
-    # "duplicate_of" entry (the body-scan result is authoritative).
-    dup_target_ids = {r.ticket_id for r in relations if r.kind == "duplicate_of"}
-    if dup_target_ids:
-        relations = [
-            r for r in relations
-            if not (r.kind == "relates_to" and r.ticket_id in dup_target_ids)
-        ]
+    # comes back from the links API as "relates_to" (or "blocks" /
+    # "blocked_by") carrying real title/state/url (resolved=True), while
+    # the body scan above also emits an unresolved "duplicate_of" for
+    # the same target — one target, two relations. Rather than dropping
+    # the resolved link outright (which discarded real metadata — ticket
+    # #136), merge its title/state/url onto the surviving "duplicate_of"
+    # entry and then drop the now-redundant resolved link. A link with
+    # no matching body-scan "duplicate_of" passes through unchanged.
+    dup_indices = {
+        r.ticket_id: i for i, r in enumerate(relations) if r.kind == "duplicate_of"
+    }
+    if dup_indices:
+        to_drop: set[int] = set()
+        for i, r in enumerate(relations):
+            if r.kind not in ("relates_to", "blocks", "blocked_by"):
+                continue
+            dup_idx = dup_indices.get(r.ticket_id)
+            if dup_idx is None:
+                continue
+            dup_entry = relations[dup_idx]
+            relations[dup_idx] = Relation(
+                kind="duplicate_of",
+                ticket_id=dup_entry.ticket_id,
+                title=r.title,
+                url=r.url,
+                state=r.state,
+                is_pull_request=r.is_pull_request,
+                resolved=True,
+            )
+            to_drop.add(i)
+        if to_drop:
+            relations = [r for i, r in enumerate(relations) if i not in to_drop]
 
     return relations
 
@@ -2756,18 +2778,31 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                         )
                     else:
                         _approve_url = note_raw.get("web_url") or ""
-                else:
-                    _approve_url = _canonical_url(
-                        mr_raw.get("web_url") or "", project
+                    _approve_author = (note_raw.get("author") or {}).get(
+                        "username", ""
                     )
+                    _approve_body: str | None = note_raw.get("body", "")
+                else:
+                    # No note was posted — the `/approve` response is a
+                    # *MergeRequestApproval* object, which carries
+                    # `approved_by[]` rather than a top-level `user`, so
+                    # there's no reliable per-call actor on it. Resolve
+                    # the acting user via the authenticated-identity
+                    # endpoint instead of guessing from `approved_by[]`
+                    # (which can list multiple approvers). There is also
+                    # no note-specific body/url to report for a bare
+                    # approve, so both are genuinely absent (`None`) —
+                    # see `Review.body`/`Review.url` docstring.
+                    ru = client.get("/user")
+                    _check(ru)
+                    _approve_author = ru.json().get("username", "")
+                    _approve_body = None
+                    _approve_url = None
                 return Review(
                     id=str((note_raw or {}).get("id") or mr_raw.get("iid", "")),
                     state="approve",
-                    author=((note_raw or {}).get("author") or {}).get(
-                        "username", ""
-                    )
-                    or (mr_raw.get("user") or {}).get("username", ""),
-                    body=(note_raw or {}).get("body", "") if note_raw else "",
+                    author=_approve_author,
+                    body=_approve_body,
                     url=_approve_url,
                     submitted_at=(note_raw or {}).get("created_at")
                     or mr_raw.get("updated_at")

@@ -421,6 +421,73 @@ def test_duplicate_of_suppresses_relates_to_for_same_target(
     # Exactly one entry for #1 in total.
     entries_for_1 = [(k, t) for k, t in pairs if t == "#1"]
     assert len(entries_for_1) == 1
+    # Ticket #136: the surviving duplicate_of must carry the real
+    # metadata from the resolved relates_to link, not the empty-title/
+    # unresolved body-scan stub — the link's data must not be discarded.
+    dup = next(r for r in relations if r.kind == "duplicate_of" and r.ticket_id == "#1")
+    assert dup.title == "Target issue"
+    assert dup.state == "open"
+    assert dup.url == "https://gitlab.com/acme/backend/-/issues/1"
+    assert dup.resolved is True
+
+
+def test_duplicate_of_without_matching_link_stays_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A body-scan `duplicate_of` with no matching issue-links entry keeps
+    the unresolved fallback (`resolved=False`, empty title/state) — the
+    merge must not fabricate metadata that was never fetched."""
+    body = "Duplicate of #1"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("issues/5"):
+            return _json(_issue_with_body(5, body=body))
+        aux = _empty_aux_handler(req)
+        return aux if aux else _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    _, _, relations, _ = GitLabProvider().get_ticket(_project(), "t", "5")
+    dup_rels = [r for r in relations if r.kind == "duplicate_of" and r.ticket_id == "#1"]
+    assert len(dup_rels) == 1
+    rel = dup_rels[0]
+    assert rel.resolved is False
+    assert rel.title == ""
+    assert rel.state == ""
+
+
+def test_relates_to_link_without_body_scan_duplicate_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An issue-links `relates_to` entry with no matching body-scan
+    `duplicate_of` for the same target must pass through unchanged —
+    the merge must not swallow unrelated links."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("issues/5"):
+            return _json(_issue_with_body(5, body=""))
+        if "/issues/5/links" in url:
+            return _json([{
+                "iid": 3,
+                "link_type": "relates_to",
+                "title": "Unrelated issue",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/3",
+                "state": "opened",
+                "references": {"relative": "#3"},
+            }])
+        aux = _empty_aux_handler(req)
+        return aux if aux else _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    _, _, relations, _ = GitLabProvider().get_ticket(_project(), "t", "5")
+    related = [r for r in relations if r.ticket_id == "#3"]
+    assert len(related) == 1
+    rel = related[0]
+    assert rel.kind == "relates_to"
+    assert rel.title == "Unrelated issue"
+    assert rel.state == "open"
+    assert rel.resolved is True
 
 
 # ---------- F10: state normalisation -----------------------------------------

@@ -576,6 +576,171 @@ def test_duplicate_of_no_extra_mentions_from_body_marker(
     assert len(entries_for_target) == 1
 
 
+# ---------- ticket #136: duplicate_of resolution vs body-scan dedup --------
+
+
+def test_duplicate_of_resolved_entry_wins_over_body_scan_stub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Body scan + resolving timeline event for the same target: the
+    single surviving `duplicate_of` relation must carry the real
+    title/state from the timeline entry and `resolved is True` — not the
+    empty-title/state unresolved stub the body scan emits first."""
+
+    body = "Duplicate of #9"
+    canonical = _issue_payload(9, title="Canonical issue", state="open")
+    canonical["repository"] = {"full_name": "acme/backend"}
+    timeline = [
+        {
+            "event": "marked_as_duplicate",
+            "canonical": canonical,
+            "dupe": _issue_payload(42, body=body),
+        }
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/42":
+            return _json(_issue_payload(42, body=body))
+        if path == "/repos/acme/backend/issues/42/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/42/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/42/timeline":
+            return _json(timeline)
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="42")
+    dup_rels = [r for r in relations if r.kind == "duplicate_of" and r.ticket_id == "#9"]
+    assert len(dup_rels) == 1, f"expected exactly one duplicate_of #9, got {relations}"
+    rel = dup_rels[0]
+    assert rel.title == "Canonical issue"
+    assert rel.state == "open"
+    assert rel.resolved is True
+
+
+def test_duplicate_of_without_timeline_stays_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Body-scan `duplicate_of` with no resolving timeline event keeps
+    the unresolved fallback (`resolved=False`, empty title/state) —
+    the merge must not fabricate metadata that was never fetched."""
+
+    body = "Duplicate of #1"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/4":
+            return _json(_issue_payload(
+                4, body=body, state="closed", state_reason="duplicate",
+            ))
+        if path == "/repos/acme/backend/issues/4/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/4/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/4/timeline":
+            return _json([])
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="4")
+    dup_rels = [r for r in relations if r.kind == "duplicate_of" and r.ticket_id == "#1"]
+    assert len(dup_rels) == 1
+    rel = dup_rels[0]
+    assert rel.resolved is False
+    assert rel.title == ""
+    assert rel.state == ""
+
+
+def test_duplicate_of_resolved_without_body_scan_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolved `duplicate_of` from the timeline with no matching
+    body-scan entry passes through unchanged (nothing to merge)."""
+
+    canonical = _issue_payload(9, title="Canonical issue", state="open")
+    canonical["repository"] = {"full_name": "acme/backend"}
+    timeline = [
+        {
+            "event": "marked_as_duplicate",
+            "canonical": canonical,
+            "dupe": _issue_payload(42),
+        }
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/42":
+            return _json(_issue_payload(42))
+        if path == "/repos/acme/backend/issues/42/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/42/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/42/timeline":
+            return _json(timeline)
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="42")
+    assert len(relations) == 1
+    rel = relations[0]
+    assert rel.kind == "duplicate_of"
+    assert rel.ticket_id == "#9"
+    assert rel.title == "Canonical issue"
+    assert rel.resolved is True
+
+
+def test_mentions_suppressed_when_duplicate_of_resolved_via_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even after the resolved-vs-unresolved merge, the strong-label
+    suppression of `mentioned_by`/`mentions` for the same target still
+    holds — the merge must not reintroduce a weakened duplicate label."""
+
+    body = "Duplicate of #9"
+    canonical = _issue_payload(9, title="Canonical issue", state="open")
+    canonical["repository"] = {"full_name": "acme/backend"}
+    timeline = [
+        {
+            "event": "marked_as_duplicate",
+            "canonical": canonical,
+            "dupe": _issue_payload(42, body=body),
+        }
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/42":
+            return _json(_issue_payload(42, body=body))
+        if path == "/repos/acme/backend/issues/42/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/42/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/42/timeline":
+            return _json(timeline)
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="42")
+    assert not any(r.kind in ("mentions", "mentioned_by") and r.ticket_id == "#9" for r in relations)
+
+
 def test_duplicated_by_relabel_from_cross_ref(monkeypatch: pytest.MonkeyPatch) -> None:
     """A cross-ref from a closed-as-duplicate source becomes `duplicated_by`."""
 

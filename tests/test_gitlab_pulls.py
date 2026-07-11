@@ -896,13 +896,21 @@ def test_create_then_reply_round_trip_uses_surfaced_discussion_id(
 
 
 def test_submit_pr_review_approve_no_body(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Approve without body hits only `/approve`."""
+    """Approve without body hits `/approve` and `GET /user` — never `/notes`.
+
+    Ticket #136: the `/approve` response is a MergeRequestApproval object
+    (no top-level `user`), so `author` must come from the authenticated-
+    identity endpoint instead of degrading to `""`. `body`/`url` are
+    genuinely absent (no note was posted) so they must be `None`, not `""`.
+    """
     seen: list[str] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
         seen.append(f"{req.method} {req.url.path}")
         if req.method == "POST" and req.url.path.endswith("/approve"):
             return _json({"iid": 5, "web_url": "u", "updated_at": "t"})
+        if req.method == "GET" and req.url.path.endswith("/user"):
+            return _json({"id": 1, "username": "acting-user"})
         return _json({}, status_code=404)
 
     _install_mock(monkeypatch, handler)
@@ -910,7 +918,39 @@ def test_submit_pr_review_approve_no_body(monkeypatch: pytest.MonkeyPatch) -> No
         _project(), "t", "5", state="approve",
     )
     assert review.state == "approve"
+    assert review.author == "acting-user"
+    assert review.body is None
+    assert review.url is None
     assert all("notes" not in p for p in seen)
+    assert any(p.endswith("/user") for p in seen)
+
+
+def test_submit_pr_review_approve_with_body_populates_note_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to the bare-approve case: when a note IS created, the
+    note's author/body/url stay populated (non-None) strings — the
+    None-on-absence behavior must not regress this path."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path.endswith("/approve"):
+            return _json({"iid": 5, "web_url": "u", "updated_at": "t"})
+        if req.method == "POST" and req.url.path.endswith("/notes"):
+            return _json({
+                "id": 9, "body": "#ai-generated\n\nlgtm",
+                "author": {"username": "alice"},
+                "web_url": "url",
+                "created_at": "2024-01-01T00:00:00Z",
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    review = GitLabProvider().submit_pr_review(
+        _project(), "t", "5", state="approve", body="lgtm",
+    )
+    assert review.author == "alice"
+    assert isinstance(review.body, str) and review.body
+    assert isinstance(review.url, str) and review.url
 
 
 def test_submit_pr_review_approve_with_body_posts_note(
@@ -1395,10 +1435,11 @@ def test_add_pr_review_comment_reply_url_synthesised(
 # ---------- submit_pr_review URL synthesis (ticket #4) -----------------------
 
 
-def test_submit_pr_review_approve_no_body_url_is_mr_url(
+def test_submit_pr_review_approve_no_body_url_is_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Approve without body → url comes from MR web_url in the approve response."""
+    """Approve without body → url is None (ticket #136: no note means no
+    review-specific URL to report, regardless of the MR's own web_url)."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         if req.method == "POST" and req.url.path.endswith("/approve"):
@@ -1407,11 +1448,13 @@ def test_submit_pr_review_approve_no_body_url_is_mr_url(
                 "web_url": "https://gitlab.com/acme/backend/-/merge_requests/5",
                 "updated_at": "2024-01-01T00:00:00Z",
             })
+        if req.method == "GET" and req.url.path.endswith("/user"):
+            return _json({"id": 1, "username": "acting-user"})
         return _json({}, status_code=404)
 
     _install_mock(monkeypatch, handler)
     review = GitLabProvider().submit_pr_review(_project(), "t", "5", state="approve")
-    assert review.url == "https://gitlab.com/acme/backend/-/merge_requests/5"
+    assert review.url is None
 
 
 def test_submit_pr_review_approve_with_body_url_is_note_anchor(

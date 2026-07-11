@@ -546,13 +546,22 @@ class Review:
 
     `commit_sha` is set only when the provider pins reviews to a
     specific commit (GitHub). GitLab leaves it `None`.
+
+    `body` / `url` follow the shared "``null`` vs empty string"
+    convention: `None` means the field is genuinely not applicable to
+    this review (nothing to report), while `""` means the field is
+    present but empty. Only GitLab currently emits `None` here — on a
+    bare `approve` (no note posted), there is no review-specific body
+    or URL to report, so both come back `None`. GitHub and Azure DevOps
+    are unaffected by this and continue to emit `str` (falling back to
+    `""`) for every review.
     """
 
     id: str
     state: ReviewState
     author: str
-    body: str
-    url: str
+    body: str | None
+    url: str | None
     submitted_at: str
     commit_sha: str | None = None
 
