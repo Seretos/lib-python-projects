@@ -43,6 +43,7 @@ from lib_python_projects.providers.base import (
     RelationNotFound,
     Review,
     ReviewComment,
+    ReviewState,
     Status,
     StatusSpec,
     Ticket,
@@ -374,6 +375,35 @@ def _map_review_comment(raw: dict) -> ReviewComment:
         updated_at=normalize_timestamp(raw.get("updated_at") or ""),
         url=raw.get("html_url") or None,
         discussion_id=discussion_id,
+    )
+
+
+_REVIEW_STATE_MAP: dict[str, ReviewState] = {
+    "APPROVED": "approve",
+    "CHANGES_REQUESTED": "request_changes",
+    "COMMENTED": "comment",
+    "DISMISSED": "comment",
+}
+
+
+def _map_review(raw: dict) -> Review | None:
+    """Translate a GitHub `/pulls/{n}/reviews` item into `Review`.
+
+    Returns `None` for `PENDING` entries (an unsubmitted review still
+    being drafted by the reviewer) — callers filter those out so
+    `list_pr_reviews` only reports reviews that were actually submitted.
+    """
+    state = _REVIEW_STATE_MAP.get(raw.get("state") or "")
+    if state is None:
+        return None
+    return Review(
+        id=str(raw["id"]),
+        state=state,
+        author=(raw.get("user") or {}).get("login", ""),
+        body=raw.get("body") or "",
+        url=raw.get("html_url") or "",
+        submitted_at=raw.get("submitted_at"),
+        commit_sha=raw.get("commit_id"),
     )
 
 
@@ -3586,6 +3616,28 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             _check(r)
             return [_map_review_comment(it) for it in r.json()]
 
+    def list_pr_reviews(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        pr_id: str,
+    ) -> list[Review]:
+        """List submitted reviews on a PR.
+
+        Hits `GET /repos/{o}/{r}/pulls/{n}/reviews`, capped at 100 per
+        page (the GitHub maximum) — matching `list_pr_review_comments`'s
+        single-page take. `PENDING` reviews (still being drafted by the
+        reviewer, not yet submitted) are skipped.
+        """
+        with _client(token) as client:
+            r = client.get(
+                f"{_repo_path(project)}/pulls/{pr_id}/reviews",
+                params={"per_page": 100},
+            )
+            _check(r)
+            reviews = [_map_review(it) for it in r.json()]
+            return [rv for rv in reviews if rv is not None]
+
     def add_pr_review_comment(
         self,
         project: ProjectConfig,
@@ -3695,7 +3747,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     raise GitHubError(
                         404, f"PR '{project.id}#{pr_id}' not found"
                     ) from exc
-                if exc.status == 422 and "can not approve your own pull request" in exc.message.lower():
+                if exc.status == 422 and "your own pull request" in exc.message.lower():
                     raise GitHubError(
                         422,
                         exc.message + " (GitHub platform restriction; use another account)",

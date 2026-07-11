@@ -2590,6 +2590,58 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                     ))
             return out
 
+    def list_pr_reviews(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        pr_id: str,
+    ) -> list[Review]:
+        """List reviews on an MR, synthesized from the approvals state.
+
+        GitLab has no review-object endpoint — unlike GitHub/Azure DevOps,
+        there is nothing that models a submitted "review" as a distinct
+        resource. This method hits `GET /projects/:id/merge_requests/
+        :iid/approvals` (the same endpoint `get_pr` already uses) and
+        emits one `Review(state="approve", ...)` per entry in the
+        `approved_by[]` array.
+
+        **Known limitation**: request_changes/comment-style reviews are
+        posted as plain notes on GitLab (see `submit_pr_review`), which
+        are indistinguishable from ordinary MR comments once posted —
+        there is no marker separating a "review comment" note from a
+        regular discussion note. Those are therefore NOT recoverable via
+        this method; only approvals are. The approvals payload also
+        carries no per-approver timestamp or note body, so `body` and
+        `url` are `None` and `submitted_at` is `""` for every entry —
+        this mirrors the `Review.body`/`Review.url` "null means not
+        applicable" convention documented on the dataclass.
+
+        If the approvals endpoint is unavailable (403 restricted scope,
+        404 self-hosted edition without the approvals API), this
+        degrades to `[]` rather than raising — same graceful fallback
+        `get_pr` uses for the same endpoint.
+        """
+        path = _project_path(project)
+        with _client(project, token) as client:
+            ar = client.get(
+                f"/projects/{path}/merge_requests/{pr_id}/approvals"
+            )
+            if ar.status_code in (403, 404):
+                return []
+            _check(ar)
+            approved_by = ar.json().get("approved_by") or []
+            return [
+                Review(
+                    id=str((entry.get("user") or {}).get("id", "")),
+                    state="approve",
+                    author=(entry.get("user") or {}).get("username", ""),
+                    body=None,
+                    url=None,
+                    submitted_at="",
+                )
+                for entry in approved_by
+            ]
+
     def add_pr_review_comment(
         self,
         project: ProjectConfig,

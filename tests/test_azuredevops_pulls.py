@@ -342,6 +342,196 @@ def test_list_pr_review_comments_only_anchored_threads(
     assert rc.side == "RIGHT"
 
 
+# ---------- list_pr_reviews -------------------------------------------------
+
+
+def test_list_pr_reviews_maps_votes_and_attaches_matched_thread_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reviewers with votes 10/-10/0: the 0-vote reviewer is skipped, the
+    others map to approve/request_changes. The body is pulled from the
+    matching review-body thread (author id == reviewer id); an unrelated
+    (non-review-body) thread must NOT be attached."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[
+                    {
+                        "id": "reviewer-approve",
+                        "displayName": "Alice Builder",
+                        "uniqueName": "alice@example.com",
+                        "vote": 10,
+                    },
+                    {
+                        "id": "reviewer-reject",
+                        "displayName": "Bob Reviewer",
+                        "uniqueName": "bob@example.com",
+                        "vote": -10,
+                    },
+                    {
+                        "id": "reviewer-pending",
+                        "displayName": "Carol Pending",
+                        "uniqueName": "carol@example.com",
+                        "vote": 0,
+                    },
+                ],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 10,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": "2026-06-01T12:00:00Z",
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "reviewer-approve"},
+                                "content": "<p>lgtm</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                    {
+                        # Unrelated plain thread — not a review-body thread
+                        # and not authored by a reviewer with a matching id.
+                        # Must not be attached to any review.
+                        "id": 11,
+                        "threadContext": None,
+                        "publishedDate": "2026-06-01T13:00:00Z",
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "reviewer-approve"},
+                                "content": "<p>just a regular comment</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    reviews = AzureDevOpsProvider().list_pr_reviews(
+        _project(), token="t", pr_id="7"
+    )
+    by_id = {rv.id.split(":")[0]: rv for rv in reviews}
+    assert set(by_id) == {"reviewer-approve", "reviewer-reject"}
+    assert "reviewer-pending" not in by_id  # vote==0 skipped
+
+    approve_review = by_id["reviewer-approve"]
+    assert approve_review.state == "approve"
+    assert approve_review.author == "alice@example.com"  # login, not display name
+    assert approve_review.body == "lgtm"  # from the matched review-body thread
+    assert approve_review.submitted_at
+
+    reject_review = by_id["reviewer-reject"]
+    assert reject_review.state == "request_changes"
+    assert reject_review.author == "bob@example.com"
+    # No matching review-body thread for this reviewer.
+    assert reject_review.body == ""
+    assert reject_review.submitted_at == ""
+
+
+def test_list_pr_reviews_reviewer_with_no_matching_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reviewer with a vote but no matching review-body thread gets
+    body=='' and submitted_at==''."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[
+                    {
+                        "id": "reviewer-1",
+                        "displayName": "Alice Builder",
+                        "uniqueName": "alice@example.com",
+                        "vote": 5,
+                    },
+                ],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    reviews = AzureDevOpsProvider().list_pr_reviews(
+        _project(), token="t", pr_id="7"
+    )
+    assert len(reviews) == 1
+    assert reviews[0].state == "approve"  # vote 5 = approve-with-suggestions
+    assert reviews[0].body == ""
+    assert reviews[0].submitted_at == ""
+
+
+def test_list_pr_reviews_waiting_for_author_maps_to_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vote -5 (waiting-for-author) maps to the "comment" state."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[
+                    {
+                        "id": "reviewer-1",
+                        "uniqueName": "alice@example.com",
+                        "vote": -5,
+                    },
+                ],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    reviews = AzureDevOpsProvider().list_pr_reviews(
+        _project(), token="t", pr_id="7"
+    )
+    assert len(reviews) == 1
+    assert reviews[0].state == "comment"
+
+
+def test_list_pr_reviews_no_reviewers_returns_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(7, reviewers=[]))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    reviews = AzureDevOpsProvider().list_pr_reviews(
+        _project(), token="t", pr_id="7"
+    )
+    assert reviews == []
+
+
 # ---------- create_pr -------------------------------------------------------
 
 
@@ -579,6 +769,105 @@ def test_add_pr_comment_creates_thread_without_context(
     # Top-of-thread comments expose the bare thread id, matching the
     # GitHub `id == discussion_id` invariant.
     assert comment.id == "42"
+
+
+def test_add_pr_comment_author_is_login_email(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #148 finding 2: `add_pr_comment`'s author must prefer the
+    login-shaped `uniqueName` over `displayName`, matching
+    `list_pr_review_comments`' author shape. This fails on the
+    pre-fix `_map_thread_comment` (which returned the displayName
+    "Alice" via `_identity_display_name`)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if req.method == "POST" and req.url.path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "id": 42,
+                "threadContext": None,
+                "comments": [
+                    {
+                        "id": 1,
+                        "author": {
+                            "displayName": "Alice",
+                            "uniqueName": "alice@example.com",
+                        },
+                        "content": "<p>LGTM</p>",
+                        "commentType": "text",
+                        "publishedDate": "2026-05-18T10:00:00Z",
+                    }
+                ],
+            })
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    comment = AzureDevOpsProvider().add_pr_comment(
+        _project(), token="t", pr_id="7", body="LGTM"
+    )
+    assert comment.author == "alice@example.com"
+    assert comment.author != "Alice"
+
+
+def test_add_pr_comment_and_list_pr_review_comments_agree_on_author(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same underlying actor must produce the same author string on
+    both `add_pr_comment`'s returned `Comment` and
+    `list_pr_review_comments`' returned `ReviewComment` — the core
+    parity/consistency this ticket is about (ticket #148 finding 2)."""
+    actor = {"displayName": "Alice Builder", "uniqueName": "alice@example.com"}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "id": 42,
+                "threadContext": None,
+                "comments": [
+                    {
+                        "id": 1,
+                        "author": actor,
+                        "content": "<p>LGTM</p>",
+                        "commentType": "text",
+                    }
+                ],
+            })
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 43,
+                        "threadContext": {
+                            "filePath": "/a.py",
+                            "rightFileStart": {"line": 5},
+                        },
+                        "comments": [
+                            {
+                                "id": 1,
+                                "parentCommentId": 0,
+                                "author": actor,
+                                "content": "<p>inline note</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    }
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    provider = AzureDevOpsProvider()
+    comment = provider.add_pr_comment(_project(), token="t", pr_id="7", body="LGTM")
+    review_comments = provider.list_pr_review_comments(
+        _project(), token="t", pr_id="7"
+    )
+    assert comment.author == review_comments[0].author == "alice@example.com"
 
 
 def _items_handler_for_file(line_count: int = 50):
@@ -1034,9 +1323,11 @@ def test_submit_pr_review_tags_body_thread_with_property(
     # Body got the #ai-generated prefix.
     assert "#ai-generated" in thread["comments"][0]["content"]
     # Review surface fields.
-    # author uses displayName to match _map_pr / _map_thread_comment on
-    # Azure (consistent identity shape across all PR surfaces).
-    assert review.author == "Alice Builder"
+    # author uses the login-shaped identifier (uniqueName/email) to match
+    # _map_thread_comment / _map_thread_comment_for_review on Azure —
+    # every comment/review authorship surface uses the same login shape,
+    # mirroring GitHub's user.login and GitLab's username.
+    assert review.author == "alice@example.com"
     assert review.author != "user-guid"  # never the bare GUID
     assert review.submitted_at  # not empty
     assert review.id != "user-guid"  # synthesized, not the reviewer GUID
@@ -1251,9 +1542,11 @@ def test_submit_pr_review_author_never_falls_through_to_guid(
     review = AzureDevOpsProvider().submit_pr_review(
         _project(), token="t", pr_id="7", state="approve", body="lgtm"
     )
-    # author uses displayName, matching the _map_pr / _map_thread_comment
-    # convention so the same user looks the same across all Azure
-    # PR-related surfaces.
+    # No uniqueName/mailAddress/principalName is present anywhere in the
+    # merged identity, so _identity_login_or_display correctly falls
+    # through to displayName here — this is the "no login-shaped field
+    # available" edge case, not a change from the uniqueName-preferred
+    # default.
     assert review.author == "Arne von Appen"
     assert review.author != "guid-only"
 
@@ -1290,8 +1583,8 @@ def test_submit_pr_review_author_via_reviewer_put_response(
 ) -> None:
     """When connectionData returns only the GUID, the reviewer PUT
     response carries the human-readable identity. The merged identity
-    must surface the displayName so the author field is consistent
-    with the PR-level / comment-level author shape on Azure."""
+    must surface the login-shaped uniqueName so the author field is
+    consistent with the comment-level author shape on Azure."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         cached = _repos_handler(req)
@@ -1317,9 +1610,9 @@ def test_submit_pr_review_author_via_reviewer_put_response(
     review = AzureDevOpsProvider().submit_pr_review(
         _project(), token="t", pr_id="7", state="approve", body="lgtm",
     )
-    # The merged identity surfaces displayName from the PUT response;
+    # The merged identity surfaces the uniqueName from the PUT response;
     # the bare GUID from connectionData never bleeds through.
-    assert review.author == "Arne von Appen"
+    assert review.author == "arne@example.com"
     assert "guid-only" not in review.author
 
 

@@ -1773,3 +1773,74 @@ def test_list_prs_base_sha_is_none_when_diff_refs_absent(
     )
     assert len(prs) == 1
     assert prs[0].base["sha"] is None
+
+
+# ---------- Ticket #148: list_pr_reviews synthesized from approvals --------
+
+
+def test_list_pr_reviews_maps_approved_by_to_approve_reviews(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each entry in approvals.approved_by[] becomes a Review(state=
+    "approve", ...). body/url are None and submitted_at is "" because
+    the approvals payload carries no per-approver note/timestamp."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.endswith("merge_requests/9/approvals"):
+            return _json({
+                "approvals_required": 1,
+                "approved": True,
+                "approved_by": [
+                    {"user": {"id": 1, "username": "alice"}},
+                    {"user": {"id": 2, "username": "bob"}},
+                ],
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    reviews = GitLabProvider().list_pr_reviews(_project(), "t", "9")
+    assert [rv.author for rv in reviews] == ["alice", "bob"]
+    for rv in reviews:
+        assert rv.state == "approve"
+        assert rv.body is None
+        assert rv.url is None
+        assert rv.submitted_at == ""
+
+
+def test_list_pr_reviews_empty_approved_by_returns_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No approvers yet -> empty list, not an error."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.endswith("merge_requests/9/approvals"):
+            return _json({
+                "approvals_required": 1,
+                "approved": False,
+                "approved_by": [],
+            })
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    reviews = GitLabProvider().list_pr_reviews(_project(), "t", "9")
+    assert reviews == []
+
+
+def test_list_pr_reviews_approvals_endpoint_unavailable_returns_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403 (restricted scope) or 404 (self-hosted edition without the
+    approvals API) on the approvals endpoint degrades to [] rather than
+    raising — mirroring get_pr's fallback for the same endpoint."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.endswith("merge_requests/9/approvals"):
+            return _json({"message": "403 Forbidden"}, status_code=403)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    reviews = GitLabProvider().list_pr_reviews(_project(), "t", "9")
+    assert reviews == []

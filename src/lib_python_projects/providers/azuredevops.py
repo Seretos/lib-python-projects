@@ -73,6 +73,7 @@ from lib_python_projects.providers.base import (
     RelationNotFound,
     Review,
     ReviewComment,
+    ReviewState,
     Status,
     StatusSpec,
     Ticket,
@@ -1196,7 +1197,7 @@ def _map_thread_comment(
     comment_id = raw.get("id") or 0
     return Comment(
         id=_format_thread_comment_id(thread_id, comment_id),
-        author=_identity_display_name(raw.get("author")),
+        author=_identity_login_or_display(raw.get("author")),
         body=_html_to_markdown(raw.get("content") or ""),
         url=_build_pr_url(project, pr_id) + f"?discussionId={thread_id}",
         created_at=normalize_timestamp(raw.get("publishedDate") or ""),
@@ -3069,6 +3070,95 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 )
         return out
 
+    _VOTE_STATE_MAP: dict[int, ReviewState] = {
+        10: "approve",
+        5: "approve",
+        -10: "request_changes",
+        -5: "comment",
+    }
+
+    def list_pr_reviews(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        pr_id: str,
+    ) -> list[Review]:
+        """List reviews on a PR, synthesized from reviewer votes.
+
+        ADO models a review as a per-reviewer `vote` on the PR resource
+        rather than a distinct review object (mirrors `submit_pr_review`'s
+        write path). This fetches the PR (the same GET `get_pr` uses) and
+        emits one `Review` per reviewer with a non-zero vote:
+
+          - `10` (approved) / `5` (approved-with-suggestions) -> `"approve"`
+          - `-10` (rejected) -> `"request_changes"`
+          - `-5` (waiting-for-author) -> `"comment"`
+          - `0` (merely requested, hasn't voted) -> skipped, matching the
+            reviewers/requested split already applied in `_map_pr`.
+
+        Bodies aren't attached to the vote itself, so this best-effort
+        matches each review to the review-body thread (tagged via
+        `_is_review_body_thread`) whose first comment's author id equals
+        the reviewer's id. When matched, `body`/`submitted_at` come from
+        that thread; otherwise both fall back to `""` (there is no
+        review-specific body/timestamp to report on Azure DevOps, and
+        GitHub/Azure both emit `str` rather than `None` for `Review.body`
+        per the shared convention documented on the dataclass).
+        """
+        repo_id = self._resolve_repository_id(project, token)
+        path = (
+            f"{_project_scope(project)}/_apis/git/repositories/"
+            f"{quote(repo_id, safe='')}/pullrequests/{quote(str(pr_id), safe='')}"
+        )
+        with _client(project, token) as c:
+            resp = c.get(path, params=_api_version_params())
+        _check(resp)
+        raw = resp.json()
+
+        review_body_threads = [
+            t
+            for t in self._list_pr_threads(project, token, pr_id, repo_id)
+            if _is_review_body_thread(t)
+        ]
+
+        def _matching_thread(reviewer_id: str) -> dict | None:
+            for thread in review_body_threads:
+                comments = thread.get("comments") or []
+                if not comments:
+                    continue
+                author_id = (comments[0].get("author") or {}).get("id")
+                if author_id == reviewer_id:
+                    return thread
+            return None
+
+        out: list[Review] = []
+        for reviewer in raw.get("reviewers") or []:
+            vote = reviewer.get("vote") or 0
+            state = self._VOTE_STATE_MAP.get(vote)
+            if state is None:
+                continue
+            reviewer_id = reviewer.get("id") or ""
+            thread = _matching_thread(reviewer_id)
+            if thread is not None:
+                body = _html_to_markdown(
+                    (thread.get("comments") or [{}])[0].get("content") or ""
+                )
+                submitted_at = normalize_timestamp(thread.get("publishedDate") or "")
+            else:
+                body = ""
+                submitted_at = ""
+            out.append(
+                Review(
+                    id=f"{reviewer_id}:{vote}",
+                    state=state,
+                    author=_identity_login_or_display(reviewer),
+                    body=body,
+                    url=_build_pr_url(project, pr_id),
+                    submitted_at=submitted_at,
+                )
+            )
+        return out
+
     # ---------- pull requests — write -------------------------------------
 
     def create_pr(
@@ -3805,14 +3895,17 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         return Review(
             id=synthesized_id,
             state=normalized_state,
-            # `_identity_display_name` keeps the author field
-            # consistent with `_map_pr` (PR-level author) and
-            # `_map_thread_comment` (PR comment author) — all three
-            # surfaces use the same display-name shape on Azure, so an
-            # agent that compares them sees a single identity string
-            # per user. Cross-provider, GitHub still returns its login;
-            # Azure returns the display name (its natural primary key).
-            author=_identity_display_name(merged_identity),
+            # `_identity_login_or_display` keeps the author field
+            # consistent with `_map_thread_comment` (PR comment author)
+            # and `_map_thread_comment_for_review` (review-comment
+            # author) — all comment/review authorship surfaces on Azure
+            # now use the same login-shaped identifier, matching how
+            # GitHub and GitLab surface `user.login`/username on every
+            # comment-author surface. PR-level participant fields
+            # (`_map_pr`'s author/reviewers/requested_reviewers) are a
+            # different surface and intentionally keep the display-name
+            # shape.
+            author=_identity_login_or_display(merged_identity),
             # Surface the marker-prefixed body so the contract docs
             # ("body carries #ai-generated") hold for the Review return.
             body=body_with_marker,

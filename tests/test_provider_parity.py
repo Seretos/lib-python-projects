@@ -851,6 +851,19 @@ def test_all_providers_expose_delete_comment():
         )
 
 
+def test_all_providers_expose_list_pr_reviews():
+    """All three providers must expose list_pr_reviews as a callable.
+    This is a static structural assertion (ticket #148 finding 1)."""
+    from lib_python_projects.providers.github import GitHubProvider
+    from lib_python_projects.providers.gitlab import GitLabProvider
+    from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+
+    for provider_cls in (GitHubProvider, GitLabProvider, AzureDevOpsProvider):
+        assert callable(getattr(provider_cls, "list_pr_reviews", None)), (
+            f"{provider_cls.__name__} is missing callable 'list_pr_reviews'"
+        )
+
+
 # ---------- ticket #35: Label dataclass and LabelOperationUnsupported --------
 
 

@@ -346,6 +346,36 @@ def test_submit_pr_review_self_review_422_adds_note(
     assert "another account" in exc.value.message
 
 
+def test_submit_pr_review_self_review_422_request_changes_adds_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """submit_pr_review 422 'Can not request changes on your own pull
+    request' must get the same platform-restriction note as the approve
+    case — the guard matches the shared 'your own pull request' substring
+    so every self-review verb is enriched, not just approve."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "/reviews" in req.url.path:
+            return _json(
+                {"message": "Can not request changes on your own pull request"},
+                status_code=422,
+            )
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().submit_pr_review(
+            _project(),
+            token="t",
+            pr_id="7",
+            state="request_changes",
+            body="please fix",
+        )
+    assert exc.value.status == 422
+    assert "GitHub platform restriction" in exc.value.message
+    assert "another account" in exc.value.message
+
+
 def test_submit_pr_review_other_422_not_modified(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
