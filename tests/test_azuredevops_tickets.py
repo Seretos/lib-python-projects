@@ -307,6 +307,222 @@ def test_list_tickets_no_area_path_clause_when_unset(
     assert " AND " in wiql
 
 
+def test_list_tickets_area_path_not_found_swallowed_recursive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #147, defect (a): ADO's WIQL endpoint 404s
+    with TF51011 for an area path it doesn't recognise, instead of the
+    documented "invalid area path yields zero matches" behaviour — even
+    for a value that `list_custom_fields` itself just reported as a valid
+    allowed_value (see defect b). `list_tickets` must swallow that
+    specific 404 into an empty result rather than raising. Covers
+    area_path_recursive=True (UNDER, the default). Fails (raises
+    AzureDevOpsError) on the unfixed code."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            return _json(
+                {
+                    "message": (
+                        "TF51011: The specified area path "
+                        "azure-tests\\Area does not exist. Verify that "
+                        "the area path is correct."
+                    ),
+                    "typeKey": "AreaOrIterationDoesNotExistInProjectException",
+                },
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    tickets, has_more = AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(area_path="azure-tests\\Area"),
+    )
+    assert tickets == []
+    assert has_more is False
+
+
+def test_list_tickets_area_path_not_found_swallowed_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same regression as above but for area_path_recursive=False (the
+    `=` operator) — ADO returns the same TF51011 404 for both operators,
+    so both must be swallowed."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            return _json(
+                {"message": "TF51011: The specified area path does not exist."},
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    tickets, has_more = AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(
+            area_path="azure-tests\\Area", area_path_recursive=False,
+        ),
+    )
+    assert tickets == []
+    assert has_more is False
+
+
+def test_list_tickets_area_path_non_area_404_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A WIQL 404 with `area_path` set but an unrelated message (no
+    TF51011, no "area path ... does not exist") must not be swallowed —
+    the swallow is narrowly anchored so genuine 404s from other causes
+    (e.g. missing project) still surface."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            return _json(
+                {"message": "TF200016: The following project does not exist"},
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    with pytest.raises(AzureDevOpsError):
+        AzureDevOpsProvider().list_tickets(
+            _project(default_type="Issue"),
+            token="t",
+            filters=TicketFilters(area_path="azure-tests\\Area"),
+        )
+
+
+def test_list_tickets_no_area_path_404_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The swallow is gated on `filters.area_path` being set — a WIQL 404
+    that carries the TF51011 area-path-not-found signature must still
+    raise when no `area_path` filter was requested, guarding against
+    over-broad swallowing."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            return _json(
+                {"message": "TF51011: The specified area path does not exist."},
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    with pytest.raises(AzureDevOpsError):
+        AzureDevOpsProvider().list_tickets(
+            _project(default_type="Issue"),
+            token="t",
+            filters=TicketFilters(labels=["bug"]),
+        )
+
+
+def test_list_tickets_area_path_set_happy_path_returns_tickets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: a successful WIQL response with `area_path` set
+    still returns tickets normally — the new swallow-before-`_check` must
+    not interfere with the happy path."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if path.endswith("/_apis/wit/wiql"):
+            return _json({"workItems": [{"id": 1}]})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            return _json({"value": [_work_item_payload(1)]})
+        raise AssertionError(f"unexpected path {path}")
+
+    _install_mock(monkeypatch, handler)
+    tickets, has_more = AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(area_path="azure-tests"),
+    )
+    assert [t.id for t in tickets] == ["1"]
+    assert has_more is False
+
+
+def test_list_tickets_area_path_round_trip_discovered_value_is_filterable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-defect acceptance test (ticket #147): an `allowed_value`
+    discovered via `list_fields`'s classification-tree stripping (defect
+    b) must be a value the WIQL `area_path` filter (defect a) actually
+    accepts — i.e. the emitted WIQL clause uses the stripped value
+    (`azure-tests`), not the raw, non-functional node path
+    (`azure-tests\\Area`)."""
+    bt = _basic_template_handler()
+    fields = [
+        {
+            "referenceName": "System.AreaPath",
+            "name": "Area Path",
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+    registry = [{"referenceName": "System.AreaPath", "type": "treePath"}]
+    tree = {"path": "\\azure-tests\\Area", "children": []}
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
+            return _json({"value": fields})
+        if path.endswith("/_apis/wit/classificationnodes/Areas"):
+            return _json(tree)
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry})
+        if path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {path}")
+
+    p = _project(default_type="Issue")
+    _install_mock(monkeypatch, handler)
+
+    discovered = AzureDevOpsProvider().list_fields(p, token="t")
+    area_field = next(f for f in discovered if f.reference_name == "System.AreaPath")
+    assert area_field.allowed_values == ["azure-tests"]
+
+    AzureDevOpsProvider().list_tickets(
+        p,
+        token="t",
+        filters=TicketFilters(area_path=area_field.allowed_values[0]),
+    )
+    assert "[System.AreaPath] UNDER 'azure-tests'" in captured["wiql"]
+
+
 def test_list_tickets_state_open_filters_by_categories(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
