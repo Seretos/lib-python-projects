@@ -1138,6 +1138,20 @@ def _scan_refs(text: str, pattern: re.Pattern) -> list[str]:
     return seen
 
 
+def _gitlab_body_marks_duplicate_of(body: str, target_iid: str) -> bool:
+    """Does `body` contain a `Duplicate of #<target_iid>` marker?
+
+    This is the *same* discriminator `_fetch_relations` uses to report
+    `duplicate_of` relations (it scans the body with `_DUPLICATE_PATTERN`
+    via `_scan_refs`), so `remove_relation` can verify that the stored
+    relation actually is a `duplicate_of` before mutating anything —
+    fixing ticket #133 where a mismatched-kind removal deleted the
+    wrong relation. Reusing `_scan_refs` also gets us the partial-iid
+    guard for free (`#70` never matches a request for `#7`).
+    """
+    return f"#{target_iid}" in set(_scan_refs(body or "", _DUPLICATE_PATTERN))
+
+
 def _fetch_relations(
     client: httpx.Client,
     project: ProjectConfig,
@@ -2998,6 +3012,19 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         =reopen), deletes the auxiliary `relates_to` link, and strips
         the `Duplicate of #N` line from the body so that a subsequent
         `get_ticket` no longer surfaces the relation.
+
+        GitLab has no native `duplicate_of` link type — both
+        `relates_to` and `duplicate_of` are stored as the same wire
+        `link_type="relates_to"` (see `_gitlab_link_type`), with
+        `duplicate_of` additionally marked by a `Duplicate of #N` line
+        in the source issue's body. Because the wire representation is
+        identical, `remove_relation` must consult that body marker —
+        the same source of truth `_fetch_relations` uses on the read
+        side — to verify the *stored* relation is semantically the
+        `kind` being requested, before deleting anything. Otherwise a
+        mismatched-kind removal (e.g. requesting `duplicate_of` on a
+        pair that is really just `relates_to`, or vice versa) would
+        delete the wrong relation (ticket #133).
         """
         if kind == "parent" or kind == "child":
             raise RelationKindUnsupported(
@@ -3013,6 +3040,20 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         path = _project_path(project)
         with _client(project, token) as client:
             if kind == "relates_to":
+                # Verify the stored link isn't actually a duplicate_of
+                # emulation for this exact target before deleting it —
+                # otherwise removing "relates_to" would silently tear
+                # down a real duplicate_of relation (ticket #133).
+                src_r = client.get(f"/projects/{path}/issues/{ticket_id}")
+                _check(src_r)
+                src = src_r.json()
+                current_body = src.get("description") or ""
+                if _gitlab_body_marks_duplicate_of(current_body, target_iid):
+                    raise RelationNotFound(
+                        kind=kind,
+                        ticket_id=ticket_id,
+                        target=f"#{target_iid}",
+                    )
                 _gitlab_delete_issue_link(
                     client, path, ticket_id,
                     target_project_path=target_project,
@@ -3021,6 +3062,22 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 )
                 return {"removed": True}
             if kind == "duplicate_of":
+                # GET current body first (needed both to verify the
+                # marker is actually present for this target, and to
+                # strip the dup line further down).
+                src_r = client.get(f"/projects/{path}/issues/{ticket_id}")
+                _check(src_r)
+                src = src_r.json()
+                current_body = src.get("description") or ""
+                if not _gitlab_body_marks_duplicate_of(current_body, target_iid):
+                    # The stored relation isn't actually a duplicate_of
+                    # for this target — don't touch the link, body, or
+                    # state (ticket #133).
+                    raise RelationNotFound(
+                        kind=kind,
+                        ticket_id=ticket_id,
+                        target=f"#{target_iid}",
+                    )
                 # Tear down the relates_to link (best-effort) and
                 # reopen. Also strip the "Duplicate of #N" body line so
                 # a subsequent get_ticket no longer resurfaces the relation.
@@ -3034,11 +3091,6 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 except (GitLabError, RelationNotFound):
                     # Link may already be gone; reopen anyway.
                     pass
-                # GET current body so we can strip the dup line.
-                src_r = client.get(f"/projects/{path}/issues/{ticket_id}")
-                _check(src_r)
-                src = src_r.json()
-                current_body = src.get("description") or ""
                 current_labels = set(src.get("labels") or [])
                 will_be_ai_generated = AI_GENERATED_LABEL in current_labels
                 # Strip the exact "Duplicate of #<target_iid>" line and

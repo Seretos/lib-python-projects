@@ -488,10 +488,19 @@ def test_closing_mr_state_opened_normalised_to_open(
 def test_remove_relation_link_not_found_raises_relation_not_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """remove_relation raises RelationNotFound (a LookupError) when link absent."""
+    """remove_relation raises RelationNotFound (a LookupError) when link absent.
+
+    The `relates_to` branch now GETs the source issue first (to verify the
+    stored relation isn't actually a `duplicate_of` for this target — ticket
+    #133), so the mock must serve a marker-free body for issue #5 before
+    falling through to `_gitlab_delete_issue_link`, which still raises
+    `RelationNotFound` because `/links` returns no matching link.
+    """
 
     def handler(req: httpx.Request) -> httpx.Response:
         url = str(req.url)
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json(_issue_with_body(5, body=""))  # no dup marker
         if "/issues/5/links" in url:
             return _json([])  # no links
         return _json([], 404)
@@ -939,8 +948,17 @@ def test_remove_relation_duplicate_of_partial_iid_not_corrupted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """remove_relation(duplicate_of, '#7') must NOT corrupt a body that
-    contains 'Duplicate of #70' — the regex must only match the exact iid.
-    Without the (?!\\d) negative-lookahead fix, this body becomes '0\\n...'."""
+    also contains 'Duplicate of #70' — the strip regex must only match the
+    exact iid. Without the (?!\\d) negative-lookahead fix, the #70 line
+    becomes '0\\n...'.
+
+    Note (ticket #133): the body now also carries a genuine 'Duplicate of
+    #7' marker so remove_relation's stored-relation check (which requires
+    an exact-iid match via `_scan_refs`/`_DUPLICATE_PATTERN`, so '#70'
+    alone would no longer satisfy a request for '#7') passes and the
+    removal proceeds far enough to exercise the strip regex this test is
+    actually about.
+    """
     captured_put: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -958,11 +976,12 @@ def test_remove_relation_duplicate_of_partial_iid_not_corrupted(
         # DELETE /links/500 — succeed.
         if req.method == "DELETE" and "/links/500" in url:
             return _json({})
-        # GET /issues/5 — body has 'Duplicate of #70' (NOT #7).
+        # GET /issues/5 — body has both 'Duplicate of #7' (the real,
+        # exact-match marker) and 'Duplicate of #70' (must survive intact).
         if req.method == "GET" and url.endswith("/issues/5"):
             return _json({
                 "iid": 5,
-                "description": "Duplicate of #70\n\nsome content",
+                "description": "Duplicate of #7\n\nDuplicate of #70\n\nsome content",
                 "labels": [],
                 "state": "closed",
             })
@@ -976,7 +995,9 @@ def test_remove_relation_duplicate_of_partial_iid_not_corrupted(
     GitLabProvider().remove_relation(_project(), "t", "5", "duplicate_of", "#7")
 
     desc = captured_put["body"]["description"]
-    # The #70 line must be preserved intact — not truncated to "0\n...".
+    # The removed marker itself is gone...
+    assert "Duplicate of #7\n" not in desc
+    # ...but the #70 line must be preserved intact — not truncated to "0\n...".
     assert "Duplicate of #70" in desc, (
         f"'Duplicate of #70' was corrupted by partial iid match: {desc!r}"
     )
@@ -1085,3 +1106,178 @@ def test_add_relation_duplicate_of_409_path_resolved_true(
     assert relation.resolved is True, (
         f"expected resolved=True on the 409 synthesis path, got {relation.resolved!r}"
     )
+
+
+# ---------- ticket #133: remove_relation must verify the STORED relation -----
+# is semantically the requested `kind` before deleting anything, since GitLab
+# stores both `relates_to` and `duplicate_of` as the same wire
+# `link_type="relates_to"` and only the body's "Duplicate of #N" marker tells
+# them apart.
+
+
+def test_remove_relation_duplicate_of_mismatched_relates_to_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Primary regression test for ticket #133.
+
+    Source issue #5's body has NO 'Duplicate of' marker; its only stored
+    relation to #7 is a plain `relates_to` link. Calling
+    remove_relation(..., "duplicate_of", "#7") must raise RelationNotFound
+    and must NOT delete the link or touch the issue — on the unfixed code
+    this instead deleted the real `relates_to` link and returned
+    {"removed": True}.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json(_issue_with_body(5, body="no marker here"))
+        if req.method == "GET" and "/issues/5/links" in url:
+            return _json([{
+                "iid": 7, "issue_link_id": 600,
+                "link_type": "relates_to", "title": "", "web_url": "",
+                "state": "opened",
+            }])
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    seen = _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound) as exc:
+        GitLabProvider().remove_relation(
+            _project(), "t", "5", "duplicate_of", "#7"
+        )
+    assert exc.value.kind == "duplicate_of"
+    # No destructive call may have been issued: the real relates_to link
+    # and the issue's state/body must be left untouched.
+    assert not any(r.method == "DELETE" for r in seen)
+    assert not any(r.method == "PUT" for r in seen)
+
+
+def test_remove_relation_relates_to_mismatched_duplicate_of_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Symmetric regression test for ticket #133 (the other direction).
+
+    Source issue #5's body marks it as 'Duplicate of #7', and the stored
+    link to #7 is the same relates_to emulation `_gitlab_mark_duplicate_of`
+    writes. Calling remove_relation(..., "relates_to", "#7") must raise
+    RelationNotFound rather than deleting the real duplicate_of link —
+    matching GitHub/Azure DevOps behavior.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json(_issue_with_body(5, body="Duplicate of #7"))
+        if req.method == "GET" and "/issues/5/links" in url:
+            return _json([{
+                "iid": 7, "issue_link_id": 601,
+                "link_type": "relates_to", "title": "", "web_url": "",
+                "state": "opened",
+            }])
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    seen = _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound) as exc:
+        GitLabProvider().remove_relation(
+            _project(), "t", "5", "relates_to", "#7"
+        )
+    assert exc.value.kind == "relates_to"
+    assert not any(r.method == "DELETE" for r in seen)
+
+
+def test_remove_relation_duplicate_of_partial_iid_no_marker_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Edge case: body says 'Duplicate of #70', request targets '#7'.
+
+    The marker check must not partial-match #70 as covering #7 — removing
+    duplicate_of "#7" must raise RelationNotFound and must not mutate
+    anything (no DELETE, no PUT), since #7 is not actually marked as a
+    duplicate target.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json(_issue_with_body(5, body="Duplicate of #70"))
+        if req.method == "GET" and "/issues/5/links" in url:
+            return _json([])
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    seen = _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound) as exc:
+        GitLabProvider().remove_relation(
+            _project(), "t", "5", "duplicate_of", "#7"
+        )
+    assert exc.value.kind == "duplicate_of"
+    assert not any(r.method == "DELETE" for r in seen)
+    assert not any(r.method == "PUT" for r in seen)
+
+
+def test_remove_relation_relates_to_succeeds_when_dup_marker_is_for_other_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Edge case: the source has a genuine 'Duplicate of #9' marker AND a
+    separate plain relates_to link to #7. Removing relates_to "#7" must
+    still succeed (the marker check is per-target, not "any dup marker
+    present anywhere on the issue")."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json(_issue_with_body(5, body="Duplicate of #9"))
+        if req.method == "GET" and "/issues/5/links" in url:
+            return _json([{
+                "iid": 7, "issue_link_id": 602,
+                "link_type": "relates_to", "title": "", "web_url": "",
+                "state": "opened",
+            }])
+        if req.method == "DELETE" and "/links/602" in url:
+            return _json({})
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().remove_relation(
+        _project(), "t", "5", "relates_to", "#7"
+    )
+    assert result == {"removed": True}
+
+
+def test_remove_relation_duplicate_of_with_genuine_marker_still_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard for the valid path: when the body genuinely marks
+    'Duplicate of #7', remove_relation(duplicate_of, '#7') must still
+    tear down the link, strip the marker, and reopen — unchanged from
+    pre-fix behavior for the case where kind and stored relation match."""
+    captured_put: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and "/issues/5/links" in url:
+            return _json([{
+                "iid": 7, "issue_link_id": 603,
+                "link_type": "relates_to", "title": "", "web_url": "",
+                "state": "opened",
+            }])
+        if req.method == "DELETE" and "/links/603" in url:
+            return _json({})
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5,
+                "description": "Duplicate of #7\n\nsome content",
+                "labels": [],
+                "state": "closed",
+            })
+        if req.method == "PUT" and url.endswith("/issues/5"):
+            captured_put["body"] = json.loads(req.content.decode())
+            return _json({"iid": 5, "state": "opened"})
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().remove_relation(
+        _project(), "t", "5", "duplicate_of", "#7"
+    )
+    assert result == {"removed": True}
+    assert captured_put["body"]["state_event"] == "reopen"
+    assert "Duplicate of #7" not in captured_put["body"]["description"]
