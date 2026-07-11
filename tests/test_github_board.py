@@ -221,6 +221,87 @@ def test_board_items_query_is_brace_balanced() -> None:
     _assert_brace_balanced(github_provider._BOARD_ITEMS_USER_QUERY)
 
 
+# ---------- ticket #145: field-concatenation regression (`updatedAtauthor`) --
+#
+# The `_board_items_query` template used adjacent string literals
+# `"...createdAt updatedAt"` and `"author{login}"` with no separating space,
+# which Python concatenates into the single invalid GraphQL field
+# `updatedAtauthor`. GitHub's real GraphQL endpoint rejects the whole query
+# with a field-not-found error, breaking every column-filtered `list_tickets`
+# call. The `httpx.MockTransport` used elsewhere in this file returns canned
+# JSON regardless of query text, so this bug is invisible to the behavioural
+# tests above/below unless we assert on the query *string* itself.
+
+
+def test_board_items_query_has_no_field_concatenation_bug() -> None:
+    for query in (
+        github_provider._board_items_query("organization"),
+        github_provider._board_items_query("user"),
+        github_provider._BOARD_ITEMS_ORG_QUERY,
+        github_provider._BOARD_ITEMS_USER_QUERY,
+    ):
+        assert "updatedAtauthor" not in query
+        assert "updatedAt author" in query
+
+
+def test_list_tickets_board_column_query_body_has_no_field_concatenation_bug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: the query actually posted to `/graphql` by
+    `list_tickets(filters.board_column=...)` must be well-formed, and the
+    matching issue must come back — covers the org path directly."""
+    board = _board(["Review"])
+    seen_queries: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _graphql_body(req)
+        seen_queries.append(body["query"])
+        owner_field = _owner_field(body["query"])
+        return _json(
+            _items_response(owner_field, [_issue_node(1, status_name="Review")])
+        )
+
+    _install_mock(monkeypatch, handler)
+    tickets, _ = GitHubProvider().list_tickets(
+        _project(board), token="t", filters=TicketFilters(board_column="Review"),
+    )
+    assert [t.id for t in tickets] == ["1"]
+    assert seen_queries
+    for query in seen_queries:
+        assert "updatedAtauthor" not in query
+        assert "updatedAt author" in query
+
+
+def test_list_tickets_board_column_falls_back_to_user_query_body_has_no_field_concatenation_bug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same regression check, but through the user-fallback path (org
+    login unresolved) — both `_BOARD_ITEMS_ORG_QUERY` and
+    `_BOARD_ITEMS_USER_QUERY` come from the same template."""
+    board = _board(["Review"])
+    seen_queries: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _graphql_body(req)
+        seen_queries.append(body["query"])
+        owner_field = _owner_field(body["query"])
+        if owner_field == "organization":
+            return _json(_org_not_resolved_response())
+        return _json(
+            _items_response("user", [_issue_node(9, status_name="Review")])
+        )
+
+    _install_mock(monkeypatch, handler)
+    tickets, _ = GitHubProvider().list_tickets(
+        _project(board), token="t", filters=TicketFilters(board_column="Review"),
+    )
+    assert [t.id for t in tickets] == ["9"]
+    assert len(seen_queries) == 2
+    for query in seen_queries:
+        assert "updatedAtauthor" not in query
+        assert "updatedAt author" in query
+
+
 # ---------- list_board_columns ------------------------------------------------
 
 
@@ -1315,3 +1396,375 @@ def test_create_ticket_custom_fields_none_or_empty_is_unaffected_by_partial_erro
         custom_fields={},
     )
     assert ticket_empty.id == "99"
+
+
+# ---------- ticket #145: update_ticket(custom_fields=...) — write-side parity
+#
+# `create_ticket` has supported `custom_fields` since #123; `update_ticket`
+# did not, so a ticket's board column/status could never be changed after
+# creation through this provider. These tests mirror the `create_ticket`
+# custom_fields suite above, adapted for the update path: the issue already
+# exists (a `GET` fetches it), the REST write is a `PATCH` (which may end up
+# empty if `custom_fields` is the only thing changing), and a failed board
+# write raises a plain `GitHubError` — not `PartialTicketCreateError` (see
+# module docstring in the plan: no new partial-failure type on the update
+# path).
+#
+# The current issue is given the `ai-generated` label so `update_ticket`'s
+# unrelated "is this AI-generated / needs ai-modified label" bookkeeping
+# doesn't add incidental label mutations to the PATCH payload, keeping each
+# test focused on the custom_fields behaviour under test.
+
+
+def _ai_issue_payload(number: int, **overrides) -> dict:
+    overrides.setdefault("labels", [{"name": "ai-generated"}])
+    return _rest_issue_payload(number, **overrides)
+
+
+def test_update_ticket_custom_fields_writes_via_project_v2_mutations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    calls: list[tuple[str, dict]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            calls.append((query, variables))
+            if "addProjectV2ItemById" in query:
+                assert variables == {
+                    "projectId": "proj-node-id", "contentId": "issue-node-42",
+                }
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                field_name = variables["fieldName"]
+                if field_name == "Status":
+                    return _json({"data": {owner_field: {"projectV2": {"field": {
+                        "id": "field-status", "name": "Status",
+                        "options": [{"id": "opt-done", "name": "Done"}],
+                    }}}}})
+                if field_name == "Points":
+                    return _json({"data": {owner_field: {"projectV2": {"field": {
+                        "id": "field-points", "name": "Points",
+                    }}}}})
+                raise AssertionError(f"unexpected fieldName {field_name!r}")
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42",
+        custom_fields={"Status": "Done", "Points": 3},
+    )
+    assert ticket.id == "42"
+    update_calls = {
+        v["fieldId"]: v["value"] for q, v in calls
+        if "updateProjectV2ItemFieldValue" in q
+    }
+    assert update_calls == {
+        "field-status": {"singleSelectOptionId": "opt-done"},
+        "field-points": {"number": 3},
+    }
+
+
+def test_update_ticket_custom_fields_single_select_case_insensitive_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parity with `create_ticket`: a differently-cased value (`"done"`)
+    still resolves to the live option named `"Done"`'s `optionId`."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    calls: list[tuple[str, dict]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            calls.append((query, variables))
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": "done"},
+    )
+    assert ticket.id == "42"
+    update_calls = {
+        v["fieldId"]: v["value"] for q, v in calls
+        if "updateProjectV2ItemFieldValue" in q
+    }
+    assert update_calls == {"field-status": {"singleSelectOptionId": "opt-done"}}
+
+
+def test_update_ticket_custom_fields_combined_with_status_and_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single REST `PATCH` lands `title`/`status` AND the board write
+    fires — the two are not mutually exclusive."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    patch_payloads: list[dict] = []
+    board_write_seen = {"add_item": False, "update_field": False}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, title="old title"))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            patch_payloads.append(json.loads(req.content.decode("utf-8")))
+            return _json(_ai_issue_payload(42, title="new title", state="closed"))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            if "addProjectV2ItemById" in query:
+                board_write_seen["add_item"] = True
+                assert variables["contentId"] == "issue-node-42"
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                board_write_seen["update_field"] = True
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42",
+        title="new title",
+        status="closed:completed",
+        custom_fields={"Status": "Done"},
+    )
+    assert ticket.id == "42"
+    assert patch_payloads == [{
+        "title": "new title", "state": "closed", "state_reason": "completed",
+    }]
+    assert board_write_seen == {"add_item": True, "update_field": True}
+
+
+def test_update_ticket_custom_fields_none_or_empty_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`custom_fields=None`/`{}` performs no GraphQL call at all — same
+    silent no-op contract as `create_ticket`."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if path == "/graphql":
+            raise AssertionError("no GraphQL call expected when custom_fields is empty")
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket_none = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields=None,
+    )
+    assert ticket_none.id == "42"
+
+    ticket_empty = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={},
+    )
+    assert ticket_empty.id == "42"
+
+
+def test_update_ticket_custom_fields_no_board_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No board configured + non-empty custom_fields -> ValueError naming
+    the missing board config, before any HTTP call (including the GET)."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected when board is not configured")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="github-projects-v2"):
+        GitHubProvider().update_ticket(
+            _project(None), "t", "42", custom_fields={"Status": "Done"},
+        )
+
+
+def test_update_ticket_custom_fields_non_projects_v2_binding_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = Board(
+        columns=["Todo", "Done"],
+        binding=AzureBoardsBinding(kind="azure-boards", team="T", board="Stories"),
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for a non-GitHub binding")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="github-projects-v2"):
+        GitHubProvider().update_ticket(
+            _project(board), "t", "42", custom_fields={"Status": "Done"},
+        )
+
+
+def test_update_ticket_custom_fields_missing_owner_or_project_number_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=None)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected when project_number is missing")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="github-projects-v2"):
+        GitHubProvider().update_ticket(
+            _project(board), "t", "42", custom_fields={"Status": "Done"},
+        )
+
+
+def test_update_ticket_custom_fields_unmatched_single_select_value_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query = body["query"]
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="not a valid option"):
+        GitHubProvider().update_ticket(
+            _project(board), "t", "42", custom_fields={"Status": "Bogus"},
+        )
+
+
+def test_update_ticket_custom_fields_ticket_not_found_still_404s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `custom_fields` update on a non-existent ticket still gets the
+    existing 404 remap — validated before the GET, so the 404 comes from
+    the GET itself once binding validation passes."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/999"):
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError, match="not found"):
+        GitHubProvider().update_ticket(
+            _project(board), "t", "999", custom_fields={"Status": "Done"},
+        )
+
+
+def test_update_ticket_board_write_failure_raises_github_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The REST `PATCH` succeeds (title lands), but the board mutation
+    fails -> plain `GitHubError`, not `PartialTicketCreateError` — the
+    update path deliberately has no partial-failure exception type."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, title="old title"))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, title="new title"))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query = body["query"]
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+            if "addProjectV2ItemById" in query:
+                return _json({
+                    "data": {"addProjectV2ItemById": None},
+                    "errors": [{"message": "could not add item to project"}],
+                })
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as excinfo:
+        GitHubProvider().update_ticket(
+            _project(board), "t", "42",
+            title="new title", custom_fields={"Status": "Done"},
+        )
+    assert not isinstance(excinfo.value, PartialTicketCreateError)

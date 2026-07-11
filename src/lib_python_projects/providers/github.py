@@ -1163,7 +1163,7 @@ def _board_items_query(owner_field: str) -> str:
         "content{"
         "__typename"
         "...on Issue{"
-        "number title body state stateReason url createdAt updatedAt"
+        "number title body state stateReason url createdAt updatedAt "
         "author{login}"
         "assignees(first:50){nodes{login}}"
         "labels(first:50){nodes{name}}"
@@ -2639,8 +2639,45 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         labels_remove: list[str] | None = None,
         assignees_add: list[str] | None = None,
         assignees_remove: list[str] | None = None,
+        custom_fields: dict[str, Any] | None = None,
     ) -> Ticket:
+        """Update an issue, optionally also writing `custom_fields` to its
+        bound Projects v2 board (ticket #145) — the update-side
+        counterpart to `create_ticket`'s `custom_fields` support.
+
+        A non-empty `custom_fields` requires the same `github-projects-v2`
+        board binding as `create_ticket` (`project.board.binding`, with
+        `owner` and `project_number` set); an invalid/missing binding
+        raises `ValueError` before any write happens. `None`/`{}` is a
+        silent no-op, matching `create_ticket`'s contract.
+
+        The board write reuses `_write_custom_fields_to_board`, the same
+        helper `create_ticket` uses — `addProjectV2ItemById` is
+        idempotent, so no separate "resolve existing item id" step is
+        needed. Unlike `create_ticket`, a failed board write here raises
+        a plain `GitHubError` (not `PartialTicketCreateError`): the REST
+        PATCH (if any) has already landed by the time the board write is
+        attempted, so there's no "was the issue even created" ambiguity
+        to name a partial-failure type for.
+        """
         _validate_label_lists(labels_add, labels_remove)
+        binding = None
+        if custom_fields:
+            board = project.board
+            binding = board.binding if board is not None else None
+            if (
+                binding is None
+                or binding.kind != "github-projects-v2"
+                or not binding.owner
+                or not binding.project_number
+            ):
+                raise ValueError(
+                    f"custom_fields was provided but project {project.id!r} "
+                    f"has no 'github-projects-v2' board configured with "
+                    f"'owner' and 'project_number' — add one to "
+                    f"projects.yml before calling update_ticket with "
+                    f"custom_fields"
+                )
         with _client(token) as client:
             r0 = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
             try:
@@ -2712,12 +2749,36 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 payload["assignees"] = sorted(new_assignees)
 
             if not payload:
-                # Nothing to do — return the current state.
+                # Nothing to do via REST — still honor a pending board
+                # write, then return the current state.
+                if custom_fields:
+                    content_id = current.get("node_id")
+                    if not content_id:
+                        raise GitHubError(
+                            500,
+                            f"ticket '{project.id}#{ticket_id}' payload "
+                            f"missing 'node_id'; cannot write custom_fields",
+                        )
+                    _write_custom_fields_to_board(
+                        client, binding, content_id, custom_fields,
+                    )
                 return _map_issue(current)
 
             r = client.patch(f"{_repo_path(project)}/issues/{ticket_id}", json=payload)
             _check(r)
-            return _map_issue(r.json())
+            raw = r.json()
+            if custom_fields:
+                content_id = raw.get("node_id")
+                if not content_id:
+                    raise GitHubError(
+                        500,
+                        f"ticket '{project.id}#{ticket_id}' payload missing "
+                        f"'node_id'; cannot write custom_fields",
+                    )
+                _write_custom_fields_to_board(
+                    client, binding, content_id, custom_fields,
+                )
+            return _map_issue(raw)
 
     def list_statuses(
         self,
