@@ -10,6 +10,7 @@ from lib_python_projects import loader as cfg_mod
 from lib_python_projects import (
     ConfigDocument,
     ConfigError,
+    InvalidProjectEntry,
     ProjectsLoadResult,
     Permissions,
     ProjectConfig,
@@ -110,6 +111,9 @@ def test_load_yaml_returns_projects(tmp_path: Path):
     assert isinstance(result, ProjectsLoadResult)
     assert result.state == "ok"
     assert len(result.projects) == 1
+    # All-valid config regression guard: no entries were skipped.
+    assert result.invalid_projects == []
+    assert result.error is None
     p = result.projects[0]
     assert p.id == "acme"
     assert p.provider == "github"
@@ -168,6 +172,8 @@ def test_load_yaml_rejects_unknown_top_level_key(tmp_path: Path):
     result = load_projects(cwd=tmp_path)
     assert result.state == "config_error"
     assert "oops_extra" in (result.error or "")
+    # Document-level failure — never reaches per-entry validation.
+    assert result.invalid_projects == []
 
 
 def test_load_yaml_rejects_unknown_project_key(tmp_path: Path):
@@ -197,6 +203,8 @@ def test_load_yaml_rejects_future_schema_version(tmp_path: Path):
     result = load_projects(cwd=tmp_path)
     assert result.state == "config_error"
     assert "version" in (result.error or "").lower()
+    # Document-level failure — never reaches per-entry validation.
+    assert result.invalid_projects == []
 
 
 def test_load_yaml_rejects_github_path_without_slash(tmp_path: Path):
@@ -244,6 +252,10 @@ def test_load_config_empty(tmp_path: Path):
     result = load_projects(cwd=tmp_path)
     assert result.state == "config_empty"
     assert result.projects == []
+    # Genuinely empty `projects: []` doc — not to be confused with the
+    # config_error case where entries were skipped as schema-invalid.
+    assert result.invalid_projects == []
+    assert result.error is None
 
 
 def test_load_yaml_gitlab_path_is_passthrough(tmp_path: Path):
@@ -651,6 +663,12 @@ class TestBoardBlock:
         result = load_projects(cwd=tmp_path)
         assert result.state == "config_error"
         assert "bogus_key" in (result.error or "")
+        # Sole entry was schema-invalid and skipped, not raised (#132) —
+        # zero valid projects still collapses to config_error.
+        assert result.projects == []
+        assert len(result.invalid_projects) == 1
+        assert result.invalid_projects[0].id == "acme"
+        assert "bogus_key" in result.invalid_projects[0].error
 
     def test_unknown_key_nested_under_binding_rejected(self, tmp_path: Path):
         """`owner` is now a real field (ticket #118) — use a genuinely
@@ -671,6 +689,8 @@ class TestBoardBlock:
         result = load_projects(cwd=tmp_path)
         assert result.state == "config_error"
         assert "bogus_binding_key" in (result.error or "")
+        assert result.projects == []
+        assert len(result.invalid_projects) == 1
 
     def test_owner_project_number_status_field_load_ok(self, tmp_path: Path):
         """Ticket #118: the GitHub-provider fields on the binding load
@@ -719,3 +739,215 @@ class TestBoardBlock:
         assert board is not None
         assert board.binding.map is None
         assert board.resolve("Todo") == "Todo"
+
+
+# ---------- Schema-invalid project entries are skipped, not fatal (#132) ----
+
+
+class TestInvalidProjectEntries:
+    """A single schema-invalid project entry (e.g. a malformed `board:`
+    block) must not collapse the whole registry: `load_projects` skips
+    the offending entry, keeps every valid one, and records the skip in
+    `invalid_projects` / `error` for self-diagnosis.
+
+    Structural per-entry failures (non-mapping item, reserved `_auto`
+    id, duplicate id) and document-level failures stay fatal exactly as
+    before — covered separately below.
+    """
+
+    def test_one_invalid_board_block_skipped_others_load(self, tmp_path: Path):
+        """Regression test for ticket #132: a 4-entry config where
+        exactly one entry has a schema-invalid `board:` block (missing
+        required `columns` and `binding.kind`) must not crash the whole
+        registry — the other 3 valid entries still load."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: good-1
+                provider: github
+                path: acme/one
+              - id: bad-board
+                provider: github
+                path: acme/two
+                board:
+                  binding:
+                    map:
+                      Todo: Backlog
+              - id: good-2
+                provider: github
+                path: acme/three
+              - id: good-3
+                provider: github
+                path: acme/four
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        assert len(result.projects) == 3
+        ids = {p.id for p in result.projects}
+        assert ids == {"good-1", "good-2", "good-3"}
+        assert "bad-board" not in ids
+
+        assert len(result.invalid_projects) == 1
+        entry = result.invalid_projects[0]
+        assert entry.index == 1
+        assert entry.id == "bad-board"
+        assert entry.error  # non-empty Pydantic ValidationError text
+
+        # The calling agent must be able to self-diagnose from `error`
+        # alone, without reading server stderr.
+        assert result.error is not None
+        assert "bad-board" in result.error
+        assert entry.error in result.error
+
+    def test_non_string_id_alongside_other_failure_does_not_crash(self, tmp_path: Path):
+        """Regression test: an entry with a non-string `id` (e.g. an
+        unquoted YAML integer) that *also* fails `ProjectConfig`
+        validation for another reason (missing `provider`) must not
+        raise a fresh, uncaught `pydantic_core.ValidationError` while
+        constructing `InvalidProjectEntry` itself — that would crash
+        `load_projects` via a different trigger than the original
+        malformed-`board:` case in ticket #132. The raw id is coerced to
+        its string representation instead."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: good-1
+                provider: github
+                path: acme/one
+              - id: 123
+                path: acme/two
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        assert len(result.projects) == 1
+        assert result.projects[0].id == "good-1"
+
+        assert len(result.invalid_projects) == 1
+        entry = result.invalid_projects[0]
+        assert entry.index == 1
+        assert entry.id == "123"
+        assert entry.error
+
+        assert result.error is not None
+        assert "123" in result.error
+
+    def test_all_entries_invalid_no_autodiscovery(self, tmp_path: Path):
+        """Every entry is schema-invalid → zero valid projects, no
+        auto-discovery available → config_error, not a silent empty ok."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: bad-1
+                provider: github
+                path: acme/one
+                board:
+                  binding:
+                    kind: github-projects-v2
+              - id: bad-2
+                provider: github
+                path: acme/two
+                board:
+                  columns: []
+                  binding:
+                    kind: github-projects-v2
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "config_error"
+        assert result.projects == []
+        assert len(result.invalid_projects) == 2
+        assert {e.id for e in result.invalid_projects} == {"bad-1", "bad-2"}
+        assert result.error is not None
+
+    def test_non_mapping_project_item_stays_fatal(self, tmp_path: Path):
+        """A non-mapping list item (e.g. a bare string) is a structural,
+        document-level error (`ConfigDocument.projects` is typed
+        `list[dict[str, Any]]`, so this is rejected before the per-entry
+        loop even runs) — it still raises/collapses the whole registry,
+        unaffected by the #132 fix which only relaxes the nested
+        `ProjectConfig.model_validate` step."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: good
+                provider: github
+                path: acme/one
+              - "just-a-string"
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "config_error"
+        assert result.projects == []
+        assert result.invalid_projects == []
+        assert "dictionary" in (result.error or "")
+
+    def test_reserved_auto_id_alongside_valid_entry_stays_fatal(self, tmp_path: Path):
+        """The reserved `_auto` id check runs on any successfully
+        validated entry — it still raises/collapses the whole registry
+        even when paired with an otherwise-valid entry."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: good
+                provider: github
+                path: acme/one
+              - id: _auto
+                provider: github
+                path: acme/two
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "config_error"
+        assert result.projects == []
+        assert result.invalid_projects == []
+        assert "_auto" in (result.error or "")
+
+    def test_duplicate_id_alongside_valid_entry_stays_fatal(self, tmp_path: Path):
+        """Duplicate ids are a structural error — still fatal even when
+        the rest of the config is otherwise well-formed."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: dup
+                provider: github
+                path: acme/one
+              - id: dup
+                provider: github
+                path: acme/two
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "config_error"
+        assert result.projects == []
+        assert result.invalid_projects == []
+        assert "duplicate" in (result.error or "").lower()
+
+    def test_partial_success_plus_autodiscovery(self, tmp_path: Path):
+        """One invalid config entry plus a resolvable CWD git remote:
+        the valid config entries plus the auto-discovered CWD entry add
+        up to a non-empty `projects` list (state=ok), while the invalid
+        entry is still recorded for diagnosis."""
+        _set_git_remote(tmp_path, "git@github.com:Seretos/agent-plugin-dev.git")
+        cfg = tmp_path / ".seretos" / "project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: bad-board
+                provider: github
+                path: acme/two
+                board:
+                  binding:
+                    kind: github-projects-v2
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        assert len(result.projects) == 1
+        auto = result.projects[0]
+        assert auto.source == "git-remote"
+        assert auto.path == "Seretos/agent-plugin-dev"
+
+        assert len(result.invalid_projects) == 1
+        assert result.invalid_projects[0].id == "bad-board"
+        assert result.error is not None
