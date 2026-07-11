@@ -28,6 +28,10 @@ from lib_python_projects import (
     Permissions,
     IssuesPermissions,
     PullsPermissions,
+    Board,
+    BoardBinding,
+    GithubProjectsV2Binding,
+    AzureBoardsBinding,
     ConfigDocument,
     ProjectsLoadResult,
     Provider,
@@ -43,7 +47,7 @@ from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
 from lib_python_projects.providers.base import (
     Ticket, Comment, PullRequest, ReviewComment, Review,
     TicketFilters, PRFilters, RelationKind, Relation,
-    StatusSpec, PipelineRun, FailingJob, PipelineFailure,
+    StatusSpec, BoardColumnSpec, PipelineRun, FailingJob, PipelineFailure,
     TokenCapabilities, TokenCapabilityProvider,
     RelationKindUnsupported, RelationNotFound, RelationAlreadyExists,
     Label, LabelOperationUnsupported,
@@ -51,6 +55,40 @@ from lib_python_projects.providers.base import (
     WRITABLE_RELATION_KINDS, READ_ONLY_RELATION_KINDS,
 )
 ```
+
+## Board support
+
+`ProjectConfig.board` is an optional, provider-agnostic board configuration:
+an ordered list of logical `columns` plus a provider-specific `binding`.
+`Board.resolve(column)` turns a logical column name into its provider-native
+value — an explicit `binding.map` entry wins, otherwise it falls back to the
+column name itself (case-insensitive identity).
+
+GitHub Projects v2 support (ticket #118) is implemented on `GitHubProvider`:
+
+```python
+from lib_python_projects.providers.base import TicketFilters
+
+provider = GitHubProvider()
+
+# Discover the live board's columns (logical name, resolved native option
+# name, and that option's provider-native id):
+columns = provider.list_board_columns(project, token)
+
+# List only the issues currently sitting in one logical column. The column
+# is resolved against `project.board` the same way `Board.resolve()` does;
+# `labels`/`not_labels`/`assignee`/`states`/`status` still apply.
+tickets, has_more = provider.list_tickets(
+    project, token, TicketFilters(board_column="Review"),
+)
+```
+
+`board_column` requires `project.board.binding` to be a `GithubProjectsV2Binding`
+with `owner` and `project_number` set (the org/user login and project number
+GitHub Projects v2 are scoped under — auto-detected as org vs user at call
+time, not configured). It raises `ValueError` when combined with `search` or
+`area_path`, and on GitLab / Azure DevOps (Azure Boards support is the
+separate sibling ticket #119).
 
 ## Usage
 

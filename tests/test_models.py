@@ -219,8 +219,45 @@ class TestBoard:
             )
 
     def test_unknown_key_inside_binding_rejected(self) -> None:
+        """`owner` is now a real field (ticket #118) — use a genuinely
+        unknown key to exercise `extra="forbid"`."""
         with pytest.raises(ValidationError):
-            GithubProjectsV2Binding(kind="github-projects-v2", owner="acme")  # type: ignore[call-arg]
+            GithubProjectsV2Binding(kind="github-projects-v2", bogus="x")  # type: ignore[call-arg]
+
+    def test_owner_project_number_status_field_accepted(self) -> None:
+        """New in ticket #118: `owner`/`project_number`/`status_field`
+        are real fields on `GithubProjectsV2Binding`."""
+        binding = GithubProjectsV2Binding(
+            kind="github-projects-v2",
+            owner="acme",
+            project_number=7,
+            status_field="Workflow",
+        )
+        assert binding.owner == "acme"
+        assert binding.project_number == 7
+        assert binding.status_field == "Workflow"
+
+    def test_status_field_defaults_to_status(self) -> None:
+        binding = GithubProjectsV2Binding(kind="github-projects-v2")
+        assert binding.status_field == "Status"
+        assert binding.owner is None
+        assert binding.project_number is None
+
+    def test_board_with_enriched_github_binding_validates_and_resolves(self) -> None:
+        board = Board(
+            columns=["Todo", "Doing", "Done"],
+            binding=GithubProjectsV2Binding(
+                kind="github-projects-v2",
+                owner="acme",
+                project_number=3,
+                status_field="Status",
+                map={"Todo": "Backlog"},
+            ),
+        )
+        assert board.binding.owner == "acme"
+        assert board.binding.project_number == 3
+        assert board.resolve("Todo") == "Backlog"
+        assert board.resolve("Doing") == "Doing"
 
     def test_provider_extras_accepts_arbitrary_dict(self) -> None:
         binding = GithubProjectsV2Binding(

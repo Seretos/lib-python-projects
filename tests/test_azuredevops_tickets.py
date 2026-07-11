@@ -119,6 +119,25 @@ def _work_item_payload(work_item_id: int, **fields_override) -> dict:
 # ---------- list_tickets -----------------------------------------------------
 
 
+def test_list_tickets_board_column_raises_valueerror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """board_column is a GitHub Projects v2 concept — Azure DevOps must
+    fail fast rather than silently ignoring it (Azure Boards column
+    support is the separate sibling ticket #119)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected when board_column is set")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(
+        ValueError, match="board_column is not supported on Azure DevOps"
+    ):
+        AzureDevOpsProvider().list_tickets(
+            _project(), token="t", filters=TicketFilters(board_column="Review"),
+        )
+
+
 def test_list_tickets_runs_wiql_then_batch(monkeypatch: pytest.MonkeyPatch) -> None:
     bt = _basic_template_handler()
 

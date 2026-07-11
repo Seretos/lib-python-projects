@@ -23,6 +23,7 @@ from lib_python_projects.markers import (
     strip_leading_ai_marker,
 )
 from lib_python_projects.providers.base import (
+    BoardColumnSpec,
     Comment,
     DiscoveredProject,
     FailingJob,
@@ -266,6 +267,44 @@ def _map_issue(raw: dict) -> Ticket:
         url=raw.get("html_url") or "",
         created_at=normalize_timestamp(raw.get("created_at") or ""),
         updated_at=normalize_timestamp(raw.get("updated_at") or ""),
+    )
+
+
+def _map_graphql_issue_content(content: dict) -> Ticket:
+    """`_map_issue`'s counterpart for the GraphQL `Issue` content shape
+    used by the Projects-v2 items query (ticket #118).
+
+    GraphQL's `Issue.state` is the uppercase enum `OPEN`/`CLOSED` and
+    `stateReason` is `COMPLETED`/`NOT_PLANNED`/`REOPENED` — both are
+    normalised down to the same `Status` encoding `_map_issue` produces
+    (`open` / `closed:completed` / `closed:not_planned`) so callers see
+    one uniform shape regardless of which GitHub API answered the call.
+    """
+    state = (content.get("state") or "OPEN").upper()
+    state_reason = (content.get("stateReason") or "").upper() or None
+    if state != "CLOSED":
+        status: Status = "open"
+    elif state_reason == "NOT_PLANNED":
+        status = "closed:not_planned"
+    else:
+        status = "closed:completed"
+    label_names = sorted(
+        n["name"] for n in ((content.get("labels") or {}).get("nodes") or [])
+    )
+    assignees = [
+        a["login"] for a in ((content.get("assignees") or {}).get("nodes") or [])
+    ]
+    return Ticket(
+        id=str(content.get("number")),
+        title=content.get("title") or "",
+        body=content.get("body") or "",
+        status=status,
+        author=(content.get("author") or {}).get("login") or "",
+        assignees=assignees,
+        labels=label_names,
+        url=content.get("url") or "",
+        created_at=normalize_timestamp(content.get("createdAt") or ""),
+        updated_at=normalize_timestamp(content.get("updatedAt") or ""),
     )
 
 
@@ -1058,6 +1097,126 @@ def _set_pr_draft_via_graphql(
         raise GitHubError(400, f"GraphQL error toggling draft: {body['errors']}")
 
 
+# ---------- GraphQL: GitHub Projects v2 board support (ticket #118) --------
+#
+# Projects v2 are org- or user-scoped, not repo-bound: the same field
+# selection has to be tried under `organization(login:)` and, on failure,
+# retried under `user(login:)`. Every board query below is built in both
+# flavours from a single template so the two stay in lockstep.
+
+
+def _board_columns_query(owner_field: str) -> str:
+    return (
+        "query($owner:String!,$number:Int!,$fieldName:String!){"
+        f"{owner_field}(login:$owner){{projectV2(number:$number){{"
+        "field(name:$fieldName){"
+        "...on ProjectV2SingleSelectField{id name options{id name}}"
+        "}"
+        "}}}}"
+    )
+
+
+_BOARD_COLUMNS_ORG_QUERY = _board_columns_query("organization")
+_BOARD_COLUMNS_USER_QUERY = _board_columns_query("user")
+
+
+def _board_items_query(owner_field: str) -> str:
+    return (
+        "query($owner:String!,$number:Int!,$fieldName:String!,$after:String){"
+        f"{owner_field}(login:$owner){{projectV2(number:$number){{"
+        "items(first:100,after:$after){"
+        "pageInfo{hasNextPage endCursor}"
+        "nodes{"
+        "fieldValueByName(name:$fieldName){"
+        "...on ProjectV2ItemFieldSingleSelectValue{name optionId}"
+        "}"
+        "content{"
+        "__typename"
+        "...on Issue{"
+        "number title body state stateReason url createdAt updatedAt"
+        "author{login}"
+        "assignees(first:50){nodes{login}}"
+        "labels(first:50){nodes{name}}"
+        "}"
+        "}"
+        "}"
+        "}"
+        "}}}}"
+    )
+
+
+_BOARD_ITEMS_ORG_QUERY = _board_items_query("organization")
+_BOARD_ITEMS_USER_QUERY = _board_items_query("user")
+
+
+def _is_organization_resolution_error(body: dict) -> bool:
+    """True iff `body`'s GraphQL `errors` say the owner login isn't an
+    Organization (GitHub's message for `organization(login:)` pointed at
+    a user account) — the signal that we should retry under `user(login:)`.
+    """
+    for err in body.get("errors") or []:
+        message = str((err or {}).get("message") or "").lower()
+        if "could not resolve to an organization" in message:
+            return True
+    return False
+
+
+def _fetch_projects_v2_via_graphql(
+    client: httpx.Client,
+    *,
+    owner: str,
+    project_number: int,
+    org_query: str,
+    user_query: str,
+    variables: dict[str, Any],
+) -> dict:
+    """POST `org_query` first (`organization(login:$owner)`); if GitHub's
+    GraphQL response says that login can't resolve to an Organization,
+    retry the identical field selection as `user_query`
+    (`user(login:$owner)`). Returns the `projectV2` payload (never
+    `None`) from whichever attempt found the project.
+
+    Raises `GitHubError` on a hard GraphQL error from either attempt
+    (other than the org/user resolution signal), and `ValueError` when
+    both attempts succeed at the transport level but neither actually
+    has the project (bad `owner`/`project_number`).
+    """
+    r = client.post(
+        "/graphql", json={"query": org_query, "variables": variables},
+    )
+    _check(r)
+    body = r.json()
+    owner_key = "organization"
+    if body.get("errors") and _is_organization_resolution_error(body):
+        r = client.post(
+            "/graphql", json={"query": user_query, "variables": variables},
+        )
+        _check(r)
+        body = r.json()
+        owner_key = "user"
+        if body.get("errors"):
+            raise GitHubError(
+                400,
+                f"GraphQL error resolving GitHub Projects v2 project "
+                f"#{project_number} for owner {owner!r} (tried both "
+                f"organization and user): {body['errors']}",
+            )
+    elif body.get("errors"):
+        raise GitHubError(
+            400,
+            f"GraphQL error resolving GitHub Projects v2 project "
+            f"#{project_number} for owner {owner!r}: {body['errors']}",
+        )
+    project_v2 = ((body.get("data") or {}).get(owner_key) or {}).get("projectV2")
+    if not project_v2:
+        tried = "organization and user" if owner_key == "user" else "organization"
+        raise ValueError(
+            f"GitHub Projects v2 project #{project_number} not found for "
+            f"owner {owner!r} (tried {tried})"
+        )
+    return project_v2
+
+
 # ---------- GraphQL fallback for `parent` ---------------------------------
 
 _PARENT_GRAPHQL_QUERY = (
@@ -1736,6 +1895,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         `filters.area_path` is an Azure-DevOps-only concept (`System.AreaPath`)
         and raises `ValueError` on this provider rather than being silently
         ignored.
+
+        `filters.board_column` (ticket #118) takes a dedicated path — see
+        `_list_tickets_by_board_column` — instead of the search/`/issues`
+        REST endpoints below: it resolves the logical column against
+        `project.board`, runs a single Projects-v2 GraphQL items query,
+        and applies labels/not_labels/assignee/states/status client-side.
         """
         if filters and filters.area_path:
             raise ValueError(
@@ -1743,6 +1908,8 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 "System.AreaPath filter"
             )
         _validate_limit(filters.limit)
+        if filters and filters.board_column:
+            return self._list_tickets_by_board_column(project, token, filters)
         per_page = min(max(1, filters.limit), 100)
         # Normalize `not_labels=[]` (truthy-but-empty containers) to "not set".
         if not filters.not_labels:
@@ -1809,6 +1976,123 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     page += 1
                 has_more = len(collected) >= filters.limit and last_raw_page_full
                 return [_map_issue(it) for it in collected[: filters.limit]], has_more
+
+    def _list_tickets_by_board_column(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        filters: TicketFilters,
+    ) -> tuple[list[Ticket], bool]:
+        """Dedicated `filters.board_column` listing path (ticket #118).
+
+        Resolves the logical column against `project.board`, then runs a
+        single (paginated) Projects-v2 GraphQL items query — instead of
+        the search/`/issues` REST paths `list_tickets` otherwise uses —
+        keeping only items whose status field matches the resolved
+        native column and whose content is an `Issue` (PRs/DraftIssues
+        are dropped, same invariant as the REST paths). The remaining
+        cheap filters (`labels`/`not_labels`/`assignee`/`states`/
+        `status`) are then applied client-side, and results are sorted
+        and paginated per `sort_by`/`sort_order`/`limit`.
+        """
+        if filters.search:
+            raise ValueError(
+                "board_column cannot be combined with search — the "
+                "board-column path runs a dedicated GitHub Projects v2 "
+                "GraphQL query, not the search/`/issues` REST paths"
+            )
+        board = project.board
+        if board is None:
+            raise ValueError(
+                f"project {project.id!r} has no 'board' configuration — "
+                f"board_column requires one"
+            )
+        binding = board.binding
+        if binding.kind != "github-projects-v2":
+            raise ValueError(
+                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"not 'github-projects-v2' — board_column filtering is "
+                f"GitHub-only"
+            )
+        columns_lower = {c.lower() for c in board.columns}
+        if filters.board_column.lower() not in columns_lower:
+            raise ValueError(
+                f"board_column {filters.board_column!r} is not one of "
+                f"this project's board columns {board.columns!r}"
+            )
+        if not binding.owner or not binding.project_number:
+            raise ValueError(
+                f"project {project.id!r} board binding is missing "
+                f"'owner' and/or 'project_number' — both are required to "
+                f"resolve a GitHub Projects v2 board"
+            )
+        native_column = board.resolve(filters.board_column)
+        target = native_column.lower()
+        state_pairs = _github_states_pairs(filters.states) if filters.states else None
+        not_labels = filters.not_labels or []
+
+        matched: list[Ticket] = []
+        after: str | None = None
+        with _client(token) as client:
+            while True:
+                variables = {
+                    "owner": binding.owner,
+                    "number": binding.project_number,
+                    "fieldName": binding.status_field,
+                    "after": after,
+                }
+                project_v2 = _fetch_projects_v2_via_graphql(
+                    client,
+                    owner=binding.owner,
+                    project_number=binding.project_number,
+                    org_query=_BOARD_ITEMS_ORG_QUERY,
+                    user_query=_BOARD_ITEMS_USER_QUERY,
+                    variables=variables,
+                )
+                items = project_v2.get("items") or {}
+                for node in items.get("nodes") or []:
+                    content = node.get("content") or {}
+                    if content.get("__typename") != "Issue":
+                        continue  # drop PRs / DraftIssues
+                    field_value = node.get("fieldValueByName") or {}
+                    option_name = (field_value.get("name") or "").lower()
+                    if option_name != target:
+                        continue
+                    ticket = _map_graphql_issue_content(content)
+                    if filters.labels and not set(filters.labels).issubset(
+                        ticket.labels
+                    ):
+                        continue
+                    if not_labels and set(not_labels) & set(ticket.labels):
+                        continue
+                    if filters.assignee and filters.assignee.lower() not in {
+                        a.lower() for a in ticket.assignees
+                    }:
+                        continue
+                    if state_pairs is not None:
+                        pseudo_raw = {
+                            "state": "open" if ticket.status == "open" else "closed",
+                            "state_reason": (
+                                None if ticket.status == "open"
+                                else ticket.status.split(":", 1)[1]
+                            ),
+                        }
+                        if not _github_item_matches_states(pseudo_raw, state_pairs):
+                            continue
+                    elif filters.status == "open" and ticket.status != "open":
+                        continue
+                    elif filters.status == "closed" and ticket.status == "open":
+                        continue
+                    matched.append(ticket)
+                page_info = items.get("pageInfo") or {}
+                if not page_info.get("hasNextPage"):
+                    break
+                after = page_info.get("endCursor")
+
+        sort_attr = "updated_at" if filters.sort_by == "updated" else "created_at"
+        matched.sort(key=lambda t: getattr(t, sort_attr), reverse=filters.sort_order == "desc")
+        has_more = len(matched) > filters.limit
+        return matched[: filters.limit], has_more
 
     def get_ticket(
         self,
@@ -2091,6 +2375,80 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         iterate over all providers without special-casing GitHub.
         """
         return []
+
+    def list_board_columns(
+        self, project: ProjectConfig, token: str | None,
+    ) -> list[BoardColumnSpec]:
+        """Resolve `project.board.columns` against the live GitHub
+        Projects v2 board (ticket #118).
+
+        Reads the single-select field named `binding.status_field`
+        (default `"Status"`) and its `options`, then pairs each logical
+        column with its resolved native option (`Board.resolve()`:
+        explicit `map` wins, else case-insensitive identity fallback)
+        and that option's live `id`.
+
+        Raises `ValueError` when: `project.board` is unset; the binding
+        isn't `kind="github-projects-v2"`; the binding is missing
+        `owner`/`project_number`; the named status field doesn't exist
+        or isn't a single-select field; or a resolved native option
+        isn't present among the live board's options.
+        """
+        board = project.board
+        if board is None:
+            raise ValueError(
+                f"project {project.id!r} has no 'board' configuration — "
+                f"add one to projects.yml before calling list_board_columns"
+            )
+        binding = board.binding
+        if binding.kind != "github-projects-v2":
+            raise ValueError(
+                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"not 'github-projects-v2' — list_board_columns is GitHub-only"
+            )
+        if not binding.owner or not binding.project_number:
+            raise ValueError(
+                f"project {project.id!r} board binding is missing "
+                f"'owner' and/or 'project_number' — both are required to "
+                f"resolve a GitHub Projects v2 board"
+            )
+        with _client(token) as client:
+            project_v2 = _fetch_projects_v2_via_graphql(
+                client,
+                owner=binding.owner,
+                project_number=binding.project_number,
+                org_query=_BOARD_COLUMNS_ORG_QUERY,
+                user_query=_BOARD_COLUMNS_USER_QUERY,
+                variables={
+                    "owner": binding.owner,
+                    "number": binding.project_number,
+                    "fieldName": binding.status_field,
+                },
+            )
+        field = project_v2.get("field")
+        live_options = (field or {}).get("options") or []
+        if not field or not live_options:
+            raise ValueError(
+                f"GitHub Projects v2 field {binding.status_field!r} was not "
+                f"found (or is not a single-select field) on project "
+                f"#{binding.project_number} for owner {binding.owner!r}"
+            )
+        by_lower_name = {opt["name"].lower(): opt for opt in live_options}
+        result: list[BoardColumnSpec] = []
+        for col in board.columns:
+            native = board.resolve(col)
+            opt = by_lower_name.get(native.lower())
+            if opt is None:
+                available = sorted(o["name"] for o in live_options)
+                raise ValueError(
+                    f"board column {col!r} resolves to native option "
+                    f"{native!r}, which is not present on the live GitHub "
+                    f"Projects v2 board (available options: {available})"
+                )
+            result.append(
+                BoardColumnSpec(logical=col, native=native, option_id=opt["id"])
+            )
+        return result
 
     def add_comment(
         self,

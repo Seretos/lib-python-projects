@@ -1879,7 +1879,17 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         entirely (including `status == "any"`) — see `_build_wiql`.
         Unknown values raise `ValueError` pointing back to
         `list_ticket_statuses`.
+
+        `filters.board_column` is a GitHub-Projects-v2-only concept and
+        raises `ValueError` on this provider rather than being silently
+        ignored. Azure Boards column support is tracked separately as
+        the sibling ticket #119 and is out of scope here.
         """
+        if filters and filters.board_column:
+            raise ValueError(
+                "board_column is not supported on Azure DevOps — it is a "
+                "GitHub Projects v2 board filter"
+            )
         _validate_limit(filters.limit)
         wiql = self._build_wiql(project, token, filters)
         with _client(project, token) as c:
