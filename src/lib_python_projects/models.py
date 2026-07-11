@@ -15,7 +15,7 @@ Schema policy (carried over from the plugin):
 from __future__ import annotations
 
 import os
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
@@ -48,6 +48,84 @@ class Permissions(BaseModel):
     model_config = ConfigDict(extra="forbid")
     issues: IssuesPermissions = Field(default_factory=IssuesPermissions)
     pulls: PullsPermissions = Field(default_factory=PullsPermissions)
+
+
+class BoardBinding(BaseModel):
+    """Shared shape for provider-specific board bindings.
+
+    `map` translates logical column names (see `Board.columns`) to the
+    provider-native primitive (e.g. a GitHub Projects v2 status option, or
+    an Azure Boards column/state). `provider_extras` is a generic escape
+    hatch for provider-specific settings that don't warrant a dedicated
+    field yet; it is not validated beyond being a dict.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    map: dict[str, str] | None = None
+    provider_extras: dict[str, Any] = Field(default_factory=dict)
+
+
+class GithubProjectsV2Binding(BoardBinding):
+    kind: Literal["github-projects-v2"]
+
+
+class AzureBoardsBinding(BoardBinding):
+    kind: Literal["azure-boards"]
+
+
+class Board(BaseModel):
+    """Optional board configuration for a project.
+
+    `columns` is the ordered list of logical column names the agent
+    reasons about; `binding` maps those logical names onto a specific
+    provider's native board primitives.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    columns: list[str]
+    binding: Annotated[
+        GithubProjectsV2Binding | AzureBoardsBinding, Field(discriminator="kind")
+    ]
+
+    @model_validator(mode="after")
+    def _check_columns(self) -> "Board":
+        if not self.columns:
+            raise ValueError("board 'columns' must not be empty")
+        seen: dict[str, str] = {}
+        for col in self.columns:
+            key = col.lower()
+            if key in seen:
+                raise ValueError(
+                    f"board 'columns' has a duplicate entry (case-insensitive): "
+                    f"{col!r}"
+                )
+            seen[key] = col
+        return self
+
+    @model_validator(mode="after")
+    def _check_map_keys(self) -> "Board":
+        if self.binding.map:
+            columns_lower = {col.lower() for col in self.columns}
+            for key in self.binding.map:
+                if key.lower() not in columns_lower:
+                    raise ValueError(
+                        f"board binding 'map' key {key!r} does not match any "
+                        f"entry in 'columns' {self.columns!r}"
+                    )
+        return self
+
+    def resolve(self, column: str) -> str:
+        """Resolve a logical column name to its provider-native value.
+
+        Looks up `column` in `binding.map` case-insensitively; falls back
+        to the column name itself (identity) when unmapped.
+        """
+        if self.binding.map:
+            for key, value in self.binding.map.items():
+                if key.lower() == column.lower():
+                    return value
+        return column
 
 
 class ProjectConfig(BaseModel):
@@ -99,6 +177,10 @@ class ProjectConfig(BaseModel):
     # git-remote-sourced projects; populated by the loader for the
     # auto-discovered CWD repo.
     local_path: str | None = None
+    # Optional board configuration: an ordered list of logical columns plus
+    # a provider-specific binding. Resolution logic (turning this into
+    # actual provider board calls) is out of scope here — see #118/#119.
+    board: Board | None = None
 
     @model_validator(mode="after")
     def _check_provider_fields(self) -> "ProjectConfig":

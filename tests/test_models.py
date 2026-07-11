@@ -9,8 +9,15 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import ValidationError
 
-from lib_python_projects import ProjectConfig, ProjectsLoadResult
+from lib_python_projects import (
+    AzureBoardsBinding,
+    Board,
+    GithubProjectsV2Binding,
+    ProjectConfig,
+    ProjectsLoadResult,
+)
 
 
 def _make_project(**kwargs) -> ProjectConfig:
@@ -96,6 +103,142 @@ class TestDefaultBranchField:
         p = _make_project()
         d = p.model_dump()
         assert d["default_branch"] == "main"
+
+
+class TestBoard:
+    """`board` is new in ticket #117 — optional ordered `columns` plus a
+    provider-discriminated `binding`. Schema + model only; no provider
+    board-resolution logic (that's #118/#119)."""
+
+    def test_board_none_by_default(self) -> None:
+        p = _make_project()
+        assert p.board is None
+
+    def test_board_with_github_binding_accepted(self) -> None:
+        p = _make_project(
+            board={
+                "columns": ["Todo", "Doing", "Done"],
+                "binding": {
+                    "kind": "github-projects-v2",
+                    "map": {"Todo": "Backlog"},
+                },
+            }
+        )
+        assert isinstance(p.board, Board)
+        assert p.board.columns == ["Todo", "Doing", "Done"]
+        assert isinstance(p.board.binding, GithubProjectsV2Binding)
+        assert p.board.binding.map == {"Todo": "Backlog"}
+
+    def test_board_with_azure_binding_accepted(self) -> None:
+        p = _make_project(
+            board={
+                "columns": ["Todo", "Doing", "Done"],
+                "binding": {"kind": "azure-boards"},
+            }
+        )
+        assert isinstance(p.board.binding, AzureBoardsBinding)
+
+    def test_resolve_returns_mapped_value(self) -> None:
+        board = Board(
+            columns=["Todo", "Doing", "Done"],
+            binding=GithubProjectsV2Binding(
+                kind="github-projects-v2", map={"Todo": "Backlog"}
+            ),
+        )
+        assert board.resolve("Todo") == "Backlog"
+
+    def test_resolve_falls_back_to_identity_when_unmapped(self) -> None:
+        board = Board(
+            columns=["Todo", "Doing", "Done"],
+            binding=GithubProjectsV2Binding(
+                kind="github-projects-v2", map={"Todo": "Backlog"}
+            ),
+        )
+        assert board.resolve("Doing") == "Doing"
+
+    def test_resolve_falls_back_to_identity_when_no_map(self) -> None:
+        board = Board(
+            columns=["Todo", "Doing", "Done"],
+            binding=GithubProjectsV2Binding(kind="github-projects-v2"),
+        )
+        assert board.resolve("Todo") == "Todo"
+
+    def test_resolve_matches_map_key_case_insensitively(self) -> None:
+        board = Board(
+            columns=["Todo", "Doing", "Done"],
+            binding=GithubProjectsV2Binding(
+                kind="github-projects-v2", map={"todo": "Backlog"}
+            ),
+        )
+        assert board.resolve("Todo") == "Backlog"
+
+    def test_empty_columns_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="columns"):
+            Board(
+                columns=[],
+                binding=GithubProjectsV2Binding(kind="github-projects-v2"),
+            )
+
+    def test_case_insensitive_duplicate_columns_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="[Dd]one"):
+            Board(
+                columns=["Done", "done"],
+                binding=GithubProjectsV2Binding(kind="github-projects-v2"),
+            )
+
+    def test_map_key_not_in_columns_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="stray"):
+            Board(
+                columns=["Todo", "Doing", "Done"],
+                binding=GithubProjectsV2Binding(
+                    kind="github-projects-v2", map={"stray": "x"}
+                ),
+            )
+
+    def test_map_key_matching_column_case_insensitively_accepted(self) -> None:
+        board = Board(
+            columns=["Todo", "Doing", "Done"],
+            binding=GithubProjectsV2Binding(
+                kind="github-projects-v2", map={"DONE": "Closed"}
+            ),
+        )
+        assert board.binding.map == {"DONE": "Closed"}
+
+    def test_missing_kind_raises_discriminator_error(self) -> None:
+        with pytest.raises(ValidationError):
+            Board(
+                columns=["Todo"],
+                binding={"map": {"Todo": "x"}},  # type: ignore[arg-type]
+            )
+
+    def test_unknown_kind_raises_discriminator_error(self) -> None:
+        with pytest.raises(ValidationError):
+            Board(
+                columns=["Todo"],
+                binding={"kind": "trello"},  # type: ignore[arg-type]
+            )
+
+    def test_unknown_key_inside_binding_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            GithubProjectsV2Binding(kind="github-projects-v2", owner="acme")  # type: ignore[call-arg]
+
+    def test_provider_extras_accepts_arbitrary_dict(self) -> None:
+        binding = GithubProjectsV2Binding(
+            kind="github-projects-v2",
+            provider_extras={"anything": 1, "goes": [1, 2, 3]},
+        )
+        assert binding.provider_extras == {"anything": 1, "goes": [1, 2, 3]}
+
+    def test_project_config_board_appears_in_model_dump(self) -> None:
+        p = _make_project(
+            board={
+                "columns": ["Todo"],
+                "binding": {"kind": "azure-boards"},
+            }
+        )
+        d = p.model_dump()
+        assert d["board"]["columns"] == ["Todo"]
+        assert d["board"]["binding"]["kind"] == "azure-boards"
 
 
 class TestProjectsLoadResult:
