@@ -475,12 +475,17 @@ def test_list_tickets_states_invalid_value_raises(
         raise AssertionError(f"unexpected path {req.url.path}")
 
     _install_mock(monkeypatch, handler)
-    with pytest.raises(ValueError, match="use list_ticket_statuses to discover valid values"):
+    with pytest.raises(ValueError, match="use list_ticket_statuses to discover valid values") as exc:
         AzureDevOpsProvider().list_tickets(
             _project(default_type="Issue"),
             token="t",
             filters=TicketFilters(states=["Bogus"]),
         )
+    msg = str(exc.value)
+    # Comma-prose accepted list — matching the discovered Agile-template
+    # states (New/Approved/Active/Closed/Removed) — no Python list repr.
+    assert "Accepted: New, Approved, Active, Closed, Removed." in msg
+    assert "['" not in msg and "']" not in msg
 
 
 def test_list_tickets_states_empty_list_unchanged_status_behaviour(
@@ -1362,11 +1367,52 @@ def test_update_ticket_invalid_status_includes_accepted_list(
     assert "Azure DevOps" in msg
     assert "list_ticket_statuses" in msg
     assert "accepted" in msg.lower()
-    # The accepted list must include the discovered states.
-    assert "To Do" in msg
-    assert "Done" in msg
-    # No raw provider prefix.
-    assert "Azure DevOps 400" not in msg
+    # The accepted list must include the discovered states, rendered as a
+    # single well-formed comma-prose sentence — matching the GitHub/GitLab
+    # "Accepted: a, b, c." style, not a Python list repr.
+    assert "Accepted: To Do, Doing, Done." in msg
+    assert "['" not in msg and "']" not in msg
+    assert msg.count("—") == 1
+    assert " — accepted:" not in msg
+
+
+def test_update_ticket_invalid_status_no_accepted_list_when_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the rewrap's follow-up `list_statuses` lookup itself fails,
+    `accepted` stays `None` and the message must cleanly end at
+    '...valid values.' with no dangling 'Accepted:' fragment."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and "/_apis/wit/workitems/5" in path:
+            return _json(_work_item_payload(5))
+        if req.method == "PATCH" and "/_apis/wit/workitems/5" in path:
+            return _json(
+                {
+                    "message": "The field 'State' contains the value 'Bogus' which is not in the list of supported values",
+                    "typeKey": "RuleValidationException",
+                },
+                status_code=400,
+            )
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+
+    def _boom(self, project, token):
+        raise RuntimeError("discovery unavailable")
+
+    monkeypatch.setattr(AzureDevOpsProvider, "list_statuses", _boom)
+
+    with pytest.raises(ValueError) as exc:
+        AzureDevOpsProvider().update_ticket(
+            _project(default_type="Issue"),
+            token="t", ticket_id="5", status="Bogus",
+        )
+    msg = str(exc.value)
+    assert msg.endswith("use list_ticket_statuses to discover valid values.")
+    assert "Accepted:" not in msg
+    assert "accepted:" not in msg.lower()
 
 
 def test_get_comment_int32_overflow_id_pre_rejected(
@@ -1676,12 +1722,14 @@ def test_create_ticket_invalid_status_message_format(
     DevOps — use list_ticket_statuses ...'."""
 
     def handler(req: httpx.Request) -> httpx.Response:
+        # States endpoint — return a small valid list. Checked before the
+        # generic workitemtypes branch below since its path is a substring
+        # of this one.
+        if "/_apis/wit/workitemtypes/Task/states" in req.url.path:
+            return _json({"value": [{"name": "To Do"}, {"name": "Done"}]})
         # Work item type list (for default type resolution).
         if "/_apis/wit/workitemtypes" in req.url.path and req.method == "GET":
             return _json({"value": [{"name": "Task"}]})
-        # States endpoint — return a small valid list.
-        if "/_apis/wit/workitemtypes/Task/states" in req.url.path:
-            return _json({"value": [{"name": "To Do"}, {"name": "Done"}]})
         raise AssertionError(f"unexpected {req.method} {req.url.path}")
 
     _install_mock(monkeypatch, handler)
@@ -1694,6 +1742,36 @@ def test_create_ticket_invalid_status_message_format(
     assert "unsupported status" in msg
     assert "Azure DevOps" in msg
     assert "list_ticket_statuses" in msg
+    # Comma-prose accepted list, matching the GitHub/GitLab style — not a
+    # Python list repr.
+    assert "Accepted: To Do, Done." in msg
+    assert "['" not in msg and "']" not in msg
+    assert msg.count("—") == 1
+
+
+def test_create_ticket_invalid_status_single_accepted_value_no_brackets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single-element accepted list must render as `Accepted: To Do.`
+    with no brackets and no trailing comma."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/_apis/wit/workitemtypes/Task/states" in req.url.path:
+            return _json({"value": [{"name": "To Do"}]})
+        if "/_apis/wit/workitemtypes" in req.url.path and req.method == "GET":
+            return _json({"value": [{"name": "Task"}]})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError) as exc:
+        AzureDevOpsProvider().create_ticket(
+            _project(), token="t", title="Test", body="body",
+            labels=[], assignees=[], status="Bogus",
+        )
+    msg = str(exc.value)
+    assert "Accepted: To Do." in msg
+    assert "['" not in msg and "']" not in msg
+    assert "To Do," not in msg
 
 
 def test_update_ticket_invalid_status_message_format(

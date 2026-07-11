@@ -374,6 +374,33 @@ def test_gitlab_status_error_mirrors_list_statuses():
     assert "closed:not_planned" not in msg
 
 
+def test_azuredevops_status_error_matches_github_gitlab_shape(monkeypatch):
+    """Per #143: Azure DevOps's status-rejection message must converge on
+    the same shape as GitHub/GitLab — provider name, `list_ticket_statuses`
+    hint, and a comma-prose `Accepted: ...` list (no Python list repr)."""
+    _cache_clear_all()
+
+    def handler(req):
+        if "/_apis/wit/workitemtypes/Task/states" in req.url.path:
+            return _resp({"value": [{"name": "To Do"}, {"name": "Done"}]})
+        if "/_apis/wit/workitemtypes" in req.url.path and req.method == "GET":
+            return _resp({"value": [{"name": "Task"}]})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_azuredevops_mock(monkeypatch, handler)
+    with pytest.raises(ValueError) as excinfo:
+        AzureDevOpsProvider().create_ticket(
+            _ado_project(), "t", title="Test", body="body",
+            labels=[], assignees=[], status="Bogus",
+        )
+    msg = str(excinfo.value)
+    assert "unsupported status" in msg
+    assert "Azure DevOps" in msg
+    assert "list_ticket_statuses" in msg
+    assert "Accepted: To Do, Done." in msg
+    assert "['" not in msg and "']" not in msg
+
+
 # ---------- finding 9: marker body trailing-newline asymmetry ---------------
 
 

@@ -1882,7 +1882,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                     raise ValueError(
                         f"unsupported status {value!r} for Azure DevOps — "
                         f"use list_ticket_statuses to discover valid values. "
-                        f"Accepted: {valid_names}."
+                        f"Accepted: {', '.join(valid_names)}."
                     )
             in_list = ", ".join(f"'{_escape_wiql(v)}'" for v in filters.states)
             clauses.append(f"[System.State] IN ({in_list})")
@@ -2391,7 +2391,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 raise ValueError(
                     f"unsupported status {status!r} for Azure DevOps — "
                     f"use list_ticket_statuses to discover valid values. "
-                    f"Accepted: {valid_names}."
+                    f"Accepted: {', '.join(valid_names)}."
                 )
 
         body_with_marker = ensure_body_prefix(body or "")
@@ -2554,10 +2554,10 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         except AzureDevOpsError as exc:
             # If the patch was rejected for an invalid state value,
             # surface a curated `ValueError` with the accepted list —
-            # mirrors `github._split_github_status` so the `_safe`
-            # translation produces a clean `{"error": "ticket #5 state
-            # 'Bogus' rejected — accepted: [...]"}` payload without the
-            # raw "Azure DevOps 400:" provider prefix.
+            # matching the comma-prose "Accepted: ..." style used by
+            # `github._split_github_status` and `gitlab.py` so the
+            # `_safe` translation produces a clean, uniform message
+            # without the raw "Azure DevOps 400:" provider prefix.
             #
             # `_check` already appended the `list_ticket_statuses` hint
             # to the message; we use that as the trigger for the
@@ -2574,7 +2574,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 except Exception:
                     accepted = None
                 accepted_clause = (
-                    f" — accepted: {accepted}" if accepted else ""
+                    f" Accepted: {', '.join(accepted)}." if accepted else ""
                 )
                 raise ValueError(
                     f"unsupported status {status!r} for Azure DevOps — "
