@@ -75,6 +75,36 @@ class GitHubError(ProviderError):
         self.message = cleaned
 
 
+class PartialTicketCreateError(GitHubError):
+    """`create_ticket(custom_fields=...)` created the REST issue but the
+    Projects v2 board write (add-to-board or a field update) failed
+    partway through (ticket #131).
+
+    The issue itself is NOT rolled back: deleting it needs elevated
+    GraphQL rights and is destructive/irreversible, so this is a
+    deliberate "enriched exception, no deletion" design — callers get
+    `issue_number` / `issue_url` / `issue_node_id` as structured
+    attributes (not just baked into the message string) so a retrying
+    caller can dedupe against the already-created issue instead of
+    creating a duplicate. Subclasses `GitHubError` so every existing
+    `except GitHubError` call site keeps working unchanged.
+    """
+
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        *,
+        issue_number: int | None,
+        issue_url: str | None,
+        issue_node_id: str | None,
+    ):
+        super().__init__(status, message)
+        self.issue_number = issue_number
+        self.issue_url = issue_url
+        self.issue_node_id = issue_node_id
+
+
 def _client(token: str | None) -> httpx.Client:
     headers = {
         "Accept": ACCEPT,
@@ -1112,7 +1142,7 @@ def _board_columns_query(owner_field: str) -> str:
         "field(name:$fieldName){"
         "...on ProjectV2SingleSelectField{id name options{id name}}"
         "}"
-        "}}}}"
+        "}}}"
     )
 
 
@@ -1141,7 +1171,7 @@ def _board_items_query(owner_field: str) -> str:
         "}"
         "}"
         "}"
-        "}}}}"
+        "}}}"
     )
 
 
@@ -2568,9 +2598,22 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         f"created issue #{raw.get('number')} payload missing "
                         f"'node_id'; cannot write custom_fields",
                     )
-                _write_custom_fields_to_board(
-                    client, binding, content_id, custom_fields,
-                )
+                try:
+                    _write_custom_fields_to_board(
+                        client, binding, content_id, custom_fields,
+                    )
+                except GitHubError as exc:
+                    number = raw.get("number")
+                    url = raw.get("html_url")
+                    raise PartialTicketCreateError(
+                        exc.status,
+                        f"issue #{number} ({url}) was created, but writing "
+                        f"custom_fields to its Projects v2 board failed: "
+                        f"{exc.message}",
+                        issue_number=number,
+                        issue_url=url,
+                        issue_node_id=content_id,
+                    ) from exc
             return _map_issue(raw)
 
     def update_ticket(

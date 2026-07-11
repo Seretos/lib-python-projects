@@ -18,7 +18,11 @@ import pytest
 from lib_python_projects import AzureBoardsBinding, Board, GithubProjectsV2Binding, ProjectConfig
 from lib_python_projects.providers import github as github_provider
 from lib_python_projects.providers.base import BoardColumnSpec, TicketFilters
-from lib_python_projects.providers.github import GitHubProvider
+from lib_python_projects.providers.github import (
+    GitHubError,
+    GitHubProvider,
+    PartialTicketCreateError,
+)
 
 
 # ---------- helpers ----------------------------------------------------------
@@ -94,6 +98,13 @@ def _json(payload, status_code: int = 200) -> httpx.Response:
 
 def _graphql_body(req: httpx.Request) -> dict:
     return json.loads(req.content.decode("utf-8"))
+
+
+def _assert_brace_balanced(query: str) -> None:
+    assert query.count("{") == query.count("}"), (
+        f"unbalanced braces ({query.count('{')} '{{' vs "
+        f"{query.count('}')} '}}'): {query!r}"
+    )
 
 
 def _owner_field(query: str) -> str:
@@ -185,6 +196,29 @@ def _issue_node(
             "labels": {"nodes": [{"name": lbl} for lbl in (labels or [])]},
         },
     }
+
+
+# ---------- ticket #131: malformed GraphQL query regression ------------------
+#
+# GitHub's real GraphQL endpoint 400s on an unbalanced query document — the
+# `httpx.MockTransport` used throughout this file returns canned JSON
+# regardless of query text, so a brace-count bug is invisible to every
+# behavioural test above/below. These tests assert on the query *string*
+# itself, independent of the mock transport.
+
+
+def test_board_columns_query_is_brace_balanced() -> None:
+    _assert_brace_balanced(github_provider._board_columns_query("organization"))
+    _assert_brace_balanced(github_provider._board_columns_query("user"))
+    _assert_brace_balanced(github_provider._BOARD_COLUMNS_ORG_QUERY)
+    _assert_brace_balanced(github_provider._BOARD_COLUMNS_USER_QUERY)
+
+
+def test_board_items_query_is_brace_balanced() -> None:
+    _assert_brace_balanced(github_provider._board_items_query("organization"))
+    _assert_brace_balanced(github_provider._board_items_query("user"))
+    _assert_brace_balanced(github_provider._BOARD_ITEMS_ORG_QUERY)
+    _assert_brace_balanced(github_provider._BOARD_ITEMS_USER_QUERY)
 
 
 # ---------- list_board_columns ------------------------------------------------
@@ -1068,3 +1102,216 @@ def test_create_ticket_custom_fields_missing_project_number_raises(
             _project(board), "t", title="hi", body="b", labels=[], assignees=[],
             custom_fields={"Status": "Done"},
         )
+
+
+# ---------- ticket #131: partial-failure `create_ticket(custom_fields=...)` --
+#
+# `_write_custom_fields_to_board` can fail after the REST issue already
+# exists (project-id resolve, `addProjectV2ItemById`, or a per-field
+# `updateProjectV2ItemFieldValue`). The issue is never rolled back (real
+# deletion needs elevated GraphQL rights and is destructive/irreversible),
+# so the failure must surface as a `PartialTicketCreateError` carrying the
+# already-created issue's identity as structured attributes, not just a
+# `GitHubError` a caller has to string-parse.
+
+
+def test_create_ticket_board_write_project_id_resolve_failure_raises_partial_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The project-id resolve GraphQL call (the very first board-write
+    step) fails with a GraphQL error -> `PartialTicketCreateError`, not a
+    bare `GitHubError` and not a silently-dropped issue."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            return _json(_rest_issue_payload(99))
+        if "/labels" in path:
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query = body["query"]
+            if "projectV2(number:$number){id}" in query:
+                return _json({
+                    "data": {"organization": None},
+                    "errors": [{"message": "something went wrong resolving the project"}],
+                })
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(PartialTicketCreateError) as excinfo:
+        GitHubProvider().create_ticket(
+            _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+            custom_fields={"Status": "Done"},
+        )
+    exc = excinfo.value
+    assert isinstance(exc, GitHubError), (
+        "PartialTicketCreateError must subclass GitHubError so existing "
+        "'except GitHubError' callers keep working"
+    )
+    assert exc.issue_number == 99
+    assert exc.issue_url == "https://github.com/acme/backend/issues/99"
+    assert exc.issue_node_id == "issue-node-99"
+    assert "#99" in str(exc)
+
+
+def test_create_ticket_board_write_add_item_failure_raises_partial_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`addProjectV2ItemById` (adding the already-created issue to the
+    board) fails -> `PartialTicketCreateError`; the REST issue POST still
+    happened (documented partial-success reality — no rollback)."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    rest_calls: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            rest_calls.append(path)
+            return _json(_rest_issue_payload(99))
+        if "/labels" in path:
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query = body["query"]
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+            if "addProjectV2ItemById" in query:
+                return _json({
+                    "data": {"addProjectV2ItemById": None},
+                    "errors": [{"message": "could not add item to project"}],
+                })
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(PartialTicketCreateError) as excinfo:
+        GitHubProvider().create_ticket(
+            _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+            custom_fields={"Status": "Done"},
+        )
+    exc = excinfo.value
+    assert isinstance(exc, GitHubError)
+    assert exc.issue_number == 99
+    assert exc.issue_url == "https://github.com/acme/backend/issues/99"
+    assert "#99" in str(exc)
+    assert rest_calls == ["/repos/acme/backend/issues"], (
+        "the REST issue POST must actually have happened — the created "
+        "issue is real, not rolled back"
+    )
+
+
+def test_create_ticket_board_write_field_update_failure_raises_partial_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The item is successfully added to the board, but a per-field
+    `updateProjectV2ItemFieldValue` mutation fails -> `PartialTicketCreateError`
+    (same handler shape as the earlier-stage failures above)."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            return _json(_rest_issue_payload(99))
+        if "/labels" in path:
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query = body["query"]
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {"updateProjectV2ItemFieldValue": None},
+                    "errors": [{"message": "could not update field value"}],
+                })
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(PartialTicketCreateError) as excinfo:
+        GitHubProvider().create_ticket(
+            _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+            custom_fields={"Status": "Done"},
+        )
+    exc = excinfo.value
+    assert isinstance(exc, GitHubError)
+    assert exc.issue_number == 99
+    assert exc.issue_url == "https://github.com/acme/backend/issues/99"
+    assert "#99" in str(exc)
+
+
+def test_create_ticket_missing_node_id_raises_plain_github_error_not_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `node_id`-missing branch is checked before any board
+    interaction, so it must still raise a plain `GitHubError` — not the
+    new `PartialTicketCreateError` subclass (there is no board write to
+    have partially failed)."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            payload = _rest_issue_payload(99)
+            del payload["node_id"]
+            return _json(payload)
+        if "/labels" in path:
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as excinfo:
+        GitHubProvider().create_ticket(
+            _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+            custom_fields={"Status": "Done"},
+        )
+    assert not isinstance(excinfo.value, PartialTicketCreateError)
+    assert "node_id" in str(excinfo.value)
+
+
+def test_create_ticket_custom_fields_none_or_empty_is_unaffected_by_partial_error_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`custom_fields=None`/`{}` stays a silent no-op — no board GraphQL
+    call is ever attempted, so the new try/except around the board write
+    never engages."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            return _json(_rest_issue_payload(99))
+        if "/labels" in path:
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if path == "/graphql":
+            raise AssertionError("no GraphQL call expected when custom_fields is empty")
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket_none = GitHubProvider().create_ticket(
+        _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+        custom_fields=None,
+    )
+    assert ticket_none.id == "99"
+
+    ticket_empty = GitHubProvider().create_ticket(
+        _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+        custom_fields={},
+    )
+    assert ticket_empty.id == "99"
