@@ -40,6 +40,7 @@ from lib_python_config import (
 from lib_python_projects.autodiscover import _autodiscover_from_git
 from lib_python_projects.models import (
     ConfigDocument,
+    InvalidProjectEntry,
     IssuesPermissions,
     Permissions,
     ProjectConfig,
@@ -151,12 +152,24 @@ def _resolve_config_path(cwd: Path) -> tuple[Path | None, list[Path]]:
     )
 
 
-def _load_yaml_projects(yaml_path: Path) -> list[ProjectConfig]:
+def _load_yaml_projects(
+    yaml_path: Path,
+) -> tuple[list[ProjectConfig], list[InvalidProjectEntry]]:
     """Read + validate a single project-list YAML file.
 
-    Returns a list of `ProjectConfig`. Side effect: loads any `env_file`
-    declared in the document (or the conventional `.env` lookups) into
-    the process environment.
+    Returns a tuple of ``(projects, invalid_projects)``: the list of
+    successfully validated `ProjectConfig` entries, plus an
+    `InvalidProjectEntry` for every entry that failed `ProjectConfig`
+    schema validation (e.g. a malformed `board:` block) — those entries
+    are skipped rather than aborting the whole file (ticket #132).
+
+    Structural per-entry failures (a non-mapping item, the reserved
+    `_auto` id, a duplicate id) remain fatal and raise `ConfigError`, as
+    do document-level failures (bad top-level shape, unsupported
+    version).
+
+    Side effect: loads any `env_file` declared in the document (or the
+    conventional `.env` lookups) into the process environment.
     """
     data = load_yaml(yaml_path)
 
@@ -188,6 +201,7 @@ def _load_yaml_projects(yaml_path: Path) -> list[ProjectConfig]:
             break
 
     projects: list[ProjectConfig] = []
+    invalid_projects: list[InvalidProjectEntry] = []
     seen_ids: set[str] = set()
     for idx, item in enumerate(doc.projects):
         if not isinstance(item, dict):
@@ -197,9 +211,16 @@ def _load_yaml_projects(yaml_path: Path) -> list[ProjectConfig]:
         try:
             project = ProjectConfig.model_validate({**item, "source": "config"})
         except ValidationError as exc:
-            raise ConfigError(
-                f"{yaml_path}: projects[{idx}]: {exc}"
-            ) from exc
+            raw_id = item.get("id")
+            safe_id = (
+                raw_id
+                if isinstance(raw_id, str)
+                else (str(raw_id) if raw_id is not None else None)
+            )
+            invalid_projects.append(
+                InvalidProjectEntry(index=idx, id=safe_id, error=str(exc))
+            )
+            continue
         if project.id == "_auto":
             raise ConfigError(
                 f"{yaml_path}: project id '_auto' is reserved for "
@@ -211,7 +232,7 @@ def _load_yaml_projects(yaml_path: Path) -> list[ProjectConfig]:
             )
         seen_ids.add(project.id)
         projects.append(project)
-    return projects
+    return projects, invalid_projects
 
 
 def load_projects(
@@ -280,9 +301,10 @@ def load_projects(
     searched_strs = [str(p) for p in searched]
 
     projects: list[ProjectConfig] = []
+    invalid_projects: list[InvalidProjectEntry] = []
     if config_path:
         try:
-            projects = _load_yaml_projects(config_path)
+            projects, invalid_projects = _load_yaml_projects(config_path)
         except (ConfigError, OSError) as exc:
             # Parse failure: don't try to silently substitute auto-discovery —
             # the user told us where the config lives, and it's broken.
@@ -295,7 +317,16 @@ def load_projects(
                 error=f"failed to load {config_path}: {exc}",
                 searched_paths=searched_strs,
             )
-        log.info("loaded %d project(s) from %s", len(projects), config_path)
+        if invalid_projects:
+            log.warning(
+                "loaded %d project(s) from %s — skipped %d invalid entr%s",
+                len(projects),
+                config_path,
+                len(invalid_projects),
+                "y" if len(invalid_projects) == 1 else "ies",
+            )
+        else:
+            log.info("loaded %d project(s) from %s", len(projects), config_path)
 
     # Additive CWD-repo auto-discovery. Dedup by (provider, path).
     # Whitelist semantics for fremde repos stay intact — `_autodiscover_from_git`
@@ -363,6 +394,11 @@ def load_projects(
 
     if projects:
         state: Literal["ok", "config_empty", "no_config", "config_error"] = "ok"
+    elif config_path and invalid_projects:
+        # Config was found, but every entry that would have populated
+        # `projects` was schema-invalid and skipped (ticket #132) — this
+        # is a config problem, not a genuinely empty `projects: []` doc.
+        state = "config_error"
     elif config_path:
         state = "config_empty"
     else:
@@ -370,14 +406,27 @@ def load_projects(
         log.info("no config, no usable git remote, and no token-discovered projects in %s", cwd)
         state = "no_config"
 
+    error: str | None = None
+    if invalid_projects:
+        detail = "; ".join(
+            f"projects[{entry.index}] (id={entry.id!r}): {entry.error}"
+            for entry in invalid_projects
+        )
+        error = (
+            f"skipped {len(invalid_projects)} schema-invalid project "
+            f"entr{'y' if len(invalid_projects) == 1 else 'ies'}: {detail}"
+        )
+
     return ProjectsLoadResult(
         projects=projects,
         state=state,
         config_file=str(config_path) if config_path else None,
         git_config=str(git_path) if git_path else None,
         search_root=str(cwd),
+        error=error,
         searched_paths=searched_strs,
         discovery_truncated=_any_truncated,
+        invalid_projects=invalid_projects,
     )
 
 

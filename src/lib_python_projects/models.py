@@ -328,6 +328,26 @@ class ConfigDocument(BaseModel):
     projects: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class InvalidProjectEntry(BaseModel):
+    """A single project entry that failed `ProjectConfig` schema validation.
+
+    Recorded (rather than raised) so one schema-invalid entry — e.g. a
+    malformed `board:` block — doesn't collapse the whole registry
+    (ticket #132). `index` and `id` let the calling agent locate the
+    offending entry in the source YAML without reading server stderr;
+    `error` is the raw Pydantic `ValidationError` message.
+
+    Structural per-entry failures (non-mapping item, reserved `_auto`
+    id, duplicate id) are never recorded here — those stay fatal and
+    still raise `ConfigError`, collapsing the whole registry as before.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    index: int
+    id: str | None = None
+    error: str
+
+
 class ProjectsLoadResult(LoadResult):
     """`LoadResult` extended with the resolved project list.
 
@@ -339,6 +359,9 @@ class ProjectsLoadResult(LoadResult):
 
     projects: list[ProjectConfig] = Field(default_factory=list)
     discovery_truncated: bool = False
+    # Schema-invalid entries skipped during load (ticket #132). Empty
+    # unless at least one project entry failed `ProjectConfig` validation.
+    invalid_projects: list[InvalidProjectEntry] = Field(default_factory=list)
 
 
 class ProjectMatch(BaseModel):
