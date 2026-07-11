@@ -340,6 +340,10 @@ class TicketFilters:
     - `True` (default)  → `UNDER`, includes sub-areas.
     - `False`           → `=`, exact match only.
 
+    An `area_path` that doesn't exist yields zero matches rather than
+    raising an error — no extra classification-node lookup is performed
+    to validate it first (see `azuredevops._is_area_path_not_found`).
+
     The default is deliberately `True` because an exact match silently
     drops work items filed under sub-areas, which is rarely what callers
     want. GitHub and GitLab have no equivalent concept and raise

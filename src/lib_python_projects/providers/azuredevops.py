@@ -290,6 +290,33 @@ _500_NOT_FOUND_MSG_FRAGMENTS: tuple[str, ...] = (
 )
 
 
+def _is_area_path_not_found(resp: httpx.Response) -> bool:
+    """True when *resp* is a WIQL 400/404 signalling an unknown area path.
+
+    ADO's WIQL endpoint 404s with ``TF51011: The specified area path does
+    not exist.`` (sometimes surfaced as 400) instead of the documented
+    "invalid area path yields zero matches" behaviour. Anchors on the
+    ``TF51011`` code the same way the `TF401181` PR-review check does
+    elsewhere in this module, with a message-fragment fallback for
+    phrasings that omit the TF code. Parses the envelope the same way
+    `_check` does (message + innerException).
+    """
+    if resp.status_code not in (400, 404):
+        return False
+    try:
+        payload = resp.json()
+        msg = payload.get("message") or ""
+        inner = payload.get("innerException")
+        if isinstance(inner, dict) and inner.get("message"):
+            msg = f"{msg}: {inner['message']}"
+    except Exception:
+        return False
+    msg_lower = msg.lower()
+    return "tf51011" in msg_lower or (
+        "area path" in msg_lower and "does not exist" in msg_lower
+    )
+
+
 def _check(resp: httpx.Response) -> None:
     """Translate a non-success ADO response into an `AzureDevOpsError`.
 
@@ -451,6 +478,15 @@ _CACHE_TTL_SECONDS = 60 * 60  # 1 hour, matching tools/tickets list_ticket_statu
 # deeper than any realistic Area/Iteration tree so the full hierarchy comes
 # back in a single call.
 _CLASSIFICATION_DEPTH = 20
+
+# ADO's classification-node `path` always inserts a synthetic structure
+# label as the second segment (e.g. `\Project\Area\Child`); it is not part
+# of a valid System.AreaPath/System.IterationPath value and must be
+# stripped. Maps the `structure` argument to that singular label.
+_CLASSIFICATION_STRUCTURE_LABEL: dict[str, str] = {
+    "Areas": "Area",
+    "Iterations": "Iteration",
+}
 _cache_lock = threading.Lock()
 _repo_id_cache: dict[tuple[str, str, str], tuple[float, str]] = {}
 _state_cache: dict[tuple[str, str, str], tuple[float, list[dict]]] = {}
@@ -1674,10 +1710,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
     ) -> list[str]:
         """Return every Area/Iteration path in *structure*'s classification tree.
 
-        ``structure`` is ``"Areas"`` or ``"Iterations"``. Each returned entry
-        is the node's `path` with the leading backslash stripped (e.g.
-        ``MyProject\\Team\\SubArea``), matching the value ADO accepts for
-        `System.AreaPath` / `System.IterationPath`. The root project node is
+        ``structure`` is ``"Areas"`` or ``"Iterations"``. ADO's raw node
+        `path` is ``\\Project\\Area\\Child`` (or ``\\Project\\Iteration\\Child``)
+        — the second segment is a synthetic structure label, not part of a
+        valid `System.AreaPath` / `System.IterationPath` value (real values
+        are ``Project`` and ``Project\\Child``). Each returned entry is the
+        node's `path` with the leading backslash stripped and that synthetic
+        segment removed (e.g. ``MyProject\\Team\\SubArea``), matching the
+        value ADO actually accepts as a filter. The root project node is
         included — it is itself a valid area/iteration path. Results are
         cached per `(org, project, structure)` for 1 hour.
         """
@@ -1698,10 +1738,18 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         root = resp.json()
 
         paths: list[str] = []
+        structure_label = _CLASSIFICATION_STRUCTURE_LABEL.get(structure)
 
         def _walk(node: dict) -> None:
             raw_path = node.get("path") or ""
-            paths.append(raw_path.lstrip("\\"))
+            segments = raw_path.lstrip("\\").split("\\")
+            # Drop the synthetic structure-label segment (index 1) —
+            # name-gated so a genuine sub-area/iteration literally named
+            # "Area"/"Iteration" is only stripped at that one synthetic
+            # position, never elsewhere in the path.
+            if len(segments) > 1 and segments[1] == structure_label:
+                del segments[1]
+            paths.append("\\".join(segments))
             for child in node.get("children") or []:
                 _walk(child)
 
@@ -1956,8 +2004,13 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             clauses.append(f"[System.ChangedDate] <= '{_escape_wiql(filters.updated_before)}'")
         if filters.area_path:
             # No validation against classification nodes here — that would
-            # require an extra API round-trip and is out of scope; an
-            # invalid area path simply yields zero matching work items.
+            # require an extra API round-trip and is out of scope. ADO's
+            # WIQL endpoint 404s (TF51011) for an unrecognised area path
+            # rather than returning zero rows; `list_tickets` swallows
+            # that specific response into an empty result (see
+            # `_is_area_path_not_found`), so the "invalid area path
+            # simply yields zero matching work items" contract holds
+            # without an extra validation round-trip.
             if filters.area_path_recursive:
                 clauses.append(f"[System.AreaPath] UNDER '{_escape_wiql(filters.area_path)}'")
             else:
@@ -2012,6 +2065,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 params=_api_version_params({"$top": max(1, filters.limit)}),
                 json={"query": wiql},
             )
+        # Honour the documented "invalid area path yields zero matches"
+        # contract (ticket #147): ADO's WIQL endpoint 404s (TF51011)
+        # instead of returning an empty result set when `area_path`
+        # doesn't resolve. Swallow only that specific, gated case — any
+        # other 4xx (missing project, malformed query, etc.) still
+        # surfaces via `_check` below.
+        if filters.area_path and _is_area_path_not_found(resp):
+            return [], False
         _check(resp)
         ids = [
             int(item.get("id"))

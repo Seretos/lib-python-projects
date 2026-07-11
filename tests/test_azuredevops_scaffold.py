@@ -849,9 +849,12 @@ def test_list_fields_area_path_populated_from_classification_nodes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """System.AreaPath has no inline allowedValues but gets them from the
-    classification-node tree, as full backslash paths with the leading
-    slash stripped. Its type ("treePath") comes from the global field
-    registry, since the bulk per-type endpoint never returns `type`."""
+    classification-node tree. Real ADO node paths embed a synthetic "Area"
+    structure segment as the second path component (`\\Proj\\Area\\Team A`)
+    that is NOT part of a valid System.AreaPath filter value — it must be
+    stripped, leaving `Proj` / `Proj\\Team A` (ticket #147, defect b). Its
+    type ("treePath") comes from the global field registry, since the bulk
+    per-type endpoint never returns `type`."""
     fields = [
         {
             "referenceName": "System.AreaPath",
@@ -862,14 +865,9 @@ def test_list_fields_area_path_populated_from_classification_nodes(
     ]
     registry = [{"referenceName": "System.AreaPath", "type": "treePath"}]
     tree = {
-        "path": "\\Proj",
+        "path": "\\Proj\\Area",
         "children": [
-            {
-                "path": "\\Proj\\Team",
-                "children": [
-                    {"path": "\\Proj\\Team\\Sub", "children": []},
-                ],
-            },
+            {"path": "\\Proj\\Area\\Team A", "children": []},
         ],
     }
 
@@ -888,7 +886,7 @@ def test_list_fields_area_path_populated_from_classification_nodes(
     _install_mock(monkeypatch, handler)
     result = AzureDevOpsProvider().list_fields(p, token="t")
     assert len(result) == 1
-    assert result[0].allowed_values == ["Proj", "Proj\\Team", "Proj\\Team\\Sub"]
+    assert result[0].allowed_values == ["Proj", "Proj\\Team A"]
     assert result[0].type == "treePath"
 
 
@@ -896,7 +894,12 @@ def test_list_fields_iteration_path_populated_from_classification_nodes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """System.IterationPath is populated from the Iterations classification
-    tree. Its type ("treePath") comes from the global field registry."""
+    tree. Real ADO node paths embed a synthetic "Iteration" structure
+    segment as the second path component (`\\Proj\\Iteration\\Sprint 1`)
+    that is NOT part of a valid System.IterationPath filter value — it
+    must be stripped, leaving `Proj` / `Proj\\Sprint 1` (ticket #147,
+    defect b). Its type ("treePath") comes from the global field
+    registry."""
     fields = [
         {
             "referenceName": "System.IterationPath",
@@ -907,10 +910,10 @@ def test_list_fields_iteration_path_populated_from_classification_nodes(
     ]
     registry = [{"referenceName": "System.IterationPath", "type": "treePath"}]
     tree = {
-        "path": "\\Proj",
+        "path": "\\Proj\\Iteration",
         "children": [
-            {"path": "\\Proj\\Sprint 1", "children": []},
-            {"path": "\\Proj\\Sprint 2", "children": []},
+            {"path": "\\Proj\\Iteration\\Sprint 1", "children": []},
+            {"path": "\\Proj\\Iteration\\Sprint 2", "children": []},
         ],
     }
 
@@ -931,6 +934,124 @@ def test_list_fields_iteration_path_populated_from_classification_nodes(
     assert len(result) == 1
     assert result[0].allowed_values == ["Proj", "Proj\\Sprint 1", "Proj\\Sprint 2"]
     assert result[0].type == "treePath"
+
+
+def test_list_fields_area_path_root_only_tree_no_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A project with no sub-areas still yields the stripped root path
+    (ticket #147 was only observed on such a project, since the bug is
+    invisible on a root-only tree without this regression check)."""
+    fields = [
+        {
+            "referenceName": "System.AreaPath",
+            "name": "Area Path",
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+    registry = [{"referenceName": "System.AreaPath", "type": "treePath"}]
+    tree = {"path": "\\azure-tests\\Area", "children": []}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
+            return _json({"value": fields})
+        if path.endswith("/_apis/wit/classificationnodes/Areas"):
+            return _json(tree)
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry})
+        raise AssertionError(f"unexpected path {path}")
+
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    assert result[0].allowed_values == ["azure-tests"]
+
+
+def test_list_fields_area_path_deep_nesting_strips_only_synthetic_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deeper tree (`\\Proj\\Area\\Team\\Sub`) still only strips the
+    synthetic index-1 "Area" segment, leaving the rest of the hierarchy
+    intact (`Proj\\Team\\Sub`)."""
+    fields = [
+        {
+            "referenceName": "System.AreaPath",
+            "name": "Area Path",
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+    registry = [{"referenceName": "System.AreaPath", "type": "treePath"}]
+    tree = {
+        "path": "\\Proj\\Area",
+        "children": [
+            {
+                "path": "\\Proj\\Area\\Team",
+                "children": [
+                    {"path": "\\Proj\\Area\\Team\\Sub", "children": []},
+                ],
+            },
+        ],
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
+            return _json({"value": fields})
+        if path.endswith("/_apis/wit/classificationnodes/Areas"):
+            return _json(tree)
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry})
+        raise AssertionError(f"unexpected path {path}")
+
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    assert result[0].allowed_values == ["Proj", "Proj\\Team", "Proj\\Team\\Sub"]
+
+
+def test_list_fields_area_path_genuine_subarea_named_area_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine sub-area literally named "Area" (`\\Proj\\Area\\Area`) must
+    only have the synthetic index-1 segment removed, not the later,
+    real "Area" segment — name-gated positional removal, not a blanket
+    filter on the string "Area"."""
+    fields = [
+        {
+            "referenceName": "System.AreaPath",
+            "name": "Area Path",
+            "isReadOnly": False,
+            "alwaysRequired": False,
+        }
+    ]
+    registry = [{"referenceName": "System.AreaPath", "type": "treePath"}]
+    tree = {
+        "path": "\\Proj\\Area",
+        "children": [
+            {"path": "\\Proj\\Area\\Area", "children": []},
+        ],
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes/Issue/fields"):
+            return _json({"value": fields})
+        if path.endswith("/_apis/wit/classificationnodes/Areas"):
+            return _json(tree)
+        if path.endswith("/_apis/wit/fields"):
+            return _json({"value": registry})
+        raise AssertionError(f"unexpected path {path}")
+
+    p = _project()
+    p.default_work_item_type = "Issue"  # type: ignore[misc]
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_fields(p, token="t")
+    assert result[0].allowed_values == ["Proj", "Proj\\Area"]
 
 
 def test_list_fields_picklist_falls_back_to_per_field_endpoint(
