@@ -1039,6 +1039,30 @@ def _resolve_assignee_ids(
     return resolved
 
 
+def _resolve_milestone_id(
+    client: httpx.Client, path: str, title: str,
+) -> int:
+    """Resolve a milestone title -> integer milestone id.
+
+    Used by `GitLabProvider.create_ticket`'s `custom_fields["milestone"]`
+    support (ticket #123). `GET /projects/{path}/milestones?title=<title>`
+    filters server-side on an exact title match; the first match's `id`
+    is used. No match raises `ValueError` naming the bad title, rather
+    than silently creating the issue without a milestone.
+    """
+    r = client.get(f"/projects/{path}/milestones", params={"title": title})
+    _check(r)
+    matches = r.json()
+    if matches:
+        milestone_id = matches[0].get("id")
+        if isinstance(milestone_id, int):
+            return milestone_id
+    raise ValueError(
+        f"milestone {title!r} not found on this GitLab project — "
+        "check the title (case-sensitive) or create it first"
+    )
+
+
 _MENTION_PATTERN = re.compile(r"(?:(?P<scope>[\w./-]+)?#)(?P<n>\d+)\b")
 _CLOSE_PATTERN = re.compile(
     r"(?i)\b(?:closes?|fixes?|resolves?|implements?)\s+"
@@ -1618,17 +1642,24 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         System notes (state changes, label edits) are filtered out —
         they're not user-facing comments.
 
-        `include_custom_fields` is accepted for cross-provider signature
-        parity with Azure DevOps but is a no-op here: GitLab has no
-        provider-native raw-field map, so `ticket.custom_fields` stays
-        `None` regardless of this flag. Cross-provider support is
-        deferred to ticket #123.
+        When `include_custom_fields` is `True`, `ticket.custom_fields` is
+        populated from the issue JSON already fetched for this call (no
+        extra HTTP request) with two fixed keys: `"labels"` (the issue's
+        label list) and `"milestone"` (the milestone title, or `None`
+        when the issue has no milestone). Defaults to `False`, in which
+        case `ticket.custom_fields` stays `None`.
         """
         path = _project_path(project)
         with _client(project, token) as client:
             r = client.get(f"/projects/{path}/issues/{ticket_id}")
             _check(r)
-            ticket = _map_issue(r.json(), project)
+            raw = r.json()
+            ticket = _map_issue(raw, project)
+            if include_custom_fields:
+                ticket.custom_fields = {
+                    "labels": list(raw.get("labels") or []),
+                    "milestone": (raw.get("milestone") or {}).get("title"),
+                }
             c = client.get(
                 f"/projects/{path}/issues/{ticket_id}/notes",
                 params={"per_page": 100, "sort": "asc", "order_by": "created_at"},
@@ -1682,25 +1713,39 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         performed up-front (`_status_to_state_event`) so an invalid
         value rejects before the POST.
 
-        `custom_fields` is accepted for cross-provider signature parity
-        with Azure DevOps, but GitLab has no provider-native raw-field
-        write path yet: a non-empty dict raises `ValueError` (cross-provider
-        support is deferred to ticket #123). `None`/`{}` is a silent no-op
+        `custom_fields` supports exactly two keys, applied *after* the
+        standard `labels`/`status` handling so they win on overlap:
+          - `"labels"` (`list[str]`) — **replaces** the positional
+            `labels` argument entirely before the `ai-generated` marker
+            is merged in, so the marker is always present regardless.
+          - `"milestone"` (`str | None`) — a milestone title, resolved
+            to a `milestone_id` via `GET /projects/{path}/milestones`.
+            `None` omits/clears the milestone. An unmatched title raises
+            `ValueError`.
+        Any other key raises `ValueError`. `None`/`{}` is a silent no-op
         so existing callers are unaffected.
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
-        if custom_fields:
+        allowed_custom_field_keys = {"labels", "milestone"}
+        unknown_keys = set(custom_fields or {}) - allowed_custom_field_keys
+        if unknown_keys:
             raise ValueError(
-                "custom_fields is not supported on GitLab yet — "
-                "cross-provider support is deferred to ticket #123"
+                f"unsupported custom_fields key(s) {sorted(unknown_keys)!r} "
+                f"for GitLab — supported: 'labels' (list[str]), "
+                f"'milestone' (title str or None)"
             )
         # Validate `status` up-front. Pass None through; raise on
         # unknown values before POST commits an issue.
         state_event: str | None = None
         if status is not None:
             state_event = _status_to_state_event(status)
-        merged_labels = list(dict.fromkeys([*labels, AI_GENERATED_LABEL]))
+        effective_labels = (
+            custom_fields["labels"]
+            if custom_fields and "labels" in custom_fields
+            else labels
+        )
+        merged_labels = list(dict.fromkeys([*(effective_labels or []), AI_GENERATED_LABEL]))
         prefixed_body = ensure_body_prefix(body)
         path = _project_path(project)
         with _client(project, token) as client:
@@ -1713,6 +1758,12 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 payload["labels"] = ",".join(merged_labels)
             if assignee_ids:
                 payload["assignee_ids"] = assignee_ids
+            if custom_fields and "milestone" in custom_fields:
+                milestone_title = custom_fields["milestone"]
+                if milestone_title is not None:
+                    payload["milestone_id"] = _resolve_milestone_id(
+                        client, path, milestone_title,
+                    )
             r = client.post(f"/projects/{path}/issues", json=payload)
             _check(r)
             raw = r.json()

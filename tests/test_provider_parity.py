@@ -888,22 +888,75 @@ def test_gitlab_list_fields_returns_empty():
     assert result == []
 
 
-# ---------- ticket #114: custom_fields cross-provider guards (GitHub/GitLab) -
+# ---------- ticket #114/#123: custom_fields cross-provider parity ------------
+#
+# Non-empty custom_fields on GitHub/GitLab now write real provider-native
+# data (ticket #123) — see `tests/test_github_board.py` (Projects v2 field
+# read/write) and `tests/test_gitlab_issues.py` (labels/milestone
+# read/write) for the detailed behavioural coverage. The tests below only
+# assert the cross-provider shape: real reads/writes happen, and the
+# `None`/`{}` no-op contract is preserved on both providers.
 
 
-def test_github_create_ticket_custom_fields_nonempty_raises(monkeypatch):
-    """GitHub has no provider-native field-write path yet; a non-empty
-    custom_fields must raise ValueError referencing the #123 deferral
-    before any HTTP call."""
+def test_github_create_ticket_custom_fields_writes_real_data(monkeypatch):
+    """Cross-provider parity check (ticket #123): a non-empty custom_fields
+    no longer raises on GitHub — it's written via the bound
+    github-projects-v2 board's GraphQL mutations. Detailed field-type and
+    error-path coverage lives in test_github_board.py."""
+    from lib_python_projects import Board, GithubProjectsV2Binding
+
+    board = Board(
+        columns=["Todo", "Done"],
+        binding=GithubProjectsV2Binding(
+            kind="github-projects-v2", owner="acme-org", project_number=7,
+        ),
+    )
+    mutations_seen: list[str] = []
+
     def handler(req):
-        raise AssertionError("no HTTP call expected when custom_fields is rejected")
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            return _resp({
+                "number": 9, "node_id": "issue-node-9",
+                "title": "hi", "body": "b", "state": "open",
+                "user": {"login": "a"}, "assignees": [],
+                "labels": [{"name": "ai-generated"}],
+                "html_url": "https://github.com/acme/backend/issues/9",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        if "/labels" in path:
+            return _resp({"name": "ai-generated", "color": "0075ca"})
+        if path == "/graphql":
+            body = json.loads(req.content.decode())
+            query, variables = body["query"], body["variables"]
+            if "addProjectV2ItemById" in query:
+                mutations_seen.append("add")
+                return _resp({"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}})
+            if "updateProjectV2ItemFieldValue" in query:
+                mutations_seen.append("update")
+                return _resp({
+                    "data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "item-1"}}}
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = "organization" if "organization(login:" in query else "user"
+                return _resp({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = "organization" if "organization(login:" in query else "user"
+                return _resp({"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}})
+        raise AssertionError(f"unexpected request {req.method} {path}")
 
     _install_github_mock(monkeypatch, handler)
-    with pytest.raises(ValueError, match="#123"):
-        GitHubProvider().create_ticket(
-            _github_project(), "t", title="hi", body="b", labels=[], assignees=[],
-            custom_fields={"some.field": "x"},
-        )
+    ticket = GitHubProvider().create_ticket(
+        ProjectConfig(id="acme", provider="github", path="acme/backend", board=board),
+        "t", title="hi", body="b", labels=[], assignees=[],
+        custom_fields={"Status": "Done"},
+    )
+    assert ticket.id == "9"
+    assert mutations_seen == ["add", "update"]
 
 
 def test_github_create_ticket_custom_fields_none_or_empty_is_noop(monkeypatch):
@@ -938,9 +991,11 @@ def test_github_create_ticket_custom_fields_none_or_empty_is_noop(monkeypatch):
         assert payload["title"] == "hi"
 
 
-def test_github_get_ticket_include_custom_fields_returns_none(monkeypatch):
-    """GitHub has no raw-field map: include_custom_fields=True still leaves
-    ticket.custom_fields None, with no extra HTTP request."""
+def test_github_get_ticket_include_custom_fields_no_board_returns_none(monkeypatch):
+    """No github-projects-v2 board configured: include_custom_fields=True
+    still leaves ticket.custom_fields None, with no extra HTTP request —
+    "not applicable" semantics (ticket #123). Populated-map coverage lives
+    in test_github_board.py."""
     seen: list = []
 
     def handler(req):
@@ -967,19 +1022,40 @@ def test_github_get_ticket_include_custom_fields_returns_none(monkeypatch):
     assert len(seen) == 2, "no extra HTTP request beyond issue GET + comments GET"
 
 
-def test_gitlab_create_ticket_custom_fields_nonempty_raises(monkeypatch):
-    """GitLab has no provider-native field-write path yet; a non-empty
-    custom_fields must raise ValueError referencing the #123 deferral
-    before any HTTP call."""
+def test_gitlab_create_ticket_custom_fields_writes_real_data(monkeypatch):
+    """Cross-provider parity check (ticket #123): a non-empty custom_fields
+    no longer raises on GitLab — `labels` replaces the positional labels
+    arg and `milestone` resolves to a milestone_id. Detailed key-rejection
+    and error-path coverage lives in test_gitlab_issues.py."""
+    captured: dict = {}
+
     def handler(req):
-        raise AssertionError("no HTTP call expected when custom_fields is rejected")
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _resp([])
+        if req.method == "GET" and req.url.path.endswith("/milestones"):
+            return _resp([{"id": 9, "title": "v2.0"}])
+        if req.method == "POST" and req.url.path.endswith("/issues"):
+            captured["body"] = json.loads(req.content.decode())
+            return _resp({
+                "iid": 6, "title": "hi", "description": "b", "state": "opened",
+                "author": {"username": "a"}, "assignees": [],
+                "labels": ["from-custom-fields", "ai-generated"],
+                "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/6",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        return _resp([])
 
     _install_gitlab_mock(monkeypatch, handler)
-    with pytest.raises(ValueError, match="#123"):
-        GitLabProvider().create_ticket(
-            _gitlab_project(), "t", title="hi", body="b", labels=[], assignees=[],
-            custom_fields={"some_field": "x"},
-        )
+    ticket = GitLabProvider().create_ticket(
+        _gitlab_project(), "t", title="hi", body="b", labels=[], assignees=[],
+        custom_fields={"labels": ["from-custom-fields"], "milestone": "v2.0"},
+    )
+    assert ticket.id == "6"
+    sent_labels = captured["body"]["labels"].split(",")
+    assert "from-custom-fields" in sent_labels
+    assert "ai-generated" in sent_labels
+    assert captured["body"]["milestone_id"] == 9
 
 
 def test_gitlab_create_ticket_custom_fields_none_or_empty_is_noop(monkeypatch):
@@ -1011,9 +1087,13 @@ def test_gitlab_create_ticket_custom_fields_none_or_empty_is_noop(monkeypatch):
         assert payload["title"] == "hi"
 
 
-def test_gitlab_get_ticket_include_custom_fields_returns_none(monkeypatch):
-    """GitLab has no raw-field map: include_custom_fields=True still leaves
-    ticket.custom_fields None, with no extra HTTP request."""
+def test_gitlab_get_ticket_include_custom_fields_returns_labels_and_milestone(
+    monkeypatch,
+):
+    """Cross-provider parity check (ticket #123): include_custom_fields=True
+    populates a real `{"labels": [...], "milestone": ...}` map from the
+    issue JSON already fetched, with no extra HTTP request. Milestone-unset
+    and key-rejection coverage lives in test_gitlab_issues.py."""
     seen: list = []
 
     def handler(req):
@@ -1024,7 +1104,8 @@ def test_gitlab_get_ticket_include_custom_fields_returns_none(monkeypatch):
         if path.endswith("/issues/5"):
             return _resp({
                 "iid": 5, "title": "T", "description": "", "state": "opened",
-                "author": {"username": "a"}, "assignees": [], "labels": [],
+                "author": {"username": "a"}, "assignees": [],
+                "labels": ["bug"], "milestone": {"id": 9, "title": "v2.0"},
                 "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/5",
                 "created_at": "2024-01-01T00:00:00Z",
                 "updated_at": "2024-01-01T00:00:00Z",
@@ -1035,5 +1116,5 @@ def test_gitlab_get_ticket_include_custom_fields_returns_none(monkeypatch):
     ticket, _c, _r, _t = GitLabProvider().get_ticket(
         _gitlab_project(), "t", "5", include_relations=False, include_custom_fields=True,
     )
-    assert ticket.custom_fields is None
+    assert ticket.custom_fields == {"labels": ["bug"], "milestone": "v2.0"}
     assert len(seen) == 2, "no extra HTTP request beyond issue GET + notes GET"
