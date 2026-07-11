@@ -220,6 +220,21 @@ def test_list_tickets_nonpositive_limit_raises_before_http(
         )
 
 
+def test_list_tickets_area_path_raises_valueerror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """area_path is an Azure DevOps concept — GitLab must fail fast."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected when area_path is set")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="area_path is not supported on GitLab"):
+        GitLabProvider().list_tickets(
+            _project(), "t", TicketFilters(area_path="MyProj\\Team A"),
+        )
+
+
 def test_list_tickets_has_more_true_when_full_page(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -179,6 +179,115 @@ def test_list_tickets_translates_label_filter(monkeypatch: pytest.MonkeyPatch) -
     assert "[System.Tags] NOT CONTAINS 'ignore'" in captured["wiql"]
 
 
+def test_list_tickets_translates_area_path_recursive_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _basic_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(area_path="MyProj\\Team A"),
+    )
+    assert "[System.AreaPath] UNDER 'MyProj\\Team A'" in captured["wiql"]
+
+
+def test_list_tickets_translates_area_path_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _basic_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(area_path="MyProj\\Team A", area_path_recursive=False),
+    )
+    assert "[System.AreaPath] = 'MyProj\\Team A'" in captured["wiql"]
+    assert "UNDER" not in captured["wiql"]
+
+
+def test_list_tickets_area_path_escapes_single_quote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _basic_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(area_path="Proj\\O'Brien"),
+    )
+    assert "O''Brien" in captured["wiql"]
+
+
+def test_list_tickets_no_area_path_clause_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bt = _basic_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(labels=["bug"]),
+    )
+    assert "[System.AreaPath]" not in captured["wiql"]
+
+    # Composes correctly under AND with an existing filter.
+    captured.clear()
+    AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(labels=["bug"], area_path="MyProj\\Team A"),
+    )
+    wiql = captured["wiql"]
+    assert "[System.Tags] CONTAINS 'bug'" in wiql
+    assert "[System.AreaPath] UNDER 'MyProj\\Team A'" in wiql
+    assert " AND " in wiql
+
+
 def test_list_tickets_state_open_filters_by_categories(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
