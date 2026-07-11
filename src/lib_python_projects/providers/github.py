@@ -1217,6 +1217,295 @@ def _fetch_projects_v2_via_graphql(
     return project_v2
 
 
+# ---------- GraphQL: custom_fields read/write via Projects v2 (ticket #123) -
+#
+# `get_ticket(..., include_custom_fields=True)` / `create_ticket(...,
+# custom_fields=...)` piggyback on the same `github-projects-v2` board
+# binding as `list_board_columns` (ticket #118): custom fields *are* the
+# board's Projects v2 fields.
+
+
+_ISSUE_PROJECT_FIELDS_QUERY = (
+    "query($owner:String!,$repo:String!,$number:Int!){"
+    "repository(owner:$owner,name:$repo){"
+    "issue(number:$number){"
+    "projectItems(first:20){"
+    "nodes{"
+    "project{number}"
+    "fieldValues(first:50){"
+    "nodes{"
+    "...on ProjectV2ItemFieldSingleSelectValue{name field{...on ProjectV2FieldCommon{name}}}"
+    "...on ProjectV2ItemFieldTextValue{text field{...on ProjectV2FieldCommon{name}}}"
+    "...on ProjectV2ItemFieldNumberValue{number field{...on ProjectV2FieldCommon{name}}}"
+    "...on ProjectV2ItemFieldDateValue{date field{...on ProjectV2FieldCommon{name}}}"
+    "...on ProjectV2ItemFieldIterationValue{title field{...on ProjectV2FieldCommon{name}}}"
+    "}"
+    "}"
+    "}"
+    "}"
+    "}"
+    "}}"
+)
+
+
+def _extract_project_field_values(item: dict) -> dict[str, Any]:
+    """Flatten a `projectItems` node's typed `fieldValues` into a plain
+    `{field name: native display value}` map (ticket #123).
+
+    Each `fieldValues` node only carries the sub-selection matching its
+    concrete GraphQL type (the inline fragment that applied), so exactly
+    one of `name`/`text`/`number`/`date`/`title` is present per node —
+    whichever is present *is* the field's native value.
+    """
+    result: dict[str, Any] = {}
+    for fv in (item.get("fieldValues") or {}).get("nodes") or []:
+        field_name = (fv.get("field") or {}).get("name")
+        if not field_name:
+            continue
+        for key in ("name", "text", "number", "date", "title"):
+            if key in fv:
+                result[field_name] = fv[key]
+                break
+    return result
+
+
+def _fetch_issue_project_fields_via_graphql(
+    client: httpx.Client,
+    *,
+    repo_owner: str,
+    repo: str,
+    issue_number: int,
+    project_number: int,
+) -> dict[str, Any] | None:
+    """Return the `custom_fields` map for `issue_number`'s item on the
+    Projects v2 board `project_number`, or `None` if the issue has no
+    item on that project (ticket #123 read path).
+
+    Scoped through the repository (not org/user), so no org/user retry
+    is needed here — `list_board_columns`'s retry dance is only for
+    resolving the *board itself* by owner login.
+    """
+    r = client.post(
+        "/graphql",
+        json={
+            "query": _ISSUE_PROJECT_FIELDS_QUERY,
+            "variables": {
+                "owner": repo_owner, "repo": repo, "number": issue_number,
+            },
+        },
+    )
+    _check(r)
+    body = r.json()
+    if body.get("errors"):
+        raise GitHubError(
+            400,
+            f"GraphQL error fetching project fields for issue "
+            f"#{issue_number}: {body['errors']}",
+        )
+    issue = ((body.get("data") or {}).get("repository") or {}).get("issue") or {}
+    for item in (issue.get("projectItems") or {}).get("nodes") or []:
+        if (item.get("project") or {}).get("number") == project_number:
+            return _extract_project_field_values(item)
+    return None
+
+
+def _board_field_write_query(owner_field: str) -> str:
+    """Like `_board_columns_query`, but exposes the field's own `id`
+    for *every* field type (via the `ProjectV2FieldCommon` interface),
+    not just single-select — the write path needs `fieldId` regardless
+    of whether the field is single-select, text, number, or date.
+    """
+    return (
+        "query($owner:String!,$number:Int!,$fieldName:String!){"
+        f"{owner_field}(login:$owner){{projectV2(number:$number){{"
+        "field(name:$fieldName){"
+        "...on ProjectV2FieldCommon{id name}"
+        "...on ProjectV2SingleSelectField{options{id name}}"
+        "}"
+        "}}}"
+    )
+
+
+_BOARD_FIELD_WRITE_ORG_QUERY = _board_field_write_query("organization")
+_BOARD_FIELD_WRITE_USER_QUERY = _board_field_write_query("user")
+
+
+def _board_project_id_query(owner_field: str) -> str:
+    return (
+        "query($owner:String!,$number:Int!){"
+        f"{owner_field}(login:$owner){{projectV2(number:$number){{id}}}}}}"
+    )
+
+
+_BOARD_PROJECT_ID_ORG_QUERY = _board_project_id_query("organization")
+_BOARD_PROJECT_ID_USER_QUERY = _board_project_id_query("user")
+
+
+_ADD_PROJECT_V2_ITEM_MUTATION = (
+    "mutation($projectId:ID!,$contentId:ID!){"
+    "addProjectV2ItemById(input:{projectId:$projectId,contentId:$contentId})"
+    "{item{id}}}"
+)
+_UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION = (
+    "mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){"
+    "updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,"
+    "fieldId:$fieldId,value:$value}){projectV2Item{id}}}"
+)
+
+
+def _resolve_project_field_for_write(
+    client: httpx.Client, binding: Any, field_name: str,
+) -> dict:
+    """Resolve `field_name` against the bound Projects v2 board.
+
+    Returns the GraphQL `field` payload: `{"id":..., "name":...,
+    "options":[{"id":..., "name":...}, ...]}` for single-select fields,
+    `{"id":..., "name":...}` for text/number/date/iteration fields.
+    Raises `ValueError` when the field doesn't exist on the board.
+    """
+    project_v2 = _fetch_projects_v2_via_graphql(
+        client,
+        owner=binding.owner,
+        project_number=binding.project_number,
+        org_query=_BOARD_FIELD_WRITE_ORG_QUERY,
+        user_query=_BOARD_FIELD_WRITE_USER_QUERY,
+        variables={
+            "owner": binding.owner,
+            "number": binding.project_number,
+            "fieldName": field_name,
+        },
+    )
+    field = project_v2.get("field")
+    if not field or not field.get("id"):
+        raise ValueError(
+            f"GitHub Projects v2 field {field_name!r} was not found on "
+            f"project #{binding.project_number} for owner {binding.owner!r}"
+        )
+    return field
+
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _project_v2_field_value_input(
+    field: dict, field_name: str, value: Any,
+) -> dict:
+    """Map a `custom_fields` value to the `ProjectV2FieldValue` input
+    shape `updateProjectV2ItemFieldValue` expects — exactly one of
+    `singleSelectOptionId` / `text` / `number` / `date` is set.
+
+    Single-select fields resolve `value` (a display-name string) to its
+    live `optionId`, matched case-insensitively; an unmatched value
+    raises `ValueError`. Non-single-select fields infer the input kind
+    from `value`'s Python type (`bool`/`str` digits-only date -> date,
+    `int`/`float` -> number, everything else -> text).
+    """
+    options = field.get("options")
+    if options:
+        if not isinstance(value, str):
+            raise ValueError(
+                f"custom_fields[{field_name!r}] must be a string option "
+                f"name for single-select field {field_name!r}, got {value!r}"
+            )
+        by_lower_name = {opt["name"].lower(): opt for opt in options}
+        opt = by_lower_name.get(value.lower())
+        if opt is None:
+            available = sorted(o["name"] for o in options)
+            raise ValueError(
+                f"custom_fields[{field_name!r}] value {value!r} is not a "
+                f"valid option (available: {available})"
+            )
+        return {"singleSelectOptionId": opt["id"]}
+    if isinstance(value, bool):
+        return {"text": str(value)}
+    if isinstance(value, (int, float)):
+        return {"number": value}
+    if isinstance(value, str) and _ISO_DATE_RE.match(value):
+        return {"date": value}
+    return {"text": "" if value is None else str(value)}
+
+
+def _add_project_v2_item(
+    client: httpx.Client, project_id: str, content_id: str,
+) -> str:
+    """Add `content_id` (an issue's `node_id`) to `project_id`'s board
+    and return the new item's node id."""
+    r = client.post(
+        "/graphql",
+        json={
+            "query": _ADD_PROJECT_V2_ITEM_MUTATION,
+            "variables": {"projectId": project_id, "contentId": content_id},
+        },
+    )
+    _check(r)
+    body = r.json()
+    if body.get("errors"):
+        raise GitHubError(
+            400, f"GraphQL error adding issue to project: {body['errors']}"
+        )
+    item = ((body.get("data") or {}).get("addProjectV2ItemById") or {}).get("item") or {}
+    item_id = item.get("id")
+    if not item_id:
+        raise GitHubError(500, "addProjectV2ItemById did not return an item id")
+    return item_id
+
+
+def _update_project_v2_item_field_value(
+    client: httpx.Client,
+    project_id: str,
+    item_id: str,
+    field_id: str,
+    value: dict,
+) -> None:
+    r = client.post(
+        "/graphql",
+        json={
+            "query": _UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION,
+            "variables": {
+                "projectId": project_id,
+                "itemId": item_id,
+                "fieldId": field_id,
+                "value": value,
+            },
+        },
+    )
+    _check(r)
+    body = r.json()
+    if body.get("errors"):
+        raise GitHubError(
+            400, f"GraphQL error updating project field value: {body['errors']}"
+        )
+
+
+def _write_custom_fields_to_board(
+    client: httpx.Client, binding: Any, content_id: str, custom_fields: dict[str, Any],
+) -> None:
+    """Add the created issue to the bound Projects v2 board and write
+    each `custom_fields` entry onto it (ticket #123 write path)."""
+    project_v2 = _fetch_projects_v2_via_graphql(
+        client,
+        owner=binding.owner,
+        project_number=binding.project_number,
+        org_query=_BOARD_PROJECT_ID_ORG_QUERY,
+        user_query=_BOARD_PROJECT_ID_USER_QUERY,
+        variables={"owner": binding.owner, "number": binding.project_number},
+    )
+    project_id = project_v2.get("id")
+    if not project_id:
+        raise GitHubError(
+            500,
+            f"GitHub Projects v2 project #{binding.project_number} for "
+            f"owner {binding.owner!r} did not return an 'id'",
+        )
+    item_id = _add_project_v2_item(client, project_id, content_id)
+    for field_name, value in custom_fields.items():
+        field = _resolve_project_field_for_write(client, binding, field_name)
+        value_input = _project_v2_field_value_input(field, field_name, value)
+        _update_project_v2_item_field_value(
+            client, project_id, item_id, field["id"], value_input,
+        )
+
+
 # ---------- GraphQL fallback for `parent` ---------------------------------
 
 _PARENT_GRAPHQL_QUERY = (
@@ -2111,11 +2400,15 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         `truncated=None` signals "skipped"; `truncated=False` signals
         "fetched but empty".  `relations` is always a list (never `None`).
 
-        `include_custom_fields` is accepted for cross-provider signature
-        parity with Azure DevOps but is a no-op here: GitHub has no
-        provider-native raw-field map, so `ticket.custom_fields` stays
-        `None` regardless of this flag. Cross-provider support is
-        deferred to ticket #123.
+        When `include_custom_fields` is `True`, `ticket.custom_fields` is
+        populated from the configured `github-projects-v2` board binding
+        (`project.board.binding`): the issue's `fieldValues` on that
+        board's item, keyed by field name (ticket #123). No board
+        binding configured (or the binding isn't `github-projects-v2`,
+        or is missing `owner`/`project_number`) -> `custom_fields` stays
+        `None` (never raises on read — "not applicable" semantics).
+        Binding configured but the issue has no item on that project ->
+        `custom_fields = {}`.
         """
         with _client(token) as client:
             r = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
@@ -2129,6 +2422,23 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 raise
             issue_raw = r.json()
             ticket = _map_issue(issue_raw)
+            if include_custom_fields:
+                board = project.board
+                binding = board.binding if board is not None else None
+                if (
+                    binding is not None
+                    and binding.kind == "github-projects-v2"
+                    and binding.owner
+                    and binding.project_number
+                ):
+                    fields = _fetch_issue_project_fields_via_graphql(
+                        client,
+                        repo_owner=project.owner,
+                        repo=project.repo,
+                        issue_number=int(ticket_id),
+                        project_number=binding.project_number,
+                    )
+                    ticket.custom_fields = fields if fields is not None else {}
             c = client.get(
                 f"{_repo_path(project)}/issues/{ticket_id}/comments",
                 params={"per_page": 100},
@@ -2173,19 +2483,35 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         landed via a follow-up PATCH inside this method — the agent
         sees one logical call.
 
-        `custom_fields` is accepted for cross-provider signature parity
-        with Azure DevOps, but GitHub has no provider-native raw-field
-        write path yet: a non-empty dict raises `ValueError` (cross-provider
-        support is deferred to ticket #123). `None`/`{}` is a silent no-op
-        so existing callers are unaffected.
+        A non-empty `custom_fields` requires a `github-projects-v2` board
+        binding configured on `project.board` (ticket #123): after the
+        issue is created, it's added to the bound board via
+        `addProjectV2ItemById`, then each `custom_fields` entry is
+        written via `updateProjectV2ItemFieldValue` (single-select
+        values are resolved to their live `optionId`, matched
+        case-insensitively). No board binding configured -> `ValueError`
+        naming the missing config. `None`/`{}` is a silent no-op so
+        existing callers are unaffected.
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
+        binding = None
         if custom_fields:
-            raise ValueError(
-                "custom_fields is not supported on GitHub yet — "
-                "cross-provider support is deferred to ticket #123"
-            )
+            board = project.board
+            binding = board.binding if board is not None else None
+            if (
+                binding is None
+                or binding.kind != "github-projects-v2"
+                or not binding.owner
+                or not binding.project_number
+            ):
+                raise ValueError(
+                    f"custom_fields was provided but project {project.id!r} "
+                    f"has no 'github-projects-v2' board configured with "
+                    f"'owner' and 'project_number' — add one to "
+                    f"projects.yml before calling create_ticket with "
+                    f"custom_fields"
+                )
         # Deduplicate while preserving order, ensure ai-generated is present.
         merged = list(dict.fromkeys([*labels, AI_GENERATED_LABEL]))
         prefixed_body = ensure_body_prefix(body)
@@ -2234,6 +2560,17 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 )
                 _check(pr)
                 raw = pr.json()
+            if custom_fields:
+                content_id = raw.get("node_id")
+                if not content_id:
+                    raise GitHubError(
+                        500,
+                        f"created issue #{raw.get('number')} payload missing "
+                        f"'node_id'; cannot write custom_fields",
+                    )
+                _write_custom_fields_to_board(
+                    client, binding, content_id, custom_fields,
+                )
             return _map_issue(raw)
 
     def update_ticket(

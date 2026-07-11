@@ -594,6 +594,181 @@ def test_create_ticket_default_status_skips_put(
     assert not any(s.startswith("PUT ") for s in seen)
 
 
+# ---------- ticket #123: custom_fields (labels + milestone) -----------------
+
+
+def test_get_ticket_include_custom_fields_returns_labels_and_milestone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("acme%2Fbackend/issues/5"):
+            return _json(_issue_payload(
+                5, labels=["bug", "urgent"],
+                milestone={"id": 9, "title": "v2.0"},
+            ))
+        if "acme%2Fbackend/issues/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, _r, _t = GitLabProvider().get_ticket(
+        _project(), "t", "5", include_relations=False, include_custom_fields=True,
+    )
+    assert ticket.custom_fields == {
+        "labels": ["bug", "urgent"], "milestone": "v2.0",
+    }
+
+
+def test_get_ticket_include_custom_fields_milestone_unset_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No milestone on the issue -> `custom_fields["milestone"]` is `None`,
+    not omitted."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("acme%2Fbackend/issues/5"):
+            return _json(_issue_payload(5, labels=[], milestone=None))
+        if "acme%2Fbackend/issues/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, _r, _t = GitLabProvider().get_ticket(
+        _project(), "t", "5", include_relations=False, include_custom_fields=True,
+    )
+    assert ticket.custom_fields == {"labels": [], "milestone": None}
+
+
+def test_get_ticket_without_include_custom_fields_stays_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default `include_custom_fields=False` leaves `custom_fields` at its
+    `None` default — this is the "not requested" sentinel."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("acme%2Fbackend/issues/5"):
+            return _json(_issue_payload(5))
+        if "acme%2Fbackend/issues/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, _r, _t = GitLabProvider().get_ticket(
+        _project(), "t", "5", include_relations=False,
+    )
+    assert ticket.custom_fields is None
+
+
+def test_create_ticket_custom_fields_labels_replaces_positional_and_keeps_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`custom_fields["labels"]` replaces the positional `labels` arg
+    entirely, but the `ai-generated` marker is still merged in — the
+    attribution marker must never be dropped."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        if req.method == "POST" and req.url.path.endswith("/issues"):
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_issue_payload(70))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().create_ticket(
+        _project(), "t", title="t", body="b",
+        labels=["ignored-positional-label"], assignees=[],
+        custom_fields={"labels": ["from-custom-fields"]},
+    )
+    sent_labels = captured["body"]["labels"].split(",")
+    assert "ignored-positional-label" not in sent_labels
+    assert "from-custom-fields" in sent_labels
+    assert "ai-generated" in sent_labels
+
+
+def test_create_ticket_custom_fields_milestone_resolves_to_milestone_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        if req.method == "GET" and req.url.path.endswith("/milestones"):
+            assert req.url.params.get("title") == "v2.0"
+            return _json([{"id": 9, "title": "v2.0"}])
+        if req.method == "POST" and req.url.path.endswith("/issues"):
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_issue_payload(71))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().create_ticket(
+        _project(), "t", title="t", body="b", labels=[], assignees=[],
+        custom_fields={"milestone": "v2.0"},
+    )
+    assert captured["body"]["milestone_id"] == 9
+
+
+def test_create_ticket_custom_fields_milestone_none_omits_milestone_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        if req.method == "GET" and req.url.path.endswith("/milestones"):
+            raise AssertionError("no milestone lookup expected for milestone=None")
+        if req.method == "POST" and req.url.path.endswith("/issues"):
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_issue_payload(72))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().create_ticket(
+        _project(), "t", title="t", body="b", labels=[], assignees=[],
+        custom_fields={"milestone": None},
+    )
+    assert "milestone_id" not in captured["body"]
+
+
+def test_create_ticket_custom_fields_unknown_milestone_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        if req.method == "GET" and req.url.path.endswith("/milestones"):
+            return _json([])
+        raise AssertionError("no POST expected when milestone resolution fails")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="not found"):
+        GitLabProvider().create_ticket(
+            _project(), "t", title="t", body="b", labels=[], assignees=[],
+            custom_fields={"milestone": "does-not-exist"},
+        )
+
+
+def test_create_ticket_custom_fields_unrecognized_key_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only 'labels' and 'milestone' are recognized custom_fields keys on
+    GitLab; anything else raises ValueError before any HTTP call."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for an unknown key")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="some_field"):
+        GitLabProvider().create_ticket(
+            _project(), "t", title="t", body="b", labels=[], assignees=[],
+            custom_fields={"some_field": "x"},
+        )
+
+
 # ---------- Ticket #74: create_ticket blank-title guard (GitLab) --------------
 
 
