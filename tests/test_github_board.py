@@ -185,6 +185,7 @@ def _issue_node(
     assignees: list[str] | None = None,
     labels: list[str] | None = None,
     created_at: str = "2024-01-01T00:00:00Z",
+    repository: str | None = "acme/backend",
 ) -> dict:
     return {
         "fieldValueByName": {"name": status_name, "optionId": f"opt-{status_name.lower()}"},
@@ -201,6 +202,7 @@ def _issue_node(
             "author": {"login": author},
             "assignees": {"nodes": [{"login": a} for a in (assignees or [])]},
             "labels": {"nodes": [{"name": lbl} for lbl in (labels or [])]},
+            "repository": {"nameWithOwner": repository} if repository is not None else None,
         },
     }
 
@@ -460,6 +462,79 @@ def test_list_tickets_board_column_returns_only_matching_issues(
     )
     assert [t.id for t in tickets] == ["2"]
     assert has_more is False
+
+
+# ---------- ticket #174: cross-repo board leak regression --------------------
+#
+# Projects v2 boards can span multiple repos under the same owner. A
+# `filters.board_column` listing for project `acme/backend` must only
+# return issues that actually live in `acme/backend`, even when another
+# repo's issue is sitting in the same board column.
+
+
+def test_list_tickets_board_column_excludes_foreign_repo_issues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Review"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _graphql_body(req)
+        owner_field = _owner_field(body["query"])
+        nodes = [
+            _issue_node(1, status_name="Review"),  # acme/backend — in-repo
+            _issue_node(2, status_name="Review", repository="acme/other-service"),
+        ]
+        return _json(_items_response(owner_field, nodes))
+
+    _install_mock(monkeypatch, handler)
+    tickets, _ = GitHubProvider().list_tickets(
+        _project(board), token="t", filters=TicketFilters(board_column="Review"),
+    )
+    assert [t.id for t in tickets] == ["1"]
+
+
+def test_list_tickets_board_column_repo_match_is_case_insensitive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub logins/repo names are case-insensitive, so a `repository`
+    differing only in case from the project's `owner/repo` must still be
+    treated as the same repo and INCLUDED."""
+    board = _board(["Review"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _graphql_body(req)
+        owner_field = _owner_field(body["query"])
+        nodes = [_issue_node(1, status_name="Review", repository="ACME/Backend")]
+        return _json(_items_response(owner_field, nodes))
+
+    _install_mock(monkeypatch, handler)
+    tickets, _ = GitHubProvider().list_tickets(
+        _project(board), token="t", filters=TicketFilters(board_column="Review"),
+    )
+    assert [t.id for t in tickets] == ["1"]
+
+
+def test_list_tickets_board_column_excludes_issue_with_missing_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A node whose content has no (or a null) `repository` must be
+    dropped rather than assumed to belong to the requesting project."""
+    board = _board(["Review"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _graphql_body(req)
+        owner_field = _owner_field(body["query"])
+        nodes = [
+            _issue_node(1, status_name="Review"),
+            _issue_node(2, status_name="Review", repository=None),
+        ]
+        return _json(_items_response(owner_field, nodes))
+
+    _install_mock(monkeypatch, handler)
+    tickets, _ = GitHubProvider().list_tickets(
+        _project(board), token="t", filters=TicketFilters(board_column="Review"),
+    )
+    assert [t.id for t in tickets] == ["1"]
 
 
 def test_list_tickets_board_column_uses_map(monkeypatch: pytest.MonkeyPatch) -> None:
