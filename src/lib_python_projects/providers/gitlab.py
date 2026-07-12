@@ -46,6 +46,7 @@ from lib_python_projects.markers import (
     strip_leading_ai_marker,
 )
 from lib_python_projects.providers.base import (
+    BulkTicketResult,
     Comment,
     DiscoveredProject,
     FailingJob,
@@ -1916,6 +1917,60 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             )
             _check(r)
             return _map_issue(r.json(), project)
+
+    def bulk_update_tickets(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        ticket_ids: list[str],
+        *,
+        title: str | None = None,
+        body: str | None = None,
+        status: Status | None = None,
+        labels_add: list[str] | None = None,
+        labels_remove: list[str] | None = None,
+        assignees_add: list[str] | None = None,
+        assignees_remove: list[str] | None = None,
+    ) -> list[BulkTicketResult]:
+        """Apply the same update to each id in `ticket_ids` (ticket #149).
+
+        Mirrors `GitHubProvider.bulk_update_tickets` — loops over
+        `ticket_ids`, calling `update_ticket` once per id and catching
+        `(ProviderError, ValueError)` around each call so one failing id
+        (e.g. 404, invalid status) does not abort the rest of the batch.
+        Results preserve `ticket_ids` order 1:1 — duplicates are not
+        deduped, each occurrence is updated independently. An empty
+        `ticket_ids` returns `[]` without any HTTP call.
+
+        Unlike GitHub/Azure DevOps, GitLab's `update_ticket` has no
+        `custom_fields` parameter, so this method doesn't accept one
+        either — passing `custom_fields=` raises `TypeError`, matching
+        `update_ticket`'s own signature.
+        """
+        results: list[BulkTicketResult] = []
+        for ticket_id in ticket_ids:
+            try:
+                ticket = self.update_ticket(
+                    project,
+                    token,
+                    ticket_id,
+                    title=title,
+                    body=body,
+                    status=status,
+                    labels_add=labels_add,
+                    labels_remove=labels_remove,
+                    assignees_add=assignees_add,
+                    assignees_remove=assignees_remove,
+                )
+            except (ProviderError, ValueError) as exc:
+                results.append(
+                    BulkTicketResult(ticket_id=ticket_id, ticket=None, error=str(exc))
+                )
+            else:
+                results.append(
+                    BulkTicketResult(ticket_id=ticket_id, ticket=ticket, error=None)
+                )
+        return results
 
     def list_statuses(
         self,
