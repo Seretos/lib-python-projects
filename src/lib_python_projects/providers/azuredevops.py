@@ -58,6 +58,7 @@ from lib_python_projects.providers.base import (
     Comment,
     DiscoveredProject,
     FailingJob,
+    FailureAnnotation,
     FieldSpec,
     Label,
     LabelOperationUnsupported,
@@ -1435,6 +1436,53 @@ def _map_build_run(raw: dict, project: ProjectConfig) -> PipelineRun:
         updated_at=normalize_timestamp(raw.get("finishTime") or raw.get("queueTime") or ""),
         run_attempt=int(raw.get("retainedByRelease", 0) or 0) + 1,
     )
+
+
+def _normalize_az_issues(rec: dict) -> list[FailureAnnotation]:
+    """Map an Azure Pipelines timeline record's `issues[]` into
+    `FailureAnnotation`s (ticket #152).
+
+    Each timeline record for a failed Job/Task carries an `issues` array
+    of `{"type": "error"|"warning", "message": "...", "data": {...}}`
+    entries — real structured failure data that was previously fetched
+    and discarded. `rec.get("name")` (the job/task name) becomes every
+    mapped annotation's `step`.
+
+    `data` carries the source location under provider-inconsistent
+    casing (`sourcePath`/`sourcepath`, `lineNumber`/`linenumber`, ...);
+    keys are matched case-insensitively. `line` is coerced to `int` and
+    left `None` when absent or non-numeric.
+
+    Handles a missing/empty `issues` key gracefully (returns `[]`).
+    """
+    step = rec.get("name") or ""
+    out: list[FailureAnnotation] = []
+    for issue in rec.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        data = issue.get("data") or {}
+        file_val: str | None = None
+        line_val: int | None = None
+        if isinstance(data, dict):
+            for key, value in data.items():
+                key_lower = key.lower() if isinstance(key, str) else ""
+                if key_lower == "sourcepath" and file_val is None:
+                    file_val = value
+                elif key_lower == "linenumber" and line_val is None:
+                    try:
+                        line_val = int(value)
+                    except (TypeError, ValueError):
+                        line_val = None
+        out.append(
+            FailureAnnotation(
+                step=step,
+                message=issue.get("message") or "",
+                file=file_val,
+                line=line_val,
+                severity=issue.get("type"),
+            )
+        )
+    return out
 
 
 # ---------- relation kind mapping -------------------------------------------
@@ -4553,7 +4601,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                         name=rec.get("name") or "",
                         url=(log_ref.get("url") or ""),
                         failed_step=rec.get("name") or "",
-                        annotations=[],
+                        annotations=_normalize_az_issues(rec),
                         log_excerpt=log_excerpt,
                     )
                 )

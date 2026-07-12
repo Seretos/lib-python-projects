@@ -742,21 +742,52 @@ class PRFilters:
 
 
 @dataclass
+class FailureAnnotation:
+    """A single structured CI failure datum, normalized across providers
+    (ticket #152).
+
+    Cross-provider shape for GitHub Actions Check-Run annotations and
+    Azure Pipelines timeline-record issues — replaces raw, provider-
+    specific JSON so agents can read a failure's root cause without
+    pulling the full log.
+
+    `step` is the job/step name the annotation belongs to. `message` is
+    the human-readable annotation text (empty string when the provider
+    omitted it). `file` / `line` are the source location the provider
+    anchored the annotation to, when available. `severity` is the
+    provider-native level string (e.g. `"failure"`/`"warning"`/`"error"`/
+    `"notice"`) — deliberately left un-normalized across providers since
+    the vocabularies don't line up cleanly. `title` is a short summary,
+    when the provider supplies one distinct from `message`.
+    """
+
+    step: str
+    message: str
+    file: str | None = None
+    line: int | None = None
+    severity: str | None = None
+    title: str | None = None
+
+
+@dataclass
 class FailingJob:
     """A single failing job within a pipeline run.
 
     `failed_step` is the name of the step that flipped the job red, when
-    GitHub reports it. `annotations` is the list of GitHub Check-Run
-    annotations attached to the job (typically the `failure` /
-    `warning` items emitted by build tooling). `log_excerpt` is a small
-    text excerpt around the failure (or `None` when logs were
-    unavailable, e.g. 403/404 on the log endpoint).
+    GitHub reports it. `annotations` is the list of normalized structured
+    failure data for this job (ticket #152) — GitHub Check-Run
+    annotations and Azure Pipelines timeline-record issues both map into
+    `FailureAnnotation`; GitLab currently has no structured surface to
+    map from, so its `annotations` is always `[]` (see
+    `gitlab._fetch_pipeline_failure`). `log_excerpt` is a small text
+    excerpt around the failure (or `None` when logs were unavailable,
+    e.g. 403/404 on the log endpoint).
     """
 
     name: str
     url: str
     failed_step: str
-    annotations: list[dict]
+    annotations: list[FailureAnnotation]
     log_excerpt: str | None
 
 
@@ -766,6 +797,15 @@ class PipelineFailure:
 
     failing_jobs: list[FailingJob]
     note: str | None = None  # e.g. "logs unavailable"
+
+    @property
+    def failures(self) -> list[FailureAnnotation]:
+        """Flattened `FailureAnnotation`s across every failing job, in job
+        order (ticket #152) — a convenience projection over
+        `failing_jobs[*].annotations` so callers that just want "all the
+        structured failure data" don't have to flatten it themselves.
+        """
+        return [a for j in self.failing_jobs for a in j.annotations]
 
 
 @dataclass

@@ -1613,3 +1613,129 @@ def test_all_three_providers_round_trip_parent_id_and_milestone(monkeypatch):
     assert gh_ticket.parent_id.startswith("#")
     assert gl_ticket.parent_id.startswith("#")
     assert ado_ticket.parent_id.startswith("#")
+
+
+# ---------- ticket #152: FailingJob.annotations shape parity ----------------
+
+
+def test_all_providers_populate_annotations_as_failure_annotation_list(monkeypatch):
+    """Cross-provider parity check (ticket #152): every provider's
+    `get_run(..., include_failure_excerpt=True)` on a failed run must
+    populate each `FailingJob.annotations` as a `list[FailureAnnotation]`
+    (possibly empty) — never raw provider dicts, on any of the three
+    providers."""
+    from lib_python_projects.providers.base import FailureAnnotation
+
+    # --- GitHub: one failed job, a check-run annotation present. ---
+    gh_run_id = 5001
+    gh_job_id = 6001
+
+    def gh_handler(req):
+        path = req.url.path
+        if path == f"/repos/Seretos/agent-project-issues/actions/runs/{gh_run_id}":
+            return _resp({
+                "id": gh_run_id, "name": "CI", "head_sha": "sha1",
+                "head_branch": "main", "event": "push", "status": "completed",
+                "conclusion": "failure",
+                "html_url": f"https://github.com/Seretos/agent-project-issues/actions/runs/{gh_run_id}",
+                "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:01:00Z",
+                "run_attempt": 1,
+            })
+        if path == f"/repos/Seretos/agent-project-issues/actions/runs/{gh_run_id}/jobs":
+            return _resp({
+                "jobs": [{
+                    "id": gh_job_id, "name": "build", "conclusion": "failure",
+                    "html_url": "https://github.com/x/jobs/6001",
+                    "check_run_url": "https://api.github.com/repos/Seretos/agent-project-issues/check-runs/9",
+                    "steps": [{"name": "Run make", "conclusion": "failure", "number": 1}],
+                }]
+            })
+        if path == "/repos/Seretos/agent-project-issues/check-runs/9/annotations":
+            return _resp([{
+                "path": "x.py", "start_line": 1, "annotation_level": "failure",
+                "message": "boom",
+            }])
+        raise AssertionError(f"unexpected GH request: {req.url}")
+
+    _install_github_mock(monkeypatch, gh_handler)
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log",
+        lambda token, url, *, max_bytes=256 * 1024: "some log text",
+    )
+    gh_run = GitHubProvider().get_run(
+        _github_project(), token="t", run_id=str(gh_run_id),
+    )
+    assert gh_run.failure is not None
+    for job in gh_run.failure.failing_jobs:
+        assert isinstance(job.annotations, list)
+        for ann in job.annotations:
+            assert isinstance(ann, FailureAnnotation)
+    assert len(gh_run.failure.failing_jobs) == 1
+    assert len(gh_run.failure.failing_jobs[0].annotations) == 1
+
+    # --- GitLab: one failed job, annotations always [] (deliberate). ---
+    def gl_handler(req):
+        url = str(req.url)
+        if "/pipelines/200/jobs" in url:
+            return _resp([
+                {"id": 1, "name": "test", "status": "failed", "stage": "test", "web_url": "u"},
+            ])
+        if "/pipelines/200" in url and "/jobs" not in url:
+            return _resp({
+                "id": 200, "ref": "main", "sha": "abc", "source": "push",
+                "status": "failed",
+                "web_url": "https://gitlab.com/x/-/pipelines/200",
+                "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:05:00Z",
+            })
+        if "/jobs/1/trace" in url:
+            return httpx.Response(200, content=b"trace text", headers={"Content-Type": "text/plain"})
+        return _resp({}, 404)
+
+    _install_gitlab_mock(monkeypatch, gl_handler)
+    gl_run = GitLabProvider().get_run(
+        _gitlab_project(), "t", "200", include_failure_excerpt=True,
+    )
+    assert gl_run.failure is not None
+    for job in gl_run.failure.failing_jobs:
+        assert isinstance(job.annotations, list)
+        for ann in job.annotations:
+            assert isinstance(ann, FailureAnnotation)
+    assert len(gl_run.failure.failing_jobs) == 1
+    assert gl_run.failure.failing_jobs[0].annotations == []
+
+    # --- Azure DevOps: one failed timeline record with a structured issue. ---
+    from lib_python_projects.providers.azuredevops import _cache_clear_all
+    _cache_clear_all()
+
+    def ado_handler(req):
+        path = req.url.path
+        if path.endswith("/_apis/build/builds/300"):
+            return _resp({
+                "id": 300, "status": "completed", "result": "failed",
+                "definition": {"name": "CI"}, "sourceBranch": "refs/heads/main",
+                "sourceVersion": "abc", "reason": "manual",
+                "queueTime": "2024-01-01T00:00:00Z", "finishTime": "2024-01-01T00:05:00Z",
+            })
+        if path.endswith("/_apis/build/builds/300/timeline"):
+            return _resp({
+                "records": [{
+                    "id": "r1", "type": "Job", "name": "Build", "result": "failed",
+                    "issues": [{
+                        "type": "error", "message": "compile error",
+                        "data": {"sourcePath": "a.cs", "lineNumber": "1"},
+                    }],
+                }]
+            })
+        raise AssertionError(f"unexpected ADO request: {req.url}")
+
+    _install_azuredevops_mock(monkeypatch, ado_handler)
+    ado_run = AzureDevOpsProvider().get_run(
+        _ado_project(), token="t", run_id="300", include_failure_excerpt=True,
+    )
+    assert ado_run.failure is not None
+    for job in ado_run.failure.failing_jobs:
+        assert isinstance(job.annotations, list)
+        for ann in job.annotations:
+            assert isinstance(ann, FailureAnnotation)
+    assert len(ado_run.failure.failing_jobs) == 1
+    assert len(ado_run.failure.failing_jobs[0].annotations) == 1

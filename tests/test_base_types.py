@@ -380,3 +380,102 @@ class TestExtractParentId:
             ),
         ]
         assert _extract_parent_id(relations) == "#5"
+
+
+# ---------- ticket #152: PipelineFailure.failures / FailureAnnotation --------
+
+
+class TestPipelineFailureFailuresProperty:
+    """`PipelineFailure.failures` is a computed property (ticket #152)
+    flattening `failing_jobs[*].annotations` in job order — not a stored
+    field, just a convenience projection."""
+
+    def test_empty_when_no_failing_jobs(self):
+        from lib_python_projects.providers.base import PipelineFailure
+
+        pf = PipelineFailure(failing_jobs=[])
+        assert pf.failures == []
+
+    def test_empty_when_failing_jobs_have_no_annotations(self):
+        from lib_python_projects.providers.base import FailingJob, PipelineFailure
+
+        pf = PipelineFailure(
+            failing_jobs=[
+                FailingJob(
+                    name="build", url="u1", failed_step="compile",
+                    annotations=[], log_excerpt=None,
+                ),
+            ]
+        )
+        assert pf.failures == []
+
+    def test_flattens_annotations_across_jobs_in_order(self):
+        from lib_python_projects.providers.base import (
+            FailingJob,
+            FailureAnnotation,
+            PipelineFailure,
+        )
+
+        a1 = FailureAnnotation(step="build", message="m1")
+        a2 = FailureAnnotation(step="build", message="m2")
+        a3 = FailureAnnotation(step="test", message="m3")
+        pf = PipelineFailure(
+            failing_jobs=[
+                FailingJob(
+                    name="build", url="u1", failed_step="compile",
+                    annotations=[a1, a2], log_excerpt=None,
+                ),
+                FailingJob(
+                    name="test", url="u2", failed_step="pytest",
+                    annotations=[a3], log_excerpt=None,
+                ),
+            ]
+        )
+        assert pf.failures == [a1, a2, a3]
+
+    def test_is_not_a_dataclass_field(self):
+        """`failures` must be a computed property, not a stored dataclass
+        field — `PipelineFailure(...)` construction must not accept it as
+        a constructor kwarg."""
+        import dataclasses
+        from lib_python_projects.providers.base import PipelineFailure
+
+        field_names = {f.name for f in dataclasses.fields(PipelineFailure)}
+        assert "failures" not in field_names
+
+
+class TestFailureAnnotation:
+    """`FailureAnnotation` dataclass construction and defaults (ticket #152)."""
+
+    def test_required_only_construction_yields_defaults(self):
+        from lib_python_projects.providers.base import FailureAnnotation
+
+        ann = FailureAnnotation(step="build", message="boom")
+        assert ann.step == "build"
+        assert ann.message == "boom"
+        assert ann.file is None
+        assert ann.line is None
+        assert ann.severity is None
+        assert ann.title is None
+
+    def test_all_fields_round_trip(self):
+        from lib_python_projects.providers.base import FailureAnnotation
+
+        ann = FailureAnnotation(
+            step="build", message="boom", file="src/x.py", line=42,
+            severity="failure", title="Compile error",
+        )
+        assert ann.file == "src/x.py"
+        assert ann.line == 42
+        assert ann.severity == "failure"
+        assert ann.title == "Compile error"
+
+    def test_failing_job_annotations_field_accepts_failure_annotation_list(self):
+        from lib_python_projects.providers.base import FailingJob, FailureAnnotation
+
+        ann = FailureAnnotation(step="build", message="boom")
+        job = FailingJob(
+            name="build", url="u", failed_step="compile",
+            annotations=[ann], log_excerpt=None,
+        )
+        assert job.annotations == [ann]

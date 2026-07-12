@@ -28,6 +28,7 @@ from lib_python_projects.providers.base import (
     Comment,
     DiscoveredProject,
     FailingJob,
+    FailureAnnotation,
     FieldSpec,
     Label,
     normalize_timestamp,
@@ -5402,6 +5403,49 @@ def _fetch_job_log(
             return None
 
 
+def _normalize_gh_annotations(
+    raw: list[dict], step: str,
+) -> list[FailureAnnotation]:
+    """Map raw GitHub Check-Run annotation JSON into `FailureAnnotation`s
+    (ticket #152).
+
+    `raw` is exactly the payload `_get_failure_excerpt` already fetches
+    from `{check_run_url}/annotations` and continues to pass, unchanged,
+    into `_extract_log_excerpt` for its annotation-anchor heuristic —
+    this helper is a separate, parallel projection for the agent-facing
+    `FailingJob.annotations` field and does not affect that log-excerpt
+    logic. `step` is the job name, applied to every mapped annotation.
+
+    Field mapping:
+      - `path`                              -> `file`
+      - `start_line` (falls back to `end_line`) -> `line`
+      - `message` (default `""`)            -> `message`
+      - `title`                             -> `title`
+      - `annotation_level`                  -> `severity`
+
+    Missing/malformed keys degrade gracefully (no `KeyError`); an empty
+    or non-list `raw` yields `[]`.
+    """
+    out: list[FailureAnnotation] = []
+    for ann in raw or []:
+        if not isinstance(ann, dict):
+            continue
+        line = ann.get("start_line")
+        if line is None:
+            line = ann.get("end_line")
+        out.append(
+            FailureAnnotation(
+                step=step,
+                message=ann.get("message") or "",
+                file=ann.get("path"),
+                line=line if isinstance(line, int) else None,
+                severity=ann.get("annotation_level"),
+                title=ann.get("title"),
+            )
+        )
+    return out
+
+
 def _get_failure_excerpt(
     client: httpx.Client,
     project: ProjectConfig,
@@ -5479,7 +5523,9 @@ def _get_failure_excerpt(
                 name=job.get("name") or "",
                 url=job.get("html_url") or "",
                 failed_step=failed_step,
-                annotations=annotations,
+                annotations=_normalize_gh_annotations(
+                    annotations, job.get("name") or "",
+                ),
                 log_excerpt=log_excerpt,
             )
         )

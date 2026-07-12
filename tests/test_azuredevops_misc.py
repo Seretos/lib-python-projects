@@ -780,6 +780,130 @@ def test_get_run_includes_failure_context(
     assert "ERROR boom" in (job.log_excerpt or "")
 
 
+# ---------- ticket #152: structured annotations (_normalize_az_issues) ------
+
+
+def test_get_run_failure_context_normalizes_timeline_issues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed timeline record carrying an `issues` array with
+    `data.sourcePath`/`lineNumber` (and a case-variant key form,
+    `sourcepath`) must come back on `FailingJob.annotations` as mapped
+    `FailureAnnotation`s (ticket #152)."""
+    from lib_python_projects.providers.base import FailureAnnotation
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/build/builds/101"):
+            return _json(_build_payload(101, result="failed"))
+        if path.endswith("/_apis/build/builds/101/timeline"):
+            return _json({
+                "records": [
+                    {
+                        "id": "j1",
+                        "type": "Job",
+                        "name": "Build",
+                        "result": "failed",
+                        "issues": [
+                            {
+                                "type": "error",
+                                "message": "compile error",
+                                "data": {
+                                    "sourcePath": "src/main.cs",
+                                    "lineNumber": "42",
+                                },
+                            },
+                            {
+                                "type": "warning",
+                                "message": "unused variable",
+                                # Case-variant key form.
+                                "data": {
+                                    "sourcepath": "src/other.cs",
+                                    "linenumber": 7,
+                                },
+                            },
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    run = AzureDevOpsProvider().get_run(
+        _project(), token="t", run_id="101", include_failure_excerpt=True
+    )
+    assert run.failure is not None
+    assert len(run.failure.failing_jobs) == 1
+    job = run.failure.failing_jobs[0]
+    assert job.annotations == [
+        FailureAnnotation(
+            step="Build", message="compile error",
+            file="src/main.cs", line=42, severity="error",
+        ),
+        FailureAnnotation(
+            step="Build", message="unused variable",
+            file="src/other.cs", line=7, severity="warning",
+        ),
+    ]
+
+
+class TestNormalizeAzIssues:
+    """Table-driven unit tests for `_normalize_az_issues` — a pure
+    function, no HTTP involved (ticket #152)."""
+
+    def test_no_issues_key_returns_empty_list(self) -> None:
+        from lib_python_projects.providers.azuredevops import _normalize_az_issues
+
+        assert _normalize_az_issues({"name": "Build"}) == []
+
+    def test_empty_issues_list_returns_empty_list(self) -> None:
+        from lib_python_projects.providers.azuredevops import _normalize_az_issues
+
+        assert _normalize_az_issues({"name": "Build", "issues": []}) == []
+
+    def test_non_numeric_line_number_yields_none(self) -> None:
+        from lib_python_projects.providers.azuredevops import _normalize_az_issues
+
+        rec = {
+            "name": "Build",
+            "issues": [
+                {
+                    "type": "error",
+                    "message": "boom",
+                    "data": {"sourcePath": "a.cs", "lineNumber": "not-a-number"},
+                },
+            ],
+        }
+        out = _normalize_az_issues(rec)
+        assert len(out) == 1
+        assert out[0].line is None
+        assert out[0].file == "a.cs"
+
+    def test_missing_data_yields_none_file_and_line(self) -> None:
+        from lib_python_projects.providers.azuredevops import _normalize_az_issues
+
+        rec = {"name": "Build", "issues": [{"type": "error", "message": "boom"}]}
+        out = _normalize_az_issues(rec)
+        assert out[0].file is None
+        assert out[0].line is None
+        assert out[0].message == "boom"
+        assert out[0].step == "Build"
+
+    def test_missing_message_defaults_to_empty_string(self) -> None:
+        from lib_python_projects.providers.azuredevops import _normalize_az_issues
+
+        rec = {"name": "Build", "issues": [{"type": "error"}]}
+        out = _normalize_az_issues(rec)
+        assert out[0].message == ""
+
+    def test_step_uses_record_name(self) -> None:
+        from lib_python_projects.providers.azuredevops import _normalize_az_issues
+
+        rec = {"name": "Lint", "issues": [{"message": "x"}, {"message": "y"}]}
+        out = _normalize_az_issues(rec)
+        assert [a.step for a in out] == ["Lint", "Lint"]
+
+
 # ---------- token probe -----------------------------------------------------
 
 
