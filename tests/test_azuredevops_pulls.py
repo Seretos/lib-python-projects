@@ -343,6 +343,54 @@ def test_list_pr_review_comments_only_anchored_threads(
     assert rc.side == "RIGHT"
 
 
+def test_list_pr_review_comments_commit_sha_is_none_even_with_change_tracking_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #175: `pullRequestThreadContext.changeTrackingId` is an int
+    iteration-tracking counter, never a commit SHA — the old dead
+    `isinstance(..., str)` check meant it always evaluated False in
+    practice, so this was already a no-op. Assert explicitly that the int
+    is never coerced into a bogus `commit_sha`; ADO exposes no commit SHA
+    on a thread at all, so `commit_sha` must be None on read."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 2,
+                        "threadContext": {
+                            "filePath": "/a.py",
+                            "rightFileStart": {"line": 5},
+                        },
+                        "pullRequestThreadContext": {
+                            "changeTrackingId": 42,
+                        },
+                        "comments": [
+                            {
+                                "id": 1,
+                                "parentCommentId": 0,
+                                "author": {"displayName": "Reviewer"},
+                                "content": "<p>fix here</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError
+
+    _install_mock(monkeypatch, handler)
+    rcs = AzureDevOpsProvider().list_pr_review_comments(
+        _project(), token="t", pr_id="7"
+    )
+    assert len(rcs) == 1
+    assert rcs[0].commit_sha is None
+
+
 # ---------- list_pr_reviews -------------------------------------------------
 
 

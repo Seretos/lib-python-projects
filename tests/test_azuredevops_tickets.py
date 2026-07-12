@@ -586,6 +586,73 @@ def test_list_tickets_status_any_omits_state_filter(
     assert "[System.State]" not in captured["wiql"]
 
 
+def test_list_tickets_populates_milestone_from_iteration_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #175: `_fetch_work_items_batch`'s hardcoded field list must
+    request `System.IterationPath` so `list_tickets` populates
+    `Ticket.milestone` the same way `get_ticket` (full work-item fetch)
+    already does — before this fix the batch endpoint never returned the
+    field, so `_map_work_item` always saw it missing and milestone was
+    always None from `list_tickets`.
+    """
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if path.endswith("/_apis/wit/wiql"):
+            return _json({"workItems": [{"id": 1}]})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            body = json.loads(req.content.decode("utf-8"))
+            assert "System.IterationPath" in body["fields"]
+            return _json({
+                "value": [
+                    _work_item_payload(
+                        1, **{"System.IterationPath": "MyProj\\Sprint 3"},
+                    )
+                ]
+            })
+        raise AssertionError(f"unexpected path {path}")
+
+    _install_mock(monkeypatch, handler)
+    tickets, _ = AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(status="open"),
+    )
+    assert tickets[0].milestone == "MyProj\\Sprint 3"
+
+
+def test_list_tickets_milestone_none_when_iteration_path_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion case: a batch work item without `System.IterationPath`
+    still yields `milestone is None` rather than erroring."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if path.endswith("/_apis/wit/wiql"):
+            return _json({"workItems": [{"id": 1}]})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            return _json({"value": [_work_item_payload(1)]})
+        raise AssertionError(f"unexpected path {path}")
+
+    _install_mock(monkeypatch, handler)
+    tickets, _ = AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue"),
+        token="t",
+        filters=TicketFilters(status="open"),
+    )
+    assert tickets[0].milestone is None
+
+
 # ---------- list_tickets: states (ticket #115) --------------------------------
 
 

@@ -3007,6 +3007,18 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         iteration field (`clearProjectV2ItemFieldValue`); `milestone=`
         omitted (`_UNSET`) issues no milestone write at all. A failed
         board write raises a plain `GitHubError`, same as `custom_fields`.
+
+        `status` changes only the REST issue state (`state`/
+        `state_reason` via the PATCH below) — it never touches the
+        Projects-v2 board's Status field (ticket #175). In particular,
+        reopening a ticket (`status="open"`) that was previously moved
+        to a terminal board column (e.g. "Done") leaves that column
+        unchanged: there is no configured default/open column in the
+        board binding for this method to reset it to, and guessing one
+        would be non-deterministic. Callers who need the board column
+        reset on a status change must pass
+        `custom_fields={"Status": "<column>"}` in the same
+        `update_ticket` call.
         """
         _validate_label_lists(labels_add, labels_remove)
         binding = None

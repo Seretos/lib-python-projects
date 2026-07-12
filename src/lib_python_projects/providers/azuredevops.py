@@ -1209,16 +1209,15 @@ def _map_thread_comment_for_review(
     discussion_id = str(thread_id) if thread_id is not None else None
     in_reply_to = str(thread_id) if parent_id else None
 
-    # ADO doesn't expose a commit SHA on the thread itself. The
-    # iteration tracking only carries iteration indices; resolving them
-    # to SHAs needs an extra `/iterations` round-trip per thread, which
-    # is too expensive for `list_pr_review_comments`. Leave `None` when
-    # not derivable rather than fabricating from an unrelated field.
-    commit_sha_raw = (
-        (thread.get("pullRequestThreadContext") or {})
-        .get("changeTrackingId")
-    )
-    commit_sha = str(commit_sha_raw) if isinstance(commit_sha_raw, str) else None
+    # ADO exposes no commit SHA on a thread at all — there's no field on
+    # the thread or comment payload that carries one, so `commit_sha` is
+    # always None here on read (ticket #175). `add_pr_review_comment`
+    # echoes back the caller-supplied `commit_sha` into the object it
+    # returns, but that's a create-time convenience only: it is never
+    # persisted server-side, so a subsequent `get_pr`/
+    # `list_pr_review_comments` re-read of the same comment goes through
+    # this function and comes back with `commit_sha=None`.
+    commit_sha = None
 
     return ReviewComment(
         id=_format_thread_comment_id(thread_id, comment_id),
@@ -2302,6 +2301,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                             "System.CreatedBy",
                             "System.CreatedDate",
                             "System.ChangedDate",
+                            "System.IterationPath",
                         ],
                     },
                 )
@@ -3933,6 +3933,19 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         commit_sha: str | None = None,
         in_reply_to: str | None = None,
     ) -> ReviewComment:
+        """Add a review comment to a PR, either as a new diff-anchored
+        thread (`path`+`line`) or as a reply to an existing thread
+        (`in_reply_to`).
+
+        `commit_sha`, if provided, is echoed into the returned
+        `ReviewComment` as a create-time convenience (matching GitHub's
+        review-comment return shape) — it is NOT written to Azure
+        DevOps and is not persisted anywhere on the thread. A later
+        `get_pr`/`list_pr_review_comments` re-read of this same comment
+        goes through `_map_thread_comment_for_review`, which always
+        reports `commit_sha=None` for Azure DevOps threads (ticket #175):
+        ADO simply doesn't expose a commit SHA on a thread.
+        """
         # Validate before doing any network I/O so callers fail fast.
         if not in_reply_to and (not path or line is None):
             raise AzureDevOpsError(
