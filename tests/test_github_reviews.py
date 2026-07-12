@@ -169,3 +169,148 @@ def test_list_pr_reviews_null_body_becomes_empty_string(
     _install_mock(monkeypatch, handler)
     reviews = GitHubProvider().list_pr_reviews(_project(), token="t", pr_id="7")
     assert reviews[0].body == ""
+
+
+def test_list_pr_reviews_missing_submitted_at_is_empty_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A review payload with no `submitted_at` maps to `""`, not `None` —
+    `Review.submitted_at` is typed `str`, not `str | None`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        payload = _review(8, "APPROVED")
+        del payload["submitted_at"]
+        return _json([payload])
+
+    _install_mock(monkeypatch, handler)
+    reviews = GitHubProvider().list_pr_reviews(_project(), token="t", pr_id="7")
+    assert reviews[0].submitted_at == ""
+
+
+# ---------- get_pr reviews (ticket #148) --------------------------------------
+
+
+def _pr_payload(number: int = 7) -> dict:
+    """Minimal GitHub PR REST payload accepted by _map_pr."""
+    return {
+        "number": number,
+        "state": "open",
+        "title": "Test PR",
+        "body": "Description.",
+        "user": {"login": "bot"},
+        "assignees": [],
+        "requested_reviewers": [],
+        "labels": [],
+        "head": {"ref": "feature", "sha": "abc", "repo": {"full_name": "acme/backend"}},
+        "base": {"ref": "main", "sha": "def"},
+        "draft": False,
+        "merged": False,
+        "mergeable": None,
+        "mergeable_state": "unknown",
+        "html_url": f"https://github.com/acme/backend/pull/{number}",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z",
+    }
+
+
+def _install_get_pr_mock(
+    monkeypatch: pytest.MonkeyPatch,
+    reviews_payload: list[dict],
+    pr_number: int = 7,
+) -> list[httpx.Request]:
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == f"/repos/acme/backend/pulls/{pr_number}":
+            return _json(_pr_payload(pr_number))
+        if path == f"/repos/acme/backend/issues/{pr_number}/comments":
+            return _json([])
+        if path == f"/repos/acme/backend/pulls/{pr_number}/reviews":
+            return _json(reviews_payload)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    return _install_mock(monkeypatch, handler)
+
+
+def test_get_pr_populates_reviews_reviewers_and_decision_approved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #148: get_pr previously left `pr.reviews`
+    empty, `pr.reviewers` hardcoded `[]`, and `pr.review_decision` `None`
+    on the REST path. A single APPROVED review must now populate all
+    three."""
+    _install_get_pr_mock(monkeypatch, [_review(1, "APPROVED")])
+    pr, _ = GitHubProvider().get_pr(_project(), token="t", pr_id="7")
+    assert len(pr.reviews) == 1
+    assert pr.reviews[0].id == "1"
+    assert pr.reviews[0].state == "approve"
+    assert pr.reviewers == ["reviewer1"]
+    assert pr.review_decision == "APPROVED"
+
+
+def test_get_pr_empty_reviews_leaves_fields_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No submitted reviews -> reviews=[], reviewers=[], review_decision=None."""
+    _install_get_pr_mock(monkeypatch, [])
+    pr, _ = GitHubProvider().get_pr(_project(), token="t", pr_id="7")
+    assert pr.reviews == []
+    assert pr.reviewers == []
+    assert pr.review_decision is None
+
+
+def test_get_pr_changes_requested_wins_over_approved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CHANGES_REQUESTED from one author and APPROVED from another ->
+    review_decision is CHANGES_REQUESTED (a single blocking review
+    outweighs an approval from someone else)."""
+    _install_get_pr_mock(
+        monkeypatch,
+        [
+            _review(1, "APPROVED", user={"login": "alice"}),
+            _review(2, "CHANGES_REQUESTED", user={"login": "bob"}),
+        ],
+    )
+    pr, _ = GitHubProvider().get_pr(_project(), token="t", pr_id="7")
+    assert pr.review_decision == "CHANGES_REQUESTED"
+    assert set(pr.reviewers) == {"alice", "bob"}
+
+
+def test_get_pr_pending_review_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PENDING (unsubmitted draft) review must not surface in
+    `pr.reviews`/`pr.reviewers`, nor influence `review_decision`."""
+    _install_get_pr_mock(monkeypatch, [_review(1, "PENDING")])
+    pr, _ = GitHubProvider().get_pr(_project(), token="t", pr_id="7")
+    assert pr.reviews == []
+    assert pr.reviewers == []
+    assert pr.review_decision is None
+
+
+def test_get_pr_same_author_multiple_reviews_latest_state_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same author submits CHANGES_REQUESTED then later APPROVED (a
+    re-review) -> only the latest state counts, the author appears once
+    in `pr.reviewers`, and the decision reflects the newer APPROVED
+    state (not stuck on the earlier CHANGES_REQUESTED)."""
+    _install_get_pr_mock(
+        monkeypatch,
+        [
+            _review(
+                1, "CHANGES_REQUESTED",
+                submitted_at="2024-01-01T00:00:00Z",
+                user={"login": "alice"},
+            ),
+            _review(
+                2, "APPROVED",
+                submitted_at="2024-01-02T00:00:00Z",
+                user={"login": "alice"},
+            ),
+        ],
+    )
+    pr, _ = GitHubProvider().get_pr(_project(), token="t", pr_id="7")
+    assert pr.reviewers == ["alice"]
+    assert pr.review_decision == "APPROVED"
+    assert len(pr.reviews) == 2  # pr.reviews keeps the full history

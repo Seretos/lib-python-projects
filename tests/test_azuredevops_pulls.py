@@ -533,6 +533,91 @@ def test_list_pr_reviews_no_reviewers_returns_empty_list(
     assert reviews == []
 
 
+# ---------- get_pr reviews (ticket #148) ------------------------------------
+
+
+def test_get_pr_populates_reviews_and_changes_requested_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """get_pr synthesizes `pr.reviews` from the already-fetched vote data
+    (no extra thread round-trip): a `10` (approve) and a `-10` (reject)
+    vote map to Review entries, and `review_decision` derives to
+    "CHANGES_REQUESTED" since a rejection is present. `pr.reviewers`
+    stays untouched — still the `_identity_display_name` form `_map_pr`
+    already produces."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[
+                    {
+                        "id": "reviewer-approve",
+                        "displayName": "Alice Builder",
+                        "uniqueName": "alice@example.com",
+                        "vote": 10,
+                    },
+                    {
+                        "id": "reviewer-reject",
+                        "displayName": "Bob Reviewer",
+                        "uniqueName": "bob@example.com",
+                        "vote": -10,
+                    },
+                ],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+
+    by_id = {rv.id.split(":")[0]: rv for rv in pr.reviews}
+    assert set(by_id) == {"reviewer-approve", "reviewer-reject"}
+    assert by_id["reviewer-approve"].state == "approve"
+    assert by_id["reviewer-approve"].author == "alice@example.com"
+    assert by_id["reviewer-approve"].body == ""
+    assert by_id["reviewer-reject"].state == "request_changes"
+
+    assert pr.review_decision == "CHANGES_REQUESTED"
+    # Untouched: still the display-name form `_map_pr` has always produced.
+    assert pr.reviewers == ["Alice Builder", "Bob Reviewer"]
+
+
+def test_get_pr_no_votes_leaves_reviews_and_decision_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No reviewers have voted (or none are assigned) -> `pr.reviews`
+    is `[]` and `pr.review_decision` stays `None` (no signal), rather
+    than raising or defaulting to some other state."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(7, reviewers=[]))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+    assert pr.reviews == []
+    assert pr.review_decision is None
+
+
 # ---------- create_pr -------------------------------------------------------
 
 

@@ -73,6 +73,7 @@ from lib_python_projects.providers.base import (
     RelationKindUnsupported,
     RelationNotFound,
     Review,
+    review_decision_from_states,
     ReviewComment,
     ReviewState,
     Status,
@@ -1071,6 +1072,19 @@ def _build_pr_url(project: ProjectConfig, pr_id: int | str) -> str:
         project.repository,
     )
     return f"{base}/{org}/{proj}/_git/{repo}/pullrequest/{pr_id}"
+
+
+def _latest_reviews_by_author(reviews: list[Review]) -> list[Review]:
+    """Reduce a review list to one entry per author: the most recently
+    submitted review. Ties (equal or missing `submitted_at`) fall back to
+    list order — the entry appearing later in `reviews` wins.
+    """
+    latest: dict[str, Review] = {}
+    for rv in reviews:
+        existing = latest.get(rv.author)
+        if existing is None or rv.submitted_at >= existing.submitted_at:
+            latest[rv.author] = rv
+    return list(latest.values())
 
 
 def _map_work_item(raw: dict, project: ProjectConfig) -> Ticket:
@@ -3167,12 +3181,21 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         with _client(project, token) as c:
             resp = c.get(path, params=_api_version_params())
         _check(resp)
-        pr = _map_pr(resp.json(), project)
+        raw = resp.json()
+        pr = _map_pr(raw, project)
         # ADO's single-PR GET doesn't include labels by default; the
         # list-PRs endpoint does. Fetch the labels endpoint so every
         # PR-returning surface (create / update / get / merge_pr)
         # advertises labels consistently.
         pr.labels = self._fetch_pr_labels(project, token, repo_id, pr_id)
+        # Synthesize reviews from the vote data already present on `raw`
+        # (ticket #148) — no extra round trip. `pr.reviewers` is left
+        # untouched (`_map_pr` already sets it via `_identity_display_name`).
+        reviews = self._reviews_from_votes(raw, project, pr_id)
+        pr.reviews = reviews
+        pr.review_decision = review_decision_from_states(
+            [rv.state for rv in _latest_reviews_by_author(reviews)]
+        )
         comments = self._list_pr_top_level_comments(project, token, pr_id, repo_id)
         return pr, comments
 
@@ -3279,6 +3302,40 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         -10: "request_changes",
         -5: "comment",
     }
+
+    def _reviews_from_votes(
+        self, raw: dict, project: ProjectConfig, pr_id: str
+    ) -> list[Review]:
+        """Synthesize `Review` objects from `raw["reviewers"]` vote data.
+
+        Lighter-weight sibling of `list_pr_reviews`: reuses the same
+        vote -> state mapping (`_VOTE_STATE_MAP`) and identity resolution
+        (`_identity_login_or_display`), but skips the extra thread fetch
+        `list_pr_reviews` performs to recover a review body — `get_pr` is
+        on the single-PR read path and shouldn't pay for an extra round
+        trip just to populate `Review.body`. `body` is always `""` and
+        `url` is the PR URL (via `_build_pr_url`) for every entry.
+        Reviewers with a `0` (not-yet-voted) vote are skipped, matching
+        `list_pr_reviews`.
+        """
+        out: list[Review] = []
+        for reviewer in raw.get("reviewers") or []:
+            vote = reviewer.get("vote") or 0
+            state = self._VOTE_STATE_MAP.get(vote)
+            if state is None:
+                continue
+            reviewer_id = reviewer.get("id") or ""
+            out.append(
+                Review(
+                    id=f"{reviewer_id}:{vote}",
+                    state=state,
+                    author=_identity_login_or_display(reviewer),
+                    body="",
+                    url=_build_pr_url(project, pr_id),
+                    submitted_at="",
+                )
+            )
+        return out
 
     def list_pr_reviews(
         self,

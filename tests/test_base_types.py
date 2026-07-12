@@ -479,3 +479,93 @@ class TestFailureAnnotation:
             annotations=[ann], log_excerpt=None,
         )
         assert job.annotations == [ann]
+
+
+# ---------- ticket #148: review_decision_from_states + PullRequest.reviews ---
+
+
+class TestReviewDecisionFromStates:
+    """`review_decision_from_states` is the pure helper `get_pr` uses on
+    every provider to derive `review_decision` from a list of already
+    latest-per-author normalized review states."""
+
+    def test_request_changes_wins_over_approve(self):
+        from lib_python_projects.providers.base import review_decision_from_states
+
+        assert (
+            review_decision_from_states(["approve", "request_changes"])
+            == "CHANGES_REQUESTED"
+        )
+
+    def test_approve_only_yields_approved(self):
+        from lib_python_projects.providers.base import review_decision_from_states
+
+        assert review_decision_from_states(["approve"]) == "APPROVED"
+
+    def test_comment_only_yields_none(self):
+        """A comment-only review carries no approval/blocking signal."""
+        from lib_python_projects.providers.base import review_decision_from_states
+
+        assert review_decision_from_states(["comment"]) is None
+
+    def test_empty_states_yields_none(self):
+        from lib_python_projects.providers.base import review_decision_from_states
+
+        assert review_decision_from_states([]) is None
+
+
+def _make_pr(**overrides):
+    from lib_python_projects.providers.base import PullRequest
+
+    base = dict(
+        id="1",
+        number=1,
+        title="t",
+        body="b",
+        status="open",
+        draft=False,
+        author="a",
+        assignees=[],
+        reviewers=[],
+        requested_reviewers=[],
+        labels=[],
+        head={},
+        base={},
+        merged=False,
+        mergeable=None,
+        url="https://example.invalid/1",
+        created_at="2024-01-01T00:00:00Z",
+        updated_at="2024-01-01T00:00:00Z",
+    )
+    base.update(overrides)
+    return PullRequest(**base)
+
+
+class TestPullRequestReviewsField:
+    """`PullRequest.reviews` (ticket #148) defaults to an empty list that
+    is independent per instance — the classic mutable-default-argument
+    trap dataclasses guard against via `field(default_factory=list)`."""
+
+    def test_defaults_to_empty_list(self):
+        pr = _make_pr()
+        assert pr.reviews == []
+
+    def test_default_is_independent_per_instance(self):
+        """Mutating one instance's `reviews` must not leak into another
+        freshly constructed instance — proves the default isn't a single
+        shared list object."""
+        pr1 = _make_pr()
+        pr2 = _make_pr()
+        pr1.reviews.append("not-a-real-review-but-proves-independence")
+        assert pr2.reviews == []
+        assert pr1.reviews != pr2.reviews
+
+    def test_reviews_settable(self):
+        from lib_python_projects.providers.base import Review
+
+        rv = Review(
+            id="1", state="approve", author="alice", body="lgtm",
+            url="https://example.invalid/review/1", submitted_at="2024-01-01T00:00:00Z",
+        )
+        pr = _make_pr(reviews=[rv])
+        assert pr.reviews == [rv]
