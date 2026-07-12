@@ -89,6 +89,7 @@ from lib_python_projects.providers.base import (
     _validate_limit,
 )
 from lib_python_projects.providers._http_cache import make_cached_transport
+from lib_python_projects.providers import _idempotency
 
 log = logging.getLogger("project-issues.azuredevops")
 
@@ -2417,6 +2418,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         assignees: list[str],
         status: Status | None = None,
         custom_fields: dict[str, Any] | None = None,
+        *,
+        idempotency_key: str | None = None,
     ) -> Ticket:
         """Create an ADO work item.
 
@@ -2447,9 +2450,26 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         wins if both are given), and neither key becomes a ``/fields/...``
         op. This is resolved before status validation so states are
         checked against the overridden type.
+
+        Optional ``idempotency_key`` (ticket #150): a retried call with
+        the same key (scoped to this project) returns the work item
+        created by the first successful call instead of creating a
+        duplicate, with ``idempotent_replay=True`` set on the result.
+        Only ``title``/``body`` are compared across calls with the same
+        key. A retry with the same key but a different ``title``/``body``
+        raises ``IdempotencyConflict``. ``None``/``""`` (the default)
+        disables idempotency entirely.
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
+        if idempotency_key:
+            replay = _idempotency.lookup(
+                (project.provider, project.id),
+                idempotency_key,
+                {"title": title, "body": body},
+            )
+            if replay is not None:
+                return replay
 
         remaining_custom_fields = dict(custom_fields or {})
         canonical_type_override = remaining_custom_fields.pop("System.WorkItemType", None)
@@ -2516,7 +2536,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         # work-item's resulting initial state, transition via update.
         if status is not None and status != created.status:
             try:
-                return self.update_ticket(
+                created = self.update_ticket(
                     project, token, str(created.id), status=status
                 )
             except Exception as exc:  # AzureDevOpsError or httpx errors
@@ -2525,6 +2545,13 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                     f"work item #{created.id} created but state "
                     f"transition to '{status}' failed: {exc}",
                 ) from exc
+        if idempotency_key:
+            _idempotency.record(
+                (project.provider, project.id),
+                idempotency_key,
+                {"title": title, "body": body},
+                created,
+            )
         return created
 
     def update_ticket(
@@ -3225,6 +3252,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         labels: list[str] | None = None,
         assignees: list[str] | None = None,
         requested_reviewers: list[str] | None = None,
+        *,
+        idempotency_key: str | None = None,
     ) -> PullRequest:
         """Create a pull request, applying the AI-generated marker + label.
 
@@ -3234,7 +3263,24 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         caller's order). Label application is best-effort — a 403/404
         from `_add_pr_label` is swallowed so a missing tag-management
         permission doesn't kill the legitimate PR.
+
+        Optional `idempotency_key` (ticket #150): a retried call with the
+        same key (scoped to this project) returns the PR created by the
+        first successful call instead of creating a duplicate, with
+        `idempotent_replay=True` set on the result. Only `title`/`head`/
+        `base` are compared across calls with the same key. A retry with
+        the same key but a different `title`/`head`/`base` raises
+        `IdempotencyConflict`. `None`/`""` (the default) disables
+        idempotency entirely.
         """
+        if idempotency_key:
+            replay = _idempotency.lookup(
+                (project.provider, project.id),
+                idempotency_key,
+                {"title": title, "head": head, "base": base},
+            )
+            if replay is not None:
+                return replay
         repo_id = self._resolve_repository_id(project, token)
         body_with_marker = ensure_body_prefix(body or "")
         payload: dict[str, Any] = {
@@ -3265,6 +3311,13 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             for lbl in merged_labels:
                 self._add_pr_label_best_effort(project, token, repo_id, pr.id, lbl)
             pr, _ = self.get_pr(project, token, pr.id)
+        if idempotency_key:
+            _idempotency.record(
+                (project.provider, project.id),
+                idempotency_key,
+                {"title": title, "head": head, "base": base},
+                pr,
+            )
         return pr
 
     def _add_pr_label_best_effort(

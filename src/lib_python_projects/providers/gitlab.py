@@ -78,6 +78,7 @@ from lib_python_projects.providers.base import (
     _validate_limit,
 )
 from lib_python_projects.providers._http_cache import make_cached_transport
+from lib_python_projects.providers import _idempotency
 
 log = logging.getLogger("project-issues.gitlab")
 
@@ -1728,6 +1729,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         *,
         status: Status | None = None,
         custom_fields: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> Ticket:
         """Create a GitLab issue with the AI-generated marker.
 
@@ -1761,9 +1763,26 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             `ValueError`.
         Any other key raises `ValueError`. `None`/`{}` is a silent no-op
         so existing callers are unaffected.
+
+        Optional `idempotency_key` (ticket #150): a retried call with the
+        same key (scoped to this project) returns the ticket created by
+        the first successful call instead of creating a duplicate, with
+        `idempotent_replay=True` set on the result. Only `title`/`body`
+        are compared across calls with the same key. A retry with the
+        same key but a different `title`/`body` raises
+        `IdempotencyConflict`. `None`/`""` (the default) disables
+        idempotency entirely.
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
+        if idempotency_key:
+            replay = _idempotency.lookup(
+                (project.provider, project.id),
+                idempotency_key,
+                {"title": title, "body": body},
+            )
+            if replay is not None:
+                return replay
         allowed_custom_field_keys = {"labels", "milestone"}
         unknown_keys = set(custom_fields or {}) - allowed_custom_field_keys
         if unknown_keys:
@@ -1815,7 +1834,15 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 )
                 _check(pu)
                 raw = pu.json()
-            return _map_issue(raw, project)
+            ticket = _map_issue(raw, project)
+            if idempotency_key:
+                _idempotency.record(
+                    (project.provider, project.id),
+                    idempotency_key,
+                    {"title": title, "body": body},
+                    ticket,
+                )
+            return ticket
 
     def update_ticket(
         self,
@@ -2410,6 +2437,8 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         labels: list[str] | None = None,
         assignees: list[str] | None = None,
         requested_reviewers: list[str] | None = None,
+        *,
+        idempotency_key: str | None = None,
     ) -> PullRequest:
         """Create a merge request with the AI-generated marker.
 
@@ -2419,7 +2448,24 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         on some GitLab setups (observed during ticket #43 live-verify);
         the title prefix is the canonical signal GitLab itself uses
         for `detailed_merge_status="draft_status"`, so it always sticks.
+
+        Optional `idempotency_key` (ticket #150): a retried call with the
+        same key (scoped to this project) returns the MR created by the
+        first successful call instead of creating a duplicate, with
+        `idempotent_replay=True` set on the result. Only `title`/`head`/
+        `base` are compared across calls with the same key. A retry with
+        the same key but a different `title`/`head`/`base` raises
+        `IdempotencyConflict`. `None`/`""` (the default) disables
+        idempotency entirely.
         """
+        if idempotency_key:
+            replay = _idempotency.lookup(
+                (project.provider, project.id),
+                idempotency_key,
+                {"title": title, "head": head, "base": base},
+            )
+            if replay is not None:
+                return replay
         merged_labels = list(dict.fromkeys([*(labels or []), AI_GENERATED_LABEL]))
         prefixed_body = ensure_body_prefix(body)
         path = _project_path(project)
@@ -2447,7 +2493,15 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 payload["reviewer_ids"] = reviewer_ids
             r = client.post(f"/projects/{path}/merge_requests", json=payload)
             _check(r)
-            return _map_mr(r.json(), project)
+            pr = _map_mr(r.json(), project)
+            if idempotency_key:
+                _idempotency.record(
+                    (project.provider, project.id),
+                    idempotency_key,
+                    {"title": title, "head": head, "base": base},
+                    pr,
+                )
+            return pr
 
     def update_pr(
         self,
