@@ -1238,7 +1238,9 @@ def _board_items_query(owner_field: str) -> str:
         "content{"
         "__typename"
         "...on Issue{"
-        "number title body state stateReason url createdAt updatedAt "
+        "number title body state stateReason url "
+        "repository{nameWithOwner} "
+        "createdAt updatedAt "
         "author{login}"
         "assignees(first:50){nodes{login}}"
         "labels(first:50){nodes{name}}"
@@ -2572,6 +2574,10 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         target = native_column.lower()
         state_pairs = _github_states_pairs(filters.states) if filters.states else None
         not_labels = filters.not_labels or []
+        # Projects v2 boards can span multiple repos under the same owner;
+        # match case-insensitively since GitHub owner logins/repo names
+        # are themselves case-insensitive.
+        expected_repo = f"{project.owner}/{project.repo}".lower()
 
         matched: list[Ticket] = []
         after: str | None = None
@@ -2596,6 +2602,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     content = node.get("content") or {}
                     if content.get("__typename") != "Issue":
                         continue  # drop PRs / DraftIssues
+                    # The board can span repos beyond this project's own
+                    # owner/repo; drop anything that isn't actually ours
+                    # (case-insensitive: GitHub owner/repo names are).
+                    repo_name = (content.get("repository") or {}).get("nameWithOwner") or ""
+                    if repo_name.lower() != expected_repo:
+                        continue
                     field_value = node.get("fieldValueByName") or {}
                     option_name = (field_value.get("name") or "").lower()
                     if option_name != target:
