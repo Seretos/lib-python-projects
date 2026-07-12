@@ -1869,8 +1869,9 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             )
         if filters and filters.board_column:
             raise ValueError(
-                "board_column is not supported on GitLab — it is a GitHub "
-                "Projects v2 board filter"
+                "board_column is not supported on GitLab — it is a "
+                "board-column filter for GitHub Projects v2 and Azure "
+                "Boards, which have no equivalent on GitLab"
             )
         _validate_limit(filters.limit)
         per_page = min(max(1, filters.limit), 100)
