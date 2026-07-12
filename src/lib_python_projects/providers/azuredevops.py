@@ -967,10 +967,34 @@ def _label_list_from_tags(tags: str | None) -> list[str]:
 
 
 def _tags_string_from_labels(labels: list[str]) -> str:
-    """Inverse of `_label_list_from_tags` — deduplicates, sorts, joins."""
+    """Inverse of `_label_list_from_tags` — deduplicates, sorts, joins.
+
+    Validate-and-reject (ticket #172): raises `ValueError` for any label
+    that is `None`, empty, or whitespace-only, and for any label
+    containing ``";"`` (ADO's tag separator — a literal ``;`` inside a
+    label would silently split into extra tags on round-trip through
+    `_label_list_from_tags`). The previous behaviour silently dropped
+    such labels instead of rejecting them, desyncing the caller's view
+    of a ticket's labels from what actually got persisted.
+
+    This is the single serialization chokepoint for `System.Tags`,
+    called from `create_ticket` and `update_ticket` while they're still
+    building the JSON-Patch body — before either issues its mutating
+    HTTP call — so the raise happens before any write.
+    """
     seen: list[str] = []
     for lbl in labels:
-        if lbl and lbl not in seen:
+        if lbl is None or not lbl.strip():
+            raise ValueError(
+                f"invalid label {lbl!r}: labels must be non-empty, "
+                f"non-whitespace strings"
+            )
+        if ";" in lbl:
+            raise ValueError(
+                f"invalid label {lbl!r}: Azure DevOps uses ';' as the "
+                f"System.Tags separator, so labels cannot contain ';'"
+            )
+        if lbl not in seen:
             seen.append(lbl)
     return "; ".join(sorted(seen))
 
@@ -4965,30 +4989,62 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         project: ProjectConfig,
         token: str | None,
     ) -> list[Label]:
-        """List work-item tags for the project (best-effort approximation).
+        """List tags actually applied to the project's work items (best-effort).
 
         Azure DevOps tags are implicit — they have no dedicated create/
         rename/delete API and carry no colour or description metadata.
-        This method approximates a label list by calling:
 
-          ``GET /{org}/{project}/_apis/wit/tags?api-version=7.1``
+        This method derives the "in use" tag set from the project's work
+        items rather than calling the org/project tag catalog (``GET
+        /{org}/{project}/_apis/wit/tags``): the catalog also lists
+        catalog-only tags — tags that exist in ADO's tag-picker history
+        but are not currently applied to any work item — which leaked
+        into the previous implementation's results (ticket #172).
 
-        If that endpoint is unavailable or returns no items, an empty
-        list is returned. Each `Label` is returned with `color=""` and
-        `description=""` because ADO tags have no such fields.
+        The approach: run a WIQL query scoped to `[System.TeamProject] =
+        @project` to get every work-item id in the project, then reuse
+        `_fetch_work_items_batch` (chunked at 200 ids/request) to pull
+        `System.Tags` for each. The returned list is the sorted union of
+        tags present on at least one work item.
+
+        Note: two wrapper `ProjectConfig`s that map to the same
+        organization/ado_project (differing only by `repository`) share
+        one ADO team project and therefore legitimately share work items
+        — and this in-use tag list — since ADO has no finer scope than
+        the team project for tags/work items (`ProjectConfig` has no
+        `area_path` field to narrow further). That sharing is expected
+        behaviour; what this method fixes is catalog-only tags leaking
+        in, not cross-repository tag sharing.
+
+        Best-effort: if the WIQL query or the batch fetch returns a
+        non-success response, returns `[]` rather than raising. Each
+        `Label` is returned with `color=""` and `description=""` because
+        ADO tags have no such fields.
         """
-        path = f"{_project_scope(project)}/_apis/wit/tags"
+        wiql = "SELECT [System.Id] FROM workitems WHERE [System.TeamProject] = @project"
         with _client(project, token) as c:
-            resp = c.get(path, params=_api_version_params())
+            resp = c.post(
+                f"{_project_scope(project)}/_apis/wit/wiql",
+                params=_api_version_params(),
+                json={"query": wiql},
+            )
         if not resp.is_success:
             return []
-        payload = resp.json() or {}
-        items = payload.get("value") or []
-        return [
-            Label(name=item.get("name") or "", color="", description="")
-            for item in items
-            if item.get("name")
+        ids = [
+            int(item.get("id"))
+            for item in (resp.json().get("workItems") or [])
+            if item.get("id") is not None
         ]
+        if not ids:
+            return []
+        try:
+            tickets = self._fetch_work_items_batch(project, token, ids)
+        except AzureDevOpsError:
+            return []
+        tags: set[str] = set()
+        for ticket in tickets:
+            tags.update(ticket.labels)
+        return [Label(name=name, color="", description="") for name in sorted(tags)]
 
     def create_label(
         self,

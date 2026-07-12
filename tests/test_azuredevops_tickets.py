@@ -1346,6 +1346,38 @@ def test_create_ticket_invalid_status_rejected_before_post(
     assert posts == [], "create_ticket must not POST when status is invalid"
 
 
+def test_create_ticket_invalid_label_rejected_before_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #172 bug 1: a label containing ';' (ADO's tag separator) must
+    raise ValueError before the work-item create POST is issued — the old
+    behaviour silently dropped such labels instead of rejecting them, which
+    desynced the caller's view of the ticket's labels from what actually
+    got persisted."""
+    posts: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$" in path and req.method == "POST":
+            posts.append(req)
+            return _json(_work_item_payload(1))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError):
+        AzureDevOpsProvider().create_ticket(
+            _project(default_type="Issue"),
+            token="t",
+            title="hi",
+            body="b",
+            labels=["foo;bar"],
+            assignees=[],
+        )
+    assert posts == [], "create_ticket must not POST when a label is invalid"
+
+
 def test_add_comment_on_missing_work_item_500_normalized_to_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1428,6 +1460,32 @@ def test_update_ticket_label_diff_marks_ai_modified(
     tag_op = next(op for op in captured["patch"] if op["path"] == "/fields/System.Tags")
     tags = set(t.strip() for t in tag_op["value"].split(";") if t.strip())
     assert tags == {"p1", "regression", "ai-modified"}
+
+
+def test_update_ticket_invalid_label_rejected_before_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #172 bug 1: a label containing ';' passed to labels_add must
+    raise ValueError before the mutating PATCH is issued. A preceding GET
+    of the current work item (needed for the tag read-modify-write diff)
+    is fine — only the write must be blocked."""
+    patches: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/5"):
+            return _json(_work_item_payload(5, **{"System.Tags": "p1"}))
+        if req.method == "PATCH" and path.endswith("/workitems/5"):
+            patches.append(req)
+            return _json(_work_item_payload(5))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError):
+        AzureDevOpsProvider().update_ticket(
+            _project(), token="t", ticket_id="5", labels_add=["foo;bar"]
+        )
+    assert patches == [], "update_ticket must not PATCH when a label is invalid"
 
 
 def test_update_ticket_body_stamps_ai_modified_when_not_ai_generated(
