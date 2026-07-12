@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lib-python-projects"
-version = "0.1.0"
+version = "0.3.3"
 description = "Domain library: project-list model, provider abstraction (GitHub/GitLab/Azure DevOps), and project loader for the Seretos agent-plugin ecosystem"
 requires-python = ">=3.11"
 authors = [{ name = "Arne von Appen" }]
