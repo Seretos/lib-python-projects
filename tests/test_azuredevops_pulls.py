@@ -19,7 +19,7 @@ from typing import Callable
 import httpx
 import pytest
 
-from lib_python_projects import ProjectConfig
+from lib_python_projects import AutoLabels, ProjectConfig
 from lib_python_projects.providers import azuredevops as azure_mod
 from lib_python_projects.providers.azuredevops import (
     AzureDevOpsError,
@@ -33,12 +33,13 @@ from lib_python_projects.providers.base import PRFilters
 REPO_ID = "da0d7da0-6a8c-4958-aad3-be17cbf806eb"
 
 
-def _project() -> ProjectConfig:
+def _project(auto_labels: AutoLabels | None = None) -> ProjectConfig:
     return ProjectConfig(
         id="azure-tests",
         provider="azuredevops",
         path="seredos/azure-tests/azure-tests",
         token_env="AZURE_TOKEN",
+        auto_labels=auto_labels or AutoLabels(),
     )
 
 
@@ -582,6 +583,46 @@ def test_create_pr_emits_refs_and_marker(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "ai-generated" in pr.labels
 
 
+def test_create_pr_applies_custom_auto_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A project with a custom `auto_labels.ai_generated` name gets that
+    name stamped on the body marker + applied as the PR label, instead of
+    the default `ai-generated`."""
+    captured: dict = {}
+    applied_labels: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/pullrequests"):
+            captured["body"] = json.loads(req.content.decode("utf-8"))
+            return _json(_pr_payload(11))
+        if req.method == "POST" and path.endswith("/pullrequests/11/labels"):
+            applied_labels.append(json.loads(req.content.decode("utf-8"))["name"])
+            return _json({})
+        labels = _labels_handler(req, labels=applied_labels)
+        if labels is not None:
+            return labels
+        if req.method == "GET" and path.endswith("/pullrequests/11"):
+            return _json(_pr_payload(11))
+        if req.method == "GET" and path.endswith("/pullrequests/11/threads"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    project = _project(auto_labels=AutoLabels(ai_generated="robot-made", ai_modified="robot-touched"))
+    pr = AzureDevOpsProvider().create_pr(
+        project, token="t", title="hello", body="Body", head="feat/x", base="main",
+    )
+    body = captured["body"]
+    assert "#robot-made" in body["description"]
+    assert "#ai-generated" not in body["description"]
+    assert "robot-made" in applied_labels
+    assert "ai-generated" not in applied_labels
+    assert "robot-made" in pr.labels
+
+
 # ---------- update_pr -------------------------------------------------------
 
 
@@ -616,6 +657,41 @@ def test_update_pr_status_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
     AzureDevOpsProvider().update_pr(_project(), token="t", pr_id="7", status="closed")
     assert captured["body"]["status"] == "abandoned"
     assert "ai-modified" in applied_labels
+
+
+def test_update_pr_applies_custom_modified_label(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A project with a custom `auto_labels.ai_modified` name gets that
+    name auto-applied instead of the default `ai-modified` when updating
+    a PR that isn't already AI-generated."""
+    captured: dict = {}
+    applied_labels: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/pullrequests/7/labels"):
+            applied_labels.append(json.loads(req.content.decode("utf-8"))["name"])
+            return _json({})
+        labels = _labels_handler(req, labels=applied_labels)
+        if labels is not None:
+            return labels
+        if req.method == "PATCH" and path.endswith("/pullrequests/7"):
+            captured["body"] = json.loads(req.content.decode("utf-8"))
+            return _json(_pr_payload(7, status="abandoned"))
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(7, status="abandoned"))
+        if path.endswith("/threads"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    project = _project(auto_labels=AutoLabels(ai_generated="robot-made", ai_modified="robot-touched"))
+    AzureDevOpsProvider().update_pr(project, token="t", pr_id="7", status="closed")
+    assert captured["body"]["status"] == "abandoned"
+    assert "robot-touched" in applied_labels
+    assert "ai-modified" not in applied_labels
 
 
 # ---------- merge_pr --------------------------------------------------------

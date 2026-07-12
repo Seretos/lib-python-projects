@@ -18,7 +18,7 @@ from typing import Callable
 import httpx
 import pytest
 
-from lib_python_projects import ProjectConfig
+from lib_python_projects import AutoLabels, ProjectConfig
 from lib_python_projects.providers import azuredevops as azure_mod
 from lib_python_projects.providers.azuredevops import (
     AzureDevOpsProvider,
@@ -34,6 +34,7 @@ from lib_python_projects.providers.base import TicketFilters
 def _project(
     default_type: str | None = None,
     path: str = "seredos/azure-tests/azure-tests",
+    auto_labels: AutoLabels | None = None,
 ) -> ProjectConfig:
     return ProjectConfig(
         id="azure-tests",
@@ -41,6 +42,7 @@ def _project(
         path=path,
         token_env="AZURE_TOKEN",
         default_work_item_type=default_type,
+        auto_labels=auto_labels or AutoLabels(),
     )
 
 
@@ -1063,6 +1065,37 @@ def test_create_ticket_emits_json_patch_with_marker(
     assert assignee_op["value"] == "alice@x.io"
 
 
+def test_create_ticket_applies_custom_auto_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A project with a custom `auto_labels.ai_generated` name gets that
+    name stamped on both the tag list and the body marker line, instead
+    of the default `ai-generated`."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(7))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    project = _project(auto_labels=AutoLabels(ai_generated="robot-made", ai_modified="robot-touched"))
+    AzureDevOpsProvider().create_ticket(
+        project, token="t", title="hello", body="World", labels=["bug"], assignees=[],
+    )
+    patch = captured["patch"]
+    desc_op = next(op for op in patch if op["path"] == "/fields/System.Description")
+    assert "#robot-made" in desc_op["value"]
+    assert "#ai-generated" not in desc_op["value"]
+    tag_op = next(op for op in patch if op["path"] == "/fields/System.Tags")
+    assert "robot-made" in tag_op["value"]
+    assert "ai-generated" not in tag_op["value"]
+
+
 def test_create_ticket_uses_configured_default_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1408,6 +1441,59 @@ def test_update_ticket_preserves_ai_generated_when_already_generated(
     desc = next(op for op in captured["patch"] if op["path"] == "/fields/System.Description")["value"]
     assert "#ai-generated" in desc
     assert "#ai-modified" not in desc
+
+
+def test_update_ticket_label_diff_marks_custom_modified_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A project with a custom `auto_labels.ai_modified` name gets that
+    name stamped instead of the default `ai-modified` when a label is
+    added to a work item that isn't already AI-generated."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/5"):
+            return _json(_work_item_payload(5, **{"System.Tags": "p1"}))
+        if req.method == "PATCH" and path.endswith("/workitems/5"):
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(5))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    project = _project(auto_labels=AutoLabels(ai_generated="robot-made", ai_modified="robot-touched"))
+    AzureDevOpsProvider().update_ticket(
+        project, token="t", ticket_id="5", labels_add=["regression"]
+    )
+    tag_op = next(op for op in captured["patch"] if op["path"] == "/fields/System.Tags")
+    tags = set(t.strip() for t in tag_op["value"].split(";") if t.strip())
+    assert tags == {"p1", "regression", "robot-touched"}
+
+
+def test_update_ticket_body_stamps_custom_modified_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/5"):
+            return _json(
+                _work_item_payload(5, **{"System.Description": "<p>human content</p>"})
+            )
+        if req.method == "PATCH" and path.endswith("/workitems/5"):
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(5))
+        raise AssertionError
+
+    _install_mock(monkeypatch, handler)
+    project = _project(auto_labels=AutoLabels(ai_generated="robot-made", ai_modified="robot-touched"))
+    AzureDevOpsProvider().update_ticket(
+        project, token="t", ticket_id="5", body="My update"
+    )
+    desc_op = next(op for op in captured["patch"] if op["path"] == "/fields/System.Description")
+    assert "#robot-touched" in desc_op["value"]
+    assert "#ai-modified" not in desc_op["value"]
 
 
 # ---------- comments ---------------------------------------------------------

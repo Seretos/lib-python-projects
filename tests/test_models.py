@@ -105,6 +105,44 @@ class TestDefaultBranchField:
         assert d["default_branch"] == "main"
 
 
+class TestAutoLabels:
+    """`auto_labels` is new in ticket #153 — per-project AI-attribution
+    names, defaulting to the module-level `ai-generated`/`ai-modified`
+    constants from `markers.py` when unset."""
+
+    def test_auto_labels_defaults_to_module_constants(self) -> None:
+        p = _make_project()
+        assert p.auto_labels.ai_generated == "ai-generated"
+        assert p.auto_labels.ai_modified == "ai-modified"
+
+    def test_auto_labels_accepts_custom_names(self) -> None:
+        p = _make_project(
+            auto_labels={"ai_generated": "robot-made", "ai_modified": "robot-touched"}
+        )
+        assert p.auto_labels.ai_generated == "robot-made"
+        assert p.auto_labels.ai_modified == "robot-touched"
+
+    def test_auto_labels_rejects_unknown_keys(self) -> None:
+        with pytest.raises(ValidationError):
+            _make_project(auto_labels={"bogus_key": "nope"})
+
+    def test_auto_labels_rejects_empty_ai_generated(self) -> None:
+        with pytest.raises(ValidationError):
+            _make_project(auto_labels={"ai_generated": ""})
+
+    def test_auto_labels_rejects_empty_ai_modified(self) -> None:
+        with pytest.raises(ValidationError):
+            _make_project(auto_labels={"ai_modified": ""})
+
+    def test_auto_labels_appears_in_model_dump(self) -> None:
+        p = _make_project(auto_labels={"ai_generated": "robot-made"})
+        d = p.model_dump()
+        assert d["auto_labels"] == {
+            "ai_generated": "robot-made",
+            "ai_modified": "ai-modified",
+        }
+
+
 class TestBoard:
     """`board` is new in ticket #117 — optional ordered `columns` plus a
     provider-discriminated `binding`. Schema + model only; no provider

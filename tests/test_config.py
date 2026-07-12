@@ -741,6 +741,95 @@ class TestBoardBlock:
         assert board.resolve("Todo") == "Todo"
 
 
+# ---------- Optional `auto_labels` block (ticket #153) ----------------------
+
+
+class TestAutoLabelsBlock:
+    """Loader-level coverage for the optional `auto_labels` block. Nested
+    validation errors are expected to surface through the existing
+    ValidationError -> ConfigError -> state="config_error" path with no
+    loader changes required — `auto_labels` parses automatically via
+    `ProjectConfig.model_validate`."""
+
+    def test_auto_labels_block_round_trips(self, tmp_path: Path):
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+                auto_labels:
+                  ai_generated: robot-made
+                  ai_modified: robot-touched
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        p = result.projects[0]
+        assert p.auto_labels.ai_generated == "robot-made"
+        assert p.auto_labels.ai_modified == "robot-touched"
+
+    def test_auto_labels_less_yaml_still_loads_with_defaults(self, tmp_path: Path):
+        """Backward-compat: omitting `auto_labels` entirely stays valid
+        and resolves to the historical `ai-generated`/`ai-modified`
+        names."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        p = result.projects[0]
+        assert p.auto_labels.ai_generated == "ai-generated"
+        assert p.auto_labels.ai_modified == "ai-modified"
+
+    def test_unknown_key_nested_under_auto_labels_rejected(self, tmp_path: Path):
+        """A malformed `auto_labels:` block (unknown key, `extra="forbid"`)
+        skips only the offending entry (#132 path) rather than aborting
+        the whole load."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+                auto_labels:
+                  ai_generated: robot-made
+                  bogus_key: nope
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "config_error"
+        assert "bogus_key" in (result.error or "")
+        assert result.projects == []
+        assert len(result.invalid_projects) == 1
+        assert result.invalid_projects[0].id == "acme"
+        assert "bogus_key" in result.invalid_projects[0].error
+
+    def test_empty_auto_labels_name_rejected(self, tmp_path: Path):
+        """`min_length=1` on both fields — an empty-string name is a
+        schema-invalid entry, skipped via the #132 path."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+                auto_labels:
+                  ai_generated: ""
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "config_error"
+        assert result.projects == []
+        assert len(result.invalid_projects) == 1
+        assert result.invalid_projects[0].id == "acme"
+
+
 # ---------- Schema-invalid project entries are skipped, not fatal (#132) ----
 
 

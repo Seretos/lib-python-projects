@@ -20,6 +20,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from lib_python_config import LoadResult
+from lib_python_projects.markers import AI_GENERATED_LABEL, AI_MODIFIED_LABEL
 
 Provider = Literal["github", "gitlab", "azuredevops"]
 Source = Literal["config", "git-remote", "token-discovery"]
@@ -48,6 +49,24 @@ class Permissions(BaseModel):
     model_config = ConfigDict(extra="forbid")
     issues: IssuesPermissions = Field(default_factory=IssuesPermissions)
     pulls: PullsPermissions = Field(default_factory=PullsPermissions)
+
+
+class AutoLabels(BaseModel):
+    """Per-project AI-attribution names for the `#153` auto-labels.
+
+    Drives *both* the provider labels applied to tickets/PRs and the
+    `#…` body/comment marker lines (see `markers.py`'s `MarkerSet`).
+    Defaults to the module-level `AI_GENERATED_LABEL`/`AI_MODIFIED_LABEL`
+    constants so a project with no `auto_labels:` block behaves exactly
+    as before.
+
+    `AI_NOT_PLANNED_LABEL` (GitLab's `state_reason` stand-in) is
+    deliberately not configurable here — out of scope for #153.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    ai_generated: str = Field(default=AI_GENERATED_LABEL, min_length=1)
+    ai_modified: str = Field(default=AI_MODIFIED_LABEL, min_length=1)
 
 
 class BoardBinding(BaseModel):
@@ -229,6 +248,10 @@ class ProjectConfig(BaseModel):
     # Projects v2 support landed in #118, Azure Boards support in #119
     # (both via `<Provider>.list_board_columns` / `TicketFilters.board_column`).
     board: Board | None = None
+    # Per-project AI-attribution names (ticket #153). Defaults to the
+    # module-level ai-generated/ai-modified names when unset, so existing
+    # `projects.yml` entries behave unchanged.
+    auto_labels: AutoLabels = Field(default_factory=AutoLabels)
 
     @model_validator(mode="after")
     def _check_provider_fields(self) -> "ProjectConfig":

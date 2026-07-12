@@ -1739,3 +1739,121 @@ def test_all_providers_populate_annotations_as_failure_annotation_list(monkeypat
             assert isinstance(ann, FailureAnnotation)
     assert len(ado_run.failure.failing_jobs) == 1
     assert len(ado_run.failure.failing_jobs[0].annotations) == 1
+
+
+# ---------- ticket #153: per-project auto_labels cross-provider parity ------
+#
+# Detailed per-provider coverage (label-name resolution, role-based
+# color/description, create/update paths) lives in test_github_labels.py,
+# test_gitlab_issues.py, and test_azuredevops_tickets.py. These tests only
+# assert the cross-provider *shape*: all three providers apply the same
+# configured `auto_labels` names — both as the applied label/tag and as
+# the body-marker prefix — instead of the literal 'ai-generated'/
+# 'ai-modified' defaults, on create_ticket.
+
+
+def _custom_auto_labels() -> "AutoLabels":
+    from lib_python_projects import AutoLabels
+    return AutoLabels(ai_generated="robot-made", ai_modified="robot-touched")
+
+
+def test_github_create_ticket_honors_custom_auto_labels(monkeypatch):
+    project = ProjectConfig(
+        id="github-tests", provider="github", path="Seretos/agent-project-issues",
+        auto_labels=_custom_auto_labels(),
+    )
+    captured: dict = {}
+
+    def handler(req):
+        path = req.url.path
+        if req.method == "POST" and "/labels" in path:
+            return _resp({"name": "robot-made", "color": "0e8a16"}, status_code=201)
+        if req.method == "POST" and path.endswith("/issues"):
+            captured["body"] = json.loads(req.content.decode())
+            return _resp({
+                "number": 9, "title": "hi", "body": captured["body"]["body"],
+                "state": "open", "user": {"login": "a"}, "assignees": [],
+                "labels": [{"name": "robot-made"}],
+                "html_url": "https://github.com/acme/backend/issues/9",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        return _resp({})
+
+    _install_github_mock(monkeypatch, handler)
+    GitHubProvider().create_ticket(
+        project, "t", title="hi", body="B", labels=[], assignees=[],
+    )
+    assert "robot-made" in captured["body"]["labels"]
+    assert "ai-generated" not in captured["body"]["labels"]
+    assert captured["body"]["body"].startswith("#robot-made")
+
+
+def test_gitlab_create_ticket_honors_custom_auto_labels(monkeypatch):
+    project = ProjectConfig(
+        id="gitlab-tests", provider="gitlab", path="Seredos/gitlab-tests",
+        auto_labels=_custom_auto_labels(),
+    )
+    captured: dict = {}
+
+    def handler(req):
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _resp([])
+        if req.method == "POST" and req.url.path.endswith("/issues"):
+            captured["body"] = json.loads(req.content.decode())
+            return _resp({
+                "iid": 6, "title": "hi", "description": captured["body"]["description"],
+                "state": "opened", "author": {"username": "a"}, "assignees": [],
+                "labels": ["robot-made"],
+                "web_url": "https://gitlab.com/seredos/gitlab-tests/-/issues/6",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        return _resp([])
+
+    _install_gitlab_mock(monkeypatch, handler)
+    GitLabProvider().create_ticket(
+        project, "t", title="hi", body="B", labels=[], assignees=[],
+    )
+    assert "robot-made" in captured["body"]["labels"]
+    assert "ai-generated" not in captured["body"]["labels"]
+    assert captured["body"]["description"].startswith("#robot-made")
+
+
+def test_azuredevops_create_ticket_honors_custom_auto_labels(monkeypatch):
+    from lib_python_projects.providers.azuredevops import _cache_clear_all
+    _cache_clear_all()
+    project = ProjectConfig(
+        id="azure-tests", provider="azuredevops",
+        path="seredos/azure-tests/azure-tests", token_env="AZURE_TOKEN",
+        auto_labels=_custom_auto_labels(),
+    )
+    captured: dict = {}
+
+    def handler(req):
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _resp({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            fields = {
+                "System.Title": "hi", "System.Description": "<p>B</p>",
+                "System.State": "To Do", "System.WorkItemType": "Issue",
+                "System.Tags": "robot-made",
+                "System.CreatedDate": "2024-01-01T00:00:00Z",
+                "System.ChangedDate": "2024-01-01T00:00:00Z",
+            }
+            return _resp({"id": 7, "fields": fields})
+        raise AssertionError(f"unexpected {path}")
+
+    _install_azuredevops_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        project, token="t", title="hi", body="B", labels=[], assignees=[],
+    )
+    patch = captured["patch"]
+    desc_op = next(op for op in patch if op["path"] == "/fields/System.Description")
+    tag_op = next(op for op in patch if op["path"] == "/fields/System.Tags")
+    assert "#robot-made" in desc_op["value"]
+    assert "#ai-generated" not in desc_op["value"]
+    assert "robot-made" in tag_op["value"]
+    assert "ai-generated" not in tag_op["value"]

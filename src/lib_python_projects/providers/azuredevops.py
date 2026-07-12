@@ -44,8 +44,7 @@ import httpx
 
 from lib_python_projects.models import ProjectConfig
 from lib_python_projects.markers import (
-    AI_GENERATED_LABEL,
-    AI_MODIFIED_LABEL,
+    MarkerSet,
     apply_body_marker,
     ensure_body_prefix,
     ensure_comment_prefix,
@@ -151,6 +150,10 @@ def _client(
         timeout=30.0,
         transport=make_cached_transport(),
     )
+
+
+def _marker_set(project: ProjectConfig) -> MarkerSet:
+    return MarkerSet(project.auto_labels.ai_generated, project.auto_labels.ai_modified)
 
 
 # ---------- discovery sentinel + helpers ------------------------------------
@@ -2560,8 +2563,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                     f"Accepted: {', '.join(valid_names)}."
                 )
 
-        body_with_marker = ensure_body_prefix(body or "")
-        merged_labels = sorted(set([*labels, AI_GENERATED_LABEL]))
+        markers = _marker_set(project)
+        body_with_marker = ensure_body_prefix(body or "", markers=markers)
+        merged_labels = sorted(set([*labels, project.auto_labels.ai_generated]))
 
         patch: list[dict] = [
             {"op": "add", "path": "/fields/System.Title", "value": title},
@@ -2670,15 +2674,17 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             raise
         current = resp.json()
         cur_fields = current.get("fields") or {}
+        markers = _marker_set(project)
 
         patch: list[dict] = []
         if title is not None:
             patch.append({"op": "replace", "path": "/fields/System.Title", "value": title})
         if body is not None:
             already_ai = has_ai_generated_marker(
-                _html_to_markdown(cur_fields.get("System.Description") or "")
+                _html_to_markdown(cur_fields.get("System.Description") or ""),
+                markers=markers,
             )
-            new_body = apply_body_marker(body, will_be_ai_generated=already_ai)
+            new_body = apply_body_marker(body, will_be_ai_generated=already_ai, markers=markers)
             patch.append({
                 "op": "replace",
                 "path": "/fields/System.Description",
@@ -2694,11 +2700,12 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 current_labels.add(lbl)
             for lbl in labels_remove or []:
                 current_labels.discard(lbl)
-            # Always stamp the `ai-modified` marker on a write that doesn't
-            # carry `ai-generated` already (parity with github.py).
-            already_ai_label = AI_GENERATED_LABEL in current_labels
+            # Always stamp the project's configured "modified" label on a
+            # write that doesn't carry the "generated" label already
+            # (parity with github.py).
+            already_ai_label = project.auto_labels.ai_generated in current_labels
             if not already_ai_label:
-                current_labels.add(AI_MODIFIED_LABEL)
+                current_labels.add(project.auto_labels.ai_modified)
             patch.append({
                 "op": "replace",
                 "path": "/fields/System.Tags",
@@ -2853,7 +2860,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
     ) -> Comment:
         if not body or not body.strip():
             raise ValueError("body must not be empty")
-        body_with_marker = ensure_comment_prefix(body)
+        body_with_marker = ensure_comment_prefix(body, markers=_marker_set(project))
         path = (
             f"{_project_scope(project)}/_apis/wit/workItems/"
             f"{quote(str(ticket_id), safe='')}/comments"
@@ -3010,8 +3017,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 ) from exc
             raise
         cur_markdown = _html_to_markdown((resp.json() or {}).get("text") or "")
-        already_ai = has_ai_generated_marker(cur_markdown)
-        new_body = apply_body_marker(body, will_be_ai_generated=already_ai)
+        markers = _marker_set(project)
+        already_ai = has_ai_generated_marker(cur_markdown, markers=markers)
+        new_body = apply_body_marker(body, will_be_ai_generated=already_ai, markers=markers)
         with _client(project, token) as c:
             resp = c.patch(
                 path,
@@ -3356,12 +3364,13 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
     ) -> PullRequest:
         """Create a pull request, applying the AI-generated marker + label.
 
-        Mirrors `github.py:create_pr`: the body always gets the
-        `#ai-generated` marker prefix and the `ai-generated` label is
-        appended to the user-supplied labels (de-duped, preserving the
-        caller's order). Label application is best-effort — a 403/404
-        from `_add_pr_label` is swallowed so a missing tag-management
-        permission doesn't kill the legitimate PR.
+        Mirrors `github.py:create_pr`: the body always gets the project's
+        configured "generated" marker prefix and the project's configured
+        "generated" label (`project.auto_labels.ai_generated`, `ai-generated`
+        by default) is appended to the user-supplied labels (de-duped,
+        preserving the caller's order). Label application is best-effort —
+        a 403/404 from `_add_pr_label` is swallowed so a missing
+        tag-management permission doesn't kill the legitimate PR.
 
         Optional `idempotency_key` (ticket #150): a retried call with the
         same key (scoped to this project) returns the PR created by the
@@ -3381,7 +3390,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             if replay is not None:
                 return replay
         repo_id = self._resolve_repository_id(project, token)
-        body_with_marker = ensure_body_prefix(body or "")
+        body_with_marker = ensure_body_prefix(body or "", markers=_marker_set(project))
         payload: dict[str, Any] = {
             "sourceRefName": head if head.startswith("refs/") else f"refs/heads/{head}",
             "targetRefName": base if base.startswith("refs/") else f"refs/heads/{base}",
@@ -3403,9 +3412,12 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             resp = c.post(path, params=_api_version_params(), json=payload)
         _check(resp)
         pr = _map_pr(resp.json(), project)
-        # Mirror github.py:create_pr — always merge the ai-generated
-        # label, dropping caller duplicates while preserving their order.
-        merged_labels = list(dict.fromkeys([*(labels or []), AI_GENERATED_LABEL]))
+        # Mirror github.py:create_pr — always merge the project's
+        # configured "generated" label, dropping caller duplicates while
+        # preserving their order.
+        merged_labels = list(
+            dict.fromkeys([*(labels or []), project.auto_labels.ai_generated])
+        )
         if merged_labels:
             for lbl in merged_labels:
                 self._add_pr_label_best_effort(project, token, repo_id, pr.id, lbl)
@@ -3503,11 +3515,12 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         """Update a PR's title/body/state/base, plus label/reviewer deltas.
 
         Mirrors `github.py:update_pr` for the marker + label policy:
-          - The body always carries a marker line; `#ai-generated` is
-            preserved when the PR was originally agent-authored,
-            otherwise `#ai-modified` is stamped.
-          - When the existing PR does not already carry the
-            `ai-generated` label, the `ai-modified` label is added
+          - The body always carries a marker line; the project's
+            configured "generated" marker is preserved when the PR was
+            originally agent-authored, otherwise the "modified" marker
+            is stamped.
+          - When the existing PR does not already carry the project's
+            configured "generated" label, the "modified" label is added
             (best-effort, swallowing 403/404).
 
         Limitation: ADO has no native `updated_at` field on PRs, so we
@@ -3535,15 +3548,16 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             if lbl.get("name")
         }
         cur_md = _html_to_markdown(cur.get("description") or "")
-        already_ai = has_ai_generated_marker(cur_md) or (
-            AI_GENERATED_LABEL in cur_labels
+        markers = _marker_set(project)
+        already_ai = has_ai_generated_marker(cur_md, markers=markers) or (
+            project.auto_labels.ai_generated in cur_labels
         )
 
         payload: dict[str, Any] = {}
         if title is not None:
             payload["title"] = title
         if body is not None:
-            new_body = apply_body_marker(body, will_be_ai_generated=already_ai)
+            new_body = apply_body_marker(body, will_be_ai_generated=already_ai, markers=markers)
             payload["description"] = _markdown_to_html(new_body)
         if base is not None:
             payload["targetRefName"] = (
@@ -3565,18 +3579,18 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             _check(resp)
             wrote = True
 
-        # Auto-apply `ai-modified` when the PR wasn't originally agent-
-        # authored AND that label isn't already in the requested deltas.
-        # Best-effort: a missing tag-management permission doesn't kill
-        # the legitimate update.
+        # Auto-apply the project's configured "modified" label when the PR
+        # wasn't originally agent-authored AND that label isn't already in
+        # the requested deltas. Best-effort: a missing tag-management
+        # permission doesn't kill the legitimate update.
         explicit_label_names = set(labels_add or []) | set(labels_remove or [])
         if (
             not already_ai
-            and AI_MODIFIED_LABEL not in cur_labels
-            and AI_MODIFIED_LABEL not in explicit_label_names
+            and project.auto_labels.ai_modified not in cur_labels
+            and project.auto_labels.ai_modified not in explicit_label_names
         ):
             if self._add_pr_label_best_effort(
-                project, token, repo_id, pr_id, AI_MODIFIED_LABEL
+                project, token, repo_id, pr_id, project.auto_labels.ai_modified
             ):
                 wrote = True
 
@@ -3768,7 +3782,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         body: str,
     ) -> Comment:
         repo_id = self._resolve_repository_id(project, token)
-        body_with_marker = ensure_comment_prefix(body or "")
+        body_with_marker = ensure_comment_prefix(body or "", markers=_marker_set(project))
         path = (
             f"{_project_scope(project)}/_apis/git/repositories/"
             f"{quote(repo_id, safe='')}/pullrequests/{quote(str(pr_id), safe='')}/threads"
@@ -3813,7 +3827,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 "(create a new diff-anchored thread).",
             )
         repo_id = self._resolve_repository_id(project, token)
-        body_with_marker = ensure_comment_prefix(body or "")
+        body_with_marker = ensure_comment_prefix(body or "", markers=_marker_set(project))
 
         if in_reply_to:
             # Reply lives inside an existing thread. Accept both the
@@ -4062,7 +4076,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         reviewer_identity = resp.json() or {}
         merged_identity = {**identity, **reviewer_identity}
 
-        body_with_marker = ensure_comment_prefix(body) if body else ""
+        body_with_marker = (
+            ensure_comment_prefix(body, markers=_marker_set(project)) if body else ""
+        )
         if body:
             threads_path = (
                 f"{_project_scope(project)}/_apis/git/repositories/"
@@ -4189,11 +4205,12 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             current_html = src_fields.get("System.Description") or ""
             current_markdown = _html_to_markdown(current_html)
             wi_type = src_fields.get("System.WorkItemType") or ""
-            already_ai = has_ai_generated_marker(current_markdown)
+            markers = _marker_set(project)
+            already_ai = has_ai_generated_marker(current_markdown, markers=markers)
 
             # Build the new body with "Duplicate of #N" prepended.
             dup_line = f"Duplicate of #{target_id}"
-            body_without_marker = strip_leading_ai_marker(current_markdown)
+            body_without_marker = strip_leading_ai_marker(current_markdown, markers=markers)
             if dup_line not in body_without_marker:
                 new_body_core = (
                     f"{dup_line}\n\n{body_without_marker}"
@@ -4202,7 +4219,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 )
             else:
                 new_body_core = body_without_marker
-            new_body = apply_body_marker(new_body_core, will_be_ai_generated=already_ai)
+            new_body = apply_body_marker(
+                new_body_core, will_be_ai_generated=already_ai, markers=markers
+            )
 
             # Resolve the "Completed"-category closed state for this work item type.
             closed_state = "Closed"  # safe fallback
@@ -4311,14 +4330,15 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             current_html = fields.get("System.Description") or ""
             current_markdown = _html_to_markdown(current_html)
             wi_type = fields.get("System.WorkItemType") or ""
-            already_ai = has_ai_generated_marker(current_markdown)
+            markers = _marker_set(project)
+            already_ai = has_ai_generated_marker(current_markdown, markers=markers)
 
             # Strip the exact "Duplicate of #<target_id>" line (and a
             # trailing blank line, mirroring add_relation's prepend
             # format). (?!\d) guards against a partial-id match, e.g.
             # removing "#9" must not also eat "#90".
             dup_line = f"Duplicate of #{target_id}"
-            body_core = strip_leading_ai_marker(current_markdown)
+            body_core = strip_leading_ai_marker(current_markdown, markers=markers)
             body_core = re.sub(
                 rf"^{re.escape(dup_line)}(?!\d)\n?(?:\n)?",
                 "",
@@ -4326,7 +4346,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 flags=re.MULTILINE,
             )
             body_core = re.sub(r"\n{3,}", "\n\n", body_core).strip()
-            new_body = apply_body_marker(body_core, will_be_ai_generated=already_ai)
+            new_body = apply_body_marker(
+                body_core, will_be_ai_generated=already_ai, markers=markers
+            )
 
             # Resolve the open state to reopen into. Tolerate a failed
             # states lookup (e.g. unknown work-item type) and fall back
