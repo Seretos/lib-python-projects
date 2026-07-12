@@ -265,3 +265,118 @@ def test_azuredevops_provider_implements_token_discovery():
     from lib_python_projects.providers.base import TokenProjectDiscoveryProvider
 
     assert issubclass(AzureDevOpsProvider, TokenProjectDiscoveryProvider)
+
+
+# ---------- ticket #151: Ticket.parent_id / Ticket.milestone -----------------
+
+
+def _make_ticket(**overrides):
+    from lib_python_projects.providers.base import Ticket
+
+    base = dict(
+        id="1",
+        title="t",
+        body="b",
+        status="open",
+        author="a",
+        assignees=[],
+        labels=[],
+        url="https://example.invalid/1",
+        created_at="2024-01-01T00:00:00Z",
+        updated_at="2024-01-01T00:00:00Z",
+    )
+    base.update(overrides)
+    return Ticket(**base)
+
+
+class TestTicketHierarchyAndMilestoneFields:
+    """`Ticket.parent_id` / `Ticket.milestone` are new optional fields
+    (ticket #151) — both default to `None` and every pre-existing
+    `Ticket(...)` construction call site (which never passes them) must
+    keep working unchanged."""
+
+    def test_parent_id_defaults_to_none(self):
+        t = _make_ticket()
+        assert t.parent_id is None
+
+    def test_milestone_defaults_to_none(self):
+        t = _make_ticket()
+        assert t.milestone is None
+
+    def test_parent_id_settable(self):
+        t = _make_ticket(parent_id="#7")
+        assert t.parent_id == "#7"
+
+    def test_milestone_settable(self):
+        t = _make_ticket(milestone="v2.0")
+        assert t.milestone == "v2.0"
+
+    def test_existing_construction_without_new_fields_still_works(self):
+        """A `Ticket(...)` call using only the pre-#151 fields (no
+        `parent_id`/`milestone`) must not raise — locks in backward
+        compatibility for every existing call site."""
+        t = _make_ticket(idempotent_replay=True, custom_fields={"a": 1})
+        assert t.parent_id is None
+        assert t.milestone is None
+        assert t.idempotent_replay is True
+        assert t.custom_fields == {"a": 1}
+
+
+class TestExtractParentId:
+    """`_extract_parent_id` is the shared projection helper all three
+    providers' `get_ticket` use to populate `Ticket.parent_id` from the
+    `_fetch_relations` output — a pure function over a `list[Relation]`,
+    no network calls."""
+
+    def test_returns_none_for_empty_relations(self):
+        from lib_python_projects.providers.base import _extract_parent_id
+
+        assert _extract_parent_id([]) is None
+
+    def test_returns_none_when_no_parent_relation(self):
+        from lib_python_projects.providers.base import Relation, _extract_parent_id
+
+        relations = [
+            Relation(
+                kind="blocks", ticket_id="#2", title="", url="", state="open",
+                is_pull_request=False,
+            ),
+            Relation(
+                kind="child", ticket_id="#3", title="", url="", state="open",
+                is_pull_request=False,
+            ),
+        ]
+        assert _extract_parent_id(relations) is None
+
+    def test_returns_parent_ticket_id_when_present(self):
+        from lib_python_projects.providers.base import Relation, _extract_parent_id
+
+        relations = [
+            Relation(
+                kind="blocks", ticket_id="#2", title="", url="", state="open",
+                is_pull_request=False,
+            ),
+            Relation(
+                kind="parent", ticket_id="#9", title="Epic", url="", state="open",
+                is_pull_request=False,
+            ),
+        ]
+        assert _extract_parent_id(relations) == "#9"
+
+    def test_returns_first_parent_relation_when_multiple(self):
+        """Defensive: `_fetch_relations` should never emit two `parent`
+        relations, but the helper picks the first deterministically if it
+        ever did, rather than raising."""
+        from lib_python_projects.providers.base import Relation, _extract_parent_id
+
+        relations = [
+            Relation(
+                kind="parent", ticket_id="#5", title="", url="", state="open",
+                is_pull_request=False,
+            ),
+            Relation(
+                kind="parent", ticket_id="#6", title="", url="", state="open",
+                is_pull_request=False,
+            ),
+        ]
+        assert _extract_parent_id(relations) == "#5"

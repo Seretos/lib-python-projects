@@ -164,6 +164,106 @@ def test_parent_only(monkeypatch: pytest.MonkeyPatch) -> None:
     assert rel.is_pull_request is False
 
 
+# ---------- ticket #151: Ticket.parent_id projection --------------------------
+
+
+def test_get_ticket_populates_parent_id_from_parent_relation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`Ticket.parent_id` is a pure projection over the `parent` relation
+    `_fetch_relations` already computes — same fixture as `test_parent_only`,
+    now also asserting `ticket.parent_id`."""
+
+    parent_payload = {
+        "number": 7,
+        "title": "Epic",
+        "state": "open",
+        "html_url": "https://github.com/acme/backend/issues/7",
+        "repository": {"full_name": "acme/backend"},
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/42":
+            return _json(_issue_payload(42, parent=parent_payload))
+        if path == "/repos/acme/backend/issues/42/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/42/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/42/timeline":
+            return _json([])
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _, relations, _ = GitHubProvider().get_ticket(
+        _project(), token="t", ticket_id="42"
+    )
+    assert ticket.parent_id == "#7"
+    assert [r.ticket_id for r in relations if r.kind == "parent"] == ["#7"]
+
+
+def test_get_ticket_parent_id_none_without_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No `parent` relation -> `Ticket.parent_id is None` (same fixture as
+    `test_no_relations`)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/42":
+            return _json(_issue_payload(42))
+        if path == "/repos/acme/backend/issues/42/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/42/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/42/timeline":
+            return _json([])
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _, relations, _ = GitHubProvider().get_ticket(
+        _project(), token="t", ticket_id="42"
+    )
+    assert ticket.parent_id is None
+    assert relations == []
+
+
+def test_get_ticket_include_relations_false_leaves_parent_id_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`include_relations=False` skips `_fetch_relations` entirely, so
+    `parent_id` stays at its dataclass default (`None`) rather than being
+    independently resolved."""
+
+    parent_payload = {
+        "number": 7,
+        "title": "Epic",
+        "state": "open",
+        "html_url": "https://github.com/acme/backend/issues/7",
+        "repository": {"full_name": "acme/backend"},
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/42":
+            return _json(_issue_payload(42, parent=parent_payload))
+        if path == "/repos/acme/backend/issues/42/comments":
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _, relations, truncated = GitHubProvider().get_ticket(
+        _project(), token="t", ticket_id="42", include_relations=False,
+    )
+    assert ticket.parent_id is None
+    assert relations == []
+    assert truncated is None
+
+
 def test_child_only(monkeypatch: pytest.MonkeyPatch) -> None:
     """Sub-issues surface as `child` relations."""
 

@@ -1161,6 +1161,7 @@ def test_gitlab_get_ticket_include_custom_fields_returns_labels_and_milestone(
         _gitlab_project(), "t", "5", include_relations=False, include_custom_fields=True,
     )
     assert ticket.custom_fields == {"labels": ["bug"], "milestone": "v2.0"}
+    assert ticket.milestone == "v2.0"
     assert len(seen) == 2, "no extra HTTP request beyond issue GET + notes GET"
 
 
@@ -1416,3 +1417,199 @@ def test_all_providers_create_pr_accepts_idempotency_key_keyword_only():
         )
         assert param.default is None
         assert sig.parameters["head"].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+
+
+# ---------- ticket #151: cross-provider ticket hierarchy / milestone parity -
+
+
+def test_ticket_exposes_parent_id_and_milestone_fields():
+    """`parent_id`/`milestone` are real `Ticket` fields, both defaulting to
+    `None`, on the single shared dataclass every provider returns."""
+    import dataclasses
+    from lib_python_projects.providers.base import Ticket
+
+    fields = {f.name: f for f in dataclasses.fields(Ticket)}
+    assert "parent_id" in fields
+    assert "milestone" in fields
+    assert fields["parent_id"].default is None
+    assert fields["milestone"].default is None
+
+
+def test_all_providers_create_ticket_and_update_ticket_accept_milestone_keyword_only():
+    """`milestone=` exists as a keyword-only parameter on `create_ticket`
+    AND `update_ticket` for all three providers (ticket #151), defaulting
+    to each module's private `_UNSET` sentinel — not `None` — so "omitted"
+    and "explicitly clear" stay distinguishable across every provider."""
+    import inspect
+    from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+    from lib_python_projects.providers.github import GitHubProvider
+    from lib_python_projects.providers.gitlab import GitLabProvider
+
+    for provider_cls in (GitHubProvider, GitLabProvider, AzureDevOpsProvider):
+        for method_name in ("create_ticket", "update_ticket"):
+            sig = inspect.signature(getattr(provider_cls, method_name))
+            assert "milestone" in sig.parameters, (
+                f"{provider_cls.__name__}.{method_name} is missing 'milestone'"
+            )
+            param = sig.parameters["milestone"]
+            assert param.kind == inspect.Parameter.KEYWORD_ONLY, (
+                f"{provider_cls.__name__}.{method_name}.milestone must be keyword-only"
+            )
+            # The sentinel is intentionally NOT None — None is the "clear"
+            # value, and must stay distinguishable from "not provided".
+            assert param.default is not None
+            assert param.default is not inspect.Parameter.empty
+
+
+def test_all_three_providers_round_trip_parent_id_and_milestone(monkeypatch):
+    """Live (mocked) round-trip across all three providers: each exposes
+    `parent_id`/`milestone` on `get_ticket` and accepts `milestone=` on
+    `create_ticket`, with consistent `None`-vs-value / sentinel semantics."""
+    from lib_python_projects import Board, GithubProjectsV2Binding
+
+    # ---- GitHub: milestone via the bound board's iteration field, parent
+    # via the existing sub-issues `parent` field. ----
+    github_board = Board(
+        columns=["Todo"],
+        binding=GithubProjectsV2Binding(
+            kind="github-projects-v2", owner="acme-org", project_number=7,
+            iteration_field="Sprint",
+        ),
+    )
+    github_project = ProjectConfig(
+        id="gh", provider="github", path="acme/backend", board=github_board,
+    )
+
+    def github_handler(req):
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/42":
+            return _resp({
+                "number": 42, "title": "T", "body": "", "state": "open",
+                "user": {"login": "a"}, "assignees": [], "labels": [],
+                "html_url": "https://github.com/acme/backend/issues/42",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "parent": {
+                    "number": 7, "title": "Epic", "state": "open",
+                    "html_url": "https://github.com/acme/backend/issues/7",
+                    "repository": {"full_name": "acme/backend"},
+                },
+            })
+        if path == "/repos/acme/backend/issues/42/comments":
+            return _resp([])
+        if path == "/repos/acme/backend/issues/42/sub_issues":
+            return _resp([])
+        if path == "/repos/acme/backend/issues/42/timeline":
+            return _resp([])
+        if "/dependencies/" in path:
+            return _resp([])
+        if path == "/graphql":
+            body = json.loads(req.content.decode("utf-8"))
+            assert body["variables"] == {
+                "owner": "acme", "repo": "backend", "number": 42,
+            }
+            return _resp({
+                "data": {"repository": {"issue": {"projectItems": {"nodes": [
+                    {
+                        "project": {"number": 7},
+                        "fieldValues": {"nodes": [
+                            {"title": "Sprint 5", "field": {"name": "Sprint"}},
+                        ]},
+                    }
+                ]}}}}
+            })
+        raise AssertionError(f"unexpected GitHub request: {req.method} {path}")
+
+    _install_github_mock(monkeypatch, github_handler)
+    gh_ticket, _c, gh_rel, _t = GitHubProvider().get_ticket(
+        github_project, "t", "42",
+    )
+    assert gh_ticket.parent_id == "#7"
+    assert gh_ticket.milestone == "Sprint 5"
+    assert [r.kind for r in gh_rel if r.kind == "parent"] == ["parent"]
+
+    # ---- GitLab: milestone via the native issue milestone; parent via
+    # Work Items GraphQL hierarchyWidget. ----
+    def gitlab_handler(req):
+        url = str(req.url)
+        if "/issues/5/notes" in url or "/issues/5/links" in url or "/issues/5/closed_by" in url:
+            return _resp([])
+        if url.endswith("issues/5"):
+            return _resp({
+                "iid": 5, "title": "T", "description": "", "state": "opened",
+                "author": {"username": "a"}, "assignees": [], "labels": [],
+                "milestone": {"id": 9, "title": "v2.0"},
+                "web_url": "https://gitlab.com/acme/backend/-/issues/5",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        if url.endswith("/api/graphql"):
+            body = json.loads(req.content.decode("utf-8"))
+            iid = int(body["variables"]["iid"])
+            assert iid == 5
+            return _resp({
+                "data": {"project": {"workItems": {"nodes": [{
+                    "id": "gid://gitlab/WorkItem/5", "iid": 5, "title": "T",
+                    "webUrl": "https://gitlab.com/acme/backend/-/issues/5",
+                    "state": "OPEN",
+                    "widgets": [{"parent": {
+                        "id": "gid://gitlab/WorkItem/3", "iid": 3,
+                        "title": "Epic", "webUrl": "https://gitlab.com/acme/backend/-/issues/3",
+                        "state": "OPEN",
+                    }}],
+                }]}}}
+            })
+        return _resp({}, 404)
+
+    _install_gitlab_mock(monkeypatch, gitlab_handler)
+    gl_ticket, _c, gl_rel, _t = GitLabProvider().get_ticket(
+        _gitlab_project("acme/backend"), "t", "5",
+    )
+    assert gl_ticket.parent_id == "#3"
+    assert gl_ticket.milestone == "v2.0"
+    assert [r.kind for r in gl_rel if r.kind == "parent"] == ["parent"]
+
+    # ---- Azure DevOps: milestone via System.IterationPath; parent via
+    # System.LinkTypes.Hierarchy-Reverse. ----
+    def ado_handler(req):
+        path = req.url.path
+        if "/_apis/wit/workitems/5" in path and "/comments" not in path:
+            return _resp({
+                "id": 5,
+                "fields": {
+                    "System.Title": "T", "System.Description": "",
+                    "System.State": "New", "System.IterationPath": "Proj\\Sprint 9",
+                    "System.CreatedDate": "2024-01-01T00:00:00Z",
+                    "System.ChangedDate": "2024-01-01T00:00:00Z",
+                },
+                "relations": [{
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/3",
+                }],
+            })
+        if path.endswith("/_apis/wit/workItems/5/comments"):
+            return _resp({"comments": [], "continuationToken": None})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            ids = json.loads(req.content.decode("utf-8"))["ids"]
+            return _resp({
+                "value": [
+                    {"id": wid, "fields": {
+                        "System.Title": "Epic", "System.State": "Active",
+                    }}
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected ADO request: {req.method} {path}")
+
+    _install_azuredevops_mock(monkeypatch, ado_handler)
+    ado_ticket, _c, ado_rel, _t = AzureDevOpsProvider().get_ticket(
+        _azuredevops_project(), token="t", ticket_id="5",
+    )
+    assert ado_ticket.parent_id == "#3"
+    assert ado_ticket.milestone == "Proj\\Sprint 9"
+    assert [r.kind for r in ado_rel if r.kind == "parent"] == ["parent"]
+
+    # ---- Consistent format across all three: parent_id is "#N". ----
+    assert gh_ticket.parent_id.startswith("#")
+    assert gl_ticket.parent_id.startswith("#")
+    assert ado_ticket.parent_id.startswith("#")

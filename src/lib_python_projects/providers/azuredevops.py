@@ -85,6 +85,7 @@ from lib_python_projects.providers.base import (
     WRITABLE_RELATION_KINDS,
     normalize_timestamp,
     _assert_not_self_relation,
+    _extract_parent_id,
     _validate_label_lists,
     _validate_limit,
 )
@@ -98,6 +99,11 @@ API_VERSION = "7.1"
 # Comments live on the preview-marked endpoint; the GA version drops the
 # suffix once Microsoft promotes it.
 API_VERSION_COMMENTS = "7.1-preview.4"
+
+# Sentinel distinguishing "milestone kwarg not passed" from "explicitly
+# clear the milestone" (`milestone=None`) on `create_ticket` /
+# `update_ticket` (ticket #151).
+_UNSET: Any = object()
 
 
 # ---------- error type -------------------------------------------------------
@@ -1089,6 +1095,7 @@ def _map_work_item(raw: dict, project: ProjectConfig) -> Ticket:
         url=_build_work_item_url(project, raw_id) if raw_id is not None else "",
         created_at=normalize_timestamp(fields.get("System.CreatedDate") or ""),
         updated_at=normalize_timestamp(fields.get("System.ChangedDate") or ""),
+        milestone=fields.get("System.IterationPath") or None,
     )
 
 
@@ -2237,6 +2244,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 project, token, raw, ticket_id
             )
             truncated: bool | None = False
+            ticket.parent_id = _extract_parent_id(relations)
         else:
             relations = []
             truncated = None
@@ -2420,6 +2428,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         custom_fields: dict[str, Any] | None = None,
         *,
         idempotency_key: str | None = None,
+        milestone: Any = _UNSET,
     ) -> Ticket:
         """Create an ADO work item.
 
@@ -2459,6 +2468,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         key. A retry with the same key but a different ``title``/``body``
         raises ``IdempotencyConflict``. ``None``/``""`` (the default)
         disables idempotency entirely.
+
+        Optional ``milestone`` (ticket #151, keyword-only): maps to a
+        ``/fields/System.IterationPath`` JSON-Patch "add" op, appended
+        *after* the ``custom_fields`` loop so it wins on conflict with
+        ``custom_fields["System.IterationPath"]`` (which keeps working
+        unchanged). Uses the ``_UNSET`` sentinel default so "not
+        provided" issues no patch op at all; ``milestone=None`` is also a
+        no-op on create (there's nothing to clear on a fresh work item).
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
@@ -2521,6 +2538,13 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         for field_ref, field_value in remaining_custom_fields.items():
             patch.append({"op": "add", "path": f"/fields/{field_ref}", "value": field_value})
 
+        if milestone is not _UNSET and milestone is not None:
+            patch.append({
+                "op": "add",
+                "path": "/fields/System.IterationPath",
+                "value": milestone,
+            })
+
         path = f"{_project_scope(project)}/_apis/wit/workitems/${quote(wi_type, safe='')}"
         with _client(project, token) as c:
             resp = c.post(
@@ -2568,7 +2592,20 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         assignees_add: list[str] | None = None,
         assignees_remove: list[str] | None = None,
         custom_fields: dict[str, Any] | None = None,
+        milestone: Any = _UNSET,
     ) -> Ticket:
+        """Update a work item.
+
+        Optional ``milestone`` (ticket #151, keyword-only): maps to a
+        ``/fields/System.IterationPath`` JSON-Patch op, appended *after*
+        the ``custom_fields`` loop so it wins on conflict with
+        ``custom_fields["System.IterationPath"]`` (which keeps working
+        unchanged). A title string sets the field; ``milestone=None``
+        clears it (empty-string value — ADO has no "remove" semantics
+        for ``System.IterationPath``, every work item belongs to some
+        iteration). ``milestone=`` omitted (``_UNSET``) issues no patch
+        op at all.
+        """
         _validate_label_lists(labels_add, labels_remove)
         _validate_int32_id(ticket_id, "ticket")
         # Read current work item (need tags + assignee for diff semantics).
@@ -2646,6 +2683,20 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
 
         for field_ref, field_value in (custom_fields or {}).items():
             patch.append({"op": "add", "path": f"/fields/{field_ref}", "value": field_value})
+
+        if milestone is not _UNSET:
+            if milestone is None:
+                patch.append({
+                    "op": "replace",
+                    "path": "/fields/System.IterationPath",
+                    "value": "",
+                })
+            else:
+                patch.append({
+                    "op": "add",
+                    "path": "/fields/System.IterationPath",
+                    "value": milestone,
+                })
 
         if not patch:
             return _map_work_item(current, project)

@@ -35,6 +35,7 @@ def _board(
     owner: str | None = "acme-org",
     project_number: int | None = 7,
     status_field: str = "Status",
+    iteration_field: str | None = None,
 ) -> Board:
     return Board(
         columns=columns,
@@ -43,6 +44,7 @@ def _board(
             owner=owner,
             project_number=project_number,
             status_field=status_field,
+            iteration_field=iteration_field,
             map=map_,
         ),
     )
@@ -884,6 +886,7 @@ def test_get_ticket_include_custom_fields_no_board_returns_none_no_graphql_call(
         _project(None), "t", "42", include_relations=False, include_custom_fields=True,
     )
     assert ticket.custom_fields is None
+    assert ticket.milestone is None
     assert all(r.url.path != "/graphql" for r in seen)
 
 
@@ -891,11 +894,22 @@ def test_get_ticket_without_include_custom_fields_stays_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Default `include_custom_fields=False` leaves `custom_fields` at its
-    `None` default even with a board configured."""
+    `None` default even with a board configured.
+
+    A board-bound `get_ticket` now (ticket #151) always issues the
+    `projectItems` query to populate `milestone` regardless of
+    `include_custom_fields` — so the mocked `/graphql` route must be
+    present, but `custom_fields` itself stays `None` since it wasn't
+    requested.
+    """
     board = _board(["Todo"])
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
+        if path == "/graphql":
+            return _json({
+                "data": {"repository": {"issue": {"projectItems": {"nodes": []}}}}
+            })
         if path.endswith("/issues/42"):
             return _json(_rest_issue_payload(42))
         if path.endswith("/issues/42/comments"):
@@ -907,6 +921,7 @@ def test_get_ticket_without_include_custom_fields_stays_none(
         _project(board), "t", "42", include_relations=False,
     )
     assert ticket.custom_fields is None
+    assert ticket.milestone is None
 
 
 def test_create_ticket_custom_fields_writes_via_project_v2_mutations(
@@ -1768,3 +1783,539 @@ def test_update_ticket_board_write_failure_raises_github_error(
             title="new title", custom_fields={"Status": "Done"},
         )
     assert not isinstance(excinfo.value, PartialTicketCreateError)
+
+
+# ---------- ticket #151: Ticket.milestone read/write via the iteration field -
+
+
+def _iteration_field_response(owner_field: str, iterations: list[dict], completed: list[dict] | None = None) -> dict:
+    return {
+        "data": {
+            owner_field: {
+                "projectV2": {
+                    "field": {
+                        "id": "field-sprint", "name": "Sprint",
+                        "configuration": {
+                            "iterations": iterations,
+                            "completedIterations": completed or [],
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+
+def test_get_ticket_milestone_populated_from_iteration_field_auto_detect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No `iteration_field` configured -> the first iteration-typed node
+    in `fieldValues` wins (auto-detect by node order)."""
+    board = _board(["Todo", "Done"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/graphql":
+            body = _graphql_body(req)
+            assert body["variables"] == {
+                "owner": "acme", "repo": "backend", "number": 42,
+            }
+            return _json({
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "projectItems": {
+                                "nodes": [
+                                    {
+                                        "project": {"number": 7},
+                                        "fieldValues": {
+                                            "nodes": [
+                                                {"name": "Done", "field": {"name": "Status"}},
+                                                {"title": "Sprint 3", "field": {"name": "Sprint"}},
+                                            ]
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            })
+        if path.endswith("/issues/42"):
+            return _json(_rest_issue_payload(42))
+        if path.endswith("/issues/42/comments"):
+            return _json([])
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, _r, _t = GitHubProvider().get_ticket(
+        _project(board), "t", "42", include_relations=False,
+    )
+    assert ticket.milestone == "Sprint 3"
+
+
+def test_get_ticket_milestone_matches_configured_iteration_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`binding.iteration_field` set -> matches that field name exactly,
+    even when a different iteration-typed field appears earlier."""
+    board = _board(["Todo", "Done"], iteration_field="Release Train")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/graphql":
+            return _json({
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "projectItems": {
+                                "nodes": [
+                                    {
+                                        "project": {"number": 7},
+                                        "fieldValues": {
+                                            "nodes": [
+                                                {"title": "Sprint 3", "field": {"name": "Sprint"}},
+                                                {"title": "R12", "field": {"name": "Release Train"}},
+                                            ]
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            })
+        if path.endswith("/issues/42"):
+            return _json(_rest_issue_payload(42))
+        if path.endswith("/issues/42/comments"):
+            return _json([])
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, _r, _t = GitHubProvider().get_ticket(
+        _project(board), "t", "42", include_relations=False,
+    )
+    assert ticket.milestone == "R12"
+
+
+def test_get_ticket_milestone_none_when_no_item_on_board(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Board bound but the issue has no item on that project ->
+    `milestone = None`, not an error."""
+    board = _board(["Todo", "Done"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/graphql":
+            return _json(
+                {"data": {"repository": {"issue": {"projectItems": {"nodes": []}}}}}
+            )
+        if path.endswith("/issues/42"):
+            return _json(_rest_issue_payload(42))
+        if path.endswith("/issues/42/comments"):
+            return _json([])
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, _r, _t = GitHubProvider().get_ticket(
+        _project(board), "t", "42", include_relations=False,
+    )
+    assert ticket.milestone is None
+
+
+def test_get_ticket_milestone_and_custom_fields_share_single_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Board bound + `include_custom_fields=True` -> a single
+    `projectItems` round-trip feeds both `milestone` and `custom_fields`
+    (no double-query)."""
+    board = _board(["Todo", "Done"])
+    graphql_calls: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/graphql":
+            body = _graphql_body(req)
+            graphql_calls.append(body)
+            return _json({
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "projectItems": {
+                                "nodes": [
+                                    {
+                                        "project": {"number": 7},
+                                        "fieldValues": {
+                                            "nodes": [
+                                                {"name": "Done", "field": {"name": "Status"}},
+                                                {"title": "Sprint 3", "field": {"name": "Sprint"}},
+                                            ]
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            })
+        if path.endswith("/issues/42"):
+            return _json(_rest_issue_payload(42))
+        if path.endswith("/issues/42/comments"):
+            return _json([])
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, _r, _t = GitHubProvider().get_ticket(
+        _project(board), "t", "42", include_relations=False, include_custom_fields=True,
+    )
+    assert ticket.milestone == "Sprint 3"
+    assert ticket.custom_fields == {"Status": "Done", "Sprint": "Sprint 3"}
+    assert len(graphql_calls) == 1
+
+
+def test_create_ticket_milestone_writes_via_iteration_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(
+        ["Todo", "Done"], owner="acme-org", project_number=7,
+        iteration_field="Sprint",
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            return _json(_rest_issue_payload(99))
+        if "/labels" in path:
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            calls.append((query, variables))
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2IterationField" in query:
+                owner_field = _owner_field(query)
+                return _json(_iteration_field_response(
+                    owner_field,
+                    [{"id": "iter-3", "title": "Sprint 3"}],
+                    [{"id": "iter-2", "title": "Sprint 2"}],
+                ))
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().create_ticket(
+        _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+        milestone="Sprint 3",
+    )
+    assert ticket.id == "99"
+    update_calls = [v for q, v in calls if "updateProjectV2ItemFieldValue" in q]
+    assert update_calls == [{
+        "projectId": "proj-node-id", "itemId": "item-1",
+        "fieldId": "field-sprint", "value": {"iterationId": "iter-3"},
+    }]
+
+
+def test_create_ticket_milestone_matches_completed_iteration_case_insensitively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(
+        ["Todo", "Done"], owner="acme-org", project_number=7,
+        iteration_field="Sprint",
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            return _json(_rest_issue_payload(99))
+        if "/labels" in path:
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query = body["query"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2IterationField" in query:
+                owner_field = _owner_field(query)
+                return _json(_iteration_field_response(
+                    owner_field, [], [{"id": "iter-2", "title": "Sprint 2"}],
+                ))
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().create_ticket(
+        _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+        milestone="sprint 2",
+    )
+    assert ticket.id == "99"
+
+
+def test_create_ticket_milestone_no_iteration_field_configured_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Board bound but `iteration_field` unset -> `ValueError` naming the
+    missing config, before any HTTP call."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected when iteration_field is unset")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="iteration_field"):
+        GitHubProvider().create_ticket(
+            _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+            milestone="Sprint 3",
+        )
+
+
+def test_create_ticket_milestone_no_board_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected when board is not configured")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="github-projects-v2"):
+        GitHubProvider().create_ticket(
+            _project(None), "t", title="hi", body="b", labels=[], assignees=[],
+            milestone="Sprint 3",
+        )
+
+
+def test_create_ticket_milestone_unmatched_title_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(
+        ["Todo", "Done"], owner="acme-org", project_number=7,
+        iteration_field="Sprint",
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            return _json(_rest_issue_payload(99))
+        if "/labels" in path:
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query = body["query"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "ProjectV2IterationField" in query:
+                owner_field = _owner_field(query)
+                return _json(_iteration_field_response(
+                    owner_field, [{"id": "iter-3", "title": "Sprint 3"}],
+                ))
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="not a valid iteration"):
+        GitHubProvider().create_ticket(
+            _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+            milestone="does-not-exist",
+        )
+
+
+def test_create_ticket_milestone_omitted_issues_no_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`milestone=` omitted (`_UNSET`) issues no board write at all, even
+    with a board + `iteration_field` fully configured."""
+    board = _board(
+        ["Todo", "Done"], owner="acme-org", project_number=7,
+        iteration_field="Sprint",
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            return _json(_rest_issue_payload(99))
+        if "/labels" in path:
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().create_ticket(
+        _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+    )
+    assert ticket.id == "99"
+
+
+def test_update_ticket_milestone_writes_via_iteration_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(
+        ["Todo", "Done"], owner="acme-org", project_number=7,
+        iteration_field="Sprint",
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, title="new title"))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            calls.append((query, variables))
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2IterationField" in query:
+                owner_field = _owner_field(query)
+                return _json(_iteration_field_response(
+                    owner_field, [{"id": "iter-4", "title": "Sprint 4"}],
+                ))
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", title="new title", milestone="Sprint 4",
+    )
+    assert ticket.id == "42"
+    update_calls = [v for q, v in calls if "updateProjectV2ItemFieldValue" in q]
+    assert update_calls == [{
+        "projectId": "proj-node-id", "itemId": "item-1",
+        "fieldId": "field-sprint", "value": {"iterationId": "iter-4"},
+    }]
+
+
+def test_update_ticket_milestone_none_clears_via_clear_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`milestone=None` on update clears the iteration field via
+    `clearProjectV2ItemFieldValue` — there's no "clear" input shape for
+    `updateProjectV2ItemFieldValue`."""
+    board = _board(
+        ["Todo", "Done"], owner="acme-org", project_number=7,
+        iteration_field="Sprint",
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            calls.append((query, variables))
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "clearProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "clearProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2IterationField" in query:
+                owner_field = _owner_field(query)
+                return _json(_iteration_field_response(
+                    owner_field, [{"id": "iter-4", "title": "Sprint 4"}],
+                ))
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", milestone=None,
+    )
+    assert ticket.id == "42"
+    clear_calls = [v for q, v in calls if "clearProjectV2ItemFieldValue" in q]
+    assert clear_calls == [{
+        "projectId": "proj-node-id", "itemId": "item-1", "fieldId": "field-sprint",
+    }]
+
+
+def test_update_ticket_milestone_omitted_issues_no_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(
+        ["Todo", "Done"], owner="acme-org", project_number=7,
+        iteration_field="Sprint",
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(_project(board), "t", "42")
+    assert ticket.id == "42"
+
+
+def test_update_ticket_milestone_no_iteration_field_configured_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected when iteration_field is unset")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="iteration_field"):
+        GitHubProvider().update_ticket(_project(board), "t", "42", milestone="Sprint 4")

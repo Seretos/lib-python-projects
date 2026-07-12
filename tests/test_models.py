@@ -243,6 +243,30 @@ class TestBoard:
         assert binding.owner is None
         assert binding.project_number is None
 
+    def test_iteration_field_accepted(self) -> None:
+        """New in ticket #151: `iteration_field` names the Projects-v2
+        iteration field backing the normalized `Ticket.milestone`
+        projection."""
+        binding = GithubProjectsV2Binding(
+            kind="github-projects-v2",
+            owner="acme",
+            project_number=7,
+            iteration_field="Sprint",
+        )
+        assert binding.iteration_field == "Sprint"
+
+    def test_iteration_field_defaults_to_none(self) -> None:
+        binding = GithubProjectsV2Binding(kind="github-projects-v2")
+        assert binding.iteration_field is None
+
+    def test_iteration_field_unknown_key_still_rejected(self) -> None:
+        """`extra="forbid"` still rejects genuinely unknown keys even
+        after adding `iteration_field`."""
+        with pytest.raises(ValidationError):
+            GithubProjectsV2Binding(
+                kind="github-projects-v2", iteration_sprint="x",
+            )  # type: ignore[call-arg]
+
     def test_board_with_enriched_github_binding_validates_and_resolves(self) -> None:
         board = Board(
             columns=["Todo", "Doing", "Done"],
