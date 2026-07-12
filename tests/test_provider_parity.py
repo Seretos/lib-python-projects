@@ -1354,3 +1354,65 @@ def test_resolvable_duplicate_of_never_emitted_with_unresolved_sentinel(monkeypa
     gl_dup = next(r for r in gl_relations if r.kind == "duplicate_of" and r.ticket_id == "#1")
     assert gl_dup.resolved is True
     assert gl_dup.title and gl_dup.state
+
+
+# ---------- ticket #150: idempotency-key structural parity -------------------
+
+
+def test_ticket_and_pull_request_expose_idempotent_replay_field():
+    """`idempotent_replay` must exist (defaulting to False) on both
+    result dataclasses so a replayed create_ticket/create_pr call can be
+    told apart from a fresh one."""
+    import dataclasses
+    from lib_python_projects.providers.base import PullRequest, Ticket
+
+    ticket_fields = {f.name for f in dataclasses.fields(Ticket)}
+    pr_fields = {f.name for f in dataclasses.fields(PullRequest)}
+    assert "idempotent_replay" in ticket_fields
+    assert "idempotent_replay" in pr_fields
+
+
+def test_all_providers_create_ticket_accepts_idempotency_key_keyword_only():
+    """`create_ticket` on all three providers must accept
+    `idempotency_key` as a keyword-only parameter defaulting to None,
+    without disturbing any existing positional parameter (ticket #150)."""
+    import inspect
+    from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+    from lib_python_projects.providers.github import GitHubProvider
+    from lib_python_projects.providers.gitlab import GitLabProvider
+
+    for provider_cls in (GitHubProvider, GitLabProvider, AzureDevOpsProvider):
+        sig = inspect.signature(provider_cls.create_ticket)
+        assert "idempotency_key" in sig.parameters, (
+            f"{provider_cls.__name__}.create_ticket is missing 'idempotency_key'"
+        )
+        param = sig.parameters["idempotency_key"]
+        assert param.kind == inspect.Parameter.KEYWORD_ONLY, (
+            f"{provider_cls.__name__}.create_ticket.idempotency_key must be keyword-only"
+        )
+        assert param.default is None
+        # Existing positional params keep their historical order/kind.
+        assert sig.parameters["title"].kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.POSITIONAL_ONLY,
+        )
+
+
+def test_all_providers_create_pr_accepts_idempotency_key_keyword_only():
+    """`create_pr` on all three providers must accept `idempotency_key`
+    as a keyword-only parameter defaulting to None (ticket #150)."""
+    import inspect
+    from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+    from lib_python_projects.providers.github import GitHubProvider
+    from lib_python_projects.providers.gitlab import GitLabProvider
+
+    for provider_cls in (GitHubProvider, GitLabProvider, AzureDevOpsProvider):
+        sig = inspect.signature(provider_cls.create_pr)
+        assert "idempotency_key" in sig.parameters, (
+            f"{provider_cls.__name__}.create_pr is missing 'idempotency_key'"
+        )
+        param = sig.parameters["idempotency_key"]
+        assert param.kind == inspect.Parameter.KEYWORD_ONLY, (
+            f"{provider_cls.__name__}.create_pr.idempotency_key must be keyword-only"
+        )
+        assert param.default is None
+        assert sig.parameters["head"].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD

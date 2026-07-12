@@ -68,6 +68,11 @@ class Ticket:
     # exactly as returned by the provider (e.g. ADO's `fields` dict:
     # `System.*` plus any custom field references), unmapped and untyped.
     custom_fields: dict[str, Any] | None = None
+    # True when this Ticket was returned from the idempotency store (a
+    # retried `create_ticket` call with a previously-used `idempotency_key`)
+    # rather than freshly created (ticket #150). Always False on the
+    # no-op (omitted/None/"" key) path.
+    idempotent_replay: bool = False
 
 
 @dataclass
@@ -276,6 +281,25 @@ class LabelOperationUnsupported(NotImplementedError):
         super().__init__(
             f"label operation {operation!r} is not supported on provider "
             f"{provider!r}"
+        )
+
+
+class IdempotencyConflict(ProviderError):
+    """Raised when an idempotency key is reused with different core arguments.
+
+    Standard HTTP 409 idempotency-conflict semantics (ticket #150): the
+    same `idempotency_key` was already used to create a different
+    resource via `create_ticket` / `create_pr`. Carries the key plus the
+    stored vs. received core-argument maps so callers can branch without
+    parsing the message.
+    """
+
+    def __init__(self, key: str, stored: dict[str, str], received: dict[str, str]) -> None:
+        self.key = key
+        self.stored = stored
+        self.received = received
+        super().__init__(
+            409, f"idempotency key {key!r} was already used with different arguments"
         )
 
 
@@ -499,6 +523,11 @@ class PullRequest:
     approvals_required: int | None = None
     approvals_received: int | None = None
     warnings: list[str] = field(default_factory=list)
+    # True when this PullRequest was returned from the idempotency store
+    # (a retried `create_pr` call with a previously-used `idempotency_key`)
+    # rather than freshly created (ticket #150). Always False on the
+    # no-op (omitted/None/"" key) path.
+    idempotent_replay: bool = False
 
 
 @dataclass

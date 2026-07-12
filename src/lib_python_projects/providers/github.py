@@ -56,6 +56,7 @@ from lib_python_projects.providers.base import (
     _validate_limit,
 )
 from lib_python_projects.providers._http_cache import make_cached_transport
+from lib_python_projects.providers import _idempotency
 
 log = logging.getLogger("project-issues.github")
 
@@ -2535,6 +2536,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         *,
         status: Status | None = None,
         custom_fields: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> Ticket:
         """Create an issue with the `ai-generated` AI-attribution marker.
 
@@ -2563,9 +2565,27 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         case-insensitively). No board binding configured -> `ValueError`
         naming the missing config. `None`/`{}` is a silent no-op so
         existing callers are unaffected.
+
+        Optional `idempotency_key` (ticket #150): a retried call with the
+        same key (scoped to this project) returns the ticket created by
+        the first successful call instead of creating a duplicate, with
+        `idempotent_replay=True` set on the result. Only `title`/`body`
+        are compared across calls with the same key — `labels`,
+        `assignees`, `status`, and `custom_fields` are ignored for
+        conflict detection. A retry with the same key but a different
+        `title`/`body` raises `IdempotencyConflict`. `None`/`""` (the
+        default) disables idempotency entirely — behaviour is unchanged.
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
+        if idempotency_key:
+            replay = _idempotency.lookup(
+                (project.provider, project.id),
+                idempotency_key,
+                {"title": title, "body": body},
+            )
+            if replay is not None:
+                return replay
         binding = None
         if custom_fields:
             board = project.board
@@ -2655,7 +2675,15 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         issue_url=url,
                         issue_node_id=content_id,
                     ) from exc
-            return _map_issue(raw)
+            ticket = _map_issue(raw)
+            if idempotency_key:
+                _idempotency.record(
+                    (project.provider, project.id),
+                    idempotency_key,
+                    {"title": title, "body": body},
+                    ticket,
+                )
+            return ticket
 
     def update_ticket(
         self,
@@ -3331,6 +3359,8 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         labels: list[str] | None = None,
         assignees: list[str] | None = None,
         requested_reviewers: list[str] | None = None,
+        *,
+        idempotency_key: str | None = None,
     ) -> PullRequest:
         """Create a pull request, applying the AI-generated marker.
 
@@ -3345,7 +3375,25 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         Labels, assignees, and reviewer requests are applied in
         follow-up calls because the `POST /pulls` endpoint doesn't
         accept them inline.
+
+        Optional `idempotency_key` (ticket #150): a retried call with the
+        same key (scoped to this project) returns the PR created by the
+        first successful call instead of creating a duplicate, with
+        `idempotent_replay=True` set on the result. Only `title`/`head`/
+        `base` are compared across calls with the same key — `body`,
+        `draft`, `labels`, `assignees`, `requested_reviewers` are ignored
+        for conflict detection. A retry with the same key but a different
+        `title`/`head`/`base` raises `IdempotencyConflict`. `None`/`""`
+        (the default) disables idempotency entirely.
         """
+        if idempotency_key:
+            replay = _idempotency.lookup(
+                (project.provider, project.id),
+                idempotency_key,
+                {"title": title, "head": head, "base": base},
+            )
+            if replay is not None:
+                return replay
         merged_labels = list(dict.fromkeys([*(labels or []), AI_GENERATED_LABEL]))
         prefixed_body = ensure_body_prefix(body)
         with _client(token) as client:
@@ -3438,6 +3486,13 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             pr = _map_pr(pr_raw)
             if warnings:
                 pr = dataclasses.replace(pr, warnings=warnings)
+            if idempotency_key:
+                _idempotency.record(
+                    (project.provider, project.id),
+                    idempotency_key,
+                    {"title": title, "head": head, "base": base},
+                    pr,
+                )
             return pr
 
     def update_pr(
