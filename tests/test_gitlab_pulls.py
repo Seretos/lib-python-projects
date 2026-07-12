@@ -359,6 +359,125 @@ def test_gitlab_list_prs_does_not_fetch_approvals(
     assert all("/approvals" not in str(r.url) for r in seen)
 
 
+# ---------- list_prs approvals opt-in (ticket #167) --------------------------
+
+
+def test_gitlab_list_prs_default_leaves_approvals_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Documents the default contract: PRFilters() (include_approvals
+    defaults False) leaves approvals_required/approvals_received None
+    on every returned PR, matching the "not fetched" semantics."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        assert "/approvals" not in url
+        return _json([_mr_payload(1), _mr_payload(2)])
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = GitLabProvider().list_prs(_project(), "t", PRFilters())
+    assert len(prs) == 2
+    for pr in prs:
+        assert pr.approvals_required is None
+        assert pr.approvals_received is None
+
+
+def test_gitlab_list_prs_include_approvals_populates_ints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With include_approvals=True and no approval gate configured on
+    either MR, approvals_required/approvals_received come back as 0
+    (ints), not None — mirrors get_pr's no-gate behavior."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/approvals"):
+            return _json({
+                "approved": False,
+                "approvals_required": 0,
+                "approvals_left": 0,
+                "approved_by": [],
+            })
+        return _json([_mr_payload(1), _mr_payload(2)])
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = GitLabProvider().list_prs(
+        _project(), "t", PRFilters(include_approvals=True),
+    )
+    assert len(prs) == 2
+    for pr in prs:
+        assert pr.approvals_required == 0
+        assert pr.approvals_received == 0
+        assert isinstance(pr.approvals_required, int)
+        assert isinstance(pr.approvals_received, int)
+
+
+def test_gitlab_list_prs_include_approvals_gate_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With include_approvals=True and a gate requiring 2 approvals with
+    only 1 signed off, approvals_required=2, approvals_received=1, and
+    review_decision="REVIEW_REQUIRED" (mirrors
+    test_gitlab_get_pr_gate_partially_approved)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/approvals"):
+            return _json({
+                "approved": False,
+                "approvals_required": 2,
+                "approvals_left": 1,
+                "approved_by": [{"user": {"username": "alice"}}],
+            })
+        return _json([_mr_payload(1)])
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = GitLabProvider().list_prs(
+        _project(), "t", PRFilters(include_approvals=True),
+    )
+    assert len(prs) == 1
+    pr = prs[0]
+    assert pr.approvals_required == 2
+    assert pr.approvals_received == 1
+    assert pr.review_decision == "REVIEW_REQUIRED"
+
+
+def test_gitlab_list_prs_include_approvals_degrades_per_mr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When one MR's /approvals call 403s/404s, only that MR degrades
+    to None fields — the rest of the listing still gets real ints,
+    proving the per-MR degrade doesn't abort the whole listing."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/1/approvals"):
+            return _json({
+                "approved": True,
+                "approvals_required": 1,
+                "approvals_left": 0,
+                "approved_by": [{"user": {"username": "alice"}}],
+            })
+        if url.endswith("merge_requests/2/approvals"):
+            return _json({}, status_code=403)
+        if url.endswith("merge_requests/3/approvals"):
+            return _json({}, status_code=404)
+        return _json([_mr_payload(1), _mr_payload(2), _mr_payload(3)])
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = GitLabProvider().list_prs(
+        _project(), "t", PRFilters(include_approvals=True),
+    )
+    assert len(prs) == 3
+    by_id = {pr.id: pr for pr in prs}
+    assert by_id["1"].approvals_required == 1
+    assert by_id["1"].approvals_received == 1
+    assert by_id["2"].approvals_required is None
+    assert by_id["2"].approvals_received is None
+    assert by_id["3"].approvals_required is None
+    assert by_id["3"].approvals_received is None
+
+
 # ---------- create_pr --------------------------------------------------------
 
 

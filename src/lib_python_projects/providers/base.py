@@ -521,7 +521,17 @@ class PullRequest:
       - `pipeline_status`: head-pipeline status (`success`, `failed`,
         `running`, ...). `None` when no pipeline is attached.
       - `approvals_required` / `approvals_received`: GitLab approval
-        counts (Premium+); both `None` on free tier.
+        counts. Tri-state contract (ticket #167):
+          * `list_prs` with the default `PRFilters(include_approvals=False)`
+            → `None` (not fetched, avoids an N+1 `/approvals` round trip
+            across the listing).
+          * `list_prs` with `PRFilters(include_approvals=True)` → `int`
+            (`0` when no approval gate is configured), matching `get_pr`
+            — except `None` for any individual MR whose `/approvals`
+            call returns 403/404.
+          * `get_pr` → `int` (`0` when no gate), `None` only on 403/404
+            when the approvals endpoint is inaccessible (restricted
+            token scope or a self-hosted edition without the API).
 
     Mergeability note (Issue 6):
       `list_prs` never populates `mergeable` or `mergeable_state` — the
@@ -736,6 +746,12 @@ class PRFilters:
     base: str | None = None
     search: str | None = None
     limit: int = 30
+    # Opt-in (ticket #167): when True, GitLabProvider.list_prs fetches
+    # per-MR `/approvals` data so approvals_required/approvals_received
+    # are populated as ints (matching get_pr) instead of staying None.
+    # Costs one extra request per MR in the page — off by default to
+    # avoid the N+1 round trip across a listing. No-op on other providers.
+    include_approvals: bool = False
 
 
 # ---------- pipelines / CI runs ---------------------------------------------

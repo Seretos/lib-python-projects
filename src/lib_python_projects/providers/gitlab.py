@@ -517,10 +517,14 @@ def _map_mr(
     separate `/approvals` endpoint. When the caller has already fetched
     that payload, it can pass it via `approvals=...` and we derive
     `review_decision` + `approvals_received` + `approvals_required`
-    from it. When `approvals` is `None` (the cheaper `list_prs` path),
-    we fall back to whatever (usually `None`) the MR root happened to
-    carry and leave `review_decision` at the dataclass default of
-    `None`.
+    from it. This serves both `get_pr` (always fetches `/approvals`)
+    and the opt-in `list_prs` path (`PRFilters(include_approvals=True)`,
+    ticket #167), which fetches `/approvals` per MR and passes the
+    result — or `None` on a per-MR 403/404 — through here. When
+    `approvals` is `None` (the cheaper default `list_prs` path, or a
+    degraded per-MR fetch), we fall back to whatever (usually `None`)
+    the MR root happened to carry and leave `review_decision` at the
+    dataclass default of `None`.
 
     Note on `diff_refs` / `base.sha` (Issue 7):
       GitLab only populates `diff_refs` (which carries `base_sha`) on MR
@@ -633,6 +637,25 @@ def _map_mr(
         approvals_received=approvals_received,
         review_decision=review_decision,
     )
+
+
+def _fetch_mr_approvals(
+    client: httpx.Client, path: str, iid: str | int,
+) -> dict | None:
+    """Fetch a single MR's `/approvals` payload, degrading on 403/404.
+
+    Shared by `get_pr` (always calls this) and `list_prs`'s opt-in
+    `include_approvals=True` path (ticket #167), so both surfaces
+    degrade identically: a restricted token scope or a self-hosted
+    edition without the approvals API returns `None` rather than
+    raising, letting the caller fall back to `_map_mr(..., approvals=None)`.
+    Any other non-2xx status raises via `_check`.
+    """
+    ar = client.get(f"/projects/{path}/merge_requests/{iid}/approvals")
+    if ar.status_code in (403, 404):
+        return None
+    _check(ar)
+    return ar.json()
 
 
 # GitLab pipeline statuses we treat as terminal — anything else is
@@ -2661,6 +2684,17 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
           - `search` → `search` (matches title + description).
           - `limit` → `per_page`, capped at 100.
 
+        Approvals (ticket #167): by default (`filters.include_approvals`
+        is `False`), this skips the per-MR `/approvals` round trip
+        entirely — `approvals_required`/`approvals_received` stay `None`
+        on every returned `PullRequest`, and the historical zero-request
+        behavior is preserved byte-for-byte. When
+        `filters.include_approvals` is `True`, an `/approvals` request is
+        issued for each MR in the page (see `_fetch_mr_approvals`) and
+        the result populates real ints (`0` when there's no approval
+        gate), matching `get_pr` — except `None` for any individual MR
+        whose `/approvals` call returns 403/404.
+
         Returns `(prs, has_more)`. `has_more` is True when the API returned
         exactly `per_page` results, indicating more pages may exist.
         """
@@ -2682,9 +2716,10 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             params["target_branch"] = filters.base
         if filters.search:
             params["search"] = filters.search
+        path = _project_path(project)
         with _client(project, token) as client:
             r = client.get(
-                f"/projects/{_project_path(project)}/merge_requests",
+                f"/projects/{path}/merge_requests",
                 params=params,
             )
             _check(r)
@@ -2693,7 +2728,17 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             # Note: base.sha may be None for freshly-created MRs because
             # diff_refs is absent until GitLab runs a pipeline/diff computation.
             # See _map_mr docstring (the "diff_refs / base.sha" note) for details.
-            return [_map_mr(it, project) for it in items], has_more
+            if filters.include_approvals:
+                prs = [
+                    _map_mr(
+                        it, project,
+                        approvals=_fetch_mr_approvals(client, path, it["iid"]),
+                    )
+                    for it in items
+                ]
+            else:
+                prs = [_map_mr(it, project) for it in items]
+            return prs, has_more
 
     def get_pr(
         self,
@@ -2715,29 +2760,25 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
              the approvals API), we fall back to the historical
              behavior: `_map_mr` is called without the approvals
              payload and `review_decision`/`approvals_received` stay
-             `None` rather than raising.
+             `None` rather than raising. (See `_fetch_mr_approvals`,
+             which implements this fetch+degrade logic.)
           3. `GET /projects/:id/merge_requests/:iid/notes` — the
              discussion notes.
 
-        `list_prs` deliberately skips step (2) to avoid an N+1 round
-        trip across the listing. Callers that need accurate approval
-        state on a single MR should always use `get_pr`.
+        `list_prs` deliberately skips step (2) by default to avoid an
+        N+1 round trip across the listing — unless the caller opts in
+        via `PRFilters(include_approvals=True)` (ticket #167), in which
+        case it performs the same fetch+degrade per MR. Callers that
+        need accurate approval state on a single MR should always use
+        `get_pr`.
         """
         path = _project_path(project)
         with _client(project, token) as client:
             r = client.get(f"/projects/{path}/merge_requests/{pr_id}")
             _check(r)
             raw_mr = r.json()
-            ar = client.get(
-                f"/projects/{path}/merge_requests/{pr_id}/approvals"
-            )
-            if ar.status_code in (403, 404):
-                # No approvals data accessible on this edition / with
-                # this token's scope — degrade gracefully.
-                pr = _map_mr(raw_mr, project)
-            else:
-                _check(ar)
-                pr = _map_mr(raw_mr, project, approvals=ar.json())
+            approvals = _fetch_mr_approvals(client, path, pr_id)
+            pr = _map_mr(raw_mr, project, approvals=approvals)
             c = client.get(
                 f"/projects/{path}/merge_requests/{pr_id}/notes",
                 params={"per_page": 100, "sort": "asc", "order_by": "created_at"},
