@@ -1538,6 +1538,23 @@ _RELATION_FORWARD: dict[str, str] = {
     "relates_to": "System.LinkTypes.Related",
 }
 
+# Write-direction table for add_relation/remove_relation (ticket #171).
+# `_RELATION_FORWARD` above is the *read* basis: it defines how a native
+# ADO link type maps back to our generic kind when hydrating relations
+# from a work item (`_RELATION_REVERSE` / `_ado_rel_to_kind`), and must
+# stay untouched. On write, parent/child are intentionally the inverse of
+# that read mapping: writing "parent" places the target as this item's
+# child (System.LinkTypes.Hierarchy-Forward is the link type ADO uses to
+# express "the target is my child"), which is the mirror image of how the
+# read table interprets an existing native Hierarchy-Forward link as
+# "child". blocks/blocked_by/duplicate_of/relates_to are symmetric and
+# unaffected.
+_RELATION_WRITE: dict[str, str] = {
+    **_RELATION_FORWARD,
+    "parent": "System.LinkTypes.Hierarchy-Forward",
+    "child": "System.LinkTypes.Hierarchy-Reverse",
+}
+
 _RELATION_REVERSE: dict[str, str] = {v: k for k, v in _RELATION_FORWARD.items()}
 
 # Pairs where the inverse relation kind is what the *other* work item
@@ -4248,7 +4265,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             )
         target_id = _parse_relation_target(target, project)
         _assert_not_self_relation(ticket_id, target_id)
-        rel_name = _RELATION_FORWARD[kind]
+        rel_name = _RELATION_WRITE[kind]
         target_url = _build_workitem_api_url(project, target_id)
         path = f"{_project_scope(project)}/_apis/wit/workitems/{quote(str(ticket_id), safe='')}"
 
@@ -4384,7 +4401,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 kind, "azuredevops", SUPPORTED_RELATION_KINDS
             )
         target_id = _parse_relation_target(target, project)
-        rel_name = _RELATION_FORWARD[kind]
+        rel_name = _RELATION_WRITE[kind]
         target_url_marker = f"/workItems/{target_id}"
 
         path = f"{_project_scope(project)}/_apis/wit/workitems/{quote(str(ticket_id), safe='')}"

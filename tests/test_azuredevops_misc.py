@@ -25,6 +25,7 @@ from lib_python_projects.providers.azuredevops import (
     AzureDevOpsProvider,
     SUPPORTED_RELATION_KINDS,
     _RELATION_FORWARD,
+    _RELATION_WRITE,
     _ado_rel_to_kind,
     _basic_auth_header,
     _cache_clear_all,
@@ -155,7 +156,10 @@ def test_add_relation_emits_json_patch(monkeypatch: pytest.MonkeyPatch) -> None:
     op = patch[0]
     assert op["op"] == "add"
     assert op["path"] == "/relations/-"
-    assert op["value"]["rel"] == "System.LinkTypes.Hierarchy-Forward"
+    # kind="child" writes Hierarchy-Reverse (ticket #171: write table is the
+    # inverse of the read table so add_relation(X, "child", Y) means X is Y's
+    # child).
+    assert op["value"]["rel"] == "System.LinkTypes.Hierarchy-Reverse"
     assert op["value"]["url"].endswith("/_apis/wit/workItems/9")
     assert rel.kind == "child"
     assert rel.ticket_id == "#9"
@@ -206,7 +210,9 @@ def test_remove_relation_finds_index_and_emits_remove(
                         "url": "vstfs:///Build/Build/100",
                     },
                     {
-                        "rel": "System.LinkTypes.Hierarchy-Forward",
+                        # kind="child" writes/matches Hierarchy-Reverse
+                        # (ticket #171 write table).
+                        "rel": "System.LinkTypes.Hierarchy-Reverse",
                         "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
                     },
                 ],
@@ -473,7 +479,9 @@ def test_remove_relation_non_duplicate_kind_has_no_side_effects(
                 "id": 5,
                 "relations": [
                     {
-                        "rel": "System.LinkTypes.Hierarchy-Forward",
+                        # kind="child" writes/matches Hierarchy-Reverse
+                        # (ticket #171 write table).
+                        "rel": "System.LinkTypes.Hierarchy-Reverse",
                         "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
                     },
                 ],
@@ -538,7 +546,9 @@ def test_add_relation_duplicate_raises_409(
                 "id": 5,
                 "relations": [
                     {
-                        "rel": "System.LinkTypes.Hierarchy-Forward",
+                        # kind="child" writes/matches Hierarchy-Reverse
+                        # (ticket #171 write table).
+                        "rel": "System.LinkTypes.Hierarchy-Reverse",
                         "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
                     },
                 ],
@@ -633,8 +643,11 @@ def test_add_relation_no_duplicate_proceeds(
                 "id": 5,
                 "relations": [
                     {
-                        # Different rel type — not a match.
-                        "rel": "System.LinkTypes.Hierarchy-Reverse",
+                        # Different rel type — not a match (kind="child"
+                        # writes/matches Hierarchy-Reverse per the ticket
+                        # #171 write table, so Hierarchy-Forward here must
+                        # NOT trip the duplicate guard).
+                        "rel": "System.LinkTypes.Hierarchy-Forward",
                         "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
                     },
                 ],
@@ -666,6 +679,169 @@ def test_add_relation_no_duplicate_proceeds(
     assert len(patch_count) == 1
     assert rel.kind == "child"
     assert rel.ticket_id == "#9"
+
+
+# ---------- Ticket #171: parent/child write direction was inverted -----------
+
+
+def test_add_relation_parent_emits_hierarchy_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation(ticket_id='5', kind='parent', target='9'): 5 is the
+    parent of 9, so the emitted native link must be Hierarchy-Forward (the
+    pre-fix code emitted Hierarchy-Reverse for 'parent')."""
+
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and "/workitems/5" in req.url.path:
+            return _json({"id": 5, "relations": []})
+        if req.method == "PATCH" and "/workitems/5" in req.url.path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json({"id": 5})
+        if req.url.path.endswith("/_apis/wit/workitemsbatch"):
+            ids = json.loads(req.content.decode("utf-8"))["ids"]
+            return _json({
+                "value": [
+                    {
+                        "id": wid,
+                        "fields": {
+                            "System.Title": f"target {wid}",
+                            "System.State": "Active",
+                        },
+                    }
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    rel = AzureDevOpsProvider().add_relation(
+        _project(), token="t", ticket_id="5", kind="parent", target="9"
+    )
+    op = captured["patch"][0]
+    assert op["value"]["rel"] == "System.LinkTypes.Hierarchy-Forward"
+    assert rel.kind == "parent"
+
+
+def test_add_relation_child_emits_hierarchy_reverse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation(ticket_id='5', kind='child', target='9'): 5 is the
+    child of 9, so the emitted native link must be Hierarchy-Reverse (the
+    pre-fix code emitted Hierarchy-Forward for 'child')."""
+
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and "/workitems/5" in req.url.path:
+            return _json({"id": 5, "relations": []})
+        if req.method == "PATCH" and "/workitems/5" in req.url.path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json({"id": 5})
+        if req.url.path.endswith("/_apis/wit/workitemsbatch"):
+            ids = json.loads(req.content.decode("utf-8"))["ids"]
+            return _json({
+                "value": [
+                    {
+                        "id": wid,
+                        "fields": {
+                            "System.Title": f"target {wid}",
+                            "System.State": "Active",
+                        },
+                    }
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    rel = AzureDevOpsProvider().add_relation(
+        _project(), token="t", ticket_id="5", kind="child", target="9"
+    )
+    op = captured["patch"][0]
+    assert op["value"]["rel"] == "System.LinkTypes.Hierarchy-Reverse"
+    assert rel.kind == "child"
+
+
+def test_remove_relation_parent_matches_hierarchy_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """remove_relation(kind='parent') must match/remove a native
+    Hierarchy-Forward link, mirroring add_relation('parent')."""
+
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and "/workitems/5" in req.url.path:
+            return _json({
+                "id": 5,
+                "relations": [
+                    {
+                        "rel": "System.LinkTypes.Hierarchy-Forward",
+                        "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
+                    },
+                ],
+            })
+        if req.method == "PATCH" and "/workitems/5" in req.url.path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json({"id": 5})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().remove_relation(
+        _project(), token="t", ticket_id="5", kind="parent", target="9"
+    )
+    assert result == {"removed": True}
+    op = captured["patch"][0]
+    assert op["op"] == "remove"
+    assert op["path"] == "/relations/0"
+
+
+def test_remove_relation_child_matches_hierarchy_reverse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """remove_relation(kind='child') must match/remove a native
+    Hierarchy-Reverse link, mirroring add_relation('child')."""
+
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and "/workitems/5" in req.url.path:
+            return _json({
+                "id": 5,
+                "relations": [
+                    {
+                        "rel": "System.LinkTypes.Hierarchy-Reverse",
+                        "url": "https://dev.azure.com/seredos/_apis/wit/workItems/9",
+                    },
+                ],
+            })
+        if req.method == "PATCH" and "/workitems/5" in req.url.path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json({"id": 5})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().remove_relation(
+        _project(), token="t", ticket_id="5", kind="child", target="9"
+    )
+    assert result == {"removed": True}
+    op = captured["patch"][0]
+    assert op["op"] == "remove"
+    assert op["path"] == "/relations/0"
+
+
+def test_ado_read_mapping_unchanged_after_write_flip() -> None:
+    """The read basis (`_RELATION_FORWARD` / `_ado_rel_to_kind`) must stay
+    untouched by the write-direction fix, while `_RELATION_WRITE` carries
+    the corrected (flipped) parent/child mapping."""
+    assert _ado_rel_to_kind("System.LinkTypes.Hierarchy-Reverse") == "parent"
+    assert _ado_rel_to_kind("System.LinkTypes.Hierarchy-Forward") == "child"
+    assert _RELATION_FORWARD["parent"] == "System.LinkTypes.Hierarchy-Reverse"
+    assert _RELATION_FORWARD["child"] == "System.LinkTypes.Hierarchy-Forward"
+    assert _RELATION_WRITE["parent"] == "System.LinkTypes.Hierarchy-Forward"
+    assert _RELATION_WRITE["child"] == "System.LinkTypes.Hierarchy-Reverse"
 
 
 # ---------- pipelines -------------------------------------------------------
