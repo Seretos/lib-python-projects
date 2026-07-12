@@ -37,8 +37,7 @@ import httpx
 
 from lib_python_projects.models import ProjectConfig
 from lib_python_projects.markers import (
-    AI_GENERATED_LABEL,
-    AI_MODIFIED_LABEL,
+    MarkerSet,
     apply_body_marker,
     ensure_body_prefix,
     ensure_comment_prefix,
@@ -168,6 +167,11 @@ def _discovery_client(base_url: str, token: str) -> httpx.Client:
         timeout=30.0,
         transport=make_cached_transport(),
     )
+
+
+def _marker_set(project: ProjectConfig) -> MarkerSet:
+    """Resolve the AI-attribution marker names configured for `project`."""
+    return MarkerSet(project.auto_labels.ai_generated, project.auto_labels.ai_modified)
 
 
 def _extract_access_level(permissions: dict) -> int | None:
@@ -879,12 +883,13 @@ def _gitlab_mark_duplicate_of(
     AI-attribution marker stays consistent.
     """
     path = _project_path(project)
+    markers = _marker_set(project)
     src_r = client.get(f"/projects/{path}/issues/{source_iid}")
     _check(src_r)
     src = src_r.json()
     current_body = src.get("description") or ""
     current_labels = set(src.get("labels") or [])
-    will_be_ai_generated = AI_GENERATED_LABEL in current_labels
+    will_be_ai_generated = project.auto_labels.ai_generated in current_labels
 
     # Step 1: write the structured link FIRST so any failure surfaces
     # before we mutate the body / close the issue. If the link already
@@ -911,7 +916,7 @@ def _gitlab_mark_duplicate_of(
 
     # Step 2 + 3: body prefix + close.
     dup_line = f"Duplicate of #{target_iid}"
-    body_without_marker = strip_leading_ai_marker(current_body)
+    body_without_marker = strip_leading_ai_marker(current_body, markers=markers)
     if dup_line not in body_without_marker:
         new_body_core = (
             f"{dup_line}\n\n{body_without_marker}"
@@ -921,7 +926,7 @@ def _gitlab_mark_duplicate_of(
     else:
         new_body_core = body_without_marker
     new_body = apply_body_marker(
-        new_body_core, will_be_ai_generated=will_be_ai_generated,
+        new_body_core, will_be_ai_generated=will_be_ai_generated, markers=markers,
     )
     payload: dict[str, Any] = {
         "description": new_body,
@@ -2005,12 +2010,13 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         """Create a GitLab issue with the AI-generated marker.
 
         Marker policy mirrors `GitHubProvider.create_ticket`:
-          - The `#ai-generated` body prefix is the canonical attribution
-            and is always applied (idempotent).
-          - The `ai-generated` LABEL is also applied. Unlike GitHub,
-            GitLab allows any project member to apply labels by name
-            (no pre-create step required) — but if the label doesn't
-            exist yet, GitLab silently creates it.
+          - The project's configured `ai_generated` body prefix (see
+            `ProjectConfig.auto_labels`, `#ai-generated` by default) is
+            the canonical attribution and is always applied (idempotent).
+          - The project's configured `ai_generated` LABEL is also
+            applied. Unlike GitHub, GitLab allows any project member to
+            apply labels by name (no pre-create step required) — but if
+            the label doesn't exist yet, GitLab silently creates it.
 
         Assignees are passed as usernames; GitLab requires user IDs on
         the POST. We resolve usernames → IDs via `/users?username=` so
@@ -2026,8 +2032,8 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         `custom_fields` supports exactly two keys, applied *after* the
         standard `labels`/`status` handling so they win on overlap:
           - `"labels"` (`list[str]`) — **replaces** the positional
-            `labels` argument entirely before the `ai-generated` marker
-            is merged in, so the marker is always present regardless.
+            `labels` argument entirely before the configured `ai_generated`
+            marker is merged in, so the marker is always present regardless.
           - `"milestone"` (`str | None`) — a milestone title, resolved
             to a `milestone_id` via `GET /projects/{path}/milestones`.
             `None` omits/clears the milestone. An unmatched title raises
@@ -2088,8 +2094,10 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             if custom_fields and "labels" in custom_fields
             else labels
         )
-        merged_labels = list(dict.fromkeys([*(effective_labels or []), AI_GENERATED_LABEL]))
-        prefixed_body = ensure_body_prefix(body)
+        merged_labels = list(
+            dict.fromkeys([*(effective_labels or []), project.auto_labels.ai_generated])
+        )
+        prefixed_body = ensure_body_prefix(body, markers=_marker_set(project))
         path = _project_path(project)
         with _client(project, token) as client:
             assignee_ids = _resolve_assignee_ids(client, assignees)
@@ -2169,11 +2177,13 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         we fetch current assignees, apply the delta, resolve usernames
         to ids, and send the result.
 
-        `ai-modified` is added when the issue wasn't tagged
-        `ai-generated` originally — same heuristic as the GitHub
-        provider but implemented with the GitLab params.
+        The project's configured `ai_modified` label is added when the
+        issue wasn't tagged with the configured `ai_generated` label
+        originally — same heuristic as the GitHub provider but
+        implemented with the GitLab params.
         """
         _validate_label_lists(labels_add, labels_remove)
+        markers = _marker_set(project)
         path = _project_path(project)
         with _client(project, token) as client:
             # Always fetch current — needed for the ai-modified marker
@@ -2190,7 +2200,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             current = r0.json()
             current_labels = set(current.get("labels") or [])
 
-            will_be_ai_generated = AI_GENERATED_LABEL in current_labels
+            will_be_ai_generated = project.auto_labels.ai_generated in current_labels
 
             payload: dict[str, Any] = {}
             if title is not None:
@@ -2198,7 +2208,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             if body is not None:
                 # Ticket #44: re-stamp body marker to match label state.
                 payload["description"] = apply_body_marker(
-                    body, will_be_ai_generated=will_be_ai_generated,
+                    body, will_be_ai_generated=will_be_ai_generated, markers=markers,
                 )
             if status is not None:
                 payload["state_event"] = _status_to_state_event(status)
@@ -2214,9 +2224,9 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             remove_set = set(labels_remove or [])
             if (
                 not will_be_ai_generated
-                and AI_MODIFIED_LABEL not in current_labels
+                and project.auto_labels.ai_modified not in current_labels
             ):
-                add_set.add(AI_MODIFIED_LABEL)
+                add_set.add(project.auto_labels.ai_modified)
             if add_set:
                 payload["add_labels"] = ",".join(sorted(add_set))
             if remove_set:
@@ -2355,7 +2365,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         """Post a note on an issue. The AI-comment prefix is applied."""
         if not body or not body.strip():
             raise ValueError("body must not be empty")
-        prefixed = ensure_comment_prefix(body)
+        prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
         path = _project_path(project)
         with _client(project, token) as client:
             r = client.post(
@@ -2545,8 +2555,9 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         """Edit a note, re-stamping the AI-marker.
 
         Marker policy (ticket #44): same as `GitHubProvider.update_comment`
-        — if the existing note carries `#ai-generated`, the edit
-        preserves that marker; otherwise it stamps `#ai-modified`.
+        — if the existing note carries the project's configured
+        `ai_generated` marker, the edit preserves that marker; otherwise
+        it stamps the configured `ai_modified` marker.
 
         Accepts the same two comment-id forms as `get_comment` (ticket
         #41 addendum B/C): composite `"<iid>/<note_id>"` in `comment_id`,
@@ -2554,6 +2565,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         """
         if not body or not body.strip():
             raise ValueError("body must not be empty")
+        markers = _marker_set(project)
         path = _project_path(project)
         issue_iid, note_id = _split_composite_comment_id(
             comment_id, ticket_id,
@@ -2571,9 +2583,9 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                     ) from exc
                 raise
             current_body = r0.json().get("body") or ""
-            will_be_ai_generated = has_ai_generated_marker(current_body)
+            will_be_ai_generated = has_ai_generated_marker(current_body, markers=markers)
             prefixed = apply_body_marker(
-                body, will_be_ai_generated=will_be_ai_generated,
+                body, will_be_ai_generated=will_be_ai_generated, markers=markers,
             )
             r = client.put(
                 f"/projects/{path}/issues/{issue_iid}/notes/{note_id}",
@@ -2743,7 +2755,8 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
     ) -> PullRequest:
         """Create a merge request with the AI-generated marker.
 
-        Body prefix + `ai-generated` label applied. `draft` translates
+        Body prefix + the project's configured `ai_generated` label
+        applied. `draft` translates
         to the GitLab `draft` param (supported 14.x+) AND mirrored as
         a `Draft: ` title prefix. The `draft` param is silently ignored
         on some GitLab setups (observed during ticket #43 live-verify);
@@ -2767,8 +2780,10 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             )
             if replay is not None:
                 return replay
-        merged_labels = list(dict.fromkeys([*(labels or []), AI_GENERATED_LABEL]))
-        prefixed_body = ensure_body_prefix(body)
+        merged_labels = list(
+            dict.fromkeys([*(labels or []), project.auto_labels.ai_generated])
+        )
+        prefixed_body = ensure_body_prefix(body, markers=_marker_set(project))
         path = _project_path(project)
         with _client(project, token) as client:
             assignee_ids = _resolve_assignee_ids(client, assignees or [])
@@ -2833,8 +2848,9 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         change + `draft` flip is supported: the prefix is applied to
         whichever title ends up being sent.
 
-        `ai-modified` is added when the MR wasn't tagged `ai-generated`
-        — mirrors `update_ticket`.
+        The project's configured `ai_modified` label is added when the
+        MR wasn't tagged with the configured `ai_generated` label —
+        mirrors `update_ticket`.
         """
         path = _project_path(project)
         if status not in (None, "open", "closed"):
@@ -2843,13 +2859,14 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 f"merge; accepted: open, closed"
             )
         _validate_label_lists(labels_add, labels_remove)
+        markers = _marker_set(project)
         with _client(project, token) as client:
             r0 = client.get(f"/projects/{path}/merge_requests/{pr_id}")
             _check(r0)
             current = r0.json()
             current_labels = set(current.get("labels") or [])
 
-            will_be_ai_generated = AI_GENERATED_LABEL in current_labels
+            will_be_ai_generated = project.auto_labels.ai_generated in current_labels
 
             payload: dict[str, Any] = {}
             if title is not None:
@@ -2860,7 +2877,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             if body is not None:
                 # Ticket #44: re-stamp body marker to match label state.
                 payload["description"] = apply_body_marker(
-                    body, will_be_ai_generated=will_be_ai_generated,
+                    body, will_be_ai_generated=will_be_ai_generated, markers=markers,
                 )
             if status == "open":
                 payload["state_event"] = "reopen"
@@ -2873,9 +2890,9 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             remove_set = set(labels_remove or [])
             if (
                 not will_be_ai_generated
-                and AI_MODIFIED_LABEL not in current_labels
+                and project.auto_labels.ai_modified not in current_labels
             ):
-                add_set.add(AI_MODIFIED_LABEL)
+                add_set.add(project.auto_labels.ai_modified)
             if add_set:
                 payload["add_labels"] = ",".join(sorted(add_set))
             if remove_set:
@@ -2925,7 +2942,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         body: str,
     ) -> Comment:
         """Post a note on a merge request. AI-comment prefix applied."""
-        prefixed = ensure_comment_prefix(body)
+        prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
         path = _project_path(project)
         with _client(project, token) as client:
             r = client.post(
@@ -3077,7 +3094,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         New-thread mode requires `path`, `line`, and `commit_sha` to be
         set; the caller (tool layer) validates that.
         """
-        prefixed = ensure_comment_prefix(body)
+        prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
         repo_path = _project_path(project)
         with _client(project, token) as client:
             if in_reply_to is not None:
@@ -3210,6 +3227,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 f"a review body is required when state={state!r}"
             )
         path = _project_path(project)
+        markers = _marker_set(project)
         with _client(project, token) as client:
             if state == "approve":
                 r = client.post(
@@ -3218,7 +3236,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 _check(r)
                 note_raw: dict | None = None
                 if body:
-                    prefixed = ensure_comment_prefix(body)
+                    prefixed = ensure_comment_prefix(body, markers=markers)
                     rn = client.post(
                         f"/projects/{path}/merge_requests/{pr_id}/notes",
                         json={"body": prefixed},
@@ -3280,7 +3298,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 )
                 if ru.status_code not in (200, 201, 204, 404, 409):
                     _check(ru)
-                prefixed = ensure_comment_prefix(body or "")
+                prefixed = ensure_comment_prefix(body or "", markers=markers)
                 rn = client.post(
                     f"/projects/{path}/merge_requests/{pr_id}/notes",
                     json={"body": prefixed},
@@ -3311,7 +3329,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 )
 
             # state == "comment"
-            prefixed = ensure_comment_prefix(body or "")
+            prefixed = ensure_comment_prefix(body or "", markers=markers)
             rn = client.post(
                 f"/projects/{path}/merge_requests/{pr_id}/notes",
                 json={"body": prefixed},
@@ -3593,12 +3611,13 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                     # Link may already be gone; reopen anyway.
                     pass
                 current_labels = set(src.get("labels") or [])
-                will_be_ai_generated = AI_GENERATED_LABEL in current_labels
+                will_be_ai_generated = project.auto_labels.ai_generated in current_labels
+                markers = _marker_set(project)
                 # Strip the exact "Duplicate of #<target_iid>" line and
                 # any blank line that immediately follows it. Leave any
                 # other "Duplicate of #M" lines (different target) intact.
                 dup_line = f"Duplicate of #{target_iid}"
-                body_core = strip_leading_ai_marker(current_body)
+                body_core = strip_leading_ai_marker(current_body, markers=markers)
                 # Remove the dup line plus optional trailing blank line.
                 # (?!\d) is a negative-lookahead that prevents a partial
                 # iid match, e.g. "Duplicate of #7" must not eat the "7"
@@ -3610,7 +3629,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                     flags=re.MULTILINE,
                 ).strip("\n")
                 new_body = apply_body_marker(
-                    body_core, will_be_ai_generated=will_be_ai_generated,
+                    body_core, will_be_ai_generated=will_be_ai_generated, markers=markers,
                 )
                 pr = client.put(
                     f"/projects/{path}/issues/{ticket_id}",

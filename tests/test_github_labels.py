@@ -15,7 +15,7 @@ from typing import Callable
 import httpx
 import pytest
 
-from lib_python_projects import ProjectConfig
+from lib_python_projects import AutoLabels, ProjectConfig
 from lib_python_projects.providers import github as github_mod
 from lib_python_projects.providers.github import GitHubError, GitHubProvider
 from lib_python_projects.providers.base import Label
@@ -27,6 +27,18 @@ def _project() -> ProjectConfig:
         provider="github",
         path="acme/backend",
         token_env="GITHUB_TOKEN_ACME",
+    )
+
+
+def _project_with_custom_labels() -> ProjectConfig:
+    return ProjectConfig(
+        id="acme",
+        provider="github",
+        path="acme/backend",
+        token_env="GITHUB_TOKEN_ACME",
+        auto_labels=AutoLabels(
+            ai_generated="robot-made", ai_modified="robot-touched"
+        ),
     )
 
 
@@ -565,3 +577,104 @@ def test_update_pr_labels_add_unknown_raises(monkeypatch: pytest.MonkeyPatch) ->
     assert not any(
         r.method == "PATCH" and "/pulls/10" in r.url.path for r in seen
     )
+
+
+# ---------- per-project configurable auto_labels (ticket #153) ---------------
+
+
+def test_create_ticket_applies_custom_ai_generated_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_ticket: a project with a custom `auto_labels.ai_generated`
+    applies that name instead of the literal 'ai-generated' — both as the
+    ensured/created label and in the labels POST payload."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        path = req.url.path
+        if "/labels" in path and req.method == "POST":
+            body = json.loads(req.content)
+            assert body["name"] == "robot-made"
+            return _json({"name": "robot-made", "color": "0e8a16"}, status_code=201)
+        if path.endswith("/issues") and req.method == "POST":
+            body = json.loads(req.content)
+            assert "robot-made" in body["labels"]
+            assert "ai-generated" not in body["labels"]
+            raw = _issue_payload(9)
+            raw["labels"] = [{"name": "robot-made"}]
+            return _json(raw, status_code=201)
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().create_ticket(
+        _project_with_custom_labels(), token="t",
+        title="T", body="B", labels=[], assignees=[],
+    )
+    label_posts = [
+        r for r in seen if r.method == "POST" and "/labels" in r.url.path
+    ]
+    assert len(label_posts) == 1
+
+
+def test_update_ticket_applies_custom_ai_modified_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_ticket: marking a not-yet-AI-generated ticket as AI-modified
+    applies the project's custom `auto_labels.ai_modified` name."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/5"):
+            return _json(_issue_payload(5))  # no labels -> not ai-generated
+        if "/labels" in path and req.method == "POST":
+            body = json.loads(req.content)
+            assert body["name"] == "robot-touched"
+            return _json({"name": "robot-touched", "color": "fbca04"}, status_code=201)
+        if req.method == "PATCH" and "/issues/5" in path:
+            raw = _issue_payload(5)
+            raw["labels"] = [{"name": "robot-touched"}]
+            return _json(raw)
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().update_ticket(
+        _project_with_custom_labels(), token="t", ticket_id="5",
+        body="edited body",
+    )
+    label_posts = [
+        r for r in seen if r.method == "POST" and "/labels" in r.url.path
+    ]
+    assert len(label_posts) == 1
+
+
+def test_ensure_label_resolves_color_and_description_by_role_not_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A renamed generated/modified label still resolves to the correct
+    role-based color/description, not the grey/empty fallback that a
+    name-keyed lookup would produce for an unrecognized literal name."""
+    posted_payloads: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/labels" in req.url.path and req.method == "POST":
+            body = json.loads(req.content)
+            posted_payloads.append(body)
+            return _json(body, status_code=201)
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    project = _project_with_custom_labels()
+    with github_mod._client("t") as client:
+        github_mod._ensure_label(client, project, "robot-made", "generated")
+        github_mod._ensure_label(client, project, "robot-touched", "modified")
+
+    assert posted_payloads[0]["name"] == "robot-made"
+    assert posted_payloads[0]["color"] == "0e8a16"
+    assert posted_payloads[0]["description"] != ""
+
+    assert posted_payloads[1]["name"] == "robot-touched"
+    assert posted_payloads[1]["color"] == "fbca04"
+    assert posted_payloads[1]["description"] != ""

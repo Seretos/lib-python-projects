@@ -16,6 +16,7 @@ from lib_python_config import ConfigError
 from lib_python_projects.finder import find_projects
 from lib_python_projects.loader import load_projects, resolve_token
 from lib_python_projects.models import (
+    AutoLabels,
     AzureBoardsBinding,
     Board,
     BoardBinding,
@@ -37,6 +38,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "ProjectConfig",
+    "AutoLabels",
     "Permissions",
     "IssuesPermissions",
     "PullsPermissions",

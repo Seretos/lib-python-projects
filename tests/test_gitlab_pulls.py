@@ -10,16 +10,17 @@ from typing import Callable
 import httpx
 import pytest
 
-from lib_python_projects import ProjectConfig
+from lib_python_projects import AutoLabels, ProjectConfig
 from lib_python_projects.providers import gitlab as gitlab_mod
 from lib_python_projects.providers.base import PRFilters
 from lib_python_projects.providers.gitlab import GitLabProvider
 
 
-def _project() -> ProjectConfig:
+def _project(**kwargs) -> ProjectConfig:
     return ProjectConfig(
         id="acme", provider="gitlab", path="acme/backend",
         token_env="GITLAB_TOKEN_ACME",
+        **kwargs,
     )
 
 
@@ -411,6 +412,35 @@ def test_create_pr_draft_omitted_when_false(
     assert "draft" not in captured["body"]
 
 
+def test_create_pr_applies_custom_auto_label_and_body_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #153: a project with custom `auto_labels` gets its own
+    configured label name and body-marker prefix, not the defaults."""
+    captured: dict = {}
+    project = _project(
+        auto_labels=AutoLabels(ai_generated="robot-made", ai_modified="robot-touched"),
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "merge_requests" in str(req.url):
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_mr_payload(7, description=captured["body"]["description"]))
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().create_pr(
+        project, "t",
+        title="New MR", body="x", head="feat/x", base="main",
+        labels=["enhancement"],
+    )
+    assert captured["body"]["description"].startswith("#robot-made")
+    assert "robot-made" in captured["body"]["labels"]
+    assert "ai-generated" not in captured["body"]["labels"]
+
+
 # ---------- update_pr -------------------------------------------------------
 
 
@@ -474,6 +504,30 @@ def test_update_pr_adds_ai_modified_when_not_ai_generated(
     _install_mock(monkeypatch, handler)
     GitLabProvider().update_pr(_project(), "t", "5", title="renamed")
     assert "ai-modified" in captured["body"]["add_labels"]
+
+
+def test_update_pr_adds_custom_ai_modified_label_for_non_ai_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #153: with custom `auto_labels`, the configured
+    `ai_modified` name is added instead of the literal `ai-modified`."""
+    captured: dict = {}
+    project = _project(
+        auto_labels=AutoLabels(ai_generated="robot-made", ai_modified="robot-touched"),
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET":
+            return _json(_mr_payload(5, labels=["bug"]))
+        if req.method == "PUT":
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_mr_payload(5))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().update_pr(project, "t", "5", title="renamed")
+    assert "robot-touched" in captured["body"]["add_labels"]
+    assert "ai-modified" not in captured["body"]["add_labels"]
 
 
 # ---------- add_pr_comment ---------------------------------------------------

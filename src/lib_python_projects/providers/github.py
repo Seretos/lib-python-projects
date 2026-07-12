@@ -12,14 +12,13 @@ import httpx
 
 from lib_python_projects.models import ProjectConfig
 from lib_python_projects.markers import (
-    AI_GENERATED_LABEL,
-    AI_MODIFIED_LABEL,
     apply_body_marker,
     has_ai_generated_marker,
-    LABEL_COLORS,
-    LABEL_DESCRIPTIONS,
+    label_color,
+    label_description,
     ensure_body_prefix,
     ensure_comment_prefix,
+    MarkerSet,
     strip_leading_ai_marker,
 )
 from lib_python_projects.providers.base import (
@@ -73,6 +72,10 @@ _UNSET: Any = object()
 
 
 _GITHUB_SUFFIX_RE = re.compile(r"\s*\(GitHub\s+\d+\)\s*$")
+
+
+def _marker_set(project: ProjectConfig) -> MarkerSet:
+    return MarkerSet(project.auto_labels.ai_generated, project.auto_labels.ai_modified)
 
 
 class GitHubError(ProviderError):
@@ -834,7 +837,8 @@ def _github_mark_duplicate_of(
     )
     current_body = src.get("body") or ""
     current_labels = {lbl["name"] for lbl in (src.get("labels") or [])}
-    will_be_ai_generated = AI_GENERATED_LABEL in current_labels
+    markers = _marker_set(project)
+    will_be_ai_generated = project.auto_labels.ai_generated in current_labels
 
     dup_line = f"Duplicate of #{target_number}"
     # Insert the duplicate-of line AFTER the AI marker (re-stamped) but
@@ -842,7 +846,7 @@ def _github_mark_duplicate_of(
     # sees. apply_body_marker strips any existing leading #ai-* line.
     # Pre-strip marker so we can splice cleanly, then re-stamp via the
     # canonical helper.
-    body_without_marker = strip_leading_ai_marker(current_body)
+    body_without_marker = strip_leading_ai_marker(current_body, markers=markers)
     if dup_line not in body_without_marker:
         if body_without_marker:
             new_body_core = f"{dup_line}\n\n{body_without_marker}"
@@ -851,7 +855,7 @@ def _github_mark_duplicate_of(
     else:
         new_body_core = body_without_marker
     new_body = apply_body_marker(
-        new_body_core, will_be_ai_generated=will_be_ai_generated,
+        new_body_core, will_be_ai_generated=will_be_ai_generated, markers=markers,
     )
     pr = client.patch(
         f"{_repo_path(project)}/issues/{source_issue_number}",
@@ -2130,7 +2134,9 @@ def _dedupe_relations(rels: list[Relation]) -> list[Relation]:
     return out
 
 
-def _ensure_label(client: httpx.Client, project: ProjectConfig, name: str) -> None:
+def _ensure_label(
+    client: httpx.Client, project: ProjectConfig, name: str, role: str
+) -> None:
     """Create the label on the target repo if it doesn't already exist.
 
     Hard-fails (raises `GitHubError`) when GitHub refuses the create call —
@@ -2151,8 +2157,8 @@ def _ensure_label(client: httpx.Client, project: ProjectConfig, name: str) -> No
     """
     payload = {
         "name": name,
-        "color": LABEL_COLORS.get(name, "ededed"),
-        "description": LABEL_DESCRIPTIONS.get(name, ""),
+        "color": label_color(role),
+        "description": label_description(role),
     }
     resp = client.post(f"{_repo_path(project)}/labels", json=payload)
     if resp.status_code in (200, 201):
@@ -2163,7 +2169,7 @@ def _ensure_label(client: httpx.Client, project: ProjectConfig, name: str) -> No
 
 
 def _ensure_label_best_effort(
-    client: httpx.Client, project: ProjectConfig, name: str
+    client: httpx.Client, project: ProjectConfig, name: str, role: str
 ) -> bool:
     """Best-effort wrapper around `_ensure_label`.
 
@@ -2175,7 +2181,7 @@ def _ensure_label_best_effort(
     truth and survives a missing label.
     """
     try:
-        _ensure_label(client, project, name)
+        _ensure_label(client, project, name, role)
         return True
     except GitHubError as exc:
         log.warning(
@@ -2193,14 +2199,14 @@ def _assert_labels_exist(
     exist on the repo.
 
     Uses ``GET /repos/{owner}/{repo}/labels/{name}`` (one call per name).
-    Internal AI-attribution labels (``ai-generated``, ``ai-modified``) are
-    excluded — they keep intentional best-effort auto-create via
+    The project's configured AI-attribution labels are excluded — they
+    keep intentional best-effort auto-create via
     ``_ensure_label_best_effort``.
 
     404 → ``GitHubError(404, "label {name!r} does not exist in {project.id}")``.
     Other non-2xx statuses go through ``_check`` as usual.
     """
-    _ai_labels = {AI_GENERATED_LABEL, AI_MODIFIED_LABEL}
+    _ai_labels = {project.auto_labels.ai_generated, project.auto_labels.ai_modified}
     for name in names:
         if name in _ai_labels:
             continue
@@ -2706,12 +2712,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         idempotency_key: str | None = None,
         milestone: Any = _UNSET,
     ) -> Ticket:
-        """Create an issue with the `ai-generated` AI-attribution marker.
+        """Create an issue with the project's AI-generated attribution marker.
 
         Marker policy (ticket Seretos/agent-marketplace#15):
-          - Body prefix `#ai-generated\\n\\n` is the canonical source of
-            truth and is always applied (idempotent).
-          - The `ai-generated` LABEL is best-effort. If the caller cannot
+          - The body prefix (`#<ai_generated>\\n\\n`, per `project.auto_labels`)
+            is the canonical source of truth and is always applied (idempotent).
+          - The `ai_generated` LABEL is best-effort. If the caller cannot
             create or apply the label (typically tokens without
             `push` / `triage` on the target repo), the label is dropped
             from the POST payload so the issue is still created. Mode A
@@ -2801,15 +2807,16 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 )
             binding = milestone_binding
         # Deduplicate while preserving order, ensure ai-generated is present.
-        merged = list(dict.fromkeys([*labels, AI_GENERATED_LABEL]))
-        prefixed_body = ensure_body_prefix(body)
+        ai_generated_label = project.auto_labels.ai_generated
+        merged = list(dict.fromkeys([*labels, ai_generated_label]))
+        prefixed_body = ensure_body_prefix(body, markers=_marker_set(project))
         # Validate `status` up-front so an invalid value rejects before
         # the POST commits an issue we'd then have to delete or close.
         patch_state, patch_state_reason = _split_github_status(status)
         with _client(token) as client:
             _assert_labels_exist(client, project, labels)
             label_ok = _ensure_label_best_effort(
-                client, project, AI_GENERATED_LABEL
+                client, project, ai_generated_label, "generated"
             )
             payload: dict[str, Any] = {
                 "title": title,
@@ -2820,7 +2827,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             else:
                 # Drop only the AI marker; keep any caller-supplied labels
                 # so an unrelated `bug` / `enhancement` label still lands.
-                other = [lbl for lbl in merged if lbl != AI_GENERATED_LABEL]
+                other = [lbl for lbl in merged if lbl != ai_generated_label]
                 if other:
                     payload["labels"] = other
             if assignees:
@@ -2828,13 +2835,13 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             r = client.post(f"{_repo_path(project)}/issues", json=payload)
             _check(r)
             raw = r.json()
-            if label_ok and not _label_present(raw, AI_GENERATED_LABEL):
+            if label_ok and not _label_present(raw, ai_generated_label):
                 log.warning(
                     "ticket #%s created on %s/%s without '%s' label "
                     "(GitHub silently dropped it — caller likely lacks "
                     "triage permission); body-prefix marker remains",
                     raw.get("number"), project.owner, project.repo,
-                    AI_GENERATED_LABEL,
+                    ai_generated_label,
                 )
             # Follow-up PATCH for non-`open` initial status.
             if patch_state is not None and patch_state != "open":
@@ -2996,6 +3003,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             current = r0.json()
             current_labels = {lbl["name"] for lbl in (current.get("labels") or [])}
             current_assignees = {a["login"] for a in (current.get("assignees") or [])}
+            markers = _marker_set(project)
 
             if labels_add:
                 _assert_labels_exist(client, project, labels_add)
@@ -3010,15 +3018,16 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             # Label application is best-effort (see ticket #15): if the
             # caller can't create or apply the label, proceed without it
             # rather than blocking the legitimate update.
-            will_be_ai_generated = AI_GENERATED_LABEL in current_labels
+            will_be_ai_generated = project.auto_labels.ai_generated in current_labels
             if not will_be_ai_generated:
-                if AI_MODIFIED_LABEL not in new_labels:
+                ai_modified_label = project.auto_labels.ai_modified
+                if ai_modified_label not in new_labels:
                     if _ensure_label_best_effort(
-                        client, project, AI_MODIFIED_LABEL
+                        client, project, ai_modified_label, "modified"
                     ):
-                        new_labels.add(AI_MODIFIED_LABEL)
+                        new_labels.add(ai_modified_label)
                 else:
-                    new_labels.add(AI_MODIFIED_LABEL)
+                    new_labels.add(ai_modified_label)
 
             new_assignees = set(current_assignees)
             if assignees_add:
@@ -3035,7 +3044,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 # Caller should NOT prepend the marker themselves; if
                 # they do, we strip + re-add the correct one.
                 payload["body"] = apply_body_marker(
-                    body, will_be_ai_generated=will_be_ai_generated,
+                    body, will_be_ai_generated=will_be_ai_generated, markers=markers,
                 )
             if status is not None:
                 # New provider-native string API (see ticket #7).
@@ -3283,7 +3292,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
     ) -> Comment:
         if not body or not body.strip():
             raise ValueError("body must not be empty")
-        prefixed = ensure_comment_prefix(body)
+        prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
         with _client(token) as client:
             r = client.post(
                 f"{_repo_path(project)}/issues/{ticket_id}/comments",
@@ -3444,13 +3453,13 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         """Update a comment's body, re-stamping the AI-marker.
 
         Marker policy (ticket #44):
-          - If the existing comment body carries `#ai-generated`, the
-            edited body is re-stamped with `#ai-generated` (we wrote it
-            originally, this is just another AI edit).
+          - If the existing comment body carries the project's configured
+            generated marker, the edited body is re-stamped with that same
+            marker (we wrote it originally, this is just another AI edit).
           - Otherwise the comment was human-authored — the edited body
-            is stamped with `#ai-modified` to mirror the label
-            distinction `update_ticket` makes between `ai-generated` and
-            `ai-modified` resources.
+            is stamped with the project's configured modified marker to
+            mirror the label distinction `update_ticket` makes between
+            AI-generated and AI-modified resources.
 
         Comments don't carry labels, so the body marker is the only
         signal a reader has of authorship — getting it right here is
@@ -3471,9 +3480,10 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     ) from exc
                 raise
             current_body = r0.json().get("body") or ""
-            will_be_ai_generated = has_ai_generated_marker(current_body)
+            markers = _marker_set(project)
+            will_be_ai_generated = has_ai_generated_marker(current_body, markers=markers)
             prefixed = apply_body_marker(
-                body, will_be_ai_generated=will_be_ai_generated,
+                body, will_be_ai_generated=will_be_ai_generated, markers=markers,
             )
             r = client.patch(
                 f"{_repo_path(project)}/issues/comments/{comment_id}",
@@ -3630,7 +3640,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
 
         Marker policy mirrors `create_ticket` (see ticket
         Seretos/agent-marketplace#15): body prefix is the canonical
-        source of truth; the `ai-generated` LABEL is best-effort. When
+        source of truth; the `ai_generated` LABEL is best-effort. When
         the caller lacks permission to create or apply the label, the
         PR is still created and the follow-up labels POST is skipped (or
         restricted to caller-supplied labels). Mode A silent-drop on the
@@ -3658,12 +3668,13 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             )
             if replay is not None:
                 return replay
-        merged_labels = list(dict.fromkeys([*(labels or []), AI_GENERATED_LABEL]))
-        prefixed_body = ensure_body_prefix(body)
+        ai_generated_label = project.auto_labels.ai_generated
+        merged_labels = list(dict.fromkeys([*(labels or []), ai_generated_label]))
+        prefixed_body = ensure_body_prefix(body, markers=_marker_set(project))
         with _client(token) as client:
             _assert_labels_exist(client, project, labels or [])
             label_ok = _ensure_label_best_effort(
-                client, project, AI_GENERATED_LABEL
+                client, project, ai_generated_label, "generated"
             )
             payload: dict[str, Any] = {
                 "title": title,
@@ -3696,7 +3707,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             labels_to_apply = (
                 merged_labels
                 if label_ok
-                else [lbl for lbl in merged_labels if lbl != AI_GENERATED_LABEL]
+                else [lbl for lbl in merged_labels if lbl != ai_generated_label]
             )
             warnings: list[str] = []
             if labels_to_apply:
@@ -3713,7 +3724,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     # returned dataclass advertises them.
                     pr_raw["labels"] = applied_raw
                     if label_ok and not _label_present(
-                        {"labels": applied_raw}, AI_GENERATED_LABEL
+                        {"labels": applied_raw}, ai_generated_label
                     ):
                         log.warning(
                             "PR #%s created on %s/%s without '%s' label "
@@ -3721,7 +3732,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                             "lacks triage permission); body-prefix marker "
                             "remains",
                             pr_number, project.owner, project.repo,
-                            AI_GENERATED_LABEL,
+                            ai_generated_label,
                         )
             if assignees:
                 a_resp = client.post(
@@ -3791,8 +3802,8 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         not accept a draft flag; we issue the corresponding GraphQL
         mutation when the value differs from the current state.
 
-        Applies the `ai-modified` label (mirroring `update_ticket`) when
-        the PR wasn't originally created by us.
+        Applies the project's configured `ai_modified` label (mirroring
+        `update_ticket`) when the PR wasn't originally created by us.
         """
         _validate_label_lists(labels_add, labels_remove)
         with _client(token) as client:
@@ -3806,6 +3817,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             current = r0.json()
             current_labels = {lbl["name"] for lbl in (current.get("labels") or [])}
             current_assignees = {a["login"] for a in (current.get("assignees") or [])}
+            markers = _marker_set(project)
 
             if labels_add:
                 _assert_labels_exist(client, project, labels_add)
@@ -3818,15 +3830,16 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             # `ai-modified` is best-effort (see ticket #15): if we can't
             # ensure the label exists, proceed without it rather than
             # failing the legitimate update.
-            will_be_ai_generated = AI_GENERATED_LABEL in current_labels
+            will_be_ai_generated = project.auto_labels.ai_generated in current_labels
             if not will_be_ai_generated:
-                if AI_MODIFIED_LABEL not in new_labels:
+                ai_modified_label = project.auto_labels.ai_modified
+                if ai_modified_label not in new_labels:
                     if _ensure_label_best_effort(
-                        client, project, AI_MODIFIED_LABEL
+                        client, project, ai_modified_label, "modified"
                     ):
-                        new_labels.add(AI_MODIFIED_LABEL)
+                        new_labels.add(ai_modified_label)
                 else:
-                    new_labels.add(AI_MODIFIED_LABEL)
+                    new_labels.add(ai_modified_label)
 
             new_assignees = set(current_assignees)
             if assignees_add:
@@ -3840,7 +3853,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             if body is not None:
                 # Ticket #44: re-stamp body marker to match label state.
                 payload["body"] = apply_body_marker(
-                    body, will_be_ai_generated=will_be_ai_generated,
+                    body, will_be_ai_generated=will_be_ai_generated, markers=markers,
                 )
             if status is not None:
                 # The tool layer already restricts `status` to open/closed;
@@ -3948,7 +3961,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         Uses the shared `/issues/{n}/comments` endpoint; the AI-marker
         prefix is applied via `ensure_comment_prefix`.
         """
-        prefixed = ensure_comment_prefix(body)
+        prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
         with _client(token) as client:
             r = client.post(
                 f"{_repo_path(project)}/issues/{pr_id}/comments",
@@ -4031,7 +4044,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         Mode is validated at the tool layer; this method trusts its
         inputs and routes them to the matching POST shape.
         """
-        prefixed = ensure_comment_prefix(body)
+        prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
         if in_reply_to is not None:
             payload: dict[str, Any] = {
                 "body": prefixed,
@@ -4102,7 +4115,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             )
         payload: dict[str, Any] = {"event": event}
         if body:
-            payload["body"] = ensure_comment_prefix(body)
+            payload["body"] = ensure_comment_prefix(body, markers=_marker_set(project))
         if commit_sha:
             payload["commit_id"] = commit_sha
         with _client(token) as client:
@@ -4528,9 +4541,10 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 current_labels = {
                     lbl["name"] for lbl in (src.get("labels") or [])
                 }
-                will_be_ai_generated = AI_GENERATED_LABEL in current_labels
+                markers = _marker_set(project)
+                will_be_ai_generated = project.auto_labels.ai_generated in current_labels
                 # Strip the AI marker first so we can work on the core body.
-                body_core = strip_leading_ai_marker(current_body)
+                body_core = strip_leading_ai_marker(current_body, markers=markers)
                 # Remove the ``Duplicate of #N`` line (and any surrounding
                 # blank lines it introduced) using a case-insensitive match.
                 dup_pattern = re.compile(
@@ -4546,7 +4560,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 # Collapse multiple consecutive blank lines to a single one.
                 body_stripped = re.sub(r"\n{3,}", "\n\n", body_stripped).strip()
                 new_body = apply_body_marker(
-                    body_stripped, will_be_ai_generated=will_be_ai_generated,
+                    body_stripped, will_be_ai_generated=will_be_ai_generated, markers=markers,
                 )
                 pr = client.patch(
                     f"{_repo_path(project)}/issues/{ticket_id}",
