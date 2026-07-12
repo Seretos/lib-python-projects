@@ -71,6 +71,24 @@ class Ticket:
 
 
 @dataclass
+class BulkTicketResult:
+    """Per-item result of `bulk_update_tickets` (ticket #149) — one entry
+    per requested id, in input order.
+
+    On success, `ticket` is the updated `Ticket` and `error` is `None`.
+    On failure, `ticket` is `None` and `error` carries the human-readable
+    message from the `ProviderError` / `ValueError` that `update_ticket`
+    raised for that id. `bulk_update_tickets` never raises out of the
+    loop for a single item's failure — this dataclass is how partial
+    failure is reported instead of all-or-nothing semantics.
+    """
+
+    ticket_id: str
+    ticket: Ticket | None
+    error: str | None
+
+
+@dataclass
 class Comment:
     id: str
     author: str

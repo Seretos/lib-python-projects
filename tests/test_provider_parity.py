@@ -1259,6 +1259,31 @@ def test_review_author_truthy_body_url_str_or_none_across_providers(monkeypatch)
     assert isinstance(ado_review.url, str) and ado_review.url
 
 
+def test_all_providers_expose_bulk_update_tickets():
+    """All three providers must expose bulk_update_tickets as a callable
+    (ticket #149). This is a static structural assertion (mirrors
+    test_all_providers_expose_label_methods)."""
+    from lib_python_projects.providers.github import GitHubProvider
+    from lib_python_projects.providers.gitlab import GitLabProvider
+    from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+
+    for provider_cls in (GitHubProvider, GitLabProvider, AzureDevOpsProvider):
+        assert callable(getattr(provider_cls, "bulk_update_tickets", None)), (
+            f"{provider_cls.__name__} is missing callable 'bulk_update_tickets'"
+        )
+
+
+def test_bulk_ticket_result_dataclass_fields():
+    """BulkTicketResult has ticket_id, ticket, error fields (ticket #149)."""
+    import dataclasses
+    from lib_python_projects.providers.base import BulkTicketResult
+
+    field_names = {f.name for f in dataclasses.fields(BulkTicketResult)}
+    assert "ticket_id" in field_names
+    assert "ticket" in field_names
+    assert "error" in field_names
+
+
 def test_resolvable_duplicate_of_never_emitted_with_unresolved_sentinel(monkeypatch):
     """Ticket #136: when a `duplicate_of` target is independently resolvable
     (GitHub timeline / GitLab issue-links both already fetched its real
