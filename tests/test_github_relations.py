@@ -1240,7 +1240,10 @@ def test_remove_relation_child_not_found_raises_relation_not_found(
         path = req.url.path
         if path == "/repos/acme/backend/issues/9":
             return _json(_issue_payload(9, id=9001))
-        if path == "/repos/acme/backend/issues/5/sub_issue":
+        # child branch resolves the ticket's own internal id.
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        if path == "/repos/acme/backend/issues/9/sub_issue":
             # GitHub returns 404 when the sub-issue relationship doesn't exist.
             return _json({"message": "Not Found"}, status_code=404)
         raise AssertionError(f"unexpected {req.url}")
@@ -1657,6 +1660,9 @@ def test_add_relation_child_duplicate_sub_issue_422(
         # Target issue resolution (for internal id).
         if path == "/repos/acme/backend/issues/5":
             return _json(_issue_payload(5, id=5001))
+        # child branch also resolves the ticket's own internal id.
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, id=1001))
         # Pre-flight GET for inverse-kind guard: empty list so the POST fires.
         if "/sub_issues" in path and req.method == "GET":
             return _json([])
@@ -1729,6 +1735,9 @@ def test_add_relation_child_duplicate_raises_relation_already_exists(
         # Target issue resolution (for internal id).
         if path == "/repos/acme/backend/issues/5":
             return _json(_issue_payload(5, id=5001))
+        # child branch also resolves the ticket's own internal id.
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, id=1001))
         # Pre-flight GET for inverse-kind guard: empty list so the POST fires.
         if "/sub_issues" in path and req.method == "GET":
             return _json([])
@@ -1957,6 +1966,132 @@ def test_remove_relation_duplicate_of_strips_body_marker(
     )
 
 
+def test_remove_relation_duplicate_of_twice_second_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #173: calling remove_relation('duplicate_of')
+    a second time on an already-removed link must raise RelationNotFound
+    instead of silently returning {"removed": True} again.
+
+    The first call strips the 'Duplicate of #99' marker and PATCHes the
+    body; the mock then serves the STRIPPED body on the next source GET
+    (mimicking GitHub after the PATCH landed). The second call must detect
+    the marker is gone and raise before issuing any PATCH.
+    """
+    original_body = "Duplicate of #99\n\nOriginal description."
+    stripped_body = "Original description."
+    patch_count = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal patch_count
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/99":
+            return _json(_issue_payload(99, id=9901))
+        if path == "/repos/acme/backend/issues/10" and req.method == "GET":
+            # First GET returns the original body; after the PATCH the
+            # "stored" body is the stripped one.
+            body = stripped_body if patch_count else original_body
+            return _json(_issue_payload(
+                10, id=1001,
+                body=body,
+                state="closed" if not patch_count else "open",
+                state_reason="duplicate" if not patch_count else None,
+                labels=[],
+            ))
+        if path == "/repos/acme/backend/issues/10" and req.method == "PATCH":
+            patch_count += 1
+            import json as _json_mod
+            payload = _json_mod.loads(req.content)
+            return _json(_issue_payload(10, state="open", body=payload.get("body", "")))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+
+    first = provider.remove_relation(
+        _project(), token="t", ticket_id="10", kind="duplicate_of", target="#99"
+    )
+    assert first == {"removed": True}
+    assert patch_count == 1, "first call must PATCH exactly once"
+
+    with pytest.raises(RelationNotFound) as exc:
+        provider.remove_relation(
+            _project(), token="t", ticket_id="10", kind="duplicate_of", target="#99"
+        )
+    assert exc.value.kind == "duplicate_of"
+    assert patch_count == 1, "second call must not issue another PATCH"
+    assert str(exc.value) == (
+        "no 'duplicate_of' relation on #10 targeting '#99' found to remove"
+    )
+
+
+def test_remove_relation_duplicate_of_no_marker_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #173: if the source body has no 'Duplicate of'
+    line at all, remove_relation('duplicate_of') must raise RelationNotFound
+    and must not PATCH.
+    """
+    body_without_marker = "Just a plain description, no marker here."
+    patched = False
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal patched
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/99":
+            return _json(_issue_payload(99, id=9901))
+        if path == "/repos/acme/backend/issues/10" and req.method == "GET":
+            return _json(_issue_payload(
+                10, id=1001, body=body_without_marker, state="open", labels=[],
+            ))
+        if path == "/repos/acme/backend/issues/10" and req.method == "PATCH":
+            patched = True
+            return _json(_issue_payload(10, state="open"))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound) as exc:
+        GitHubProvider().remove_relation(
+            _project(), token="t", ticket_id="10", kind="duplicate_of", target="#99"
+        )
+    assert exc.value.kind == "duplicate_of"
+    assert not patched, "no marker present means no PATCH should be issued"
+
+
+def test_remove_relation_duplicate_of_partial_number_mismatch_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #173: a body marker for a *different* target
+    number (e.g. 'Duplicate of #70') must not be treated as a match for a
+    remove_relation call targeting '#7' — the regex is number-anchored, so
+    this must raise RelationNotFound rather than stripping the wrong line.
+    """
+    body = "Duplicate of #70\n\nOriginal description."
+    patched = False
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal patched
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/7":
+            return _json(_issue_payload(7, id=701))
+        if path == "/repos/acme/backend/issues/10" and req.method == "GET":
+            return _json(_issue_payload(
+                10, id=1001, body=body, state="closed", state_reason="duplicate", labels=[],
+            ))
+        if path == "/repos/acme/backend/issues/10" and req.method == "PATCH":
+            patched = True
+            return _json(_issue_payload(10, state="open"))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound) as exc:
+        GitHubProvider().remove_relation(
+            _project(), token="t", ticket_id="10", kind="duplicate_of", target="#7"
+        )
+    assert exc.value.kind == "duplicate_of"
+    assert not patched, "mismatched target number must not trigger a PATCH"
+
+
 # ---------- Regression: add_relation('blocks') duplicate raises correct id ----
 
 
@@ -2012,21 +2147,20 @@ def test_add_relation_parent_duplicate_raises_relation_already_exists_with_calle
 ) -> None:
     """add_relation('parent') hitting a duplicate 422 must raise
     RelationAlreadyExists with ticket_id equal to the caller's logical
-    source ticket (A), not the wire-level parent (B).
+    source ticket (A). A ("3") is B's ("7") parent, so the wire POST goes
+    to A's own sub_issues endpoint.
     """
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
-        # Resolve target (parent, B = #7) for internal id.
+        # Resolve target (the intended child, B = #7) for internal id.
         if path == "/repos/acme/backend/issues/7":
             return _json(_issue_payload(7, id=7001))
-        # Resolve caller (child, A = #3) for internal id.
-        if path == "/repos/acme/backend/issues/3":
-            return _json(_issue_payload(3, id=3001))
         # Pre-flight GET for inverse-kind guard: empty list so the POST fires.
-        if "/repos/acme/backend/issues/7/sub_issues" in path and req.method == "GET":
+        if "/repos/acme/backend/issues/3/sub_issues" in path and req.method == "GET":
             return _json([])
-        # Wire POST is to B's sub_issues endpoint; return duplicate 422.
-        if "/repos/acme/backend/issues/7/sub_issues" in path and req.method == "POST":
+        # Wire POST is to A's (the ticket's own) sub_issues endpoint;
+        # return duplicate 422.
+        if "/repos/acme/backend/issues/3/sub_issues" in path and req.method == "POST":
             return _json(
                 {
                     "message": "Issue may not contain duplicate sub-issues",
@@ -2237,21 +2371,18 @@ def test_add_relation_blocked_by_after_blocks_raises_already_exists(
 def test_add_relation_parent_after_child_raises_already_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """add_relation('parent', A→B) when B already has A in its sub-issues list
-    (i.e. the inverse 'child' edge was added first) must raise
-    RelationAlreadyExists with kind='parent'."""
+    """add_relation('parent', A→B: A is B's parent) when A's sub-issues list
+    already contains B (i.e. the equivalent 'child' edge was added first
+    from the other side) must raise RelationAlreadyExists with kind='parent'."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
-        # Resolve target (B = #7, the intended parent) for internal id.
+        # Resolve target (B = #7, the intended child) for internal id.
         if path == "/repos/acme/backend/issues/7":
             return _json(_issue_payload(7, id=7001))
-        # Resolve caller (A = #3) for internal id.
-        if path == "/repos/acme/backend/issues/3":
-            return _json(_issue_payload(3, id=3001))
-        # Pre-flight GET: B's sub-issues list already contains A (id=3001).
-        if path == "/repos/acme/backend/issues/7/sub_issues" and req.method == "GET":
-            return _json([{"id": 3001, "number": 3, "title": "Issue 3", "state": "open"}])
+        # Pre-flight GET: A's (#3) own sub-issues list already contains B (id=7001).
+        if path == "/repos/acme/backend/issues/3/sub_issues" and req.method == "GET":
+            return _json([{"id": 7001, "number": 7, "title": "Issue 7", "state": "open"}])
         raise AssertionError(f"unexpected {req.method} {req.url}")
 
     _install_mock(monkeypatch, handler)
@@ -2268,18 +2399,21 @@ def test_add_relation_parent_after_child_raises_already_exists(
 def test_add_relation_child_after_parent_raises_already_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """add_relation('child', A→B) when A already has B in its sub-issues list
-    (i.e. the inverse 'parent' edge was added first) must raise
-    RelationAlreadyExists with kind='child'."""
+    """add_relation('child', A→B: A is B's child) when B's sub-issues list
+    already contains A (i.e. the equivalent 'parent' edge was added first
+    from the other side) must raise RelationAlreadyExists with kind='child'."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
-        # Resolve target (B = #5, the intended child) for internal id.
+        # Resolve target (B = #5, the intended parent) for internal id.
         if path == "/repos/acme/backend/issues/5":
             return _json(_issue_payload(5, id=5001))
-        # Pre-flight GET: A's (#1) sub-issues list already contains B (id=5001).
-        if path == "/repos/acme/backend/issues/1/sub_issues" and req.method == "GET":
-            return _json([{"id": 5001, "number": 5, "title": "Issue 5", "state": "open"}])
+        # child branch also resolves the ticket's own internal id.
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, id=1001))
+        # Pre-flight GET: B's (#5) sub-issues list already contains A (id=1001).
+        if path == "/repos/acme/backend/issues/5/sub_issues" and req.method == "GET":
+            return _json([{"id": 1001, "number": 1, "title": "Issue 1", "state": "open"}])
         raise AssertionError(f"unexpected {req.method} {req.url}")
 
     _install_mock(monkeypatch, handler)
@@ -2335,16 +2469,19 @@ def test_add_relation_child_no_existing_link_proceeds(
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
-        # Resolve target (B = #5, the intended child).
+        # Resolve target (B = #5, the intended parent).
         if path == "/repos/acme/backend/issues/5":
             return _json(_issue_payload(5, id=5001))
+        # child branch also resolves the ticket's own internal id.
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, id=1001))
         # Pre-flight GET: empty list — no existing link.
-        if path == "/repos/acme/backend/issues/1/sub_issues" and req.method == "GET":
+        if path == "/repos/acme/backend/issues/5/sub_issues" and req.method == "GET":
             return _json([])
         # The POST must still be issued.
-        if path == "/repos/acme/backend/issues/1/sub_issues" and req.method == "POST":
+        if path == "/repos/acme/backend/issues/5/sub_issues" and req.method == "POST":
             post_called.append(True)
-            return _json({"id": 5001, "number": 5, "title": "Issue 5", "state": "open"})
+            return _json({"id": 1001, "number": 1, "title": "Issue 1", "state": "open"})
         raise AssertionError(f"unexpected {req.method} {req.url}")
 
     _install_mock(monkeypatch, handler)
@@ -2388,3 +2525,192 @@ def test_add_relation_blocks_inverse_raises_carries_caller_ticket_id(
     )
     assert exc.value.kind == "blocks"
     assert "#5" in exc.value.target
+
+
+# ---------- Ticket #171: parent/child write direction was inverted -----------
+#
+# Contract: add_relation(ticket_id=X, kind="parent", target=Y) means "X is
+# the parent of Y". kind="child" means "X is the child of Y". The read path
+# is unaffected: after add_relation(X, "parent", Y), get_ticket(X) reports a
+# child relation to Y and get_ticket(Y) reports a parent relation to X.
+
+
+def test_add_relation_parent_posts_to_ticket_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation(ticket_id='3', kind='parent', target='#7'): 3 is the
+    parent of 7, so the sub-issue POST must land on 3's own endpoint with
+    7 as the sub-issue — NOT on 7's endpoint (the pre-fix, inverted
+    behaviour)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/7":
+            return _json(_issue_payload(7, id=7001))
+        if path == "/repos/acme/backend/issues/3/sub_issues" and req.method == "GET":
+            return _json([])
+        if path == "/repos/acme/backend/issues/3/sub_issues" and req.method == "POST":
+            assert json.loads(req.content) == {"sub_issue_id": 7001}
+            return _json(_issue_payload(7, id=7001))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    rel = GitHubProvider().add_relation(
+        _project(), token="t", ticket_id="3", kind="parent", target="#7"
+    )
+    assert rel.kind == "parent"
+
+
+def test_add_relation_child_posts_to_target_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation(ticket_id='1', kind='child', target='#5'): 1 is the
+    child of 5, so the sub-issue POST must land on 5's own endpoint with
+    1 as the sub-issue — NOT on 1's endpoint (the pre-fix, inverted
+    behaviour)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, id=1001))
+        if path == "/repos/acme/backend/issues/5/sub_issues" and req.method == "GET":
+            return _json([])
+        if path == "/repos/acme/backend/issues/5/sub_issues" and req.method == "POST":
+            assert json.loads(req.content) == {"sub_issue_id": 1001}
+            return _json(_issue_payload(1, id=1001))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    rel = GitHubProvider().add_relation(
+        _project(), token="t", ticket_id="1", kind="child", target="#5"
+    )
+    assert rel.kind == "child"
+
+
+def test_remove_relation_parent_deletes_from_ticket_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """remove_relation(ticket_id='3', kind='parent', target='#7'): the
+    DELETE must land on 3's own endpoint with sub_issue_id=7's internal id."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/7":
+            return _json(_issue_payload(7, id=7001))
+        if path == "/repos/acme/backend/issues/3/sub_issue" and req.method == "DELETE":
+            assert json.loads(req.content) == {"sub_issue_id": 7001}
+            return _json({}, status_code=204)
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().remove_relation(
+        _project(), token="t", ticket_id="3", kind="parent", target="#7"
+    )
+    assert result == {"removed": True}
+
+
+def test_remove_relation_child_deletes_from_target_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """remove_relation(ticket_id='1', kind='child', target='#5'): the
+    DELETE must land on 5's own endpoint with sub_issue_id=1's internal id."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, id=1001))
+        if path == "/repos/acme/backend/issues/5/sub_issue" and req.method == "DELETE":
+            assert json.loads(req.content) == {"sub_issue_id": 1001}
+            return _json({}, status_code=204)
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().remove_relation(
+        _project(), token="t", ticket_id="1", kind="child", target="#5"
+    )
+    assert result == {"removed": True}
+
+
+def test_parent_child_write_read_roundtrip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: add_relation(X='10', kind='parent', target='#20') writes
+    the corrected native state (X holds Y in its /sub_issues; Y's payload
+    carries parent=X). Reading both back must show: get_ticket(X) reports a
+    CHILD relation to Y, and get_ticket(Y) reports a PARENT relation to X
+    (ticket.parent_id == '#10')."""
+
+    # Step 1: perform the write and confirm wire mechanics.
+    def write_handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/20":
+            return _json(_issue_payload(20, id=20001))
+        if path == "/repos/acme/backend/issues/10/sub_issues" and req.method == "GET":
+            return _json([])
+        if path == "/repos/acme/backend/issues/10/sub_issues" and req.method == "POST":
+            assert json.loads(req.content) == {"sub_issue_id": 20001}
+            return _json(_issue_payload(20, id=20001))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, write_handler)
+    rel = GitHubProvider().add_relation(
+        _project(), token="t", ticket_id="10", kind="parent", target="#20"
+    )
+    assert rel.kind == "parent"
+
+    # Step 2: simulate GitHub's native post-write state and read it back.
+    parent_payload = {
+        "number": 10,
+        "title": "Parent ticket",
+        "state": "open",
+        "html_url": "https://github.com/acme/backend/issues/10",
+        "repository": {"full_name": "acme/backend"},
+    }
+    child_sub_issue = _issue_payload(20, title="Child ticket")
+    child_sub_issue["repository"] = {"full_name": "acme/backend"}
+
+    def read_handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/10":
+            return _json(_issue_payload(10))
+        if path == "/repos/acme/backend/issues/10/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/10/sub_issues":
+            # X (10) now holds Y (20) as a sub-issue.
+            return _json([child_sub_issue])
+        if path == "/repos/acme/backend/issues/10/timeline":
+            return _json([])
+        if path == "/repos/acme/backend/issues/20":
+            # Y's (20) native `parent` field now points at X (10).
+            return _json(_issue_payload(20, parent=parent_payload))
+        if path == "/repos/acme/backend/issues/20/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/20/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/20/timeline":
+            return _json([])
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, read_handler)
+    provider = GitHubProvider()
+
+    ticket_x, _, relations_x, _ = provider.get_ticket(
+        _project(), token="t", ticket_id="10"
+    )
+    assert [
+        (r.kind, r.ticket_id) for r in relations_x if r.kind == "child"
+    ] == [("child", "#20")]
+
+    ticket_y, _, relations_y, _ = provider.get_ticket(
+        _project(), token="t", ticket_id="20"
+    )
+    assert [
+        (r.kind, r.ticket_id) for r in relations_y if r.kind == "parent"
+    ] == [("parent", "#10")]
+    assert ticket_y.parent_id == "#10"

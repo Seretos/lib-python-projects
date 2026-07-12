@@ -967,10 +967,34 @@ def _label_list_from_tags(tags: str | None) -> list[str]:
 
 
 def _tags_string_from_labels(labels: list[str]) -> str:
-    """Inverse of `_label_list_from_tags` — deduplicates, sorts, joins."""
+    """Inverse of `_label_list_from_tags` — deduplicates, sorts, joins.
+
+    Validate-and-reject (ticket #172): raises `ValueError` for any label
+    that is `None`, empty, or whitespace-only, and for any label
+    containing ``";"`` (ADO's tag separator — a literal ``;`` inside a
+    label would silently split into extra tags on round-trip through
+    `_label_list_from_tags`). The previous behaviour silently dropped
+    such labels instead of rejecting them, desyncing the caller's view
+    of a ticket's labels from what actually got persisted.
+
+    This is the single serialization chokepoint for `System.Tags`,
+    called from `create_ticket` and `update_ticket` while they're still
+    building the JSON-Patch body — before either issues its mutating
+    HTTP call — so the raise happens before any write.
+    """
     seen: list[str] = []
     for lbl in labels:
-        if lbl and lbl not in seen:
+        if lbl is None or not lbl.strip():
+            raise ValueError(
+                f"invalid label {lbl!r}: labels must be non-empty, "
+                f"non-whitespace strings"
+            )
+        if ";" in lbl:
+            raise ValueError(
+                f"invalid label {lbl!r}: Azure DevOps uses ';' as the "
+                f"System.Tags separator, so labels cannot contain ';'"
+            )
+        if lbl not in seen:
             seen.append(lbl)
     return "; ".join(sorted(seen))
 
@@ -1185,16 +1209,15 @@ def _map_thread_comment_for_review(
     discussion_id = str(thread_id) if thread_id is not None else None
     in_reply_to = str(thread_id) if parent_id else None
 
-    # ADO doesn't expose a commit SHA on the thread itself. The
-    # iteration tracking only carries iteration indices; resolving them
-    # to SHAs needs an extra `/iterations` round-trip per thread, which
-    # is too expensive for `list_pr_review_comments`. Leave `None` when
-    # not derivable rather than fabricating from an unrelated field.
-    commit_sha_raw = (
-        (thread.get("pullRequestThreadContext") or {})
-        .get("changeTrackingId")
-    )
-    commit_sha = str(commit_sha_raw) if isinstance(commit_sha_raw, str) else None
+    # ADO exposes no commit SHA on a thread at all — there's no field on
+    # the thread or comment payload that carries one, so `commit_sha` is
+    # always None here on read (ticket #175). `add_pr_review_comment`
+    # echoes back the caller-supplied `commit_sha` into the object it
+    # returns, but that's a create-time convenience only: it is never
+    # persisted server-side, so a subsequent `get_pr`/
+    # `list_pr_review_comments` re-read of the same comment goes through
+    # this function and comes back with `commit_sha=None`.
+    commit_sha = None
 
     return ReviewComment(
         id=_format_thread_comment_id(thread_id, comment_id),
@@ -1512,6 +1535,23 @@ _RELATION_FORWARD: dict[str, str] = {
     "blocked_by": "System.LinkTypes.Dependency-Reverse",
     "duplicate_of": "System.LinkTypes.Duplicate-Forward",
     "relates_to": "System.LinkTypes.Related",
+}
+
+# Write-direction table for add_relation/remove_relation (ticket #171).
+# `_RELATION_FORWARD` above is the *read* basis: it defines how a native
+# ADO link type maps back to our generic kind when hydrating relations
+# from a work item (`_RELATION_REVERSE` / `_ado_rel_to_kind`), and must
+# stay untouched. On write, parent/child are intentionally the inverse of
+# that read mapping: writing "parent" places the target as this item's
+# child (System.LinkTypes.Hierarchy-Forward is the link type ADO uses to
+# express "the target is my child"), which is the mirror image of how the
+# read table interprets an existing native Hierarchy-Forward link as
+# "child". blocks/blocked_by/duplicate_of/relates_to are symmetric and
+# unaffected.
+_RELATION_WRITE: dict[str, str] = {
+    **_RELATION_FORWARD,
+    "parent": "System.LinkTypes.Hierarchy-Forward",
+    "child": "System.LinkTypes.Hierarchy-Reverse",
 }
 
 _RELATION_REVERSE: dict[str, str] = {v: k for k, v in _RELATION_FORWARD.items()}
@@ -2261,6 +2301,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                             "System.CreatedBy",
                             "System.CreatedDate",
                             "System.ChangedDate",
+                            "System.IterationPath",
                         ],
                     },
                 )
@@ -3892,6 +3933,19 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         commit_sha: str | None = None,
         in_reply_to: str | None = None,
     ) -> ReviewComment:
+        """Add a review comment to a PR, either as a new diff-anchored
+        thread (`path`+`line`) or as a reply to an existing thread
+        (`in_reply_to`).
+
+        `commit_sha`, if provided, is echoed into the returned
+        `ReviewComment` as a create-time convenience (matching GitHub's
+        review-comment return shape) — it is NOT written to Azure
+        DevOps and is not persisted anywhere on the thread. A later
+        `get_pr`/`list_pr_review_comments` re-read of this same comment
+        goes through `_map_thread_comment_for_review`, which always
+        reports `commit_sha=None` for Azure DevOps threads (ticket #175):
+        ADO simply doesn't expose a commit SHA on a thread.
+        """
         # Validate before doing any network I/O so callers fail fast.
         if not in_reply_to and (not path or line is None):
             raise AzureDevOpsError(
@@ -4224,7 +4278,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             )
         target_id = _parse_relation_target(target, project)
         _assert_not_self_relation(ticket_id, target_id)
-        rel_name = _RELATION_FORWARD[kind]
+        rel_name = _RELATION_WRITE[kind]
         target_url = _build_workitem_api_url(project, target_id)
         path = f"{_project_scope(project)}/_apis/wit/workitems/{quote(str(ticket_id), safe='')}"
 
@@ -4360,7 +4414,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 kind, "azuredevops", SUPPORTED_RELATION_KINDS
             )
         target_id = _parse_relation_target(target, project)
-        rel_name = _RELATION_FORWARD[kind]
+        rel_name = _RELATION_WRITE[kind]
         target_url_marker = f"/workItems/{target_id}"
 
         path = f"{_project_scope(project)}/_apis/wit/workitems/{quote(str(ticket_id), safe='')}"
@@ -4965,30 +5019,62 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         project: ProjectConfig,
         token: str | None,
     ) -> list[Label]:
-        """List work-item tags for the project (best-effort approximation).
+        """List tags actually applied to the project's work items (best-effort).
 
         Azure DevOps tags are implicit — they have no dedicated create/
         rename/delete API and carry no colour or description metadata.
-        This method approximates a label list by calling:
 
-          ``GET /{org}/{project}/_apis/wit/tags?api-version=7.1``
+        This method derives the "in use" tag set from the project's work
+        items rather than calling the org/project tag catalog (``GET
+        /{org}/{project}/_apis/wit/tags``): the catalog also lists
+        catalog-only tags — tags that exist in ADO's tag-picker history
+        but are not currently applied to any work item — which leaked
+        into the previous implementation's results (ticket #172).
 
-        If that endpoint is unavailable or returns no items, an empty
-        list is returned. Each `Label` is returned with `color=""` and
-        `description=""` because ADO tags have no such fields.
+        The approach: run a WIQL query scoped to `[System.TeamProject] =
+        @project` to get every work-item id in the project, then reuse
+        `_fetch_work_items_batch` (chunked at 200 ids/request) to pull
+        `System.Tags` for each. The returned list is the sorted union of
+        tags present on at least one work item.
+
+        Note: two wrapper `ProjectConfig`s that map to the same
+        organization/ado_project (differing only by `repository`) share
+        one ADO team project and therefore legitimately share work items
+        — and this in-use tag list — since ADO has no finer scope than
+        the team project for tags/work items (`ProjectConfig` has no
+        `area_path` field to narrow further). That sharing is expected
+        behaviour; what this method fixes is catalog-only tags leaking
+        in, not cross-repository tag sharing.
+
+        Best-effort: if the WIQL query or the batch fetch returns a
+        non-success response, returns `[]` rather than raising. Each
+        `Label` is returned with `color=""` and `description=""` because
+        ADO tags have no such fields.
         """
-        path = f"{_project_scope(project)}/_apis/wit/tags"
+        wiql = "SELECT [System.Id] FROM workitems WHERE [System.TeamProject] = @project"
         with _client(project, token) as c:
-            resp = c.get(path, params=_api_version_params())
+            resp = c.post(
+                f"{_project_scope(project)}/_apis/wit/wiql",
+                params=_api_version_params(),
+                json={"query": wiql},
+            )
         if not resp.is_success:
             return []
-        payload = resp.json() or {}
-        items = payload.get("value") or []
-        return [
-            Label(name=item.get("name") or "", color="", description="")
-            for item in items
-            if item.get("name")
+        ids = [
+            int(item.get("id"))
+            for item in (resp.json().get("workItems") or [])
+            if item.get("id") is not None
         ]
+        if not ids:
+            return []
+        try:
+            tickets = self._fetch_work_items_batch(project, token, ids)
+        except AzureDevOpsError:
+            return []
+        tags: set[str] = set()
+        for ticket in tickets:
+            tags.update(ticket.labels)
+        return [Label(name=name, color="", description="") for name in sorted(tags)]
 
     def create_label(
         self,

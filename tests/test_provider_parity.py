@@ -1626,6 +1626,82 @@ def test_all_three_providers_round_trip_parent_id_and_milestone(monkeypatch):
     assert ado_ticket.parent_id.startswith("#")
 
 
+# ---------- ticket #171: parent/child write direction was inverted ----------
+
+
+def test_add_relation_parent_places_ticket_as_parent_on_all_providers(monkeypatch):
+    """Cross-provider parity: add_relation(ticket_id=X, kind='parent',
+    target=Y) must write "X is Y's parent" on every provider that supports
+    the native sub-issue / hierarchy link — GitHub via a sub-issue POST
+    under the ticket's own endpoint, Azure DevOps via a native
+    Hierarchy-Forward link."""
+
+    # ---- GitHub: POST lands on the ticket's (#3) own sub_issues endpoint. ----
+    def gh_handler(req):
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/7":
+            return _resp({
+                "number": 7, "title": "Child", "body": "", "state": "open",
+                "user": {"login": "a"}, "assignees": [], "labels": [],
+                "html_url": "https://github.com/acme/backend/issues/7",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "id": 7001,
+            })
+        if path == "/repos/acme/backend/issues/3/sub_issues" and req.method == "GET":
+            return _resp([])
+        if path == "/repos/acme/backend/issues/3/sub_issues" and req.method == "POST":
+            assert json.loads(req.content.decode("utf-8")) == {"sub_issue_id": 7001}
+            return _resp({
+                "number": 7, "title": "Child", "body": "", "state": "open",
+                "user": {"login": "a"}, "assignees": [], "labels": [],
+                "html_url": "https://github.com/acme/backend/issues/7",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "id": 7001,
+            })
+        raise AssertionError(f"unexpected GitHub request: {req.method} {path}")
+
+    _install_github_mock(monkeypatch, gh_handler)
+    gh_rel = GitHubProvider().add_relation(
+        _github_project("acme/backend"), token="t", ticket_id="3", kind="parent", target="#7",
+    )
+    assert gh_rel.kind == "parent"
+
+    # ---- Azure DevOps: the emitted native link is Hierarchy-Forward. ----
+    captured: dict = {}
+
+    def ado_handler(req):
+        path = req.url.path
+        if req.method == "GET" and "/workitems/5" in path:
+            return _resp({"id": 5, "relations": []})
+        if req.method == "PATCH" and "/workitems/5" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _resp({"id": 5})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            ids = json.loads(req.content.decode("utf-8"))["ids"]
+            return _resp({
+                "value": [
+                    {
+                        "id": wid,
+                        "fields": {
+                            "System.Title": f"target {wid}",
+                            "System.State": "Active",
+                        },
+                    }
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected ADO request: {req.method} {path}")
+
+    _install_azuredevops_mock(monkeypatch, ado_handler)
+    ado_rel = AzureDevOpsProvider().add_relation(
+        _ado_project(), token="t", ticket_id="5", kind="parent", target="9",
+    )
+    assert captured["patch"][0]["value"]["rel"] == "System.LinkTypes.Hierarchy-Forward"
+    assert ado_rel.kind == "parent"
+
+
 # ---------- ticket #152: FailingJob.annotations shape parity ----------------
 
 

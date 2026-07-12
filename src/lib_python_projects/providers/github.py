@@ -1238,7 +1238,9 @@ def _board_items_query(owner_field: str) -> str:
         "content{"
         "__typename"
         "...on Issue{"
-        "number title body state stateReason url createdAt updatedAt "
+        "number title body state stateReason url "
+        "repository{nameWithOwner} "
+        "createdAt updatedAt "
         "author{login}"
         "assignees(first:50){nodes{login}}"
         "labels(first:50){nodes{name}}"
@@ -2572,6 +2574,10 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         target = native_column.lower()
         state_pairs = _github_states_pairs(filters.states) if filters.states else None
         not_labels = filters.not_labels or []
+        # Projects v2 boards can span multiple repos under the same owner;
+        # match case-insensitively since GitHub owner logins/repo names
+        # are themselves case-insensitive.
+        expected_repo = f"{project.owner}/{project.repo}".lower()
 
         matched: list[Ticket] = []
         after: str | None = None
@@ -2596,6 +2602,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     content = node.get("content") or {}
                     if content.get("__typename") != "Issue":
                         continue  # drop PRs / DraftIssues
+                    # The board can span repos beyond this project's own
+                    # owner/repo; drop anything that isn't actually ours
+                    # (case-insensitive: GitHub owner/repo names are).
+                    repo_name = (content.get("repository") or {}).get("nameWithOwner") or ""
+                    if repo_name.lower() != expected_repo:
+                        continue
                     field_value = node.get("fieldValueByName") or {}
                     option_name = (field_value.get("name") or "").lower()
                     if option_name != target:
@@ -2995,6 +3007,18 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         iteration field (`clearProjectV2ItemFieldValue`); `milestone=`
         omitted (`_UNSET`) issues no milestone write at all. A failed
         board write raises a plain `GitHubError`, same as `custom_fields`.
+
+        `status` changes only the REST issue state (`state`/
+        `state_reason` via the PATCH below) — it never touches the
+        Projects-v2 board's Status field (ticket #175). In particular,
+        reopening a ticket (`status="open"`) that was previously moved
+        to a terminal board column (e.g. "Done") leaves that column
+        unchanged: there is no configured default/open column in the
+        board binding for this method to reset it to, and guessing one
+        would be non-deterministic. Callers who need the board column
+        reset on a status change must pass
+        `custom_fields={"Status": "<column>"}` in the same
+        `update_ticket` call.
         """
         _validate_label_lists(labels_add, labels_remove)
         binding = None
@@ -4307,9 +4331,15 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
 
         Provider mapping:
           - `parent` / `child` → Sub-Issues API (issues/.../sub_issues).
-            Canonical wire form is `child`: `add_relation(A, kind=parent,
-            target=B)` is internally treated as
-            `add_relation(B, kind=child, target=A)`.
+            `add_relation(A, kind="parent", target=B)` means A is B's
+            parent: POST to A's own sub-issues endpoint with B as the
+            sub-issue. `add_relation(A, kind="child", target=B)` means A
+            is B's child: POST to B's own sub-issues endpoint with A as
+            the sub-issue. The read path (`_fetch_relations`) is
+            independent of this write mapping and stays authoritative:
+            after `add_relation(A, "parent", B)`, `get_ticket(A)` reports
+            a child relation to B and `get_ticket(B)` reports a parent
+            relation to A.
           - `blocks` / `blocked_by` → Dependencies API (api 2026-03-10):
             `POST /issues/{n}/dependencies/blocked_by` with
             `{"issue_id": <internal_id>}`. `blocks` is implemented as
@@ -4349,10 +4379,33 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     ) from exc
                 raise
             if kind == "parent":
-                # parent(A→B): A's parent is B → POST /issues/B/sub_issues
-                # with sub_issue_id=A. Source/target swap on the wire.
+                # parent(A→B): A is B's parent → POST /issues/A/sub_issues
+                # (A's own endpoint) with sub_issue_id=B (target becomes
+                # A's child on the wire — no source/target swap needed).
+                if _github_sub_issue_already_exists(
+                    client, _repo_path(project), ticket_id,
+                    sub_issue_internal_id=target_internal_id,
+                ):
+                    raise RelationAlreadyExists(
+                        kind="parent",
+                        ticket_id=ticket_id,
+                        target=f"#{target_number}",
+                    )
+                return _github_post_sub_issue(
+                    client, _repo_path(project), ticket_id,
+                    sub_issue_internal_id=target_internal_id,
+                    relation_kind_for_caller="parent",
+                    target_raw=target_raw,
+                    project=project,
+                    caller_ticket_id=ticket_id,
+                    caller_target_ref=f"#{target_number}",
+                )
+            if kind == "child":
+                # child(A→B): A is B's child → POST /issues/B/sub_issues
+                # (B's own endpoint) with sub_issue_id=A. Source/target
+                # swap on the wire.
                 try:
-                    _ticket_internal_id = _fetch_issue_internal_id(
+                    ticket_internal_id = _fetch_issue_internal_id(
                         client, _repo_path(project), ticket_id,
                     )[0]
                 except GitHubError as exc:
@@ -4362,36 +4415,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         ) from exc
                     raise
                 # Pre-flight: detect inverse-kind duplicates (e.g. a
-                # "child" edge already exists for this pair, which maps
-                # to the same wire endpoint).  The wire parent is
-                # target_number and the wire sub-issue is _ticket_internal_id.
-                if _github_sub_issue_already_exists(
-                    client, target_repo, target_number,
-                    sub_issue_internal_id=_ticket_internal_id,
-                ):
-                    raise RelationAlreadyExists(
-                        kind="parent",
-                        ticket_id=ticket_id,
-                        target=f"#{target_number}",
-                    )
-                return _github_post_sub_issue(
-                    client, target_repo, target_number,
-                    sub_issue_internal_id=_ticket_internal_id,
-                    relation_kind_for_caller="parent",
-                    target_raw=_fetch_issue_payload(
-                        client, target_repo, target_number,
-                    ),
-                    project=project,
-                    caller_ticket_id=ticket_id,
-                    caller_target_ref=f"#{target_number}",
-                )
-            if kind == "child":
-                # Pre-flight: detect inverse-kind duplicates (e.g. a
                 # "parent" edge already exists for this pair, which maps
-                # to the same wire endpoint).
+                # to the same wire endpoint).  The wire parent is
+                # target_number and the wire sub-issue is ticket_internal_id.
                 if _github_sub_issue_already_exists(
-                    client, _repo_path(project), ticket_id,
-                    sub_issue_internal_id=target_internal_id,
+                    client, target_repo, target_number,
+                    sub_issue_internal_id=ticket_internal_id,
                 ):
                     raise RelationAlreadyExists(
                         kind="child",
@@ -4399,10 +4428,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         target=f"#{target_number}",
                     )
                 return _github_post_sub_issue(
-                    client, _repo_path(project), ticket_id,
-                    sub_issue_internal_id=target_internal_id,
+                    client, target_repo, target_number,
+                    sub_issue_internal_id=ticket_internal_id,
                     relation_kind_for_caller="child",
-                    target_raw=target_raw,
+                    target_raw=_fetch_issue_payload(
+                        client, target_repo, target_number,
+                    ),
                     project=project,
                     caller_ticket_id=ticket_id,
                     caller_target_ref=f"#{target_number}",
@@ -4514,6 +4545,28 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     ) from exc
                 raise
             if kind == "parent":
+                # parent(A→B): A is B's parent → DELETE on A's own
+                # endpoint, removing B (target_internal_id, already
+                # fetched above) from A's sub-issues.
+                try:
+                    r = client.request(
+                        "DELETE",
+                        f"{_repo_path(project)}/issues/{ticket_id}/sub_issue",
+                        json={"sub_issue_id": target_internal_id},
+                    )
+                    _check(r)
+                except GitHubError as exc:
+                    if exc.status == 404:
+                        raise RelationNotFound(
+                            kind=kind,
+                            ticket_id=ticket_id,
+                            target=f"#{target_number}",
+                        ) from exc
+                    raise
+                return {"removed": True}
+            if kind == "child":
+                # child(A→B): A is B's child → DELETE on B's own
+                # endpoint, removing A from B's sub-issues.
                 try:
                     source_internal_id, _ = _fetch_issue_internal_id(
                         client, _repo_path(project), ticket_id,
@@ -4531,23 +4584,6 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         "DELETE",
                         f"{target_repo}/issues/{target_number}/sub_issue",
                         json={"sub_issue_id": source_internal_id},
-                    )
-                    _check(r)
-                except GitHubError as exc:
-                    if exc.status == 404:
-                        raise RelationNotFound(
-                            kind=kind,
-                            ticket_id=ticket_id,
-                            target=f"#{target_number}",
-                        ) from exc
-                    raise
-                return {"removed": True}
-            if kind == "child":
-                try:
-                    r = client.request(
-                        "DELETE",
-                        f"{_repo_path(project)}/issues/{ticket_id}/sub_issue",
-                        json={"sub_issue_id": target_internal_id},
                     )
                     _check(r)
                 except GitHubError as exc:
@@ -4634,6 +4670,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     + r"\s*$",
                     re.MULTILINE,
                 )
+                if not dup_pattern.search(body_core):
+                    raise RelationNotFound(
+                        kind="duplicate_of",
+                        ticket_id=ticket_id,
+                        target=f"#{target_number}",
+                    )
                 # Remove the matching line and collapse resulting double
                 # blank lines produced by the surrounding \n\n separators.
                 body_stripped = dup_pattern.sub("", body_core)

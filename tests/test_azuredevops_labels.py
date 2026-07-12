@@ -1,7 +1,10 @@
-"""Tests for AzureDevOpsProvider label management methods (ticket #35).
+"""Tests for AzureDevOpsProvider label management methods (ticket #35, #172).
 
 Covers:
-- list_labels — tags endpoint happy path, empty tags
+- list_labels — in-use tags derived from the project's work items (WIQL +
+  batch fetch), empty project, WIQL failure (ticket #172 bug 2)
+- _tags_string_from_labels — validate-and-reject on invalid input
+  (ticket #172 bug 1)
 - create_label / update_label / delete_label → LabelOperationUnsupported
 - LabelOperationUnsupported is a NotImplementedError subclass
 """
@@ -19,6 +22,7 @@ from lib_python_projects.providers.azuredevops import (
     AzureDevOpsProvider,
     _basic_auth_header,
     _cache_clear_all,
+    _tags_string_from_labels,
 )
 from lib_python_projects.providers.base import Label, LabelOperationUnsupported
 
@@ -73,48 +77,63 @@ def _clear_caches() -> None:
     _cache_clear_all()
 
 
-# ---------- list_labels -------------------------------------------------------
+# ---------- list_labels (ticket #172 bug 2: derive from in-use work items) ---
 
 
-def test_list_labels_returns_label_list(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Tags endpoint returns items → list[Label] with color='' and description=''."""
-    tags_payload = {
+def _wiql_payload(ids: list[int]) -> dict:
+    return {"workItems": [{"id": i} for i in ids]}
+
+
+def _batch_payload(tag_strings: list[str | None]) -> dict:
+    return {
         "value": [
-            {"id": "1", "name": "bug"},
-            {"id": "2", "name": "enhancement"},
-        ],
-        "count": 2,
+            {"id": idx + 1, "fields": ({"System.Tags": tags} if tags is not None else {})}
+            for idx, tags in enumerate(tag_strings)
+        ]
     }
 
+
+def test_list_labels_derives_from_work_item_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression (ticket #172 bug 2): list_labels must derive the tag list
+    from tags actually applied to work items (WIQL + batch fetch), and must
+    NEVER call the org/project tag-catalog endpoint (`_apis/wit/tags`),
+    which leaks catalog-only tags that aren't on any work item."""
+    requested_paths: list[str] = []
+
     def handler(req: httpx.Request) -> httpx.Response:
-        assert "_apis/wit/tags" in req.url.path
-        return _json(tags_payload)
+        requested_paths.append(req.url.path)
+        assert "_apis/wit/tags" not in req.url.path, (
+            "list_labels must not call the tag-catalog endpoint"
+        )
+        if req.method == "POST" and req.url.path.endswith("/_apis/wit/wiql"):
+            assert "/seredos/azure-tests" in req.url.path
+            return _json(_wiql_payload([1]))
+        if req.method == "POST" and req.url.path.endswith("/_apis/wit/workitemsbatch"):
+            return _json(_batch_payload(["bug"]))
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
 
     _install_mock(monkeypatch, handler)
     labels = AzureDevOpsProvider().list_labels(_project(), token="t")
-    assert isinstance(labels, list)
-    assert len(labels) == 2
-    assert all(isinstance(lbl, Label) for lbl in labels)
-    assert labels[0].name == "bug"
-    assert labels[0].color == ""        # ADO has no color concept
-    assert labels[0].description == ""  # ADO has no description concept
-    assert labels[1].name == "enhancement"
+    assert labels == [Label(name="bug", color="", description="")]
+    assert any(p.endswith("/_apis/wit/wiql") for p in requested_paths)
 
 
-def test_list_labels_empty(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Tags endpoint returns empty value array → empty list."""
-    tags_payload = {"value": [], "count": 0}
+def test_list_labels_no_work_items_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WIQL returns no work items → empty list, and no batch call is issued."""
 
     def handler(req: httpx.Request) -> httpx.Response:
-        return _json(tags_payload)
+        if req.method == "POST" and req.url.path.endswith("/_apis/wit/wiql"):
+            return _json(_wiql_payload([]))
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
 
     _install_mock(monkeypatch, handler)
     labels = AzureDevOpsProvider().list_labels(_project(), token="t")
     assert labels == []
 
 
-def test_list_labels_endpoint_unavailable_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
-    """If the tags endpoint returns a non-success status → empty list (best-effort)."""
+def test_list_labels_wiql_failure_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WIQL endpoint returns a non-success status → empty list (best-effort),
+    no exception raised."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         return _json({"message": "Not Found"}, status_code=404)
@@ -122,6 +141,76 @@ def test_list_labels_endpoint_unavailable_returns_empty(monkeypatch: pytest.Monk
     _install_mock(monkeypatch, handler)
     labels = AzureDevOpsProvider().list_labels(_project(), token="t")
     assert labels == []
+
+
+def test_list_labels_batch_failure_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WIQL succeeds but the follow-up batch fetch fails → empty list
+    (best-effort), no exception raised."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path.endswith("/_apis/wit/wiql"):
+            return _json(_wiql_payload([1]))
+        if req.method == "POST" and req.url.path.endswith("/_apis/wit/workitemsbatch"):
+            return _json({"message": "Server Error"}, status_code=500)
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    labels = AzureDevOpsProvider().list_labels(_project(), token="t")
+    assert labels == []
+
+
+def test_list_labels_empty_tags_contribute_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Work items with no/empty System.Tags don't produce spurious labels,
+    and tags shared across items are deduped + sorted in the union."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path.endswith("/_apis/wit/wiql"):
+            return _json(_wiql_payload([1, 2, 3]))
+        if req.method == "POST" and req.url.path.endswith("/_apis/wit/workitemsbatch"):
+            return _json(_batch_payload(["bug; urgent", "", None]))
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    labels = AzureDevOpsProvider().list_labels(_project(), token="t")
+    assert labels == [
+        Label(name="bug", color="", description=""),
+        Label(name="urgent", color="", description=""),
+    ]
+
+
+# ---------- _tags_string_from_labels (ticket #172 bug 1: validate-and-reject) -
+
+
+def test_tags_string_from_labels_rejects_semicolon() -> None:
+    """A label containing ';' (ADO's tag separator) must raise ValueError
+    instead of silently corrupting the joined tag string."""
+    with pytest.raises(ValueError):
+        _tags_string_from_labels(["a;b"])
+
+
+def test_tags_string_from_labels_rejects_empty_string() -> None:
+    """An empty-string label must raise ValueError instead of being
+    silently dropped."""
+    with pytest.raises(ValueError):
+        _tags_string_from_labels(["", "x"])
+
+
+def test_tags_string_from_labels_rejects_whitespace_only() -> None:
+    """A whitespace-only label must raise ValueError instead of being
+    silently dropped."""
+    with pytest.raises(ValueError):
+        _tags_string_from_labels(["  "])
+
+
+def test_tags_string_from_labels_rejects_none() -> None:
+    """A None entry in the labels list must raise ValueError."""
+    with pytest.raises(ValueError):
+        _tags_string_from_labels([None])  # type: ignore[list-item]
+
+
+def test_tags_string_from_labels_happy_path_unchanged() -> None:
+    """Valid input still dedupes, sorts, and joins with '; ' as before."""
+    assert _tags_string_from_labels(["b", "a", "a"]) == "a; b"
 
 
 # ---------- mutating operations raise LabelOperationUnsupported ---------------
