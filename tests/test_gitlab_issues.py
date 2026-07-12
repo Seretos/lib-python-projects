@@ -245,16 +245,24 @@ def test_list_tickets_area_path_raises_valueerror(
 def test_list_tickets_board_column_raises_valueerror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """board_column is a GitHub Projects v2 concept — GitLab must fail fast."""
+    """board_column has no GitLab equivalent — GitLab must fail fast.
+
+    board_column is a board-column filter supported by GitHub Projects v2
+    and Azure Boards; GitLab has no board concept, so it must keep
+    rejecting the filter rather than silently ignoring it.
+    """
 
     def handler(req: httpx.Request) -> httpx.Response:
         raise AssertionError("no HTTP call expected when board_column is set")
 
     _install_mock(monkeypatch, handler)
-    with pytest.raises(ValueError, match="board_column is not supported on GitLab"):
+    with pytest.raises(ValueError, match="board_column is not supported on GitLab") as exc_info:
         GitLabProvider().list_tickets(
             _project(), "t", TicketFilters(board_column="Review"),
         )
+    message = str(exc_info.value)
+    assert "Projects v2" in message
+    assert "Azure Boards" in message
 
 
 def test_list_tickets_has_more_true_when_full_page(
