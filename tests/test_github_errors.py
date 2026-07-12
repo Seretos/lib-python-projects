@@ -607,8 +607,14 @@ def test_add_relation_bogus_target_names_target(
 def test_add_relation_bogus_ticket_id_names_ticket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """add_relation(kind='parent') with a missing ticket_id produces
-    'ticket acme#1 not found'."""
+    """add_relation(kind='child') with a missing ticket_id produces
+    'ticket acme#1 not found'.
+
+    Ticket #171: the write direction was flipped so that kind='child' is
+    the branch that resolves the *ticket's own* internal id (to POST it as
+    a sub-issue under the target) — kind='parent' now posts to the
+    ticket's own endpoint directly and no longer needs that fetch.
+    """
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
@@ -623,7 +629,7 @@ def test_add_relation_bogus_ticket_id_names_ticket(
     _install_mock(monkeypatch, handler)
     with pytest.raises(GitHubError) as exc:
         GitHubProvider().add_relation(
-            _project(), token="t", ticket_id="1", kind="parent", target="#99",
+            _project(), token="t", ticket_id="1", kind="child", target="#99",
         )
     assert exc.value.status == 404
     assert "ticket 'acme#1' not found" in exc.value.message
