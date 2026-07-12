@@ -4597,6 +4597,40 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             )
         return run
 
+    def get_step_log(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        run_id: str,
+        job_id: str,
+    ) -> str:
+        """Fetch the full, unbounded raw log for a single job.
+
+        Here `job_id` is the Azure DevOps build *log* id
+        (`rec["log"]["id"]` on a timeline record), not the timeline
+        record GUID — the same identifier already used internally by
+        `_fetch_build_failure_context` to fetch its 120-line tail
+        excerpt. This method hits the same
+        `GET .../builds/{run_id}/logs/{job_id}` endpoint but returns the
+        full response body, unsliced. Raises `AzureDevOpsError` on a
+        non-success response (via `_check`), or
+        `AzureDevOpsError(404, ...)` when `run_id` is not numeric.
+        """
+        if not str(run_id).strip().isdigit():
+            raise AzureDevOpsError(
+                404,
+                f"pipeline '{project.id}#{run_id}' not found"
+                f" — run_id must be numeric for Azure DevOps",
+            )
+        log_path = (
+            f"{_project_scope(project)}/_apis/build/builds/"
+            f"{quote(str(run_id), safe='')}/logs/{job_id}"
+        )
+        with _client(project, token) as c:
+            resp = c.get(log_path, params=_api_version_params())
+        _check(resp)
+        return resp.text
+
     def _fetch_build_failure_context(
         self,
         project: ProjectConfig,
@@ -4642,6 +4676,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                         failed_step=rec.get("name") or "",
                         annotations=_normalize_az_issues(rec),
                         log_excerpt=log_excerpt,
+                        job_id=str(log_id or ""),
                     )
                 )
         return PipelineFailure(

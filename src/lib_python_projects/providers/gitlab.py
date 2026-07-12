@@ -1725,6 +1725,7 @@ def _fetch_pipeline_failure(
             failed_step=job.get("stage", "") or "",
             annotations=[],  # deliberate scope decision (#152) — see docstring above
             log_excerpt=trace_excerpt,
+            job_id=str(job_id or ""),
         ))
     return PipelineFailure(failing_jobs=failing, note=note)
 
@@ -3881,6 +3882,34 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                     client, project, run_id,
                 )
         return run
+
+    def get_step_log(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        run_id: str,
+        job_id: str,
+    ) -> str:
+        """Fetch the full, unbounded raw trace for a single job.
+
+        Uses the same `GET /projects/{id}/jobs/{job_id}/trace` endpoint
+        already used internally for failure-excerpt building, but
+        without the `_TRACE_TAIL_LIMIT` truncation that path applies —
+        returns the trace in full. Raises `GitLabError` on a non-success
+        response (via `_check`), or `GitLabError(404, ...)` when
+        `run_id` is not numeric.
+        """
+        if not str(run_id).strip().isdigit():
+            raise GitLabError(
+                404,
+                f"pipeline '{project.id}#{run_id}' not found"
+                f" — run_id must be a numeric pipeline id",
+            )
+        path = _project_path(project)
+        with _client(project, token) as client:
+            tr = client.get(f"/projects/{path}/jobs/{job_id}/trace")
+            _check(tr)
+            return tr.text
 
     # ---------- label management ---------------------------------------------
 
