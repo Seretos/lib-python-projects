@@ -1649,9 +1649,18 @@ def _fetch_pipeline_failure(
     """Build a `PipelineFailure` for a failed pipeline.
 
     Walks the pipeline's jobs, filters to `status == "failed"`, and
-    fetches the trace (last `_TRACE_TAIL_LIMIT` bytes) for each. GitLab
-    does not expose GitHub-style structured annotations; the
-    `annotations` field is therefore always `[]`.
+    fetches the trace (last `_TRACE_TAIL_LIMIT` bytes) for each.
+    `annotations` is always `[]` on every `FailingJob` — GitLab has no
+    per-job structured-annotation API today, so there is nothing to map
+    into `FailureAnnotation`. This is a deliberate scope decision for
+    ticket #152 (structured GitHub Check-Run annotations and Azure
+    Pipelines timeline issues were normalized; GitLab was left as `[]`
+    rather than modeled), not a technical limitation of the
+    `FailingJob.annotations` field itself — that field's type is
+    `list[FailureAnnotation]` on every provider, GitLab just never
+    populates it. Structured annotations may be revisited later, e.g. by
+    parsing JUnit test reports or code-quality artifacts attached to the
+    pipeline.
 
     Returns `None` if the jobs endpoint is unreachable — preserves
     the "best-effort" contract documented on `PipelineRun.failure`.
@@ -1686,7 +1695,7 @@ def _fetch_pipeline_failure(
             name=job.get("name", "") or "",
             url=job.get("web_url", "") or "",
             failed_step=job.get("stage", "") or "",
-            annotations=[],  # GitLab has no structured annotation surface
+            annotations=[],  # deliberate scope decision (#152) — see docstring above
             log_excerpt=trace_excerpt,
         ))
     return PipelineFailure(failing_jobs=failing, note=note)
@@ -3774,8 +3783,11 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
 
         When `include_failure_excerpt=True` and the pipeline concluded
         as failed, also fetch the failing jobs and a trace excerpt for
-        each. GitLab does not expose GitHub-style annotations; the
-        `annotations` field on each `FailingJob` is therefore `[]`.
+        each. GitLab has no per-job structured-annotation API today
+        (deliberate scope decision for ticket #152, not a technical
+        limitation); the `annotations` field on each `FailingJob` is
+        therefore always `[]` — see `_fetch_pipeline_failure`'s
+        docstring for detail.
         """
         if not str(run_id).strip().isdigit():
             raise GitLabError(

@@ -927,3 +927,158 @@ def test_get_run_failure_excerpt_no_module_pytest(monkeypatch: pytest.MonkeyPatc
     job = run.failure.failing_jobs[0]
     assert job.log_excerpt is not None
     assert "No module named pytest" in job.log_excerpt
+
+
+# ---------- ticket #152: structured annotations (_normalize_gh_annotations) --
+
+
+def _jobs_payload_with_check_run(
+    job_id: int,
+    job_name: str = "test",
+    failed_step_name: str = "Run pytest",
+    check_run_url: str = "https://api.github.com/repos/acme/backend/check-runs/555",
+) -> dict:
+    """A /jobs response with one failed job carrying a check_run_url."""
+    return {
+        "jobs": [
+            {
+                "id": job_id,
+                "name": job_name,
+                "conclusion": "failure",
+                "html_url": f"https://github.com/acme/backend/actions/runs/1/jobs/{job_id}",
+                "check_run_url": check_run_url,
+                "steps": [
+                    {
+                        "name": failed_step_name,
+                        "conclusion": "failure",
+                        "number": 1,
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def test_get_run_failure_annotations_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression test for ticket #152.
+
+    A mocked `.../annotations` response containing a realistic check-run
+    annotation (`path`, `start_line`, `annotation_level="failure"`,
+    `message`, `title`) must come back on `FailingJob.annotations` as a
+    typed `list[FailureAnnotation]` with correctly mapped fields — not
+    the raw GitHub JSON dict. The log-excerpt annotation-anchor behaviour
+    (which consumes the raw payload internally) must still work.
+    """
+    from lib_python_projects.providers.base import FailureAnnotation
+
+    run_id = 33333
+    job_id = 44
+    head_sha = "feedface"
+    job_name = "test"
+    check_run_url = "https://api.github.com/repos/acme/backend/check-runs/555"
+
+    raw_annotation = {
+        "path": "src/app.py",
+        "start_line": 10,
+        "end_line": 12,
+        "annotation_level": "failure",
+        "message": "AssertionError: expected 1 got 2",
+        "title": "Test failed",
+    }
+
+    # Log text with no group headers so the excerpt anchors on the
+    # annotation's start_line (anchor strategy #2) — proves the raw
+    # payload is still consumed by _extract_log_excerpt unaffected.
+    log_lines = [f"log-line-{i}" for i in range(1, 30)]
+    log_text = "\n".join(log_lines)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == f"/repos/acme/backend/actions/runs/{run_id}":
+            return _json(_failed_run_payload(run_id, head_sha))
+        if path == f"/repos/acme/backend/actions/runs/{run_id}/jobs":
+            return _json(_jobs_payload_with_check_run(
+                job_id, job_name=job_name, check_run_url=check_run_url,
+            ))
+        if path == "/repos/acme/backend/check-runs/555/annotations":
+            return _json([raw_annotation])
+        raise AssertionError(f"unexpected JSON request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log",
+        lambda token, url, *, max_bytes=256 * 1024: log_text,
+    )
+
+    run = GitHubProvider().get_run(_project(), token="t", run_id=str(run_id))
+    assert run.failure is not None
+    assert len(run.failure.failing_jobs) == 1
+    job = run.failure.failing_jobs[0]
+    assert job.annotations == [
+        FailureAnnotation(
+            step=job_name,
+            message="AssertionError: expected 1 got 2",
+            file="src/app.py",
+            line=10,
+            severity="failure",
+            title="Test failed",
+        )
+    ]
+    # The annotation-anchor path in _extract_log_excerpt still consumed
+    # the raw payload — the excerpt is anchored around start_line=10,
+    # i.e. "log-line-10" must be present.
+    assert job.log_excerpt is not None
+    assert "log-line-10" in job.log_excerpt
+
+
+class TestNormalizeGhAnnotations:
+    """Table-driven unit tests for `_normalize_gh_annotations` — a pure
+    function, no HTTP involved (ticket #152)."""
+
+    def test_empty_list_returns_empty_list(self) -> None:
+        from lib_python_projects.providers.github import _normalize_gh_annotations
+
+        assert _normalize_gh_annotations([], "build") == []
+
+    def test_none_input_returns_empty_list(self) -> None:
+        from lib_python_projects.providers.github import _normalize_gh_annotations
+
+        assert _normalize_gh_annotations(None, "build") == []
+
+    def test_missing_path_yields_none_file(self) -> None:
+        from lib_python_projects.providers.github import _normalize_gh_annotations
+
+        raw = [{"start_line": 5, "message": "boom", "annotation_level": "warning"}]
+        out = _normalize_gh_annotations(raw, "build")
+        assert len(out) == 1
+        assert out[0].file is None
+        assert out[0].line == 5
+        assert out[0].step == "build"
+
+    def test_missing_start_line_falls_back_to_end_line(self) -> None:
+        from lib_python_projects.providers.github import _normalize_gh_annotations
+
+        raw = [{"path": "a.py", "end_line": 7, "message": "boom"}]
+        out = _normalize_gh_annotations(raw, "build")
+        assert out[0].line == 7
+
+    def test_missing_message_defaults_to_empty_string(self) -> None:
+        from lib_python_projects.providers.github import _normalize_gh_annotations
+
+        raw = [{"path": "a.py", "start_line": 3}]
+        out = _normalize_gh_annotations(raw, "build")
+        assert out[0].message == ""
+
+    def test_missing_both_start_and_end_line_yields_none(self) -> None:
+        from lib_python_projects.providers.github import _normalize_gh_annotations
+
+        raw = [{"path": "a.py", "message": "boom"}]
+        out = _normalize_gh_annotations(raw, "build")
+        assert out[0].line is None
+
+    def test_step_applied_to_every_annotation(self) -> None:
+        from lib_python_projects.providers.github import _normalize_gh_annotations
+
+        raw = [{"message": "one"}, {"message": "two"}]
+        out = _normalize_gh_annotations(raw, "lint")
+        assert [a.step for a in out] == ["lint", "lint"]
