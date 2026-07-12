@@ -741,6 +741,158 @@ class TestBoardBlock:
         assert board.resolve("Todo") == "Todo"
 
 
+# ---------- Optional `board.auto_labels` block (ticket #154) ----------------
+
+
+class TestBoardAutoLabelsBlock:
+    """Loader-level coverage for the optional `board.auto_labels` block.
+
+    Distinct from the top-level `auto_labels` block (ticket #153, AI
+    attribution) — both can be present on the same project independently.
+    """
+
+    def test_board_auto_labels_round_trips(self, tmp_path: Path):
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+                board:
+                  columns: [Todo, Doing, Done]
+                  binding:
+                    kind: github-projects-v2
+                  auto_labels:
+                    on_create: [triaged]
+                    on_update: [touched]
+                    on_move_to:
+                      Done: [deployed, shipped]
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        board = result.projects[0].board
+        assert board is not None
+        assert board.auto_labels.on_create == ["triaged"]
+        assert board.auto_labels.on_update == ["touched"]
+        assert board.auto_labels.on_move_to == {"Done": ["deployed", "shipped"]}
+
+    def test_board_auto_labels_less_yaml_still_loads_with_defaults(
+        self, tmp_path: Path
+    ):
+        """Backward-compat: omitting `board.auto_labels` entirely stays
+        valid and resolves to empty defaults."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+                board:
+                  columns: [Todo, Doing, Done]
+                  binding:
+                    kind: github-projects-v2
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        board = result.projects[0].board
+        assert board is not None
+        assert board.auto_labels.on_create == []
+        assert board.auto_labels.on_update == []
+        assert board.auto_labels.on_move_to == {}
+
+    def test_board_omitted_entirely_still_loads_ok(self, tmp_path: Path):
+        """Backward-compat: omitting `board` entirely stays valid."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        assert result.projects[0].board is None
+
+    def test_unknown_key_nested_under_board_auto_labels_rejected(
+        self, tmp_path: Path
+    ):
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+                board:
+                  columns: [Todo]
+                  binding:
+                    kind: github-projects-v2
+                  auto_labels:
+                    bogus_key: nope
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "config_error"
+        assert "bogus_key" in (result.error or "")
+        assert result.projects == []
+        assert len(result.invalid_projects) == 1
+        assert result.invalid_projects[0].id == "acme"
+        assert "bogus_key" in result.invalid_projects[0].error
+
+    def test_on_move_to_column_not_in_columns_rejected(self, tmp_path: Path):
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+                board:
+                  columns: [Todo, Doing, Done]
+                  binding:
+                    kind: github-projects-v2
+                  auto_labels:
+                    on_move_to:
+                      Stray: [oops]
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "config_error"
+        assert "Stray" in (result.error or "")
+        assert result.projects == []
+        assert len(result.invalid_projects) == 1
+
+    def test_project_level_and_board_level_auto_labels_coexist(
+        self, tmp_path: Path
+    ):
+        """The top-level `auto_labels` (AI attribution) and
+        `board.auto_labels` (board-column-dependent labels) are distinct
+        and independent — both can be configured on the same project."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: github
+                path: acme/backend
+                auto_labels:
+                  ai_generated: robot-made
+                board:
+                  columns: [Todo, Doing, Done]
+                  binding:
+                    kind: github-projects-v2
+                  auto_labels:
+                    on_create: [triaged]
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        p = result.projects[0]
+        assert p.auto_labels.ai_generated == "robot-made"
+        assert p.board is not None
+        assert p.board.auto_labels.on_create == ["triaged"]
+
+
 # ---------- Optional `auto_labels` block (ticket #153) ----------------------
 
 

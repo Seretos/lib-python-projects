@@ -2094,8 +2094,19 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             if custom_fields and "labels" in custom_fields
             else labels
         )
+        board_create_labels = (
+            project.board.auto_label_names_on_create()
+            if project.board is not None
+            else []
+        )
         merged_labels = list(
-            dict.fromkeys([*(effective_labels or []), project.auto_labels.ai_generated])
+            dict.fromkeys(
+                [
+                    *(effective_labels or []),
+                    project.auto_labels.ai_generated,
+                    *board_create_labels,
+                ]
+            )
         )
         prefixed_body = ensure_body_prefix(body, markers=_marker_set(project))
         path = _project_path(project)
@@ -2227,6 +2238,10 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 and project.auto_labels.ai_modified not in current_labels
             ):
                 add_set.add(project.auto_labels.ai_modified)
+            # Board `on_update` auto-labels (ticket #154). `on_move_to`
+            # stays inert on GitLab — no board-write path here.
+            if project.board is not None:
+                add_set.update(project.board.auto_label_names_on_update())
             if add_set:
                 payload["add_labels"] = ",".join(sorted(add_set))
             if remove_set:

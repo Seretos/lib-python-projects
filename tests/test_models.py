@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from lib_python_projects import (
     AzureBoardsBinding,
     Board,
+    BoardAutoLabels,
     GithubProjectsV2Binding,
     ProjectConfig,
     ProjectsLoadResult,
@@ -338,6 +339,121 @@ class TestBoard:
         d = p.model_dump()
         assert d["board"]["columns"] == ["Todo"]
         assert d["board"]["binding"]["kind"] == "azure-boards"
+
+
+class TestBoardAutoLabels:
+    """`board.auto_labels` is new in ticket #154 — board-column-dependent
+    auto-labels, distinct/independent from the top-level
+    `ProjectConfig.auto_labels` (AI attribution)."""
+
+    def test_defaults_to_empty(self) -> None:
+        labels = BoardAutoLabels()
+        assert labels.on_create == []
+        assert labels.on_update == []
+        assert labels.on_move_to == {}
+
+    def test_rejects_unknown_key(self) -> None:
+        with pytest.raises(ValidationError):
+            BoardAutoLabels(bogus="nope")  # type: ignore[call-arg]
+
+    def test_board_defaults_auto_labels_to_empty(self) -> None:
+        board = Board(
+            columns=["Todo", "Doing", "Done"],
+            binding=GithubProjectsV2Binding(kind="github-projects-v2"),
+        )
+        assert board.auto_labels.on_create == []
+        assert board.auto_labels.on_update == []
+        assert board.auto_labels.on_move_to == {}
+
+    def test_on_move_to_key_matching_column_case_insensitively_accepted(self) -> None:
+        board = Board(
+            columns=["Todo", "Doing", "Done"],
+            binding=GithubProjectsV2Binding(kind="github-projects-v2"),
+            auto_labels={"on_move_to": {"done": ["shipped"]}},
+        )
+        assert board.auto_labels.on_move_to == {"done": ["shipped"]}
+
+    def test_on_move_to_key_not_in_columns_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="stray"):
+            Board(
+                columns=["Todo", "Doing", "Done"],
+                binding=GithubProjectsV2Binding(kind="github-projects-v2"),
+                auto_labels={"on_move_to": {"stray": ["x"]}},
+            )
+
+    def test_on_move_to_empty_label_list_accepted(self) -> None:
+        board = Board(
+            columns=["Todo", "Doing", "Done"],
+            binding=GithubProjectsV2Binding(kind="github-projects-v2"),
+            auto_labels={"on_move_to": {"Done": []}},
+        )
+        assert board.auto_labels.on_move_to == {"Done": []}
+
+    def test_auto_label_names_on_create_dedups_preserving_order(self) -> None:
+        board = Board(
+            columns=["Todo"],
+            binding=GithubProjectsV2Binding(kind="github-projects-v2"),
+            auto_labels={"on_create": ["b", "a", "b", "c", "a"]},
+        )
+        assert board.auto_label_names_on_create() == ["b", "a", "c"]
+
+    def test_auto_label_names_on_update_dedups_preserving_order(self) -> None:
+        board = Board(
+            columns=["Todo"],
+            binding=GithubProjectsV2Binding(kind="github-projects-v2"),
+            auto_labels={"on_update": ["x", "y", "x"]},
+        )
+        assert board.auto_label_names_on_update() == ["x", "y"]
+
+    def test_auto_label_names_for_move_matches_logical_column_name(self) -> None:
+        board = Board(
+            columns=["Todo", "Doing", "Done"],
+            binding=GithubProjectsV2Binding(kind="github-projects-v2"),
+            auto_labels={"on_move_to": {"Done": ["deployed"]}},
+        )
+        assert board.auto_label_names_for_move("Done") == ["deployed"]
+        assert board.auto_label_names_for_move("done") == ["deployed"]
+
+    def test_auto_label_names_for_move_matches_resolved_native_value(self) -> None:
+        board = Board(
+            columns=["Todo", "Doing", "Done"],
+            binding=GithubProjectsV2Binding(
+                kind="github-projects-v2", map={"Done": "Closed"}
+            ),
+            auto_labels={"on_move_to": {"Done": ["deployed"]}},
+        )
+        assert board.auto_label_names_for_move("Closed") == ["deployed"]
+        assert board.auto_label_names_for_move("closed") == ["deployed"]
+
+    def test_auto_label_names_for_move_no_match_returns_empty(self) -> None:
+        board = Board(
+            columns=["Todo", "Doing", "Done"],
+            binding=GithubProjectsV2Binding(kind="github-projects-v2"),
+            auto_labels={"on_move_to": {"Done": ["deployed"]}},
+        )
+        assert board.auto_label_names_for_move("Doing") == []
+
+    def test_auto_label_names_for_move_dedups_across_matching_keys(self) -> None:
+        """Two logical columns that resolve to the same native value both
+        match a single moved-to value; labels dedup across the union."""
+        board = Board(
+            columns=["Doing", "Review", "Done"],
+            binding=GithubProjectsV2Binding(
+                kind="github-projects-v2",
+                map={"Doing": "InProgress", "Review": "InProgress"},
+            ),
+            auto_labels={
+                "on_move_to": {
+                    "Doing": ["in-progress", "shared"],
+                    "Review": ["shared", "reviewing"],
+                }
+            },
+        )
+        assert board.auto_label_names_for_move("InProgress") == [
+            "in-progress",
+            "shared",
+            "reviewing",
+        ]
 
 
 class TestProjectsLoadResult:

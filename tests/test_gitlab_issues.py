@@ -19,7 +19,13 @@ from typing import Callable
 import httpx
 import pytest
 
-from lib_python_projects import AutoLabels, ProjectConfig
+from lib_python_projects import (
+    AutoLabels,
+    AzureBoardsBinding,
+    Board,
+    BoardAutoLabels,
+    ProjectConfig,
+)
 from lib_python_projects.providers import gitlab as gitlab_mod
 from lib_python_projects.providers.base import TicketFilters
 from lib_python_projects.providers.gitlab import GitLabError, GitLabProvider
@@ -1084,6 +1090,94 @@ def test_update_ticket_no_changes_returns_current(
     ticket = GitLabProvider().update_ticket(_project(), "t", "5")
     assert ticket.id == "5"
     assert puts == []
+
+
+# ---------- ticket #154: board.auto_labels (on_create/on_update) ------------
+#
+# `on_create`/`on_update` are honored on GitLab (folded additively into the
+# create POST / update PUT label sets). `on_move_to` is GitHub-only for this
+# iteration — GitLab has no board-write path to hang it off of, so it stays
+# a documented, validated no-op here.
+
+
+def _board_with_auto_labels(**auto_label_kwargs) -> Board:
+    return Board(
+        columns=["Todo", "Doing", "Done"],
+        binding=AzureBoardsBinding(kind="azure-boards"),
+        auto_labels=BoardAutoLabels(**auto_label_kwargs),
+    )
+
+
+def test_create_ticket_on_create_labels_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+    project = _project(board=_board_with_auto_labels(on_create=["triaged"]))
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "/issues" in req.url.path:
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_issue_payload(
+                42,
+                description=captured["body"]["description"],
+                labels=captured["body"].get("labels", "").split(",")
+                if captured["body"].get("labels") else [],
+            ))
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().create_ticket(
+        project, "t", title="New issue", body="content",
+        labels=["bug"], assignees=[],
+    )
+    assert "triaged" in captured["body"]["labels"]
+    assert "ai-generated" in captured["body"]["labels"]
+    assert "bug" in captured["body"]["labels"]
+
+
+def test_update_ticket_on_update_labels_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+    project = _project(board=_board_with_auto_labels(on_update=["touched"]))
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET":
+            return _json(_issue_payload(5, labels=["ai-generated"]))
+        if req.method == "PUT":
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_issue_payload(5))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitLabProvider().update_ticket(project, "t", "5", title="renamed")
+    assert ticket.id == "5"
+    assert "touched" in captured["body"]["add_labels"]
+
+
+def test_update_ticket_on_move_to_configured_but_inert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`on_move_to` validates and loads fine on a GitLab-bound board, but
+    GitLab has no board-write path to fire it from: `update_ticket`
+    neither adds the configured labels nor raises."""
+    captured: dict = {}
+    project = _project(board=_board_with_auto_labels(on_move_to={"Done": ["deployed"]}))
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET":
+            return _json(_issue_payload(5, labels=["ai-generated"]))
+        if req.method == "PUT":
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_issue_payload(5))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitLabProvider().update_ticket(project, "t", "5", title="renamed")
+    assert ticket.id == "5"
+    assert "deployed" not in captured["body"].get("add_labels", "")
 
 
 # ---------- comments / notes -------------------------------------------------

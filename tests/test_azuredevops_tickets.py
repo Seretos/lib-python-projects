@@ -18,7 +18,13 @@ from typing import Callable
 import httpx
 import pytest
 
-from lib_python_projects import AutoLabels, ProjectConfig
+from lib_python_projects import (
+    AutoLabels,
+    AzureBoardsBinding,
+    Board,
+    BoardAutoLabels,
+    ProjectConfig,
+)
 from lib_python_projects.providers import azuredevops as azure_mod
 from lib_python_projects.providers.azuredevops import (
     AzureDevOpsProvider,
@@ -35,6 +41,7 @@ def _project(
     default_type: str | None = None,
     path: str = "seredos/azure-tests/azure-tests",
     auto_labels: AutoLabels | None = None,
+    board: Board | None = None,
 ) -> ProjectConfig:
     return ProjectConfig(
         id="azure-tests",
@@ -43,6 +50,7 @@ def _project(
         token_env="AZURE_TOKEN",
         default_work_item_type=default_type,
         auto_labels=auto_labels or AutoLabels(),
+        board=board,
     )
 
 
@@ -1119,6 +1127,41 @@ def test_create_ticket_uses_configured_default_type(
     # (No assertion needed; the mock would have failed.)
 
 
+def test_create_ticket_on_create_labels_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #154: `board.auto_labels.on_create` labels land in the
+    `System.Tags` JSON-Patch op alongside the AI marker + caller labels."""
+    captured: dict = {}
+    board = Board(
+        columns=["Todo", "Doing", "Done"],
+        binding=AzureBoardsBinding(kind="azure-boards"),
+        auto_labels=BoardAutoLabels(on_create=["triaged"]),
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(7))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(board=board),
+        token="t",
+        title="hello",
+        body="World",
+        labels=["bug"],
+        assignees=[],
+    )
+    tag_op = next(op for op in captured["patch"] if op["path"] == "/fields/System.Tags")
+    tags = set(t.strip() for t in tag_op["value"].split(";") if t.strip())
+    assert tags == {"ai-generated", "bug", "triaged"}
+
+
 def test_azuredevops_create_ticket_without_status_single_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1494,6 +1537,67 @@ def test_update_ticket_body_stamps_custom_modified_marker(
     desc_op = next(op for op in captured["patch"] if op["path"] == "/fields/System.Description")
     assert "#robot-touched" in desc_op["value"]
     assert "#ai-modified" not in desc_op["value"]
+
+
+def test_update_ticket_on_update_labels_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #154: `board.auto_labels.on_update` labels trigger a
+    `System.Tags` write even with no `labels_add`/`labels_remove`."""
+    captured: dict = {}
+    board = Board(
+        columns=["Todo", "Doing", "Done"],
+        binding=AzureBoardsBinding(kind="azure-boards"),
+        auto_labels=BoardAutoLabels(on_update=["touched"]),
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/5"):
+            return _json(_work_item_payload(5, **{"System.Tags": "ai-generated"}))
+        if req.method == "PATCH" and path.endswith("/workitems/5"):
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(5))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = AzureDevOpsProvider().update_ticket(
+        _project(board=board), token="t", ticket_id="5",
+    )
+    assert ticket.id == "5"
+    tag_op = next(op for op in captured["patch"] if op["path"] == "/fields/System.Tags")
+    tags = set(t.strip() for t in tag_op["value"].split(";") if t.strip())
+    assert tags == {"ai-generated", "touched"}
+
+
+def test_update_ticket_on_move_to_configured_but_inert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`on_move_to` validates and loads fine on an Azure-bound board, but
+    Azure Boards has no `status_field`-equivalent write path to fire it
+    from: `update_ticket` neither adds the configured labels nor raises."""
+    captured: dict = {}
+    board = Board(
+        columns=["Todo", "Doing", "Done"],
+        binding=AzureBoardsBinding(kind="azure-boards"),
+        auto_labels=BoardAutoLabels(on_move_to={"Done": ["deployed"]}),
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/5"):
+            return _json(_work_item_payload(5, **{"System.Tags": "ai-generated"}))
+        if req.method == "PATCH" and path.endswith("/workitems/5"):
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(5, **{"System.Title": "renamed"}))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = AzureDevOpsProvider().update_ticket(
+        _project(board=board), token="t", ticket_id="5", title="renamed",
+    )
+    assert ticket.id == "5"
+    assert not any(op["path"] == "/fields/System.Tags" for op in captured["patch"])
 
 
 # ---------- comments ---------------------------------------------------------

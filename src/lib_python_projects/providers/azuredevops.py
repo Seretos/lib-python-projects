@@ -2565,7 +2565,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
 
         markers = _marker_set(project)
         body_with_marker = ensure_body_prefix(body or "", markers=markers)
-        merged_labels = sorted(set([*labels, project.auto_labels.ai_generated]))
+        board_create_labels = (
+            project.board.auto_label_names_on_create()
+            if project.board is not None
+            else []
+        )
+        merged_labels = sorted(
+            set([*labels, project.auto_labels.ai_generated, *board_create_labels])
+        )
 
         patch: list[dict] = [
             {"op": "add", "path": "/fields/System.Title", "value": title},
@@ -2694,12 +2701,22 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             patch.append({"op": "replace", "path": "/fields/System.State", "value": status})
 
         # Labels: read-modify-write the System.Tags string.
-        if labels_add or labels_remove:
+        # Board `on_update` auto-labels (ticket #154) are folded in here
+        # too, additive-only — they can trigger a Tags write even when
+        # the caller passed no labels_add/labels_remove. `on_move_to`
+        # stays inert on Azure Boards (no status_field-equivalent here).
+        board_update_labels = (
+            project.board.auto_label_names_on_update()
+            if project.board is not None
+            else []
+        )
+        if labels_add or labels_remove or board_update_labels:
             current_labels = set(_label_list_from_tags(cur_fields.get("System.Tags")))
             for lbl in labels_add or []:
                 current_labels.add(lbl)
             for lbl in labels_remove or []:
                 current_labels.discard(lbl)
+            current_labels.update(board_update_labels)
             # Always stamp the project's configured "modified" label on a
             # write that doesn't carry the "generated" label already
             # (parity with github.py).
