@@ -10,7 +10,7 @@ made through the same client are captured by one handler.
 from __future__ import annotations
 
 import json
-from typing import Callable
+from typing import Any, Callable
 
 import httpx
 import pytest
@@ -36,7 +36,11 @@ def _board(
     project_number: int | None = 7,
     status_field: str = "Status",
     iteration_field: str | None = None,
+    auto_labels: dict | None = None,
 ) -> Board:
+    kwargs: dict = {}
+    if auto_labels is not None:
+        kwargs["auto_labels"] = auto_labels
     return Board(
         columns=columns,
         binding=GithubProjectsV2Binding(
@@ -47,6 +51,7 @@ def _board(
             iteration_field=iteration_field,
             map=map_,
         ),
+        **kwargs,
     )
 
 
@@ -2319,3 +2324,434 @@ def test_update_ticket_milestone_no_iteration_field_configured_raises(
     _install_mock(monkeypatch, handler)
     with pytest.raises(ValueError, match="iteration_field"):
         GitHubProvider().update_ticket(_project(board), "t", "42", milestone="Sprint 4")
+
+
+# ---------- ticket #154: board.auto_labels (on_create/on_update/on_move_to) --
+#
+# `on_create`/`on_update` are additive, best-effort label sets folded into
+# every provider's create/update payload (GitHub covered here; GitLab/Azure
+# in their own test files). `on_move_to` is GitHub-only for this iteration —
+# it fires from `update_ticket` when `custom_fields` carries a new value for
+# the board's `status_field`.
+
+
+def _status_field_options(owner_field: str, options: list[dict]) -> dict:
+    return {"data": {owner_field: {"projectV2": {"field": {
+        "id": "field-status", "name": "Status", "options": options,
+    }}}}}
+
+
+def _status_field_number(owner_field: str) -> dict:
+    """A `Status`-named field with no `options` — lets a non-string value
+    write successfully as a plain number, isolating the `on_move_to`
+    matching logic (which only ever looks at `str` values) from the
+    unrelated single-select value-type validation."""
+    return {"data": {owner_field: {"projectV2": {"field": {
+        "id": "field-status", "name": "Status",
+    }}}}}
+
+
+def _board_write_graphql_handler(
+    field_responses: dict[str, Any],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Shared GraphQL responder for the `addProjectV2ItemById` /
+    `updateProjectV2ItemFieldValue` / `ProjectV2FieldCommon` /
+    `projectV2(number:$number){id}` sequence `_write_custom_fields_to_board`
+    issues. `field_responses` maps a `fieldName` to the JSON `field_responses[name](owner_field)`
+    the `ProjectV2FieldCommon` lookup should answer with.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path != "/graphql":
+            raise AssertionError(f"unexpected non-graphql request {req.method} {path}")
+        body = _graphql_body(req)
+        query, variables = body["query"], body["variables"]
+        if "addProjectV2ItemById" in query:
+            return _json(
+                {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+            )
+        if "updateProjectV2ItemFieldValue" in query:
+            return _json({
+                "data": {
+                    "updateProjectV2ItemFieldValue": {
+                        "projectV2Item": {"id": "item-1"},
+                    }
+                }
+            })
+        if "ProjectV2FieldCommon" in query:
+            owner_field = _owner_field(query)
+            field_name = variables["fieldName"]
+            builder = field_responses.get(field_name)
+            if builder is None:
+                raise AssertionError(f"unexpected fieldName {field_name!r}")
+            return _json(builder(owner_field))
+        if "projectV2(number:$number){id}" in query:
+            owner_field = _owner_field(query)
+            return _json(
+                {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+            )
+        raise AssertionError(f"unexpected graphql query: {query!r}")
+
+    return handler
+
+
+def test_create_ticket_on_create_labels_land_in_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo", "Done"], auto_labels={"on_create": ["triaged"]})
+    created_payload: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            created_payload.update(json.loads(req.content.decode("utf-8")))
+            return _json(_rest_issue_payload(99))
+        if "/labels" in path:
+            return _json({"name": "x", "color": "ededed"})
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().create_ticket(
+        _project(board), "t", title="hi", body="b", labels=["bug"], assignees=[],
+    )
+    assert ticket.id == "99"
+    assert set(created_payload["labels"]) == {"bug", "ai-generated", "triaged"}
+
+
+def test_create_ticket_on_create_label_already_in_caller_labels_not_duplicated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo", "Done"], auto_labels={"on_create": ["triaged"]})
+    created_payload: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            created_payload.update(json.loads(req.content.decode("utf-8")))
+            return _json(_rest_issue_payload(99))
+        if "/labels" in path:
+            return _json({"name": "x", "color": "ededed"})
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().create_ticket(
+        _project(board), "t", title="hi", body="b", labels=["triaged"], assignees=[],
+    )
+    assert created_payload["labels"].count("triaged") == 1
+
+
+def test_update_ticket_on_update_labels_land_in_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo", "Done"], auto_labels={"on_update": ["touched"]})
+    patch_payloads: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            patch_payloads.append(json.loads(req.content.decode("utf-8")))
+            return _json(_ai_issue_payload(
+                42, labels=[{"name": "ai-generated"}, {"name": "touched"}],
+            ))
+        if "/labels" in path:
+            return _json({"name": "touched", "color": "ededed"})
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(_project(board), "t", "42")
+    assert ticket.id == "42"
+    assert patch_payloads, "expected a REST PATCH carrying the new label"
+    assert "touched" in patch_payloads[0]["labels"]
+
+
+def test_update_ticket_on_move_to_matches_logical_column_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Primary feature test (ticket #154): moving a ticket's board status
+    to a column configured under `on_move_to` adds the configured label to
+    the REST PATCH payload. This fails on pre-#154 code — no such wiring
+    exists there — and passes once `update_ticket` fires `on_move_to`."""
+    board = _board(
+        ["Todo", "Doing", "Done"], owner="acme-org", project_number=7,
+        auto_labels={"on_move_to": {"Done": ["deployed"]}},
+    )
+    patch_payloads: list[dict] = []
+    graphql_handler = _board_write_graphql_handler({
+        "Status": lambda owner_field: _status_field_options(
+            owner_field, [{"id": "opt-done", "name": "Done"}],
+        ),
+    })
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if req.method == "POST" and "/labels" in path:
+            return _json({"name": "deployed", "color": "ededed"})
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            patch_payloads.append(json.loads(req.content.decode("utf-8")))
+            return _json(_ai_issue_payload(
+                42, labels=[{"name": "ai-generated"}, {"name": "deployed"}],
+            ))
+        if path == "/graphql":
+            return graphql_handler(req)
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": "Done"},
+    )
+    assert ticket.id == "42"
+    assert patch_payloads, "expected a REST PATCH carrying the new label"
+    assert "deployed" in patch_payloads[0]["labels"]
+
+
+def test_update_ticket_on_move_to_matches_resolved_native_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Matching also works against the column's resolved provider-native
+    value (via `binding.map`), not just the logical column name."""
+    board = _board(
+        ["Todo", "Doing", "Done"], owner="acme-org", project_number=7,
+        map_={"Done": "Closed"},
+        auto_labels={"on_move_to": {"Done": ["deployed"]}},
+    )
+    patch_payloads: list[dict] = []
+    graphql_handler = _board_write_graphql_handler({
+        "Status": lambda owner_field: _status_field_options(
+            owner_field, [{"id": "opt-closed", "name": "Closed"}],
+        ),
+    })
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if req.method == "POST" and "/labels" in path:
+            return _json({"name": "deployed", "color": "ededed"})
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            patch_payloads.append(json.loads(req.content.decode("utf-8")))
+            return _json(_ai_issue_payload(
+                42, labels=[{"name": "ai-generated"}, {"name": "deployed"}],
+            ))
+        if path == "/graphql":
+            return graphql_handler(req)
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": "Closed"},
+    )
+    assert ticket.id == "42"
+    assert patch_payloads
+    assert "deployed" in patch_payloads[0]["labels"]
+
+
+def test_update_ticket_on_move_to_no_match_adds_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(
+        ["Todo", "Doing", "Done"], owner="acme-org", project_number=7,
+        auto_labels={"on_move_to": {"Done": ["deployed"]}},
+    )
+    graphql_handler = _board_write_graphql_handler({
+        "Status": lambda owner_field: _status_field_options(
+            owner_field, [{"id": "opt-todo", "name": "Todo"}],
+        ),
+    })
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if req.method == "POST" and "/labels" in path:
+            raise AssertionError("no label ensure expected — no on_move_to match")
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            raise AssertionError("no REST label PATCH expected — nothing changed")
+        if path == "/graphql":
+            return graphql_handler(req)
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": "Todo"},
+    )
+    assert ticket.id == "42"
+
+
+def test_update_ticket_on_move_to_ignores_non_status_field_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `custom_fields` key that is not the board's `status_field`
+    (case-insensitively) never triggers `on_move_to`, even if its value
+    happens to match a configured column name."""
+    board = _board(
+        ["Todo", "Doing", "Done"], owner="acme-org", project_number=7,
+        auto_labels={"on_move_to": {"Done": ["deployed"]}},
+    )
+    graphql_handler = _board_write_graphql_handler({
+        "OtherField": lambda owner_field: {"data": {owner_field: {"projectV2": {
+            "field": {"id": "field-other", "name": "OtherField"},
+        }}}},
+    })
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if req.method == "POST" and "/labels" in path:
+            raise AssertionError("no label ensure expected — key isn't status_field")
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            raise AssertionError("no REST label PATCH expected — nothing changed")
+        if path == "/graphql":
+            return graphql_handler(req)
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"OtherField": "Done"},
+    )
+    assert ticket.id == "42"
+
+
+def test_update_ticket_on_move_to_non_str_value_ignored_without_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(
+        ["Todo", "Doing", "Done"], owner="acme-org", project_number=7,
+        auto_labels={"on_move_to": {"Done": ["deployed"]}},
+    )
+    graphql_handler = _board_write_graphql_handler({
+        "Status": lambda owner_field: _status_field_number(owner_field),
+    })
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if req.method == "POST" and "/labels" in path:
+            raise AssertionError("no label ensure expected — value isn't a str")
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            raise AssertionError("no REST label PATCH expected — nothing changed")
+        if path == "/graphql":
+            return graphql_handler(req)
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": 42},
+    )
+    assert ticket.id == "42"
+
+
+def test_update_ticket_on_move_to_label_create_failure_does_not_block_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Best-effort lifecycle, matching the AI markers: a repo that refuses
+    to create the `deployed` label still gets its status moved."""
+    board = _board(
+        ["Todo", "Doing", "Done"], owner="acme-org", project_number=7,
+        auto_labels={"on_move_to": {"Done": ["deployed"]}},
+    )
+    graphql_handler = _board_write_graphql_handler({
+        "Status": lambda owner_field: _status_field_options(
+            owner_field, [{"id": "opt-done", "name": "Done"}],
+        ),
+    })
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if req.method == "POST" and "/labels" in path:
+            return _json({"message": "Forbidden"}, status_code=403)
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            raise AssertionError(
+                "no REST label PATCH expected — label create failed, dropped"
+            )
+        if path == "/graphql":
+            return graphql_handler(req)
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": "Done"},
+    )
+    assert ticket.id == "42"
+
+
+def test_update_ticket_on_move_to_already_present_label_preserves_early_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dedup / additive-only: when the moved-to label is already on the
+    ticket, `new_labels == current_labels` and the existing
+    custom-fields-only board-write early-return path (no REST PATCH) is
+    preserved unchanged."""
+    board = _board(
+        ["Todo", "Doing", "Done"], owner="acme-org", project_number=7,
+        auto_labels={"on_move_to": {"Done": ["deployed"]}},
+    )
+    graphql_handler = _board_write_graphql_handler({
+        "Status": lambda owner_field: _status_field_options(
+            owner_field, [{"id": "opt-done", "name": "Done"}],
+        ),
+    })
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(
+                42, labels=[{"name": "ai-generated"}, {"name": "deployed"}],
+            ))
+        if req.method == "POST" and "/labels" in path:
+            raise AssertionError("label already present — no ensure call expected")
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            raise AssertionError("no REST label PATCH expected — label unchanged")
+        if path == "/graphql":
+            return graphql_handler(req)
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": "Done"},
+    )
+    assert ticket.id == "42"
+
+
+def test_create_ticket_on_move_to_does_not_fire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`on_move_to` is update-path only — `create_ticket` never applies it,
+    even when a matching `custom_fields["Status"]` value is supplied."""
+    board = _board(
+        ["Todo", "Done"], owner="acme-org", project_number=7,
+        auto_labels={"on_move_to": {"Done": ["deployed"]}},
+    )
+    created_payload: dict = {}
+    graphql_handler = _board_write_graphql_handler({
+        "Status": lambda owner_field: _status_field_options(
+            owner_field, [{"id": "opt-done", "name": "Done"}],
+        ),
+    })
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            created_payload.update(json.loads(req.content.decode("utf-8")))
+            return _json(_rest_issue_payload(99))
+        if "/labels" in path:
+            return _json({"name": "ai-generated", "color": "0075ca"})
+        if path == "/graphql":
+            return graphql_handler(req)
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().create_ticket(
+        _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+        custom_fields={"Status": "Done"},
+    )
+    assert ticket.id == "99"
+    assert "deployed" not in created_payload.get("labels", [])

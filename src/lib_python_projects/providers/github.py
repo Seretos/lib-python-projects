@@ -2808,7 +2808,14 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             binding = milestone_binding
         # Deduplicate while preserving order, ensure ai-generated is present.
         ai_generated_label = project.auto_labels.ai_generated
-        merged = list(dict.fromkeys([*labels, ai_generated_label]))
+        board_create_labels = (
+            project.board.auto_label_names_on_create()
+            if project.board is not None
+            else []
+        )
+        merged = list(
+            dict.fromkeys([*labels, ai_generated_label, *board_create_labels])
+        )
         prefixed_body = ensure_body_prefix(body, markers=_marker_set(project))
         # Validate `status` up-front so an invalid value rejects before
         # the POST commits an issue we'd then have to delete or close.
@@ -2818,18 +2825,21 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             label_ok = _ensure_label_best_effort(
                 client, project, ai_generated_label, "generated"
             )
+            # Best-effort ensure each board `on_create` label too (ticket
+            # #154), same non-blocking lifecycle as the AI marker: a
+            # label that can't be created is dropped from the payload
+            # rather than aborting the create.
+            dropped_labels: set[str] = set() if label_ok else {ai_generated_label}
+            for name in board_create_labels:
+                if not _ensure_label_best_effort(client, project, name, "board"):
+                    dropped_labels.add(name)
             payload: dict[str, Any] = {
                 "title": title,
                 "body": prefixed_body,
             }
-            if label_ok:
-                payload["labels"] = merged
-            else:
-                # Drop only the AI marker; keep any caller-supplied labels
-                # so an unrelated `bug` / `enhancement` label still lands.
-                other = [lbl for lbl in merged if lbl != ai_generated_label]
-                if other:
-                    payload["labels"] = other
+            payload_labels = [lbl for lbl in merged if lbl not in dropped_labels]
+            if payload_labels:
+                payload["labels"] = payload_labels
             if assignees:
                 payload["assignees"] = assignees
             r = client.post(f"{_repo_path(project)}/issues", json=payload)
@@ -3028,6 +3038,36 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         new_labels.add(ai_modified_label)
                 else:
                     new_labels.add(ai_modified_label)
+
+            # Board-column-dependent auto-labels (ticket #154), additive
+            # and best-effort like the AI markers above.
+            if project.board is not None:
+                for name in project.board.auto_label_names_on_update():
+                    if name not in new_labels and _ensure_label_best_effort(
+                        client, project, name, "board"
+                    ):
+                        new_labels.add(name)
+
+                # `on_move_to`: fires unconditionally (no prior-column
+                # diff) whenever `custom_fields` carries a new value for
+                # the board's status field. GitHub-only for now — Azure
+                # and GitLab have no equivalent board-write path here.
+                if custom_fields:
+                    status_field = binding.status_field  # type: ignore[union-attr]
+                    move_value: str | None = None
+                    for key, value in custom_fields.items():
+                        if key.lower() == status_field.lower():
+                            if isinstance(value, str):
+                                move_value = value
+                            break
+                    if move_value is not None:
+                        for name in project.board.auto_label_names_for_move(
+                            move_value
+                        ):
+                            if name not in new_labels and _ensure_label_best_effort(
+                                client, project, name, "board"
+                            ):
+                                new_labels.add(name)
 
             new_assignees = set(current_assignees)
             if assignees_add:

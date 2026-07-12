@@ -138,6 +138,36 @@ class AzureBoardsBinding(BoardBinding):
     board: str | None = None
 
 
+class BoardAutoLabels(BaseModel):
+    """Board-column-dependent auto-labels (ticket #154).
+
+    Distinct and independent from the top-level `ProjectConfig.auto_labels`
+    (`AutoLabels`): that block names the AI-attribution
+    (`ai-generated`/`ai-modified`) labels/markers applied regardless of
+    board state. This block instead lets operators declare "when this
+    happens, apply these labels" rules scoped to the board's lifecycle:
+
+    - `on_create`: labels applied whenever a ticket is created.
+    - `on_update`: labels applied whenever a ticket is updated.
+    - `on_move_to`: labels applied when a ticket moves into a specific
+      logical board column, keyed by the column name (must match an
+      entry in `Board.columns`).
+
+    `on_create`/`on_update` are honored on all three providers (GitHub,
+    GitLab, Azure DevOps), folded additively into each provider's
+    existing label set. `on_move_to` is currently honored **only on
+    GitHub Projects v2** (fires from `update_ticket` when `custom_fields`
+    carries a new value for the board's `status_field`). Azure Boards and
+    GitLab accept and validate `on_move_to` — it does not raise — but do
+    not fire it yet; it is a documented no-op on those two providers.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    on_create: list[str] = Field(default_factory=list)
+    on_update: list[str] = Field(default_factory=list)
+    on_move_to: dict[str, list[str]] = Field(default_factory=dict)
+
+
 class Board(BaseModel):
     """Optional board configuration for a project.
 
@@ -152,6 +182,10 @@ class Board(BaseModel):
     binding: Annotated[
         GithubProjectsV2Binding | AzureBoardsBinding, Field(discriminator="kind")
     ]
+    # Board-column-dependent auto-labels (ticket #154). Defaults to empty
+    # lists/dict, so a board with no `auto_labels:` block behaves exactly
+    # as before.
+    auto_labels: BoardAutoLabels = Field(default_factory=BoardAutoLabels)
 
     @model_validator(mode="after")
     def _check_columns(self) -> "Board":
@@ -180,6 +214,18 @@ class Board(BaseModel):
                     )
         return self
 
+    @model_validator(mode="after")
+    def _check_auto_labels_move_keys(self) -> "Board":
+        if self.auto_labels.on_move_to:
+            columns_lower = {col.lower() for col in self.columns}
+            for key in self.auto_labels.on_move_to:
+                if key.lower() not in columns_lower:
+                    raise ValueError(
+                        f"board auto_labels 'on_move_to' key {key!r} does not "
+                        f"match any entry in 'columns' {self.columns!r}"
+                    )
+        return self
+
     def resolve(self, column: str) -> str:
         """Resolve a logical column name to its provider-native value.
 
@@ -191,6 +237,30 @@ class Board(BaseModel):
                 if key.lower() == column.lower():
                     return value
         return column
+
+    def auto_label_names_on_create(self) -> list[str]:
+        """Order-preserving dedup of `auto_labels.on_create`."""
+        return list(dict.fromkeys(self.auto_labels.on_create))
+
+    def auto_label_names_on_update(self) -> list[str]:
+        """Order-preserving dedup of `auto_labels.on_update`."""
+        return list(dict.fromkeys(self.auto_labels.on_update))
+
+    def auto_label_names_for_move(self, value: str) -> list[str]:
+        """Labels to apply when a ticket moves into the column `value`.
+
+        For each configured `on_move_to` column key, matches `value`
+        case-insensitively against either the logical column name (the
+        key itself) or its resolved provider-native value
+        (`self.resolve(key)`). Returns the order-preserving dedup of
+        labels across every matching key; `[]` when nothing matches.
+        """
+        names: list[str] = []
+        value_lower = value.lower()
+        for key, key_labels in self.auto_labels.on_move_to.items():
+            if key.lower() == value_lower or self.resolve(key).lower() == value_lower:
+                names.extend(key_labels)
+        return list(dict.fromkeys(names))
 
 
 class ProjectConfig(BaseModel):
