@@ -1722,6 +1722,46 @@ def test_update_ticket_custom_fields_none_or_empty_is_noop(
     assert ticket_empty.id == "42"
 
 
+def test_update_ticket_status_reopen_without_custom_fields_does_not_touch_board(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #175: `status="open"` alone (no `custom_fields`) must only
+    PATCH the REST issue state/state_reason — it must never write the
+    Projects-v2 board Status field, even when the ticket was previously
+    moved to a terminal column like "Done". There is no configured
+    default/open column to reset it to, so `update_ticket` leaves the
+    board column untouched; callers who want that must pass
+    `custom_fields={"Status": "<column>"}` explicitly (see the updated
+    docstring)."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, state="closed"))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, state="open"))
+        if path == "/graphql":
+            raise AssertionError(
+                "no GraphQL/board call expected for a status-only reopen "
+                "without custom_fields"
+            )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", status="open",
+    )
+    assert ticket.status == "open"
+
+    patch_requests = [r for r in seen if r.method == "PATCH"]
+    assert len(patch_requests) == 1
+    patch_payload = json.loads(patch_requests[0].content.decode("utf-8"))
+    assert patch_payload["state"] == "open"
+
+    assert not any(r.url.path == "/graphql" for r in seen)
+
+
 def test_update_ticket_custom_fields_no_board_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
