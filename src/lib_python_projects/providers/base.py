@@ -510,8 +510,13 @@ class PullRequest:
       - `mergeable_state`: GitHub's qualitative state — `clean`, `dirty`,
         `behind`, `unstable`, `blocked`, `draft`, `unknown`.
       - `review_decision`: `APPROVED` / `REVIEW_REQUIRED` /
-        `CHANGES_REQUESTED`. Sourced from GraphQL only; the REST `_map_pr`
-        path leaves it `None`.
+        `CHANGES_REQUESTED`. No longer GitHub-GraphQL-only: `get_pr` now
+        best-effort populates it on all three providers from review /
+        approval / vote data (GitLab keeps its own existing gate-aware
+        derivation in `_map_mr`, which is richer than the generic
+        `review_decision_from_states` helper). The REST-only `_map_pr`
+        path (used by `list_prs`/search) still leaves it `None` on
+        GitHub.
       - `auto_merge`: GitHub's auto-merge configuration block (or `None`
         when auto-merge is not enabled).
 
@@ -538,6 +543,14 @@ class PullRequest:
       list endpoint does not compute mergeability for cost reasons. Both
       fields are always `None` in `list_prs` results. Call `get_pr` for
       the single-PR path, which does populate them.
+
+    Reviews note (ticket #148):
+      `reviews`: the submitted `Review` objects for this PR/MR. Populated
+      by `get_pr` on every provider (GitHub: `GET /pulls/{n}/reviews`;
+      GitLab: synthesised from the already-fetched `/approvals` payload;
+      Azure DevOps: synthesised from reviewer vote data). Stays an empty
+      list on `list_prs`/search-stub paths, which do not fetch per-PR
+      review data.
     """
 
     id: str
@@ -566,6 +579,7 @@ class PullRequest:
     pipeline_status: str | None = None
     approvals_required: int | None = None
     approvals_received: int | None = None
+    reviews: list[Review] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     # True when this PullRequest was returned from the idempotency store
     # (a retried `create_pr` call with a previously-used `idempotency_key`)
@@ -659,6 +673,21 @@ class Review:
     url: str | None
     submitted_at: str
     commit_sha: str | None = None
+
+
+def review_decision_from_states(states: list[str]) -> str | None:
+    """Derive a coarse review decision from a list of normalized review states.
+
+    `states` should already be reduced to one entry per author (e.g. the
+    latest state per author) — this helper does not itself deduplicate.
+    Any `"request_changes"` wins over everything else; otherwise any
+    `"approve"` yields `"APPROVED"`; otherwise `None` (no signal).
+    """
+    if "request_changes" in states:
+        return "CHANGES_REQUESTED"
+    if "approve" in states:
+        return "APPROVED"
+    return None
 
 
 @dataclass

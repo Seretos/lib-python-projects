@@ -334,6 +334,101 @@ def test_gitlab_get_pr_gate_partially_approved(
     assert pr.approvals_required == 2
 
 
+# ---------- get_pr reviews (ticket #148) -------------------------------------
+
+
+def test_gitlab_get_pr_populates_reviews_from_approvals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`pr.reviews` is synthesized from the same `/approvals` payload
+    `get_pr` already fetches — one `Review(state="approve", ...)` per
+    approver, no extra round trip. `review_decision`/`reviewers` are
+    unchanged from the existing `_map_mr` behavior (not touched by this
+    change)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5/approvals"):
+            return _json({
+                "approved": True,
+                "approvals_required": 1,
+                "approvals_left": 0,
+                "approved_by": [
+                    {"user": {"id": 1, "username": "alice"}},
+                    {"user": {"id": 2, "username": "bob"}},
+                ],
+            })
+        if url.endswith("merge_requests/5"):
+            return _json(_mr_payload(5))
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    assert [rv.author for rv in pr.reviews] == ["alice", "bob"]
+    assert all(rv.state == "approve" for rv in pr.reviews)
+    assert all(rv.body is None and rv.url is None for rv in pr.reviews)
+    assert all(rv.submitted_at == "" for rv in pr.reviews)
+    # Unchanged from existing _map_mr behavior.
+    assert pr.review_decision == "APPROVED"
+    assert pr.approvals_received == 2
+
+
+def test_gitlab_get_pr_degraded_approvals_leaves_reviews_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When `/approvals` 403s/404s, `get_pr` degrades gracefully: `pr.reviews`
+    stays `[]` rather than raising, and the rest of the MR data (title,
+    id, ...) is still returned intact."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5/approvals"):
+            return _json({}, status_code=403)
+        if url.endswith("merge_requests/5"):
+            return _json(_mr_payload(5))
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    assert pr.reviews == []
+    assert pr.id == "5"
+    assert pr.title == "MR 5"
+    assert pr.review_decision is None
+    assert pr.approvals_received is None
+
+
+def test_gitlab_list_pr_reviews_and_get_pr_reviews_agree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`list_pr_reviews` and `get_pr`'s `pr.reviews` are built from the
+    same `_reviews_from_approvals` helper, so they must not diverge."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/5/approvals"):
+            return _json({
+                "approved": True,
+                "approvals_required": 1,
+                "approvals_left": 0,
+                "approved_by": [{"user": {"id": 1, "username": "alice"}}],
+            })
+        if url.endswith("merge_requests/5"):
+            return _json(_mr_payload(5))
+        if "merge_requests/5/notes" in url:
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = GitLabProvider().get_pr(_project(), "t", "5")
+    standalone = GitLabProvider().list_pr_reviews(_project(), "t", "5")
+    assert [rv.author for rv in pr.reviews] == [rv.author for rv in standalone]
+    assert [rv.state for rv in pr.reviews] == [rv.state for rv in standalone]
+
+
 def test_gitlab_list_prs_does_not_fetch_approvals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -864,6 +864,17 @@ def test_all_providers_expose_list_pr_reviews():
         )
 
 
+def test_pull_request_dataclass_has_reviews_field():
+    """`PullRequest.reviews` is a new field (ticket #148) wiring
+    `list_pr_reviews` data into `get_pr` on every provider. Static
+    structural assertion mirroring `test_bulk_ticket_result_dataclass_fields`."""
+    import dataclasses
+    from lib_python_projects.providers.base import PullRequest
+
+    field_names = {f.name for f in dataclasses.fields(PullRequest)}
+    assert "reviews" in field_names
+
+
 # ---------- ticket #35: Label dataclass and LabelOperationUnsupported --------
 
 

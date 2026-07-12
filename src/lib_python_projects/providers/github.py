@@ -43,6 +43,7 @@ from lib_python_projects.providers.base import (
     RelationKindUnsupported,
     RelationNotFound,
     Review,
+    review_decision_from_states,
     ReviewComment,
     ReviewState,
     Status,
@@ -414,9 +415,40 @@ def _map_review(raw: dict) -> Review | None:
         author=(raw.get("user") or {}).get("login", ""),
         body=raw.get("body") or "",
         url=raw.get("html_url") or "",
-        submitted_at=raw.get("submitted_at"),
+        submitted_at=raw.get("submitted_at") or "",
         commit_sha=raw.get("commit_id"),
     )
+
+
+def _fetch_pr_reviews(client: httpx.Client, project: ProjectConfig, pr_id: str) -> list[Review]:
+    """Fetch and map submitted reviews for a PR via an already-open client.
+
+    Shared by `list_pr_reviews` and `get_pr` so the two paths can't
+    diverge. Hits `GET /repos/{o}/{r}/pulls/{n}/reviews`, capped at 100
+    per page (the GitHub maximum). `PENDING` reviews (still being
+    drafted by the reviewer, not yet submitted) are skipped — see
+    `_map_review`.
+    """
+    r = client.get(
+        f"{_repo_path(project)}/pulls/{pr_id}/reviews",
+        params={"per_page": 100},
+    )
+    _check(r)
+    reviews = [_map_review(it) for it in r.json()]
+    return [rv for rv in reviews if rv is not None]
+
+
+def _latest_reviews_by_author(reviews: list[Review]) -> list[Review]:
+    """Reduce a review list to one entry per author: the most recently
+    submitted review. Ties (equal or missing `submitted_at`) fall back to
+    list order — the entry appearing later in `reviews` wins.
+    """
+    latest: dict[str, Review] = {}
+    for rv in reviews:
+        existing = latest.get(rv.author)
+        if existing is None or rv.submitted_at >= existing.submitted_at:
+            latest[rv.author] = rv
+    return list(latest.values())
 
 
 def _map_pr(raw: dict) -> PullRequest:
@@ -3648,6 +3680,13 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         endpoint (`/pulls/{n}/comments`) and aren't merged in here — the
         plan scopes PR comments to the issue-shared `/issues/{n}/comments`
         endpoint, which is what `add_pr_comment` posts to.
+
+        Also fetches submitted reviews (`GET /pulls/{n}/reviews`, via the
+        shared `_fetch_pr_reviews` helper also used by `list_pr_reviews`)
+        and populates `pr.reviews` (all submitted reviews), `pr.reviewers`
+        (distinct authors, keeping each author's most recently submitted
+        review), and `pr.review_decision` (derived from the latest
+        per-author review states; ticket #148).
         """
         with _client(token) as client:
             r = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
@@ -3659,6 +3698,13 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             )
             _check(c)
             comments = [_map_comment(it) for it in c.json()]
+            reviews = _fetch_pr_reviews(client, project, pr_id)
+        latest_by_author = _latest_reviews_by_author(reviews)
+        pr.reviews = reviews
+        pr.reviewers = [rv.author for rv in latest_by_author]
+        pr.review_decision = review_decision_from_states(
+            [rv.state for rv in latest_by_author]
+        )
         return pr, comments
 
     def create_pr(
@@ -4053,13 +4099,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         reviewer, not yet submitted) are skipped.
         """
         with _client(token) as client:
-            r = client.get(
-                f"{_repo_path(project)}/pulls/{pr_id}/reviews",
-                params={"per_page": 100},
-            )
-            _check(r)
-            reviews = [_map_review(it) for it in r.json()]
-            return [rv for rv in reviews if rv is not None]
+            return _fetch_pr_reviews(client, project, pr_id)
 
     def add_pr_review_comment(
         self,

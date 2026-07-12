@@ -658,6 +658,46 @@ def _fetch_mr_approvals(
     return ar.json()
 
 
+def _reviews_from_approvals(approvals: dict | None) -> list[Review]:
+    """Synthesize `Review` objects (one per approver) from an already-
+    fetched `/approvals` payload.
+
+    Shared by `get_pr` (which already has the payload from
+    `_fetch_mr_approvals`) and `list_pr_reviews` (which fetches it
+    itself), so the two surfaces can't diverge. `approvals=None` (the
+    403/404-degraded sentinel from `_fetch_mr_approvals`) yields `[]`
+    rather than raising — same graceful fallback used elsewhere for this
+    endpoint.
+
+    GitLab has no review-object endpoint — unlike GitHub/Azure DevOps,
+    there is nothing that models a submitted "review" as a distinct
+    resource, so this emits one `Review(state="approve", ...)` per entry
+    in the `approved_by[]` array. **Known limitation**:
+    request_changes/comment-style reviews are posted as plain notes on
+    GitLab (see `submit_pr_review`), which are indistinguishable from
+    ordinary MR comments once posted — those are therefore NOT
+    recoverable here; only approvals are. The approvals payload also
+    carries no per-approver timestamp or note body, so `body` and `url`
+    are `None` and `submitted_at` is `""` for every entry — this mirrors
+    the `Review.body`/`Review.url` "null means not applicable"
+    convention documented on the dataclass.
+    """
+    if not approvals:
+        return []
+    approved_by = approvals.get("approved_by") or []
+    return [
+        Review(
+            id=str((entry.get("user") or {}).get("id", "")),
+            state="approve",
+            author=(entry.get("user") or {}).get("username", ""),
+            body=None,
+            url=None,
+            submitted_at="",
+        )
+        for entry in approved_by
+    ]
+
+
 # GitLab pipeline statuses we treat as terminal — anything else is
 # in-flight and yields `conclusion=None` on the common dataclass.
 _TERMINAL_PIPELINE_STATUSES = {"success", "failed", "canceled", "skipped"}
@@ -2772,6 +2812,11 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         case it performs the same fetch+degrade per MR. Callers that
         need accurate approval state on a single MR should always use
         `get_pr`.
+
+        `pr.reviews` is synthesized from the same approvals payload via
+        `_reviews_from_approvals` — no extra round trip. On the
+        degraded (403/404) approvals path, `pr.reviews` stays `[]` while
+        the rest of the MR data is still returned (ticket #148).
         """
         path = _project_path(project)
         with _client(project, token) as client:
@@ -2780,6 +2825,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             raw_mr = r.json()
             approvals = _fetch_mr_approvals(client, path, pr_id)
             pr = _map_mr(raw_mr, project, approvals=approvals)
+            pr.reviews = _reviews_from_approvals(approvals)
             c = client.get(
                 f"/projects/{path}/merge_requests/{pr_id}/notes",
                 params={"per_page": 100, "sort": "asc", "order_by": "created_at"},
@@ -3087,8 +3133,9 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         there is nothing that models a submitted "review" as a distinct
         resource. This method hits `GET /projects/:id/merge_requests/
         :iid/approvals` (the same endpoint `get_pr` already uses) and
-        emits one `Review(state="approve", ...)` per entry in the
-        `approved_by[]` array.
+        synthesizes one `Review(state="approve", ...)` per entry in the
+        `approved_by[]` array, via the shared `_reviews_from_approvals`
+        helper (also used by `get_pr`, so the two paths can't diverge).
 
         **Known limitation**: request_changes/comment-style reviews are
         posted as plain notes on GitLab (see `submit_pr_review`), which
@@ -3108,24 +3155,8 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         """
         path = _project_path(project)
         with _client(project, token) as client:
-            ar = client.get(
-                f"/projects/{path}/merge_requests/{pr_id}/approvals"
-            )
-            if ar.status_code in (403, 404):
-                return []
-            _check(ar)
-            approved_by = ar.json().get("approved_by") or []
-            return [
-                Review(
-                    id=str((entry.get("user") or {}).get("id", "")),
-                    state="approve",
-                    author=(entry.get("user") or {}).get("username", ""),
-                    body=None,
-                    url=None,
-                    submitted_at="",
-                )
-                for entry in approved_by
-            ]
+            approvals = _fetch_mr_approvals(client, path, pr_id)
+            return _reviews_from_approvals(approvals)
 
     def add_pr_review_comment(
         self,
