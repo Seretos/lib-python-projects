@@ -1857,3 +1857,33 @@ def test_azuredevops_create_ticket_honors_custom_auto_labels(monkeypatch):
     assert "#ai-generated" not in desc_op["value"]
     assert "robot-made" in tag_op["value"]
     assert "ai-generated" not in tag_op["value"]
+
+
+# ---------- ticket #168: get_step_log cross-provider parity ------------------
+
+
+def test_all_providers_expose_get_step_log():
+    """All three providers must expose get_step_log as a callable.
+    This is a static structural assertion."""
+    from lib_python_projects.providers.github import GitHubProvider
+    from lib_python_projects.providers.gitlab import GitLabProvider
+    from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+
+    for provider_cls in (GitHubProvider, GitLabProvider, AzureDevOpsProvider):
+        assert callable(getattr(provider_cls, "get_step_log", None)), (
+            f"{provider_cls.__name__} is missing callable 'get_step_log'"
+        )
+
+
+def test_failing_job_dataclass_exposes_job_id():
+    """FailingJob must have a job_id field so callers can round-trip from
+    get_run's failure excerpt into get_step_log. This is a static
+    structural assertion."""
+    from lib_python_projects.providers.base import FailingJob
+    import dataclasses
+    field_names = {f.name for f in dataclasses.fields(FailingJob)}
+    assert "job_id" in field_names, (
+        "FailingJob.job_id field is missing — all three providers must "
+        "populate it so callers can fetch a job's full log via "
+        "Provider.get_step_log (ticket #168)."
+    )

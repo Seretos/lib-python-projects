@@ -1082,3 +1082,131 @@ class TestNormalizeGhAnnotations:
         raw = [{"message": "one"}, {"message": "two"}]
         out = _normalize_gh_annotations(raw, "lint")
         assert [a.step for a in out] == ["lint", "lint"]
+
+
+# ---------- ticket #168: get_step_log ----------------------------------------
+
+
+def test_get_step_log_returns_full_unbounded_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_step_log must return the ENTIRE log body, uncapped — larger than
+    the 256 KB excerpt cap that _fetch_job_log normally applies."""
+    run_id = 12345
+    job_id = 99
+
+    padding_line = "x" * 200
+    padding_lines = [padding_line] * 1400  # ~281 KB, over the 256 KB cap
+    full_log_text = "\n".join(padding_lines + ["END-OF-LOG-SENTINEL"])
+    assert len(full_log_text.encode("utf-8")) > 256 * 1024
+
+    seen_max_bytes: list = []
+
+    def fake_fetch(token, url, *, max_bytes=256 * 1024):
+        seen_max_bytes.append(max_bytes)
+        assert url == f"/repos/acme/backend/actions/jobs/{job_id}/logs"
+        return full_log_text
+
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log", fake_fetch,
+    )
+
+    result = GitHubProvider().get_step_log(
+        _project(), token="t", run_id=str(run_id), job_id=str(job_id)
+    )
+    assert result == full_log_text
+    assert result.splitlines()[-1] == "END-OF-LOG-SENTINEL"
+    assert seen_max_bytes == [None]
+
+
+def test_get_step_log_404_raises_github_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When _fetch_job_log returns None (403/404 on the redirect), get_step_log
+    must raise a typed GitHubError(404, ...) rather than returning None."""
+    from lib_python_projects.providers.github import GitHubError
+
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log",
+        lambda token, url, *, max_bytes=256 * 1024: None,
+    )
+
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().get_step_log(
+            _project(), token="t", run_id="12345", job_id="99"
+        )
+    assert exc.value.status == 404
+
+
+def test_get_step_log_empty_body_returns_empty_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty (but present) log body must round-trip as "" rather than
+    being treated as an error."""
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log",
+        lambda token, url, *, max_bytes=256 * 1024: "",
+    )
+
+    result = GitHubProvider().get_step_log(
+        _project(), token="t", run_id="12345", job_id="99"
+    )
+    assert result == ""
+
+
+def test_get_step_log_non_numeric_run_id_raises_before_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-numeric run_id must raise GitHubError(404, ...) without calling
+    _fetch_job_log at all."""
+    from lib_python_projects.providers.github import GitHubError
+
+    def fail_fetch(token, url, *, max_bytes=256 * 1024):
+        raise AssertionError("_fetch_job_log must not be called for non-numeric run_id")
+
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log", fail_fetch,
+    )
+
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().get_step_log(
+            _project(), token="t", run_id="main", job_id="99"
+        )
+    assert exc.value.status == 404
+    assert "main" in exc.value.message
+
+
+def test_get_run_to_get_step_log_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The FailingJob.job_id populated by get_run(include_failure_excerpt=True)
+    must be usable, unmodified, as the job_id argument to get_step_log — and
+    it must hit the same log endpoint."""
+    run_id = 56789
+    job_id = 4242
+    head_sha = "cafefeed"
+    full_log_text = "full raw job log contents\nline 2\n"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == f"/repos/acme/backend/actions/runs/{run_id}":
+            return _json(_failed_run_payload(run_id, head_sha))
+        if path == f"/repos/acme/backend/actions/runs/{run_id}/jobs":
+            return _json(_jobs_payload(job_id))
+        raise AssertionError(f"unexpected JSON request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+
+    requested_urls: list[str] = []
+
+    def fake_fetch(token, url, *, max_bytes=256 * 1024):
+        requested_urls.append(url)
+        return full_log_text
+
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log", fake_fetch,
+    )
+
+    run = GitHubProvider().get_run(_project(), token="t", run_id=str(run_id))
+    assert run.failure is not None
+    assert len(run.failure.failing_jobs) == 1
+    resolved_job_id = run.failure.failing_jobs[0].job_id
+    assert resolved_job_id == str(job_id)
+
+    result = GitHubProvider().get_step_log(
+        _project(), token="t", run_id=str(run_id), job_id=resolved_job_id
+    )
+    assert result == full_log_text
+    assert requested_urls[-1] == f"/repos/acme/backend/actions/jobs/{job_id}/logs"

@@ -1756,3 +1756,124 @@ def test_list_runs_recent_nonpositive_limit_raises_before_http(
         AzureDevOpsProvider().list_runs_recent(
             _project(), token="t", limit=bad_limit,
         )
+
+
+# ---------- ticket #168: get_step_log -----------------------------------------
+
+
+def test_get_step_log_returns_full_unbounded_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """get_step_log must return the FULL log body, not the [-120:] tail
+    slice the failure-excerpt path applies."""
+    lines = [f"line-{i}" for i in range(200)]
+    full_log_text = "\n".join(lines)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/build/builds/101/logs/5"):
+            return httpx.Response(
+                status_code=200,
+                content=full_log_text.encode("utf-8"),
+                headers={"Content-Type": "text/plain"},
+            )
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().get_step_log(
+        _project(), token="t", run_id="101", job_id="5"
+    )
+    assert result == full_log_text
+    assert len(result.splitlines()) == 200
+    assert "line-0" in result  # no [-120:] slicing — the head must survive
+
+
+def test_get_step_log_404_raises_azuredevops_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "not found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().get_step_log(
+            _project(), token="t", run_id="101", job_id="5"
+        )
+    assert exc.value.status == 404
+
+
+def test_get_step_log_empty_body_returns_empty_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code=200, content=b"", headers={"Content-Type": "text/plain"},
+        )
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().get_step_log(
+        _project(), token="t", run_id="101", job_id="5"
+    )
+    assert result == ""
+
+
+def test_get_step_log_non_numeric_run_id_raises_404_without_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call should be made for non-numeric id")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().get_step_log(
+            _project(), token="t", run_id="not-a-number", job_id="5"
+        )
+    assert exc.value.status == 404
+    assert "not-a-number" in exc.value.message
+
+
+def test_get_run_to_get_step_log_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FailingJob.job_id from get_run(include_failure_excerpt=True) carries
+    the build *log* id (`rec["log"]["id"]`), and must be usable, unmodified,
+    as get_step_log's job_id — hitting the same logs endpoint."""
+    full_log_text = "full raw build log\nline 2\n"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/build/builds/101"):
+            return _json(_build_payload(101, result="failed"))
+        if path.endswith("/_apis/build/builds/101/timeline"):
+            return _json({
+                "records": [
+                    {
+                        "id": "j1",
+                        "type": "Job",
+                        "name": "Build",
+                        "result": "failed",
+                        "log": {"id": 5, "url": "x"},
+                    },
+                ]
+            })
+        if path.endswith("/_apis/build/builds/101/logs/5"):
+            return httpx.Response(
+                status_code=200,
+                content=full_log_text.encode("utf-8"),
+                headers={"Content-Type": "text/plain"},
+            )
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    run = AzureDevOpsProvider().get_run(
+        _project(), token="t", run_id="101", include_failure_excerpt=True
+    )
+    assert run.failure is not None
+    assert len(run.failure.failing_jobs) == 1
+    resolved_job_id = run.failure.failing_jobs[0].job_id
+    assert resolved_job_id == "5"
+
+    result = AzureDevOpsProvider().get_step_log(
+        _project(), token="t", run_id="101", job_id=resolved_job_id
+    )
+    assert result == full_log_text

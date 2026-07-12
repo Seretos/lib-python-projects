@@ -531,3 +531,99 @@ def test_list_runs_recent_nonpositive_limit_raises_before_http(
         GitLabProvider().list_runs_recent(
             _project(), token="t", limit=bad_limit,
         )
+
+
+# ---------- ticket #168: get_step_log -----------------------------------------
+
+
+def test_get_step_log_returns_full_unbounded_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """get_step_log must return the trace in full, without the
+    _TRACE_TAIL_LIMIT truncation the excerpt path applies."""
+    full_trace = ("x" * 10000) + "\nLAST LINE\n"
+    assert len(full_trace) > gitlab_mod._TRACE_TAIL_LIMIT
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert "/projects/acme%2Fbackend/jobs/2/trace" in str(req.url)
+        return httpx.Response(
+            200, content=full_trace.encode("utf-8"),
+            headers={"Content-Type": "text/plain"},
+        )
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().get_step_log(
+        _project(), "t", run_id="100", job_id="2",
+    )
+    assert result == full_trace
+    assert len(result) > gitlab_mod._TRACE_TAIL_LIMIT
+
+
+def test_get_step_log_404_raises_gitlab_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, 404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().get_step_log(_project(), "t", run_id="100", job_id="2")
+    assert exc.value.status == 404
+
+
+def test_get_step_log_empty_body_returns_empty_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=b"", headers={"Content-Type": "text/plain"},
+        )
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().get_step_log(
+        _project(), "t", run_id="100", job_id="2",
+    )
+    assert result == ""
+
+
+def test_get_run_to_get_step_log_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FailingJob.job_id from get_run(include_failure_excerpt=True) must be
+    usable, unmodified, as get_step_log's job_id — hitting the same trace
+    endpoint."""
+    full_trace = "full raw trace\nline 2\n"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/pipelines/100/jobs" in url:
+            return _json([
+                {
+                    "id": 9, "name": "test", "status": "failed",
+                    "stage": "test", "web_url": "u2",
+                },
+            ])
+        if "/pipelines/100" in url and "/jobs" not in url:
+            return _json(_pipeline(100, status="failed"))
+        if "/jobs/9/trace" in url:
+            return httpx.Response(
+                200, content=full_trace.encode("utf-8"),
+                headers={"Content-Type": "text/plain"},
+            )
+        return _json({}, 404)
+
+    _install_mock(monkeypatch, handler)
+    run = GitLabProvider().get_run(
+        _project(), "t", "100", include_failure_excerpt=True,
+    )
+    assert run.failure is not None
+    assert len(run.failure.failing_jobs) == 1
+    resolved_job_id = run.failure.failing_jobs[0].job_id
+    assert resolved_job_id == "9"
+
+    result = GitLabProvider().get_step_log(
+        _project(), "t", run_id="100", job_id=resolved_job_id,
+    )
+    assert result == full_trace

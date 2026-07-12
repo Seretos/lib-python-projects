@@ -797,7 +797,13 @@ class FailingJob:
     map from, so its `annotations` is always `[]` (see
     `gitlab._fetch_pipeline_failure`). `log_excerpt` is a small text
     excerpt around the failure (or `None` when logs were unavailable,
-    e.g. 403/404 on the log endpoint).
+    e.g. 403/404 on the log endpoint). `job_id` is the provider-native
+    identifier needed to fetch this job's full log via
+    `Provider.get_step_log` (ticket #168) — for GitHub and GitLab it's
+    the job id; for Azure DevOps it's the build *log* id
+    (`rec["log"]["id"]`), not the timeline record GUID. Defaults to
+    `""` when unavailable so existing `FailingJob(...)` call sites keep
+    working unchanged.
     """
 
     name: str
@@ -805,6 +811,7 @@ class FailingJob:
     failed_step: str
     annotations: list[FailureAnnotation]
     log_excerpt: str | None
+    job_id: str = ""
 
 
 @dataclass

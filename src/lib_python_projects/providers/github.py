@@ -4793,6 +4793,40 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 )
             return run
 
+    def get_step_log(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        run_id: str,
+        job_id: str,
+    ) -> str:
+        """Fetch the full, unbounded raw log for a single job.
+
+        Reuses the 302-redirect signed-URL flow already used internally
+        for failure-excerpt building, but with no `max_bytes` cap, so the
+        caller gets the exact same log GitHub would show, untruncated.
+        Raises `GitHubError(404, ...)` when the log is unavailable
+        (403/404 on the underlying redirect, or a non-numeric `run_id`).
+        """
+        if not str(run_id).strip().isdigit():
+            raise GitHubError(
+                404,
+                f"pipeline '{project.id}#{run_id}' not found"
+                f" — run_id must be numeric for GitHub Actions",
+            )
+        log_text = _fetch_job_log(
+            token,
+            f"{_repo_path(project)}/actions/jobs/{job_id}/logs",
+            max_bytes=None,
+        )
+        if log_text is None:
+            raise GitHubError(
+                404,
+                f"log for job '{job_id}' in pipeline"
+                f" '{project.id}#{run_id}' not found",
+            )
+        return log_text
+
     # ---------- label management ---------------------------------------------
 
     def list_labels(
@@ -5581,6 +5615,7 @@ def _get_failure_excerpt(
                     annotations, job.get("name") or "",
                 ),
                 log_excerpt=log_excerpt,
+                job_id=str(job.get("id") or ""),
             )
         )
     note = "logs unavailable" if logs_missing else None
