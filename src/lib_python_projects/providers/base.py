@@ -73,6 +73,25 @@ class Ticket:
     # rather than freshly created (ticket #150). Always False on the
     # no-op (omitted/None/"" key) path.
     idempotent_replay: bool = False
+    # Cross-provider ticket-hierarchy projection (ticket #151). This is a
+    # thin *read-side* projection over the exact `parent` relation the
+    # provider already computes in `_fetch_relations` — not a parallel
+    # write mechanism. `None` means either "no parent" or "relations
+    # weren't fetched" (i.e. `get_ticket(..., include_relations=False)`);
+    # callers that need to disambiguate must inspect `relations` instead.
+    # Format matches `Relation.ticket_id`: `"#N"` same-repo, `"owner/repo#N"`
+    # cross-repo. Hierarchy writes go through `add_relation`/
+    # `remove_relation` with `kind="parent"|"child"` — there is no
+    # dedicated hierarchy-write API.
+    parent_id: str | None = None
+    # Cross-provider milestone/iteration projection (ticket #151): GitLab's
+    # issue milestone title, Azure DevOps's `System.IterationPath`, or the
+    # value of the bound GitHub Projects-v2 board's *iteration* field (NOT
+    # GitHub's native repo-milestone concept, which this surface doesn't
+    # model). `None` when unset, not applicable to the provider, or — for
+    # GitHub specifically — when no `github-projects-v2` board is bound.
+    # Write via `create_ticket`/`update_ticket`'s `milestone=` kwarg.
+    milestone: str | None = None
 
 
 @dataclass
@@ -351,6 +370,21 @@ class Relation:
     - ``False`` — built from a body/text scan (target not independently fetched).
     - ``None``  — not applicable or not set.
     """
+
+
+def _extract_parent_id(relations: list["Relation"]) -> str | None:
+    """Return the `ticket_id` of the first `parent` relation in `relations`.
+
+    Shared by all three providers' `get_ticket` to populate
+    `Ticket.parent_id` as a pure projection over `_fetch_relations`
+    output (ticket #151) — `relations` is the single source of truth,
+    this never issues its own API call. Returns `None` when there is no
+    `parent` relation.
+    """
+    for r in relations:
+        if r.kind == "parent":
+            return r.ticket_id
+    return None
 
 
 SortBy = Literal["created", "updated", "comments"]

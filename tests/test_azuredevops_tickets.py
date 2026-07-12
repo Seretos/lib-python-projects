@@ -2773,3 +2773,317 @@ def test_update_ticket_body_html_contains_rendered_markdown(
     assert "<h2>" in desc, repr(desc)
     assert "<li>" in desc, repr(desc)
     assert "<code>snippet</code>" in desc, repr(desc)
+
+
+# ---------- ticket #151: Ticket.parent_id / Ticket.milestone -----------------
+
+
+def test_map_work_item_populates_milestone_from_iteration_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_map_work_item` projects `System.IterationPath` onto
+    `Ticket.milestone`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/5" in path and "/comments" not in path:
+            return _json(_work_item_payload(
+                5, **{"System.IterationPath": "MyProj\\Sprint 3"},
+            ))
+        if path.endswith("/_apis/wit/workItems/5/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, _r, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="5", include_relations=False,
+    )
+    assert ticket.milestone == "MyProj\\Sprint 3"
+
+
+def test_map_work_item_milestone_none_when_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/5" in path and "/comments" not in path:
+            return _json(_work_item_payload(5))
+        if path.endswith("/_apis/wit/workItems/5/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, _r, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="5", include_relations=False,
+    )
+    assert ticket.milestone is None
+
+
+def test_get_ticket_populates_parent_id_from_hierarchy_reverse_relation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`Ticket.parent_id` projects the `parent` relation
+    (`System.LinkTypes.Hierarchy-Reverse`) `_build_relations_from_work_item`
+    already computes."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/5" in path and "/comments" not in path:
+            payload = _work_item_payload(5)
+            payload["relations"] = [
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/3",
+                    "attributes": {"name": "Parent"},
+                }
+            ]
+            return _json(payload)
+        if path.endswith("/_apis/wit/workItems/5/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            ids = json.loads(req.content.decode("utf-8"))["ids"]
+            return _json({
+                "value": [
+                    {
+                        "id": wid,
+                        "fields": {
+                            "System.Title": f"work item {wid}",
+                            "System.State": "Active",
+                        },
+                    }
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, relations, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="5"
+    )
+    assert ticket.parent_id == "#3"
+    assert [r.ticket_id for r in relations if r.kind == "parent"] == ["#3"]
+
+
+def test_get_ticket_parent_id_none_without_hierarchy_relation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/5" in path and "/comments" not in path:
+            return _json(_work_item_payload(5))
+        if path.endswith("/_apis/wit/workItems/5/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, relations, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="5"
+    )
+    assert ticket.parent_id is None
+    assert relations == []
+
+
+def test_get_ticket_include_relations_false_leaves_parent_id_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/5" in path and "/comments" not in path:
+            payload = _work_item_payload(5)
+            payload["relations"] = [
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/3",
+                }
+            ]
+            return _json(payload)
+        if path.endswith("/_apis/wit/workItems/5/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, relations, truncated = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="5", include_relations=False,
+    )
+    assert ticket.parent_id is None
+    assert relations == []
+    assert truncated is None
+
+
+def test_create_ticket_milestone_kwarg_emits_iteration_path_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(
+                7, **{"System.IterationPath": "MyProj\\Sprint 1"},
+            ))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = AzureDevOpsProvider().create_ticket(
+        _project(), token="t", title="t", body="b", labels=[], assignees=[],
+        milestone="MyProj\\Sprint 1",
+    )
+    assert ticket.id == "7"
+    op = next(
+        op for op in captured["patch"] if op["path"] == "/fields/System.IterationPath"
+    )
+    assert op["value"] == "MyProj\\Sprint 1"
+
+
+def test_create_ticket_milestone_kwarg_wins_over_custom_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit `milestone=` kwarg wins over
+    `custom_fields["System.IterationPath"]` — its patch op is appended
+    last (ticket #151)."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(7))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(), token="t", title="t", body="b", labels=[], assignees=[],
+        custom_fields={"System.IterationPath": "MyProj\\Sprint-Loses"},
+        milestone="MyProj\\Sprint-Wins",
+    )
+    iteration_ops = [
+        op for op in captured["patch"] if op["path"] == "/fields/System.IterationPath"
+    ]
+    # Both ops are present (custom_fields loop runs first); the kwarg's op
+    # is last, so a JSON-Patch processor applying ops in order lands on it.
+    assert iteration_ops[-1]["value"] == "MyProj\\Sprint-Wins"
+
+
+def test_create_ticket_custom_fields_iteration_path_still_works(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backward compat: `custom_fields["System.IterationPath"]` alone
+    (no `milestone=` kwarg) keeps working unchanged."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(7))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(), token="t", title="t", body="b", labels=[], assignees=[],
+        custom_fields={"System.IterationPath": "MyProj\\Sprint 1"},
+    )
+    op = next(
+        op for op in captured["patch"] if op["path"] == "/fields/System.IterationPath"
+    )
+    assert op["value"] == "MyProj\\Sprint 1"
+
+
+def test_create_ticket_milestone_omitted_issues_no_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(7))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(), token="t", title="t", body="b", labels=[], assignees=[],
+    )
+    assert not any(
+        op["path"] == "/fields/System.IterationPath" for op in captured["patch"]
+    )
+
+
+def test_update_ticket_milestone_kwarg_emits_iteration_path_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/5"):
+            return _json(_work_item_payload(5))
+        if req.method == "PATCH" and path.endswith("/workitems/5"):
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(
+                5, **{"System.IterationPath": "MyProj\\Sprint 2"},
+            ))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().update_ticket(
+        _project(), token="t", ticket_id="5", milestone="MyProj\\Sprint 2",
+    )
+    op = next(
+        op for op in captured["patch"] if op["path"] == "/fields/System.IterationPath"
+    )
+    assert op["value"] == "MyProj\\Sprint 2"
+    assert op["op"] == "add"
+
+
+def test_update_ticket_milestone_none_clears_iteration_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`milestone=None` on update clears `System.IterationPath` — ADO has
+    no "remove" semantics for it, so this uses an empty-string value."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/5"):
+            return _json(_work_item_payload(
+                5, **{"System.IterationPath": "MyProj\\Sprint 2"},
+            ))
+        if req.method == "PATCH" and path.endswith("/workitems/5"):
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(5, **{"System.IterationPath": ""}))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().update_ticket(
+        _project(), token="t", ticket_id="5", milestone=None,
+    )
+    op = next(
+        op for op in captured["patch"] if op["path"] == "/fields/System.IterationPath"
+    )
+    assert op["value"] == ""
+    assert op["op"] == "replace"
+
+
+def test_update_ticket_milestone_omitted_issues_no_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/5"):
+            return _json(_work_item_payload(5))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = AzureDevOpsProvider().update_ticket(_project(), token="t", ticket_id="5")
+    assert ticket.id == "5"

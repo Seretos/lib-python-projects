@@ -87,6 +87,14 @@ class GithubProjectsV2Binding(BoardBinding):
     owner: str | None = None
     project_number: int | None = None
     status_field: str = "Status"
+    # Names the Projects-v2 *iteration* field backing the normalized
+    # `Ticket.milestone` projection (ticket #151) — GitHub has no native
+    # issue-milestone equivalent in this surface, so milestone read/write
+    # is modeled via the board's iteration field instead. `None` (default)
+    # means: on read, auto-detect the first iteration-typed field on the
+    # item (deterministic by field order); on write, `milestone=` raises
+    # `ValueError` since the write path can't auto-detect by type.
+    iteration_field: str | None = None
 
 
 class AzureBoardsBinding(BoardBinding):

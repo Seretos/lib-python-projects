@@ -74,6 +74,7 @@ from lib_python_projects.providers.base import (
     TokenCapabilityProvider,
     TokenProjectDiscoveryProvider,
     _assert_not_self_relation,
+    _extract_parent_id,
     _validate_label_lists,
     _validate_limit,
 )
@@ -84,6 +85,11 @@ log = logging.getLogger("project-issues.gitlab")
 
 USER_AGENT = "claude-code-project-issues-plugin/0.1.0"
 DEFAULT_BASE_URL = "https://gitlab.com"
+
+# Sentinel distinguishing "milestone kwarg not passed" from "explicitly
+# clear the milestone" (`milestone=None`) on `create_ticket` /
+# `update_ticket` (ticket #151).
+_UNSET: Any = object()
 
 # GitLab sometimes returns {"message": "404 Not Found"} whose numeric prefix
 # duplicates the HTTP status code already in GitLabError.__str__. Strip it.
@@ -394,6 +400,7 @@ def _map_issue(raw: dict, project: ProjectConfig | None = None) -> Ticket:
         url=url,
         created_at=normalize_timestamp(raw.get("created_at") or ""),
         updated_at=normalize_timestamp(raw.get("updated_at") or ""),
+        milestone=(raw.get("milestone") or {}).get("title"),
     )
 
 
@@ -1154,6 +1161,235 @@ def _gitlab_body_marks_duplicate_of(body: str, target_iid: str) -> bool:
     return f"#{target_iid}" in set(_scan_refs(body or "", _DUPLICATE_PATTERN))
 
 
+# ---------- Work Items GraphQL: hierarchy (parent/child) (ticket #151) -----
+#
+# GitLab's REST API has no issue-level parent/child endpoint. The Work
+# Items GraphQL API's `hierarchyWidget` is the native mechanism — and,
+# unlike *epic*-level hierarchy (GitLab Premium+), issue-level Work Item
+# hierarchy is available on GitLab Free. This module is otherwise pure
+# REST; this is the one deliberate GraphQL exception, kept minimal (a raw
+# POST reusing the existing REST client/auth, no GraphQL client library).
+
+
+def _gitlab_graphql_url(project: ProjectConfig) -> str:
+    """GitLab's GraphQL endpoint — sibling of `/api/v4`, not nested under it."""
+    base = (project.base_url or DEFAULT_BASE_URL).rstrip("/")
+    return f"{base}/api/graphql"
+
+
+def _gitlab_graphql(
+    client: httpx.Client, project: ProjectConfig, query: str, variables: dict,
+) -> dict:
+    """POST a GraphQL query/mutation against GitLab's GraphQL endpoint.
+
+    Reuses `client` — the same authenticated (`PRIVATE-TOKEN`) session
+    every REST call in this module uses — so no separate client/auth
+    setup is needed. Raises `GitLabError` both on a non-2xx transport
+    response and when the payload carries a top-level `errors` array
+    (GraphQL executes with `200 OK` even on field-resolution errors, so
+    that status alone can't be trusted).
+    """
+    r = client.post(
+        _gitlab_graphql_url(project),
+        json={"query": query, "variables": variables},
+    )
+    _check(r)
+    payload = r.json()
+    errors = payload.get("errors")
+    if errors:
+        msg = "; ".join(str(e.get("message", e)) for e in errors)
+        raise GitLabError(422, f"GraphQL error: {msg}")
+    return payload.get("data") or {}
+
+
+_WORK_ITEM_HIERARCHY_QUERY = (
+    "query($fullPath: ID!, $iid: String!) {"
+    "project(fullPath: $fullPath) {"
+    "workItems(iid: $iid) {"
+    "nodes {"
+    "id iid title webUrl state "
+    "widgets {"
+    "... on WorkItemWidgetHierarchy {"
+    "parent { id iid title webUrl state }"
+    "}"
+    "}"
+    "}"
+    "}"
+    "}"
+    "}"
+)
+
+
+def _gitlab_fetch_work_item(
+    client: httpx.Client, project: ProjectConfig, iid: str,
+) -> dict | None:
+    """Resolve an issue iid to its Work Item node — global `id`, own
+    fields, and (via `hierarchyWidget`) its current `parent`, when set.
+
+    Returns `None` when the project/iid can't be resolved to a work item
+    (e.g. it doesn't exist).
+    """
+    data = _gitlab_graphql(
+        client, project, _WORK_ITEM_HIERARCHY_QUERY,
+        {"fullPath": project.path, "iid": str(iid)},
+    )
+    nodes = (((data.get("project") or {}).get("workItems") or {}).get("nodes")) or []
+    return nodes[0] if nodes else None
+
+
+def _gitlab_work_item_parent(work_item: dict) -> dict | None:
+    """Extract the `hierarchyWidget`'s `parent` node from a Work Item payload."""
+    for widget in work_item.get("widgets") or []:
+        if "parent" in widget:
+            return widget.get("parent")
+    return None
+
+
+def _normalise_gl_work_item_state(state: str | None) -> str:
+    """Normalise a GitLab Work Item GraphQL `state` enum (`OPEN`/`CLOSED`)
+    to the same `open`/`closed` vocabulary `_normalise_gl_state` uses for
+    REST payloads (GraphQL enums come back upper-cased)."""
+    if not state:
+        return ""
+    s = state.upper()
+    if s == "OPEN":
+        return "open"
+    if s == "CLOSED":
+        return "closed"
+    return ""
+
+
+_WORK_ITEM_UPDATE_HIERARCHY_MUTATION = (
+    "mutation($id: WorkItemID!, $parentId: WorkItemID, $removeParent: Boolean) {"
+    "workItemUpdate(input: {id: $id, hierarchyWidget: {"
+    "parentId: $parentId, removeParent: $removeParent"
+    "}}) {"
+    "workItem {"
+    "id iid "
+    "widgets { ... on WorkItemWidgetHierarchy { parent { id iid title webUrl state } } }"
+    "} "
+    "errors"
+    "}"
+    "}"
+)
+
+
+def _gitlab_set_work_item_parent(
+    client: httpx.Client,
+    project: ProjectConfig,
+    work_item_id: str,
+    parent_id: str | None,
+) -> dict:
+    """Set (or, when `parent_id` is `None`, clear) a Work Item's parent
+    via the `workItemUpdate` mutation's `hierarchyWidget` input.
+
+    Returns the mutation's `workItem` payload. Raises `GitLabError` when
+    the mutation reports `errors` (either the top-level GraphQL kind via
+    `_gitlab_graphql`, or the mutation-payload `errors` list — e.g. the
+    acting token lacks permission, or the work item type doesn't support
+    hierarchy on this tier) — a clear provider error rather than a crash.
+    """
+    variables: dict[str, Any] = {
+        "id": work_item_id,
+        "parentId": parent_id,
+        "removeParent": parent_id is None,
+    }
+    data = _gitlab_graphql(
+        client, project, _WORK_ITEM_UPDATE_HIERARCHY_MUTATION, variables,
+    )
+    result = data.get("workItemUpdate") or {}
+    mutation_errors = result.get("errors") or []
+    if mutation_errors:
+        raise GitLabError(
+            422,
+            f"GitLab work item hierarchy update failed: "
+            f"{'; '.join(str(e) for e in mutation_errors)}",
+        )
+    work_item = result.get("workItem")
+    if not work_item:
+        raise GitLabError(500, "workItemUpdate did not return the updated work item")
+    return work_item
+
+
+def _gitlab_add_hierarchy_relation(
+    client: httpx.Client,
+    project: ProjectConfig,
+    ticket_id: str,
+    kind: str,
+    target_iid: str,
+) -> Relation:
+    """Implement `add_relation(kind="parent"|"child")` via Work Items
+    GraphQL (ticket #151).
+
+    Canonicalizes on setting `parentId` regardless of which direction the
+    caller specified: `kind="parent"` mutates `ticket_id`'s work item
+    (its parent becomes `target`); `kind="child"` mutates `target`'s work
+    item (its parent becomes `ticket_id`) — mirroring how GitHub's
+    `add_relation` treats `parent`/`child` as two views of the same edge
+    (see `GitHubProvider.add_relation`).
+    """
+    if kind == "parent":
+        subject_iid, new_parent_iid = ticket_id, target_iid
+    else:
+        subject_iid, new_parent_iid = target_iid, ticket_id
+
+    subject_wi = _gitlab_fetch_work_item(client, project, subject_iid)
+    if subject_wi is None:
+        raise RelationNotFound(kind=kind, ticket_id=ticket_id, target=f"#{target_iid}")
+    parent_wi = _gitlab_fetch_work_item(client, project, new_parent_iid)
+    if parent_wi is None:
+        raise RelationNotFound(kind=kind, ticket_id=ticket_id, target=f"#{target_iid}")
+
+    existing_parent = _gitlab_work_item_parent(subject_wi)
+    if existing_parent and str(existing_parent.get("iid")) == str(new_parent_iid):
+        raise RelationAlreadyExists(kind=kind, ticket_id=ticket_id, target=f"#{target_iid}")
+
+    _gitlab_set_work_item_parent(client, project, subject_wi["id"], parent_wi["id"])
+
+    # The Relation returned always describes the *target* ticket (the
+    # caller's `target` argument) — same convention as every other
+    # `add_relation` branch in this module.
+    target_wi = parent_wi if kind == "parent" else subject_wi
+    return Relation(
+        kind=kind,
+        ticket_id=f"#{target_iid}",
+        title=target_wi.get("title") or "",
+        url=_canonical_url(target_wi.get("webUrl") or "", project),
+        state=_normalise_gl_work_item_state(target_wi.get("state")),
+        is_pull_request=False,
+        resolved=True,
+    )
+
+
+def _gitlab_remove_hierarchy_relation(
+    client: httpx.Client,
+    project: ProjectConfig,
+    ticket_id: str,
+    kind: str,
+    target_iid: str,
+) -> dict:
+    """Implement `remove_relation(kind="parent"|"child")` — inverse of
+    `_gitlab_add_hierarchy_relation`. Verifies the stored parent edge
+    actually matches `target` before clearing it, so a mismatched-kind
+    removal doesn't tear down an unrelated hierarchy edge (mirrors the
+    `duplicate_of` verify-before-mutate pattern elsewhere in this file).
+    """
+    if kind == "parent":
+        subject_iid, expected_parent_iid = ticket_id, target_iid
+    else:
+        subject_iid, expected_parent_iid = target_iid, ticket_id
+
+    subject_wi = _gitlab_fetch_work_item(client, project, subject_iid)
+    if subject_wi is None:
+        raise RelationNotFound(kind=kind, ticket_id=ticket_id, target=f"#{target_iid}")
+    existing_parent = _gitlab_work_item_parent(subject_wi)
+    if not existing_parent or str(existing_parent.get("iid")) != str(expected_parent_iid):
+        raise RelationNotFound(kind=kind, ticket_id=ticket_id, target=f"#{target_iid}")
+
+    _gitlab_set_work_item_parent(client, project, subject_wi["id"], None)
+    return {"removed": True}
+
+
 def _fetch_relations(
     client: httpx.Client,
     project: ProjectConfig,
@@ -1292,6 +1528,30 @@ def _fetch_relations(
             to_drop.add(i)
         if to_drop:
             relations = [r for i, r in enumerate(relations) if i not in to_drop]
+
+    # --- (4) hierarchy parent (Work Items GraphQL, ticket #151) ---
+    # Best-effort: GitLab GraphQL is a separate endpoint/subsystem from
+    # the REST calls above, and older self-hosted instances or
+    # permission-restricted tokens may not support it. Any failure here
+    # (network error, non-2xx, GraphQL `errors`) is swallowed so a
+    # `parent` surfacing hiccup never breaks `get_ticket`'s relations —
+    # this mirrors GitHub's `_fetch_parent_via_graphql` best-effort
+    # sidecall.
+    try:
+        work_item = _gitlab_fetch_work_item(client, project, ticket_id)
+    except (GitLabError, httpx.HTTPError):
+        work_item = None
+    if work_item is not None:
+        parent = _gitlab_work_item_parent(work_item)
+        if parent and parent.get("iid") is not None:
+            relations.append(_make_relation(
+                kind="parent",
+                ref=f"#{parent['iid']}",
+                title=parent.get("title") or "",
+                url=_canonical_url(parent.get("webUrl") or "", project),
+                state=_normalise_gl_work_item_state(parent.get("state")),
+                resolved=True,
+            ))
 
     return relations
 
@@ -1713,6 +1973,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                     comments=comments,
                 )
                 truncated: bool | None = False
+                ticket.parent_id = _extract_parent_id(relations)
             else:
                 relations = []
                 truncated = None
@@ -1730,6 +1991,7 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         status: Status | None = None,
         custom_fields: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
+        milestone: Any = _UNSET,
     ) -> Ticket:
         """Create a GitLab issue with the AI-generated marker.
 
@@ -1764,6 +2026,15 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         Any other key raises `ValueError`. `None`/`{}` is a silent no-op
         so existing callers are unaffected.
 
+        Optional `milestone` (ticket #151, keyword-only): a milestone
+        title, resolved to a `milestone_id` the same way as
+        `custom_fields["milestone"]`. Uses the `_UNSET` sentinel default
+        to distinguish "not provided" (no milestone write at all) from
+        `None` (explicit no-op on create — a fresh issue has no milestone
+        either way). When both `milestone=` and
+        `custom_fields["milestone"]` are supplied, the explicit `milestone`
+        kwarg wins.
+
         Optional `idempotency_key` (ticket #150): a retried call with the
         same key (scoped to this project) returns the ticket created by
         the first successful call instead of creating a duplicate, with
@@ -1791,6 +2062,13 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 f"for GitLab — supported: 'labels' (list[str]), "
                 f"'milestone' (title str or None)"
             )
+        # Explicit `milestone=` kwarg wins over `custom_fields["milestone"]`
+        # on conflict; `_UNSET` means neither supplied a milestone write.
+        effective_milestone: Any = _UNSET
+        if milestone is not _UNSET:
+            effective_milestone = milestone
+        elif custom_fields and "milestone" in custom_fields:
+            effective_milestone = custom_fields["milestone"]
         # Validate `status` up-front. Pass None through; raise on
         # unknown values before POST commits an issue.
         state_event: str | None = None
@@ -1814,12 +2092,10 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 payload["labels"] = ",".join(merged_labels)
             if assignee_ids:
                 payload["assignee_ids"] = assignee_ids
-            if custom_fields and "milestone" in custom_fields:
-                milestone_title = custom_fields["milestone"]
-                if milestone_title is not None:
-                    payload["milestone_id"] = _resolve_milestone_id(
-                        client, path, milestone_title,
-                    )
+            if effective_milestone is not _UNSET and effective_milestone is not None:
+                payload["milestone_id"] = _resolve_milestone_id(
+                    client, path, effective_milestone,
+                )
             r = client.post(f"/projects/{path}/issues", json=payload)
             _check(r)
             raw = r.json()
@@ -1857,8 +2133,17 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         labels_remove: list[str] | None = None,
         assignees_add: list[str] | None = None,
         assignees_remove: list[str] | None = None,
+        milestone: Any = _UNSET,
     ) -> Ticket:
         """Update an issue.
+
+        Optional `milestone` (ticket #151, keyword-only): `update_ticket`
+        previously had no milestone support at all. A title string is
+        resolved to a `milestone_id` the same way as `create_ticket`'s
+        `custom_fields["milestone"]`; `None` clears the milestone (GitLab's
+        `milestone_id: 0` sentinel); an unmatched title raises whatever
+        error `_resolve_milestone_id` raises (`ValueError`). The `_UNSET`
+        sentinel default means "not provided" — no milestone write at all.
 
         Status mapping:
           - `"open"` (or `"reopen"` legacy) → `state_event=reopen`.
@@ -1908,6 +2193,13 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 )
             if status is not None:
                 payload["state_event"] = _status_to_state_event(status)
+            if milestone is not _UNSET:
+                if milestone is None:
+                    payload["milestone_id"] = 0
+                else:
+                    payload["milestone_id"] = _resolve_milestone_id(
+                        client, path, milestone,
+                    )
 
             add_set = set(labels_add or [])
             remove_set = set(labels_remove or [])
@@ -3130,7 +3422,9 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
 
     # ---------- relations (write side) ---------------------------------------
 
-    _SUPPORTED_RELATION_KINDS: tuple[str, ...] = ("relates_to", "duplicate_of")
+    _SUPPORTED_RELATION_KINDS: tuple[str, ...] = (
+        "relates_to", "duplicate_of", "parent", "child",
+    )
 
     def add_relation(
         self,
@@ -3151,19 +3445,13 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
             duplicate is reachable through the structured-link surface
             too. The body edit is re-marked via `apply_body_marker` so
             the AI-attribution marker stays consistent.
-          - `parent` / `child` → GitLab Work Items GraphQL (planned;
-            see follow-up). Currently raises `RelationKindUnsupported`
-            so callers don't silently fall through.
+          - `parent` / `child` → Work Items GraphQL `hierarchyWidget`
+            (ticket #151), same-project only (cross-project hierarchy is
+            not yet supported, same restriction as every other kind here).
 
         `target` is parsed via `_parse_gitlab_relation_target`;
         currently same-project only.
         """
-        if kind == "parent" or kind == "child":
-            # Work Items GraphQL hierarchyWidget is non-trivial — left
-            # as a follow-up so the rest of this surface lands.
-            raise RelationKindUnsupported(
-                kind, "gitlab", self._SUPPORTED_RELATION_KINDS,
-            )
         if kind not in self._SUPPORTED_RELATION_KINDS:
             raise RelationKindUnsupported(
                 kind, "gitlab", self._SUPPORTED_RELATION_KINDS,
@@ -3174,6 +3462,10 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         _assert_not_self_relation(ticket_id, target_iid)
         path = _project_path(project)
         with _client(project, token) as client:
+            if kind in ("parent", "child"):
+                return _gitlab_add_hierarchy_relation(
+                    client, project, ticket_id, kind, target_iid,
+                )
             if kind == "relates_to":
                 link_type = _gitlab_link_type(kind)
                 return _gitlab_post_issue_link(
@@ -3221,11 +3513,11 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         mismatched-kind removal (e.g. requesting `duplicate_of` on a
         pair that is really just `relates_to`, or vice versa) would
         delete the wrong relation (ticket #133).
+
+        `parent` / `child` (ticket #151) apply the same verify-before-mutate
+        discipline: the stored hierarchy edge must actually match `target`
+        or `RelationNotFound` is raised without touching anything.
         """
-        if kind == "parent" or kind == "child":
-            raise RelationKindUnsupported(
-                kind, "gitlab", self._SUPPORTED_RELATION_KINDS,
-            )
         if kind not in self._SUPPORTED_RELATION_KINDS:
             raise RelationKindUnsupported(
                 kind, "gitlab", self._SUPPORTED_RELATION_KINDS,
@@ -3235,6 +3527,10 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
         )
         path = _project_path(project)
         with _client(project, token) as client:
+            if kind in ("parent", "child"):
+                return _gitlab_remove_hierarchy_relation(
+                    client, project, ticket_id, kind, target_iid,
+                )
             if kind == "relates_to":
                 # Verify the stored link isn't actually a duplicate_of
                 # emulation for this exact target before deleting it —

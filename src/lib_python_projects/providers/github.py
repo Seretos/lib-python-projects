@@ -52,6 +52,7 @@ from lib_python_projects.providers.base import (
     TokenCapabilities,
     TokenProjectDiscoveryProvider,
     _assert_not_self_relation,
+    _extract_parent_id,
     _validate_label_lists,
     _validate_limit,
 )
@@ -63,6 +64,11 @@ log = logging.getLogger("project-issues.github")
 USER_AGENT = "claude-code-project-issues-plugin/0.1.0"
 ACCEPT = "application/vnd.github+json"
 API_BASE = "https://api.github.com"
+
+# Sentinel distinguishing "milestone kwarg not passed" from "explicitly
+# clear the milestone" (`milestone=None`) on `create_ticket` /
+# `update_ticket` (ticket #151).
+_UNSET: Any = object()
 
 
 _GITHUB_SUFFIX_RE = re.compile(r"\s*\(GitHub\s+\d+\)\s*$")
@@ -1331,7 +1337,7 @@ def _extract_project_field_values(item: dict) -> dict[str, Any]:
     return result
 
 
-def _fetch_issue_project_fields_via_graphql(
+def _fetch_issue_project_item_via_graphql(
     client: httpx.Client,
     *,
     repo_owner: str,
@@ -1339,9 +1345,14 @@ def _fetch_issue_project_fields_via_graphql(
     issue_number: int,
     project_number: int,
 ) -> dict[str, Any] | None:
-    """Return the `custom_fields` map for `issue_number`'s item on the
+    """Return the raw `projectItems` node for `issue_number` on the
     Projects v2 board `project_number`, or `None` if the issue has no
-    item on that project (ticket #123 read path).
+    item on that project.
+
+    This is the single query result shared by `custom_fields`
+    (`_extract_project_field_values`) and `milestone`
+    (`_extract_iteration_value`) — ticket #151 requires reusing one
+    `projectItems` round-trip for both rather than double-querying.
 
     Scoped through the repository (not org/user), so no org/user retry
     is needed here — `list_board_columns`'s retry dance is only for
@@ -1367,7 +1378,46 @@ def _fetch_issue_project_fields_via_graphql(
     issue = ((body.get("data") or {}).get("repository") or {}).get("issue") or {}
     for item in (issue.get("projectItems") or {}).get("nodes") or []:
         if (item.get("project") or {}).get("number") == project_number:
-            return _extract_project_field_values(item)
+            return item
+    return None
+
+
+def _fetch_issue_project_fields_via_graphql(
+    client: httpx.Client,
+    *,
+    repo_owner: str,
+    repo: str,
+    issue_number: int,
+    project_number: int,
+) -> dict[str, Any] | None:
+    """Return the `custom_fields` map for `issue_number`'s item on the
+    Projects v2 board `project_number`, or `None` if the issue has no
+    item on that project (ticket #123 read path)."""
+    item = _fetch_issue_project_item_via_graphql(
+        client,
+        repo_owner=repo_owner, repo=repo,
+        issue_number=issue_number, project_number=project_number,
+    )
+    return _extract_project_field_values(item) if item is not None else None
+
+
+def _extract_iteration_value(item: dict, iteration_field: str | None) -> str | None:
+    """Return the milestone/iteration field's title from a `projectItems`
+    node's raw `fieldValues` (ticket #151).
+
+    Scans `fieldValues.nodes` for the iteration-typed value — the only
+    type in `_ISSUE_PROJECT_FIELDS_QUERY`'s selection that carries a
+    `title` key (`ProjectV2ItemFieldIterationValue`). When
+    `iteration_field` is set, matches that field name exactly; otherwise
+    the first iteration-typed node wins (deterministic by node order).
+    """
+    for fv in (item.get("fieldValues") or {}).get("nodes") or []:
+        if "title" not in fv:
+            continue
+        field_name = (fv.get("field") or {}).get("name")
+        if iteration_field is not None and field_name != iteration_field:
+            continue
+        return fv.get("title")
     return None
 
 
@@ -1383,6 +1433,7 @@ def _board_field_write_query(owner_field: str) -> str:
         "field(name:$fieldName){"
         "...on ProjectV2FieldCommon{id name}"
         "...on ProjectV2SingleSelectField{options{id name}}"
+        "...on ProjectV2IterationField{configuration{iterations{id title} completedIterations{id title}}}"
         "}"
         "}}}"
     )
@@ -1461,7 +1512,33 @@ def _project_v2_field_value_input(
     raises `ValueError`. Non-single-select fields infer the input kind
     from `value`'s Python type (`bool`/`str` digits-only date -> date,
     `int`/`float` -> number, everything else -> text).
+
+    Iteration fields (`configuration` present — ticket #151's
+    `milestone=` write path) resolve `value` (a title string) against
+    the field's active + completed iterations, matched
+    case-insensitively; an unmatched title raises `ValueError` listing
+    the available titles.
     """
+    configuration = field.get("configuration")
+    if configuration:
+        if not isinstance(value, str):
+            raise ValueError(
+                f"custom_fields[{field_name!r}] must be a string iteration "
+                f"title for iteration field {field_name!r}, got {value!r}"
+            )
+        iterations = [
+            *(configuration.get("iterations") or []),
+            *(configuration.get("completedIterations") or []),
+        ]
+        by_lower_title = {it["title"].lower(): it for it in iterations}
+        matched = by_lower_title.get(value.lower())
+        if matched is None:
+            available = sorted(it["title"] for it in iterations)
+            raise ValueError(
+                f"custom_fields[{field_name!r}] value {value!r} is not a "
+                f"valid iteration (available: {available})"
+            )
+        return {"iterationId": matched["id"]}
     options = field.get("options")
     if options:
         if not isinstance(value, str):
@@ -1566,6 +1643,71 @@ def _write_custom_fields_to_board(
         _update_project_v2_item_field_value(
             client, project_id, item_id, field["id"], value_input,
         )
+
+
+_CLEAR_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION = (
+    "mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!){"
+    "clearProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,"
+    "fieldId:$fieldId}){projectV2Item{id}}}"
+)
+
+
+def _clear_project_v2_item_field_value(
+    client: httpx.Client, project_id: str, item_id: str, field_id: str,
+) -> None:
+    r = client.post(
+        "/graphql",
+        json={
+            "query": _CLEAR_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION,
+            "variables": {
+                "projectId": project_id, "itemId": item_id, "fieldId": field_id,
+            },
+        },
+    )
+    _check(r)
+    body = r.json()
+    if body.get("errors"):
+        raise GitHubError(
+            400, f"GraphQL error clearing project field value: {body['errors']}"
+        )
+
+
+def _write_milestone_to_board(
+    client: httpx.Client, binding: Any, content_id: str, milestone: str | None,
+) -> None:
+    """Write `milestone` (an iteration title, or `None` to clear) to the
+    bound board's `binding.iteration_field` (ticket #151).
+
+    Mirrors `_write_custom_fields_to_board`'s project/item resolution but
+    branches to `clearProjectV2ItemFieldValue` when `milestone` is `None`
+    instead of `updateProjectV2ItemFieldValue` (which has no "clear"
+    input shape). Callers must have already validated that
+    `binding.iteration_field` is configured.
+    """
+    project_v2 = _fetch_projects_v2_via_graphql(
+        client,
+        owner=binding.owner,
+        project_number=binding.project_number,
+        org_query=_BOARD_PROJECT_ID_ORG_QUERY,
+        user_query=_BOARD_PROJECT_ID_USER_QUERY,
+        variables={"owner": binding.owner, "number": binding.project_number},
+    )
+    project_id = project_v2.get("id")
+    if not project_id:
+        raise GitHubError(
+            500,
+            f"GitHub Projects v2 project #{binding.project_number} for "
+            f"owner {binding.owner!r} did not return an 'id'",
+        )
+    item_id = _add_project_v2_item(client, project_id, content_id)
+    field = _resolve_project_field_for_write(client, binding, binding.iteration_field)
+    if milestone is None:
+        _clear_project_v2_item_field_value(client, project_id, item_id, field["id"])
+        return
+    value_input = _project_v2_field_value_input(field, binding.iteration_field, milestone)
+    _update_project_v2_item_field_value(
+        client, project_id, item_id, field["id"], value_input,
+    )
 
 
 # ---------- GraphQL fallback for `parent` ---------------------------------
@@ -2481,6 +2623,20 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         `None` (never raises on read — "not applicable" semantics).
         Binding configured but the issue has no item on that project ->
         `custom_fields = {}`.
+
+        `ticket.milestone` (ticket #151) is populated from the same bound
+        board's *iteration* field (see `GithubProjectsV2Binding.iteration_field`)
+        — GitHub has no native issue-milestone concept in this surface.
+        No board bound -> `milestone` stays `None` and no extra GraphQL
+        call is issued. Board bound but the issue has no item on that
+        project -> `milestone = None` (not an error). When a board IS
+        bound, the `projectItems` query runs on every read regardless of
+        `include_custom_fields`; if both are requested, the single query
+        result is reused for both rather than double-querying.
+
+        `ticket.parent_id` (ticket #151) is a pure projection over the
+        `parent` relation `_fetch_relations` already computes below —
+        populated only when `include_relations=True`.
         """
         with _client(token) as client:
             r = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
@@ -2494,23 +2650,32 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 raise
             issue_raw = r.json()
             ticket = _map_issue(issue_raw)
-            if include_custom_fields:
-                board = project.board
-                binding = board.binding if board is not None else None
-                if (
-                    binding is not None
-                    and binding.kind == "github-projects-v2"
-                    and binding.owner
-                    and binding.project_number
-                ):
-                    fields = _fetch_issue_project_fields_via_graphql(
-                        client,
-                        repo_owner=project.owner,
-                        repo=project.repo,
-                        issue_number=int(ticket_id),
-                        project_number=binding.project_number,
+            board = project.board
+            binding = board.binding if board is not None else None
+            board_bound = (
+                binding is not None
+                and binding.kind == "github-projects-v2"
+                and binding.owner
+                and binding.project_number
+            )
+            if board_bound:
+                item = _fetch_issue_project_item_via_graphql(
+                    client,
+                    repo_owner=project.owner,
+                    repo=project.repo,
+                    issue_number=int(ticket_id),
+                    project_number=binding.project_number,
+                )
+                ticket.milestone = (
+                    _extract_iteration_value(item, binding.iteration_field)
+                    if item is not None else None
+                )
+                if include_custom_fields:
+                    ticket.custom_fields = (
+                        _extract_project_field_values(item) if item is not None else {}
                     )
-                    ticket.custom_fields = fields if fields is not None else {}
+            elif include_custom_fields:
+                ticket.custom_fields = None
             c = client.get(
                 f"{_repo_path(project)}/issues/{ticket_id}/comments",
                 params={"per_page": 100},
@@ -2521,6 +2686,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 relations, truncated = _fetch_relations(
                     client, project, ticket_id, issue_raw, token=token,
                 )
+                ticket.parent_id = _extract_parent_id(relations)
             else:
                 relations, truncated = [], None
         return ticket, comments, relations, truncated
@@ -2537,6 +2703,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         status: Status | None = None,
         custom_fields: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
+        milestone: Any = _UNSET,
     ) -> Ticket:
         """Create an issue with the `ai-generated` AI-attribution marker.
 
@@ -2575,6 +2742,17 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         conflict detection. A retry with the same key but a different
         `title`/`body` raises `IdempotencyConflict`. `None`/`""` (the
         default) disables idempotency entirely — behaviour is unchanged.
+
+        Optional `milestone` (ticket #151, keyword-only): an iteration
+        title, written to the bound board's `binding.iteration_field` via
+        the same board-write machinery as `custom_fields`. Requires a
+        `github-projects-v2` board bound AND `iteration_field` configured
+        on it — the write path can't auto-detect the iteration field by
+        type the way `get_ticket`'s read path does. Missing/unconfigured
+        -> `ValueError` naming the missing config. Uses the `_UNSET`
+        sentinel default so "not provided" issues no milestone write at
+        all. A board-write failure after the issue is created raises
+        `PartialTicketCreateError`, same as `custom_fields`.
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
@@ -2603,6 +2781,24 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     f"projects.yml before calling create_ticket with "
                     f"custom_fields"
                 )
+        if milestone is not _UNSET:
+            board = project.board
+            milestone_binding = board.binding if board is not None else None
+            if (
+                milestone_binding is None
+                or milestone_binding.kind != "github-projects-v2"
+                or not milestone_binding.owner
+                or not milestone_binding.project_number
+                or not milestone_binding.iteration_field
+            ):
+                raise ValueError(
+                    f"milestone was provided but project {project.id!r} "
+                    f"has no 'github-projects-v2' board configured with "
+                    f"'owner', 'project_number', and 'iteration_field' — "
+                    f"add one to projects.yml before calling create_ticket "
+                    f"with milestone"
+                )
+            binding = milestone_binding
         # Deduplicate while preserving order, ensure ai-generated is present.
         merged = list(dict.fromkeys([*labels, AI_GENERATED_LABEL]))
         prefixed_body = ensure_body_prefix(body)
@@ -2675,6 +2871,28 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         issue_url=url,
                         issue_node_id=content_id,
                     ) from exc
+            if milestone is not _UNSET:
+                content_id = raw.get("node_id")
+                if not content_id:
+                    raise GitHubError(
+                        500,
+                        f"created issue #{raw.get('number')} payload missing "
+                        f"'node_id'; cannot write milestone",
+                    )
+                try:
+                    _write_milestone_to_board(client, binding, content_id, milestone)
+                except GitHubError as exc:
+                    number = raw.get("number")
+                    url = raw.get("html_url")
+                    raise PartialTicketCreateError(
+                        exc.status,
+                        f"issue #{number} ({url}) was created, but writing "
+                        f"milestone to its Projects v2 board failed: "
+                        f"{exc.message}",
+                        issue_number=number,
+                        issue_url=url,
+                        issue_node_id=content_id,
+                    ) from exc
             ticket = _map_issue(raw)
             if idempotency_key:
                 _idempotency.record(
@@ -2699,6 +2917,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         assignees_add: list[str] | None = None,
         assignees_remove: list[str] | None = None,
         custom_fields: dict[str, Any] | None = None,
+        milestone: Any = _UNSET,
     ) -> Ticket:
         """Update an issue, optionally also writing `custom_fields` to its
         bound Projects v2 board (ticket #145) — the update-side
@@ -2718,6 +2937,14 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         PATCH (if any) has already landed by the time the board write is
         attempted, so there's no "was the issue even created" ambiguity
         to name a partial-failure type for.
+
+        Optional `milestone` (ticket #151, keyword-only): mirrors
+        `create_ticket`'s `milestone=` — requires `github-projects-v2` +
+        `iteration_field` configured (`ValueError` otherwise), writes via
+        `_write_milestone_to_board`. `milestone=None` clears the
+        iteration field (`clearProjectV2ItemFieldValue`); `milestone=`
+        omitted (`_UNSET`) issues no milestone write at all. A failed
+        board write raises a plain `GitHubError`, same as `custom_fields`.
         """
         _validate_label_lists(labels_add, labels_remove)
         binding = None
@@ -2737,6 +2964,24 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     f"projects.yml before calling update_ticket with "
                     f"custom_fields"
                 )
+        if milestone is not _UNSET:
+            board = project.board
+            milestone_binding = board.binding if board is not None else None
+            if (
+                milestone_binding is None
+                or milestone_binding.kind != "github-projects-v2"
+                or not milestone_binding.owner
+                or not milestone_binding.project_number
+                or not milestone_binding.iteration_field
+            ):
+                raise ValueError(
+                    f"milestone was provided but project {project.id!r} "
+                    f"has no 'github-projects-v2' board configured with "
+                    f"'owner', 'project_number', and 'iteration_field' — "
+                    f"add one to projects.yml before calling update_ticket "
+                    f"with milestone"
+                )
+            binding = milestone_binding
         with _client(token) as client:
             r0 = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
             try:
@@ -2821,6 +3066,15 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     _write_custom_fields_to_board(
                         client, binding, content_id, custom_fields,
                     )
+                if milestone is not _UNSET:
+                    content_id = current.get("node_id")
+                    if not content_id:
+                        raise GitHubError(
+                            500,
+                            f"ticket '{project.id}#{ticket_id}' payload "
+                            f"missing 'node_id'; cannot write milestone",
+                        )
+                    _write_milestone_to_board(client, binding, content_id, milestone)
                 return _map_issue(current)
 
             r = client.patch(f"{_repo_path(project)}/issues/{ticket_id}", json=payload)
@@ -2837,6 +3091,15 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 _write_custom_fields_to_board(
                     client, binding, content_id, custom_fields,
                 )
+            if milestone is not _UNSET:
+                content_id = raw.get("node_id")
+                if not content_id:
+                    raise GitHubError(
+                        500,
+                        f"ticket '{project.id}#{ticket_id}' payload missing "
+                        f"'node_id'; cannot write milestone",
+                    )
+                _write_milestone_to_board(client, binding, content_id, milestone)
             return _map_issue(raw)
 
     def bulk_update_tickets(

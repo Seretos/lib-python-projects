@@ -1426,3 +1426,185 @@ def test_check_no_double_status_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(GitLabError) as exc:
         GitLabProvider().list_tickets(_project(), "t", filters=TicketFilters())
     assert "404: 404" not in str(exc.value)
+
+
+# ---------- ticket #151: Ticket.milestone read + milestone= write kwarg ------
+
+
+def test_map_issue_populates_milestone_title(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_map_issue` projects the issue's milestone title onto
+    `Ticket.milestone`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json([_issue_payload(1, milestone={"title": "v2.0"})])
+
+    _install_mock(monkeypatch, handler)
+    tickets, _ = GitLabProvider().list_tickets(
+        _project(), token="t", filters=TicketFilters(),
+    )
+    assert tickets[0].milestone == "v2.0"
+
+
+def test_map_issue_milestone_none_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No milestone on the issue -> `Ticket.milestone is None`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json([_issue_payload(1)])
+
+    _install_mock(monkeypatch, handler)
+    tickets, _ = GitLabProvider().list_tickets(
+        _project(), token="t", filters=TicketFilters(),
+    )
+    assert tickets[0].milestone is None
+
+
+def test_create_ticket_milestone_kwarg_resolves_to_milestone_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        if req.method == "GET" and req.url.path.endswith("/milestones"):
+            assert req.url.params.get("title") == "v3.0"
+            return _json([{"id": 11, "title": "v3.0"}])
+        if req.method == "POST" and req.url.path.endswith("/issues"):
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_issue_payload(80))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().create_ticket(
+        _project(), "t", title="t", body="b", labels=[], assignees=[],
+        milestone="v3.0",
+    )
+    assert captured["body"]["milestone_id"] == 11
+
+
+def test_create_ticket_milestone_kwarg_wins_over_custom_fields_milestone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When both `milestone=` and `custom_fields['milestone']` are given,
+    the explicit `milestone=` kwarg wins (ticket #151)."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        if req.method == "GET" and req.url.path.endswith("/milestones"):
+            assert req.url.params.get("title") == "kwarg-wins"
+            return _json([{"id": 22, "title": "kwarg-wins"}])
+        if req.method == "POST" and req.url.path.endswith("/issues"):
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_issue_payload(81))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().create_ticket(
+        _project(), "t", title="t", body="b", labels=[], assignees=[],
+        custom_fields={"milestone": "custom-fields-loses"},
+        milestone="kwarg-wins",
+    )
+    assert captured["body"]["milestone_id"] == 22
+
+
+def test_create_ticket_milestone_omitted_issues_no_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`milestone=` omitted (default `_UNSET`) issues no milestone lookup
+    or write at all."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        if req.method == "GET" and req.url.path.endswith("/milestones"):
+            raise AssertionError("no milestone lookup expected when omitted")
+        if req.method == "POST" and req.url.path.endswith("/issues"):
+            return _json(_issue_payload(82))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitLabProvider().create_ticket(
+        _project(), "t", title="t", body="b", labels=[], assignees=[],
+    )
+    assert ticket.id == "82"
+
+
+def test_update_ticket_milestone_kwarg_resolves_to_milestone_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`update_ticket` previously had no milestone support at all —
+    ticket #151 adds it."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path.endswith("/issues/5"):
+            return _json(_issue_payload(5))
+        if req.method == "GET" and req.url.path.endswith("/milestones"):
+            assert req.url.params.get("title") == "v4.0"
+            return _json([{"id": 33, "title": "v4.0"}])
+        if req.method == "PUT" and req.url.path.endswith("/issues/5"):
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_issue_payload(5))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().update_ticket(_project(), "t", "5", milestone="v4.0")
+    assert captured["body"]["milestone_id"] == 33
+
+
+def test_update_ticket_milestone_none_clears_via_milestone_id_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`milestone=None` on update clears the milestone via GitLab's
+    `milestone_id: 0` sentinel."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path.endswith("/issues/5"):
+            return _json(_issue_payload(5))
+        if req.method == "GET" and req.url.path.endswith("/milestones"):
+            raise AssertionError("no milestone lookup expected for milestone=None")
+        if req.method == "PUT" and req.url.path.endswith("/issues/5"):
+            captured["body"] = json.loads(req.content.decode())
+            return _json(_issue_payload(5))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().update_ticket(_project(), "t", "5", milestone=None)
+    assert captured["body"]["milestone_id"] == 0
+
+
+def test_update_ticket_milestone_omitted_issues_no_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`milestone=` omitted (`_UNSET`) — with no other fields changed —
+    issues no PUT at all (matches the existing "no payload -> no PUT"
+    contract). Uses an `ai-generated`-labelled issue so the unrelated
+    ai-modified-marker heuristic doesn't itself put something in the
+    payload and mask what we're testing."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path.endswith("/issues/5"):
+            return _json(_issue_payload(5, labels=["ai-generated"]))
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitLabProvider().update_ticket(_project(), "t", "5")
+    assert ticket.id == "5"
+
+
+def test_update_ticket_milestone_unknown_title_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path.endswith("/issues/5"):
+            return _json(_issue_payload(5))
+        if req.method == "GET" and req.url.path.endswith("/milestones"):
+            return _json([])
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="not found"):
+        GitLabProvider().update_ticket(_project(), "t", "5", milestone="nope")

@@ -1348,3 +1348,327 @@ def test_remove_relation_duplicate_of_with_genuine_marker_still_succeeds(
     assert result == {"removed": True}
     assert captured_put["body"]["state_event"] == "reopen"
     assert "Duplicate of #7" not in captured_put["body"]["description"]
+
+
+# ---------- ticket #151: parent/child hierarchy via Work Items GraphQL -------
+#
+# GitLab has no REST endpoint for issue-level parent/child; the fix
+# implements it via the Work Items GraphQL API's `hierarchyWidget`
+# (`workItemUpdate` mutation) and surfaces the read side through the same
+# `_fetch_relations` path every other relation kind uses. These tests are
+# a regression suite for the reported gap: before the fix,
+# `add_relation`/`remove_relation` with `kind="parent"`/`"child"` always
+# raised `RelationKindUnsupported` (see the now-updated
+# `test_supported_relation_kinds_excludes_blocks_and_blocked_by`-style
+# guard tests above) — after the fix they return a `Relation` instead.
+
+
+def _work_item(iid: int, *, title: str = "", state: str = "OPEN", parent: dict | None = None) -> dict:
+    widgets = [{"parent": parent}]
+    return {
+        "id": f"gid://gitlab/WorkItem/{iid}",
+        "iid": iid,
+        "title": title or f"Issue {iid}",
+        "webUrl": f"https://gitlab.com/acme/backend/-/issues/{iid}",
+        "state": state,
+        "widgets": widgets,
+    }
+
+
+def _graphql_body(req: httpx.Request) -> dict:
+    return json.loads(req.content.decode("utf-8"))
+
+
+def _graphql_response(data: dict, status_code: int = 200) -> httpx.Response:
+    return _json({"data": data}, status_code)
+
+
+def test_supported_relation_kinds_includes_parent_and_child() -> None:
+    """ticket #151: `parent`/`child` are now real supported kinds — the
+    reported gap is closed."""
+    kinds = GitLabProvider._SUPPORTED_RELATION_KINDS
+    assert "parent" in kinds
+    assert "child" in kinds
+
+
+def test_add_relation_parent_via_work_items_graphql_returns_relation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation(kind='parent') sets ticket_id's parent = target and
+    returns a `Relation` (not a raise) — the reported gap, fixed."""
+    captured_mutation: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            if "workItemUpdate" in body["query"]:
+                captured_mutation.update(variables)
+                return _graphql_response({
+                    "workItemUpdate": {
+                        "workItem": _work_item(
+                            5, parent=_work_item(7, title="Epic 7"),
+                        ),
+                        "errors": [],
+                    }
+                })
+            # workItems(iid:) lookup — dispatch by iid.
+            iid = int(variables["iid"])
+            if iid == 5:
+                return _graphql_response({
+                    "project": {"workItems": {"nodes": [_work_item(5, parent=None)]}}
+                })
+            if iid == 7:
+                return _graphql_response({
+                    "project": {"workItems": {"nodes": [_work_item(7, title="Epic 7")]}}
+                })
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    relation = GitLabProvider().add_relation(_project(), "t", "5", "parent", "#7")
+    assert relation.kind == "parent"
+    assert relation.ticket_id == "#7"
+    assert relation.title == "Epic 7"
+    assert relation.resolved is True
+    assert captured_mutation["id"] == "gid://gitlab/WorkItem/5"
+    assert captured_mutation["parentId"] == "gid://gitlab/WorkItem/7"
+    assert captured_mutation["removeParent"] is False
+
+
+def test_add_relation_child_via_work_items_graphql_returns_relation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation(kind='child') canonicalizes on setting the *target's*
+    parent to ticket_id — the wire direction is swapped vs kind='parent'."""
+    captured_mutation: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            if "workItemUpdate" in body["query"]:
+                captured_mutation.update(variables)
+                return _graphql_response({
+                    "workItemUpdate": {
+                        "workItem": _work_item(
+                            7, parent=_work_item(5, title="Parent 5"),
+                        ),
+                        "errors": [],
+                    }
+                })
+            iid = int(variables["iid"])
+            if iid == 5:
+                return _graphql_response({
+                    "project": {"workItems": {"nodes": [_work_item(5, title="Parent 5")]}}
+                })
+            if iid == 7:
+                return _graphql_response({
+                    "project": {"workItems": {"nodes": [_work_item(7, parent=None)]}}
+                })
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    relation = GitLabProvider().add_relation(_project(), "t", "5", "child", "#7")
+    assert relation.kind == "child"
+    assert relation.ticket_id == "#7"
+    # The mutation is issued against the *target*'s (7's) work item, with
+    # ticket_id (5) as the new parent — canonicalized on setting parentId.
+    assert captured_mutation["id"] == "gid://gitlab/WorkItem/7"
+    assert captured_mutation["parentId"] == "gid://gitlab/WorkItem/5"
+
+
+def test_add_relation_parent_already_exists_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-flight duplicate check: subject already has this exact parent."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            iid = int(variables["iid"])
+            if iid == 5:
+                return _graphql_response({
+                    "project": {"workItems": {"nodes": [
+                        _work_item(5, parent=_work_item(7, title="Epic 7")),
+                    ]}}
+                })
+            if iid == 7:
+                return _graphql_response({
+                    "project": {"workItems": {"nodes": [_work_item(7, title="Epic 7")]}}
+                })
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationAlreadyExists) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "parent", "#7")
+    assert exc.value.kind == "parent"
+
+
+def test_add_relation_parent_target_not_found_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Target iid doesn't resolve to a work item -> RelationNotFound, not
+    a crash."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            iid = int(variables["iid"])
+            if iid == 5:
+                return _graphql_response({
+                    "project": {"workItems": {"nodes": [_work_item(5, parent=None)]}}
+                })
+            if iid == 999:
+                return _graphql_response({"project": {"workItems": {"nodes": []}}})
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound):
+        GitLabProvider().add_relation(_project(), "t", "5", "parent", "#999")
+
+
+def test_remove_relation_parent_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """remove_relation(kind='parent') clears the stored parent edge via
+    `removeParent: true` when it matches `target`."""
+    captured_mutation: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            if "workItemUpdate" in body["query"]:
+                captured_mutation.update(variables)
+                return _graphql_response({
+                    "workItemUpdate": {
+                        "workItem": _work_item(5, parent=None),
+                        "errors": [],
+                    }
+                })
+            iid = int(variables["iid"])
+            if iid == 5:
+                return _graphql_response({
+                    "project": {"workItems": {"nodes": [
+                        _work_item(5, parent=_work_item(7, title="Epic 7")),
+                    ]}}
+                })
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().remove_relation(_project(), "t", "5", "parent", "#7")
+    assert result == {"removed": True}
+    assert captured_mutation["id"] == "gid://gitlab/WorkItem/5"
+    assert captured_mutation["parentId"] is None
+    assert captured_mutation["removeParent"] is True
+
+
+def test_remove_relation_parent_mismatch_raises_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stored parent doesn't match `target` -> RelationNotFound
+    without touching anything (verify-before-mutate, ticket #133 style)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            iid = int(variables["iid"])
+            if iid == 5:
+                return _graphql_response({
+                    "project": {"workItems": {"nodes": [
+                        _work_item(5, parent=_work_item(3, title="Other parent")),
+                    ]}}
+                })
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound):
+        GitLabProvider().remove_relation(_project(), "t", "5", "parent", "#7")
+
+
+def test_get_ticket_surfaces_parent_from_work_items_graphql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read-side round-trip: `_fetch_relations` surfaces the `parent`
+    Work Item via GraphQL, and `Ticket.parent_id` projects it."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("issues/5"):
+            return _json(_issue_with_body(5))
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            assert variables["fullPath"] == "acme/backend"
+            assert variables["iid"] == "5"
+            return _graphql_response({
+                "project": {"workItems": {"nodes": [
+                    _work_item(5, parent=_work_item(9, title="Epic", state="OPEN")),
+                ]}}
+            })
+        aux = _empty_aux_handler(req)
+        return aux if aux else _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, relations, _t = GitLabProvider().get_ticket(_project(), "t", "5")
+    assert ticket.parent_id == "#9"
+    parent_rels = [r for r in relations if r.kind == "parent"]
+    assert len(parent_rels) == 1
+    assert parent_rels[0].ticket_id == "#9"
+    assert parent_rels[0].title == "Epic"
+    assert parent_rels[0].state == "open"
+    assert parent_rels[0].resolved is True
+
+
+def test_get_ticket_parent_id_none_without_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No `hierarchyWidget.parent` on the Work Item -> `parent_id` stays
+    `None` and no `parent` relation is added."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("issues/5"):
+            return _json(_issue_with_body(5))
+        if url.endswith("/api/graphql"):
+            return _graphql_response({
+                "project": {"workItems": {"nodes": [_work_item(5, parent=None)]}}
+            })
+        aux = _empty_aux_handler(req)
+        return aux if aux else _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, relations, _t = GitLabProvider().get_ticket(_project(), "t", "5")
+    assert ticket.parent_id is None
+    assert [r for r in relations if r.kind == "parent"] == []
+
+
+def test_get_ticket_include_relations_false_leaves_parent_id_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`include_relations=False` never issues the GraphQL hierarchy call
+    and `parent_id` stays unpopulated (`None`) — it's a pure projection
+    over `_fetch_relations`, not an independent fetch."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("issues/5"):
+            return _json(_issue_with_body(5))
+        if "/notes" in url:
+            return _json([])
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    ticket, _c, relations, truncated = GitLabProvider().get_ticket(
+        _project(), "t", "5", include_relations=False,
+    )
+    assert ticket.parent_id is None
+    assert relations == []
+    assert truncated is None
