@@ -1957,6 +1957,132 @@ def test_remove_relation_duplicate_of_strips_body_marker(
     )
 
 
+def test_remove_relation_duplicate_of_twice_second_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #173: calling remove_relation('duplicate_of')
+    a second time on an already-removed link must raise RelationNotFound
+    instead of silently returning {"removed": True} again.
+
+    The first call strips the 'Duplicate of #99' marker and PATCHes the
+    body; the mock then serves the STRIPPED body on the next source GET
+    (mimicking GitHub after the PATCH landed). The second call must detect
+    the marker is gone and raise before issuing any PATCH.
+    """
+    original_body = "Duplicate of #99\n\nOriginal description."
+    stripped_body = "Original description."
+    patch_count = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal patch_count
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/99":
+            return _json(_issue_payload(99, id=9901))
+        if path == "/repos/acme/backend/issues/10" and req.method == "GET":
+            # First GET returns the original body; after the PATCH the
+            # "stored" body is the stripped one.
+            body = stripped_body if patch_count else original_body
+            return _json(_issue_payload(
+                10, id=1001,
+                body=body,
+                state="closed" if not patch_count else "open",
+                state_reason="duplicate" if not patch_count else None,
+                labels=[],
+            ))
+        if path == "/repos/acme/backend/issues/10" and req.method == "PATCH":
+            patch_count += 1
+            import json as _json_mod
+            payload = _json_mod.loads(req.content)
+            return _json(_issue_payload(10, state="open", body=payload.get("body", "")))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+
+    first = provider.remove_relation(
+        _project(), token="t", ticket_id="10", kind="duplicate_of", target="#99"
+    )
+    assert first == {"removed": True}
+    assert patch_count == 1, "first call must PATCH exactly once"
+
+    with pytest.raises(RelationNotFound) as exc:
+        provider.remove_relation(
+            _project(), token="t", ticket_id="10", kind="duplicate_of", target="#99"
+        )
+    assert exc.value.kind == "duplicate_of"
+    assert patch_count == 1, "second call must not issue another PATCH"
+    assert str(exc.value) == (
+        "no 'duplicate_of' relation on #10 targeting '#99' found to remove"
+    )
+
+
+def test_remove_relation_duplicate_of_no_marker_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #173: if the source body has no 'Duplicate of'
+    line at all, remove_relation('duplicate_of') must raise RelationNotFound
+    and must not PATCH.
+    """
+    body_without_marker = "Just a plain description, no marker here."
+    patched = False
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal patched
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/99":
+            return _json(_issue_payload(99, id=9901))
+        if path == "/repos/acme/backend/issues/10" and req.method == "GET":
+            return _json(_issue_payload(
+                10, id=1001, body=body_without_marker, state="open", labels=[],
+            ))
+        if path == "/repos/acme/backend/issues/10" and req.method == "PATCH":
+            patched = True
+            return _json(_issue_payload(10, state="open"))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound) as exc:
+        GitHubProvider().remove_relation(
+            _project(), token="t", ticket_id="10", kind="duplicate_of", target="#99"
+        )
+    assert exc.value.kind == "duplicate_of"
+    assert not patched, "no marker present means no PATCH should be issued"
+
+
+def test_remove_relation_duplicate_of_partial_number_mismatch_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #173: a body marker for a *different* target
+    number (e.g. 'Duplicate of #70') must not be treated as a match for a
+    remove_relation call targeting '#7' — the regex is number-anchored, so
+    this must raise RelationNotFound rather than stripping the wrong line.
+    """
+    body = "Duplicate of #70\n\nOriginal description."
+    patched = False
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal patched
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/7":
+            return _json(_issue_payload(7, id=701))
+        if path == "/repos/acme/backend/issues/10" and req.method == "GET":
+            return _json(_issue_payload(
+                10, id=1001, body=body, state="closed", state_reason="duplicate", labels=[],
+            ))
+        if path == "/repos/acme/backend/issues/10" and req.method == "PATCH":
+            patched = True
+            return _json(_issue_payload(10, state="open"))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound) as exc:
+        GitHubProvider().remove_relation(
+            _project(), token="t", ticket_id="10", kind="duplicate_of", target="#7"
+        )
+    assert exc.value.kind == "duplicate_of"
+    assert not patched, "mismatched target number must not trigger a PATCH"
+
+
 # ---------- Regression: add_relation('blocks') duplicate raises correct id ----
 
 

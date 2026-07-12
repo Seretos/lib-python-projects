@@ -4634,6 +4634,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     + r"\s*$",
                     re.MULTILINE,
                 )
+                if not dup_pattern.search(body_core):
+                    raise RelationNotFound(
+                        kind="duplicate_of",
+                        ticket_id=ticket_id,
+                        target=f"#{target_number}",
+                    )
                 # Remove the matching line and collapse resulting double
                 # blank lines produced by the surrounding \n\n separators.
                 body_stripped = dup_pattern.sub("", body_core)
