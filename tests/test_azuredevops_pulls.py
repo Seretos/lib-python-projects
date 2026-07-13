@@ -1806,6 +1806,21 @@ def test_merge_pr_docstring_records_reviewer_non_claim() -> None:
     )
 
 
+def test_submit_pr_review_docstring_records_reviewer_side_effect() -> None:
+    """Ticket #183: casting a review vote IS a server-side side effect on
+    the PR's reviewer set (unlike `merge_pr`, which is guarded above as a
+    non-claim). Guard the docstring so this distinction stays documented
+    and the two notes can't be confused with one another."""
+    doc = AzureDevOpsProvider.submit_pr_review.__doc__
+    assert doc is not None
+    assert "reviewers" in doc
+    assert "requested_reviewers" in doc
+    assert "side effect" in doc
+    assert "does not add" not in doc, (
+        "merge_pr's non-claim negation leaked into submit_pr_review's docstring"
+    )
+
+
 def test_merge_pr_does_not_populate_requested_reviewers(
     monkeypatch: pytest.MonkeyPatch, fast_merge_settle: None
 ) -> None:
