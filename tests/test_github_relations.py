@@ -617,6 +617,10 @@ def test_duplicate_of_from_own_state(monkeypatch: pytest.MonkeyPatch) -> None:
             return _json([])
         if path == "/repos/acme/backend/issues/4/timeline":
             return _json([])
+        if path == "/repos/acme/backend/issues/1":
+            # Target of "Duplicate of #1" — the read path now hydrates
+            # duplicate_of with a live fetch of the target issue.
+            return _json(_issue_payload(1, title="Target issue", state="open"))
         if "/dependencies/" in path:
             # Ticket #41 read-path: empty Dependencies API responses
             # keep these legacy fixtures focused on their original kind.
@@ -657,6 +661,9 @@ def test_duplicate_of_no_extra_mentions_from_body_marker(
             return _json([])
         if path == "/repos/acme/backend/issues/5/timeline":
             return _json([])
+        if path == "/repos/acme/backend/issues/1":
+            # Target of "Duplicate of #1" — hydrated via live fetch.
+            return _json(_issue_payload(1, title="Target issue", state="open"))
         if "/dependencies/" in path:
             return _json([])
         raise AssertionError(f"unexpected request: {req.url}")
@@ -708,6 +715,10 @@ def test_duplicate_of_resolved_entry_wins_over_body_scan_stub(
             return _json([])
         if path == "/repos/acme/backend/issues/42/timeline":
             return _json(timeline)
+        if path == "/repos/acme/backend/issues/9":
+            # Target of "Duplicate of #9" — hydrated via live fetch; the
+            # timeline's `canonical` payload for the same target agrees.
+            return _json(_issue_payload(9, title="Canonical issue", state="open"))
         if "/dependencies/" in path:
             return _json([])
         raise AssertionError(f"unexpected request: {req.url}")
@@ -724,12 +735,13 @@ def test_duplicate_of_resolved_entry_wins_over_body_scan_stub(
     assert rel.resolved is True
 
 
-def test_duplicate_of_without_timeline_stays_unresolved(
+def test_duplicate_of_without_timeline_is_hydrated_via_target_fetch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Body-scan `duplicate_of` with no resolving timeline event keeps
-    the unresolved fallback (`resolved=False`, empty title/state) —
-    the merge must not fabricate metadata that was never fetched."""
+    """Body-scan `duplicate_of` with no resolving timeline event is still
+    fully hydrated: the read path (`_fetch_relations`) now does its own
+    live GET of the target issue for `duplicate_of` (ticket #173 point 2),
+    independent of whether a timeline `marked_as_duplicate` event exists."""
 
     body = "Duplicate of #1"
 
@@ -745,6 +757,89 @@ def test_duplicate_of_without_timeline_stays_unresolved(
             return _json([])
         if path == "/repos/acme/backend/issues/4/timeline":
             return _json([])
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, title="Target issue", state="open"))
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="4")
+    dup_rels = [r for r in relations if r.kind == "duplicate_of" and r.ticket_id == "#1"]
+    assert len(dup_rels) == 1
+    rel = dup_rels[0]
+    assert rel.resolved is True
+    assert rel.title == "Target issue"
+    assert rel.state == "open"
+
+
+def test_duplicate_of_target_fetch_404_degrades_to_unresolved_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #173 point 2: when the `duplicate_of` target
+    issue can't be fetched (404 — deleted/inaccessible), the read path
+    degrades gracefully to the thin sentinel (`resolved=False`, empty
+    title/state, but a non-empty url/ticket_id) instead of raising and
+    breaking `get_ticket` for the whole queried ticket."""
+
+    body = "Duplicate of #1"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/4":
+            return _json(_issue_payload(
+                4, body=body, state="closed", state_reason="duplicate",
+            ))
+        if path == "/repos/acme/backend/issues/4/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/4/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/4/timeline":
+            return _json([])
+        if path == "/repos/acme/backend/issues/1":
+            return _json({"message": "Not Found"}, status_code=404)
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="4")
+    dup_rels = [r for r in relations if r.kind == "duplicate_of" and r.ticket_id == "#1"]
+    assert len(dup_rels) == 1, f"expected exactly one duplicate_of #1, got {relations}"
+    rel = dup_rels[0]
+    assert rel.resolved is False
+    assert rel.title == ""
+    assert rel.state == ""
+    assert rel.url, "sentinel fallback must still carry a non-empty url"
+
+
+def test_duplicate_of_target_fetch_500_degrades_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #173 point 2: a non-404 API error (e.g. 500)
+    on the `duplicate_of` target fetch must also be swallowed into the
+    thin sentinel — `get_ticket` must not propagate the exception."""
+
+    body = "Duplicate of #1"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/4":
+            return _json(_issue_payload(
+                4, body=body, state="closed", state_reason="duplicate",
+            ))
+        if path == "/repos/acme/backend/issues/4/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/4/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/4/timeline":
+            return _json([])
+        if path == "/repos/acme/backend/issues/1":
+            return _json({"message": "Internal Server Error"}, status_code=500)
         if "/dependencies/" in path:
             return _json([])
         raise AssertionError(f"unexpected request: {req.url}")
@@ -759,6 +854,88 @@ def test_duplicate_of_without_timeline_stays_unresolved(
     assert rel.resolved is False
     assert rel.title == ""
     assert rel.state == ""
+
+
+def test_duplicate_of_cross_repo_target_is_hydrated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-repo `duplicate_of` marker (`owner/repo#N`) hydrates against
+    the *other* repo's issues endpoint, and degrades to the thin sentinel
+    on 404 — mirroring the same-repo behavior for a cross-repo target."""
+
+    body = "Duplicate of other/repo#3"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/6":
+            return _json(_issue_payload(6, body=body, state="open"))
+        if path == "/repos/acme/backend/issues/6/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/6/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/6/timeline":
+            return _json([])
+        if path == "/repos/other/repo/issues/3":
+            payload = _issue_payload(3, title="Other repo issue", state="closed")
+            payload["html_url"] = "https://github.com/other/repo/issues/3"
+            return _json(payload)
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="6")
+    dup_rels = [
+        r for r in relations
+        if r.kind == "duplicate_of" and r.ticket_id == "other/repo#3"
+    ]
+    assert len(dup_rels) == 1, f"expected duplicate_of other/repo#3, got {relations}"
+    rel = dup_rels[0]
+    assert rel.resolved is True
+    assert rel.title == "Other repo issue"
+    assert rel.state == "closed"
+
+
+def test_duplicate_of_cross_repo_target_404_degrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-repo `duplicate_of` target that 404s degrades to the thin
+    sentinel, same as the same-repo case."""
+
+    body = "Duplicate of other/repo#3"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/6":
+            return _json(_issue_payload(6, body=body, state="open"))
+        if path == "/repos/acme/backend/issues/6/comments":
+            return _json([])
+        if path == "/repos/acme/backend/issues/6/sub_issues":
+            return _json([])
+        if path == "/repos/acme/backend/issues/6/timeline":
+            return _json([])
+        if path == "/repos/other/repo/issues/3":
+            return _json({"message": "Not Found"}, status_code=404)
+        if "/dependencies/" in path:
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    _, _, relations, _ = provider.get_ticket(_project(), token="t", ticket_id="6")
+    dup_rels = [
+        r for r in relations
+        if r.kind == "duplicate_of" and r.ticket_id == "other/repo#3"
+    ]
+    assert len(dup_rels) == 1
+    rel = dup_rels[0]
+    assert rel.resolved is False
+    assert rel.title == ""
+    assert rel.state == ""
+    assert rel.url
 
 
 def test_duplicate_of_resolved_without_body_scan_passes_through(
@@ -830,6 +1007,8 @@ def test_mentions_suppressed_when_duplicate_of_resolved_via_merge(
             return _json([])
         if path == "/repos/acme/backend/issues/42/timeline":
             return _json(timeline)
+        if path == "/repos/acme/backend/issues/9":
+            return _json(_issue_payload(9, title="Canonical issue", state="open"))
         if "/dependencies/" in path:
             return _json([])
         raise AssertionError(f"unexpected request: {req.url}")
@@ -1849,6 +2028,8 @@ def test_duplicate_of_from_body_without_state_reason(
             return _json([])
         if path == "/repos/acme/backend/issues/4/timeline":
             return _json([])
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, title="Target issue", state="open"))
         if "/dependencies/" in path:
             return _json([])
         raise AssertionError(f"unexpected request: {req.url}")
@@ -1888,6 +2069,8 @@ def test_duplicate_of_from_body_with_state_reason_duplicate(
             return _json([])
         if path == "/repos/acme/backend/issues/4/timeline":
             return _json([])
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, title="Target issue", state="open"))
         if "/dependencies/" in path:
             return _json([])
         raise AssertionError(f"unexpected request: {req.url}")
@@ -2248,6 +2431,8 @@ def test_duplicate_of_dedicated_line_is_detected(
             return _json([])
         if path == "/repos/acme/backend/issues/8/timeline":
             return _json([])
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, title="Target issue", state="open"))
         if "/dependencies/" in path:
             return _json([])
         raise AssertionError(f"unexpected request: {req.url}")
@@ -2262,13 +2447,13 @@ def test_duplicate_of_dedicated_line_is_detected(
     )
 
 
-def test_duplicate_of_relation_has_resolved_false_from_body_scan(
+def test_duplicate_of_read_path_is_fully_hydrated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression for ticket #62: a duplicate_of relation produced by the body
-    scan must have resolved=False, title="", state="", a non-empty url, and the
-    correct ticket_id.  These are the intentional 'not fetched' sentinel values
-    — the target is not independently fetched at read time.
+    """Regression for ticket #173 point 2: a duplicate_of relation produced
+    by the read-path body scan must now be fully hydrated — resolved=True,
+    real title/state from a live fetch of the target issue — matching
+    parent/child, instead of the old thin resolved=False/empty sentinel.
     """
     body = "Duplicate of #5\n\nSome additional context."
 
@@ -2282,6 +2467,8 @@ def test_duplicate_of_relation_has_resolved_false_from_body_scan(
             return _json([])
         if path == "/repos/acme/backend/issues/9/timeline":
             return _json([])
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, title="Canonical target", state="closed"))
         if "/dependencies/" in path:
             return _json([])
         raise AssertionError(f"unexpected request: {req.url}")
@@ -2294,16 +2481,16 @@ def test_duplicate_of_relation_has_resolved_false_from_body_scan(
     dup = next((r for r in relations if r.kind == "duplicate_of"), None)
     assert dup is not None, f"expected a duplicate_of relation; got {relations}"
     assert dup.ticket_id == "#5", f"expected ticket_id='#5'; got {dup.ticket_id!r}"
-    assert dup.resolved is False, (
-        f"body-scan duplicate_of must have resolved=False; got {dup.resolved!r}"
+    assert dup.resolved is True, (
+        f"read-path duplicate_of must be hydrated (resolved=True); got {dup.resolved!r}"
     )
-    assert dup.title == "", (
-        f"body-scan duplicate_of must have title=''; got {dup.title!r}"
+    assert dup.title == "Canonical target", (
+        f"expected real title from target fetch; got {dup.title!r}"
     )
-    assert dup.state == "", (
-        f"body-scan duplicate_of must have state=''; got {dup.state!r}"
+    assert dup.state == "closed", (
+        f"expected real state from target fetch; got {dup.state!r}"
     )
-    assert dup.url, f"body-scan duplicate_of must have a non-empty url; got {dup.url!r}"
+    assert dup.url, f"hydrated duplicate_of must have a non-empty url; got {dup.url!r}"
 
 
 # ---------- Ticket #61: inverse-kind relation de-duplication ------------------
