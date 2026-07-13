@@ -2527,26 +2527,76 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         Returns a `{id: (title, state)}` map. Missing ids (deleted /
         invisible work items) are absent from the map so the caller can
         default to empty strings.
+
+        ADO's `workitemsbatch` defaults to `errorPolicy: "Fail"`, which
+        fails the *entire* multi-id request if even one id in the batch
+        is momentarily unresolvable — silently blanking title/state for
+        every relation in that batch, not just the poison id (#179). We
+        request `errorPolicy: "Omit"` so resolvable ids still come back,
+        and additionally fall back to per-id requests if the batch call
+        itself fails outright (non-success response or a transport
+        error), so one bad id can never blank its batch-mates.
         """
         if not ids:
             return {}
-        body = {
-            "ids": [int(i) for i in ids if i.isdigit()],
-            "fields": ["System.Title", "System.State"],
-        }
-        if not body["ids"]:
+        numeric_ids = [int(i) for i in ids if i.isdigit()]
+        if not numeric_ids:
             return {}
+        result = self._fetch_work_item_title_state_batch(project, token, numeric_ids)
+        if result is not None:
+            return result
+        log.warning(
+            "workitemsbatch request failed for ids=%s; retrying individually",
+            numeric_ids,
+        )
+        if len(numeric_ids) == 1:
+            # Already a single-id request — retrying it again would just
+            # repeat the same failure. Best-effort: empty titles beat
+            # blowing up the whole get_ticket path.
+            return {}
+        # Per-id fallback: a batch of >1 id failed outright, so retry each
+        # id as its own single-id request and merge whatever succeeds.
+        # This guarantees a single poison/failing id can't blank its
+        # batch-mates. These single-id calls never recurse into this
+        # fallback (see the `len(numeric_ids) == 1` branch above).
+        merged: dict[str, tuple[str, str]] = {}
+        for wid in numeric_ids:
+            single = self._fetch_work_item_title_state_batch(project, token, [wid])
+            if single is None:
+                log.warning(
+                    "workitemsbatch per-id fallback failed for id=%s", wid
+                )
+                continue
+            merged.update(single)
+        return merged
+
+    def _fetch_work_item_title_state_batch(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        numeric_ids: list[int],
+    ) -> dict[str, tuple[str, str]] | None:
+        """Issue a single `workitemsbatch` POST for the given ids.
+
+        Returns the `{id: (title, state)}` map on success (missing ids are
+        simply absent), or `None` if the request itself failed (non-success
+        response or a transport error) so the caller can decide whether to
+        retry.
+        """
+        body = {
+            "ids": numeric_ids,
+            "fields": ["System.Title", "System.State"],
+            "errorPolicy": "Omit",
+        }
         path = f"{_project_scope(project)}/_apis/wit/workitemsbatch"
         try:
             with _client(project, token) as c:
                 resp = c.post(path, params=_api_version_params(), json=body)
             if not resp.is_success:
-                # Best-effort: empty titles beat blowing up the whole
-                # get_ticket path. The relation array still surfaces.
-                return {}
+                return None
             value = (resp.json() or {}).get("value") or []
         except httpx.HTTPError:
-            return {}
+            return None
         out: dict[str, tuple[str, str]] = {}
         for item in value:
             wid = item.get("id")
