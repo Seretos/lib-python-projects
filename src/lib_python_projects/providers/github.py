@@ -3051,17 +3051,22 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         omitted (`_UNSET`) issues no milestone write at all. A failed
         board write raises a plain `GitHubError`, same as `custom_fields`.
 
-        `status` changes only the REST issue state (`state`/
-        `state_reason` via the PATCH below) — it never touches the
-        Projects-v2 board's Status field (ticket #175). In particular,
-        reopening a ticket (`status="open"`) that was previously moved
-        to a terminal board column (e.g. "Done") leaves that column
-        unchanged: there is no configured default/open column in the
-        board binding for this method to reset it to, and guessing one
-        would be non-deterministic. Callers who need the board column
-        reset on a status change must pass
-        `custom_fields={"Status": "<column>"}` in the same
-        `update_ticket` call.
+        `status` normally changes only the REST issue state (`state`/
+        `state_reason` via the PATCH below) and does not touch the
+        Projects-v2 board's Status field. The one exception (ticket
+        #175): reopening a ticket (`status="open"`) that was previously
+        closed **and** whose bound board has moved it into a terminal
+        column resets that column back to the board's first configured
+        column (`project.board.columns[0]`, resolved through
+        `Board.resolve` so a `binding.map` alias is honored). This only
+        fires when a `github-projects-v2` board is configured (an
+        `azure-boards` binding, or no board at all, is a silent no-op —
+        Azure's status/column model is out of scope here) and only when
+        the caller did **not** already pass an explicit value for the
+        board's `status_field` via `custom_fields` in the same call —
+        an explicit caller value always wins and no reset write happens
+        on top of it. A failed reset write raises `GitHubError`, same
+        as any other board write in this method.
         """
         _validate_label_lists(labels_add, labels_remove)
         binding = None
@@ -3099,6 +3104,19 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     f"with milestone"
                 )
             binding = milestone_binding
+        # ticket #175: on a closed→open transition, reset a terminal
+        # board column back to the board's first column. Only fires for
+        # a `github-projects-v2` board — an `azure-boards` binding, or no
+        # board at all, is a silent no-op here — and only when the
+        # caller hasn't already passed an explicit value for the
+        # board's status_field via `custom_fields` in this same call
+        # (checked below, once `custom_fields` is known to be valid).
+        reopen_binding: Any = None
+        if (
+            project.board is not None
+            and project.board.binding.kind == "github-projects-v2"
+        ):
+            reopen_binding = project.board.binding
         with _client(token) as client:
             r0 = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
             try:
@@ -3185,6 +3203,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 new_assignees.difference_update(assignees_remove)
 
             payload: dict[str, Any] = {}
+            state: str | None = None
             if title is not None:
                 payload["title"] = title
             if body is not None:
@@ -3210,6 +3229,31 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 payload["labels"] = sorted(new_labels)
             if new_assignees != current_assignees:
                 payload["assignees"] = sorted(new_assignees)
+
+            # ticket #175: reopening (closed→open) a ticket whose bound
+            # `github-projects-v2` board has it parked in a terminal
+            # column resets that column back to the board's first
+            # configured column — unless the caller already passed an
+            # explicit value for the board's status_field via
+            # `custom_fields` in this same call, in which case the
+            # caller's value wins and no reset write happens on top of
+            # it. Reuses the same case-insensitive key scan as the
+            # `on_move_to` auto-label lookup above to detect an explicit
+            # override.
+            should_reset_board_column = False
+            if (
+                reopen_binding is not None
+                and current.get("state") == "closed"
+                and state == "open"
+            ):
+                status_field = reopen_binding.status_field
+                explicit_override = False
+                if custom_fields:
+                    for key in custom_fields:
+                        if key.lower() == status_field.lower():
+                            explicit_override = True
+                            break
+                should_reset_board_column = not explicit_override
 
             if not payload:
                 # Nothing to do via REST — still honor a pending board
@@ -3261,7 +3305,22 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         f"'node_id'; cannot write milestone",
                     )
                 _write_milestone_to_board(client, binding, content_id, milestone)
-            if custom_fields:
+            if should_reset_board_column:
+                content_id = raw.get("node_id")
+                if not content_id:
+                    raise GitHubError(
+                        500,
+                        f"ticket '{project.id}#{ticket_id}' payload missing "
+                        f"'node_id'; cannot reset board column on reopen",
+                    )
+                reset_value = project.board.resolve(project.board.columns[0])  # type: ignore[union-attr]
+                _write_custom_fields_to_board(
+                    client,
+                    reopen_binding,
+                    content_id,
+                    {reopen_binding.status_field: reset_value},
+                )
+            if custom_fields or should_reset_board_column:
                 return _reget_issue()
             return _map_issue(raw)
 

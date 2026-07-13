@@ -1243,15 +1243,19 @@ def _map_thread_comment_for_review(
     discussion_id = str(thread_id) if thread_id is not None else None
     in_reply_to = str(thread_id) if parent_id else None
 
-    # ADO exposes no commit SHA on a thread at all — there's no field on
-    # the thread or comment payload that carries one, so `commit_sha` is
-    # always None here on read (ticket #175). `add_pr_review_comment`
-    # echoes back the caller-supplied `commit_sha` into the object it
-    # returns, but that's a create-time convenience only: it is never
-    # persisted server-side, so a subsequent `get_pr`/
-    # `list_pr_review_comments` re-read of the same comment goes through
-    # this function and comes back with `commit_sha=None`.
-    commit_sha = None
+    # `commit_sha` is persisted as a thread-level property
+    # (`REVIEW_COMMIT_SHA_PROPERTY_KEY`) by `add_pr_review_comment`'s
+    # new-thread branch (ticket #175): a subsequent `get_pr`/
+    # `list_pr_review_comments` re-read goes through this function and
+    # reads that property back via `_thread_property_value`, which
+    # handles both the `{"$value": ...}` envelope and flat shapes ADO
+    # returns inconsistently. Threads created before this fix (or
+    # created without a caller-supplied `commit_sha`) carry no such
+    # property and resolve to `None`, same as before. The property is
+    # stored at the thread level, not per-comment, so a reply
+    # (`in_reply_to`) inherits whatever `commit_sha` is stored on its
+    # parent thread rather than carrying its own.
+    commit_sha = _thread_property_value(thread, REVIEW_COMMIT_SHA_PROPERTY_KEY)
 
     return ReviewComment(
         id=_format_thread_comment_id(thread_id, comment_id),
@@ -1313,6 +1317,11 @@ def _format_thread_comment_id(thread_id: int | str | None, comment_id: int | str
 
 REVIEW_BODY_PROPERTY_KEY = "projectIssues.kind"
 REVIEW_BODY_PROPERTY_VALUE = "review_body"
+# Thread-level property carrying a caller-supplied `commit_sha` for a new
+# diff-anchored review-comment thread (ticket #175) — mirrors
+# `REVIEW_BODY_PROPERTY_KEY`'s envelope shape so it round-trips through the
+# same `_thread_property_value` reader.
+REVIEW_COMMIT_SHA_PROPERTY_KEY = "projectIssues.commitSha"
 
 # Work-item and comment ids are .NET Int32; anything beyond
 # `2_147_483_647` triggers an opaque ADO 400 (System.OverflowException).
@@ -4043,14 +4052,20 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         thread (`path`+`line`) or as a reply to an existing thread
         (`in_reply_to`).
 
-        `commit_sha`, if provided, is echoed into the returned
-        `ReviewComment` as a create-time convenience (matching GitHub's
-        review-comment return shape) — it is NOT written to Azure
-        DevOps and is not persisted anywhere on the thread. A later
+        `commit_sha`, if provided on the new-thread path, is now
+        persisted as a thread-level property
+        (`REVIEW_COMMIT_SHA_PROPERTY_KEY`, ticket #175): a later
         `get_pr`/`list_pr_review_comments` re-read of this same comment
-        goes through `_map_thread_comment_for_review`, which always
-        reports `commit_sha=None` for Azure DevOps threads (ticket #175):
-        ADO simply doesn't expose a commit SHA on a thread.
+        goes through `_map_thread_comment_for_review`, which reads that
+        property back and reports the same `commit_sha` instead of
+        `None`. It is also still echoed into the `ReviewComment`
+        returned immediately here as a create-time convenience
+        (matching GitHub's review-comment return shape), which is a
+        harmless no-op fallback once the property round-trips. The
+        reply (`in_reply_to`) path does not write the property itself —
+        a reply comment inherits whatever `commit_sha` is already
+        stored on its parent thread when read back, since the property
+        lives at the thread level, not per-comment.
         """
         # Validate before doing any network I/O so callers fail fast.
         if not in_reply_to and (not path or line is None):
@@ -4123,7 +4138,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             thread_context["rightFileStart"] = {"line": line, "offset": 1}
             thread_context["rightFileEnd"] = {"line": line, "offset": 1}
 
-        payload = {
+        payload: dict[str, Any] = {
             "comments": [
                 {
                     "parentCommentId": 0,
@@ -4134,6 +4149,19 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             "status": "active",
             "threadContext": thread_context,
         }
+        if commit_sha:
+            # Persist the caller-supplied commit_sha as a thread-level
+            # property (ticket #175) so a later re-read through
+            # `_map_thread_comment_for_review` gets it back instead of
+            # `None`. Mirrors `submit_pr_review`'s REVIEW_BODY_PROPERTY_KEY
+            # envelope shape so both round-trip through the same
+            # `_thread_property_value` reader.
+            payload["properties"] = {
+                REVIEW_COMMIT_SHA_PROPERTY_KEY: {
+                    "$type": "System.String",
+                    "$value": commit_sha,
+                },
+            }
         threads_path = (
             f"{_project_scope(project)}/_apis/git/repositories/"
             f"{quote(repo_id, safe='')}/pullrequests/{quote(str(pr_id), safe='')}/threads"

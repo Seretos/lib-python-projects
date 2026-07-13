@@ -1874,18 +1874,199 @@ def test_update_ticket_custom_fields_none_or_empty_is_noop(
     assert ticket_empty.id == "42"
 
 
-def test_update_ticket_status_reopen_without_custom_fields_does_not_touch_board(
+def test_update_ticket_reopen_resets_board_column(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Ticket #175: `status="open"` alone (no `custom_fields`) must only
-    PATCH the REST issue state/state_reason — it must never write the
-    Projects-v2 board Status field, even when the ticket was previously
-    moved to a terminal column like "Done". There is no configured
-    default/open column to reset it to, so `update_ticket` leaves the
-    board column untouched; callers who want that must pass
-    `custom_fields={"Status": "<column>"}` explicitly (see the updated
-    docstring)."""
+    """Ticket #175 (reopened after re-test — the prior "fixed" state was
+    doc-only and rejected): `status="open"` on a ticket that was
+    previously closed while parked in a terminal board column ("Done")
+    must actually reset the board's Status field back to the board's
+    first configured column ("Todo"), not merely PATCH the REST issue
+    state and leave the column untouched. The returned `Ticket` reflects
+    the post-write re-GET, mirroring the #178 cascade-consistency
+    behavior any other board write already gets."""
     board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    get_count = {"n": 0}
+    patch_payloads: list[dict] = []
+    field_calls: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            get_count["n"] += 1
+            if get_count["n"] == 1:
+                return _json(_ai_issue_payload(42, state="closed"))
+            return _json(_ai_issue_payload(42, state="open"))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            patch_payloads.append(json.loads(req.content.decode("utf-8")))
+            return _json(_ai_issue_payload(42, state="open"))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                field_calls.append(variables)
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [
+                        {"id": "opt-todo", "name": "Todo"},
+                        {"id": "opt-done", "name": "Done"},
+                    ],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", status="open",
+    )
+
+    assert patch_payloads == [{"state": "open"}]
+    assert field_calls == [{
+        "projectId": "proj-node-id", "itemId": "item-1",
+        "fieldId": "field-status", "value": {"singleSelectOptionId": "opt-todo"},
+    }]
+    assert get_count["n"] == 2, "expected a #178-style re-GET after the board write"
+    assert ticket.status == "open"
+
+
+def test_update_ticket_reopen_already_open_does_not_reset_board_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reset only fires on an actual closed->open transition — an
+    already-open ticket passed `status="open"` again must not trigger a
+    board write (or the extra #178 re-GET round trip)."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, state="open"))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, state="open"))
+        if path == "/graphql":
+            raise AssertionError(
+                "no GraphQL/board call expected when the ticket was "
+                "already open"
+            )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", status="open",
+    )
+    assert ticket.status == "open"
+    assert not any(r.url.path == "/graphql" for r in seen)
+
+
+def test_update_ticket_reopen_explicit_custom_fields_override_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the caller reopens AND explicitly passes a value for the
+    board's status_field via `custom_fields` in the same call, that
+    explicit value wins — exactly one board field write happens (the
+    caller's), with no additional reset write on top of it."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    field_calls: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, state="closed"))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, state="open"))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                field_calls.append(variables)
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [
+                        {"id": "opt-todo", "name": "Todo"},
+                        {"id": "opt-done", "name": "Done"},
+                    ],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().update_ticket(
+        _project(board), "t", "42",
+        status="open", custom_fields={"Status": "Todo"},
+    )
+
+    assert len(field_calls) == 1
+    assert field_calls[0]["value"] == {"singleSelectOptionId": "opt-todo"}
+
+
+def test_update_ticket_reopen_no_board_configured_rest_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No board configured at all: reopening still succeeds via REST
+    alone, with no error and no GraphQL call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, state="closed"))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, state="open"))
+        if path == "/graphql":
+            raise AssertionError("no GraphQL call expected when no board is configured")
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(None), "t", "42", status="open",
+    )
+    assert ticket.status == "open"
+    assert not any(r.url.path == "/graphql" for r in seen)
+
+
+def test_update_ticket_reopen_azure_boards_binding_rest_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A board configured with an `azure-boards` binding (not
+    `github-projects-v2`) is a silent no-op for the reopen-reset feature
+    — REST-only reopen, no board write."""
+    board = Board(
+        columns=["Todo", "Done"],
+        binding=AzureBoardsBinding(kind="azure-boards", team="T", board="Stories"),
+    )
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
@@ -1895,8 +2076,7 @@ def test_update_ticket_status_reopen_without_custom_fields_does_not_touch_board(
             return _json(_ai_issue_payload(42, state="open"))
         if path == "/graphql":
             raise AssertionError(
-                "no GraphQL/board call expected for a status-only reopen "
-                "without custom_fields"
+                "no GraphQL call expected for a non-github-projects-v2 binding"
             )
         raise AssertionError(f"unexpected request {req.method} {path}")
 
@@ -1905,13 +2085,66 @@ def test_update_ticket_status_reopen_without_custom_fields_does_not_touch_board(
         _project(board), "t", "42", status="open",
     )
     assert ticket.status == "open"
-
-    patch_requests = [r for r in seen if r.method == "PATCH"]
-    assert len(patch_requests) == 1
-    patch_payload = json.loads(patch_requests[0].content.decode("utf-8"))
-    assert patch_payload["state"] == "open"
-
     assert not any(r.url.path == "/graphql" for r in seen)
+
+
+def test_update_ticket_reopen_mapped_columns_resets_to_resolved_native_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When `binding.map` aliases the logical first column to a
+    differently-named native option, the reset writes the *resolved*
+    native value (`Board.resolve`), not the raw logical column name."""
+    board = _board(
+        ["Todo", "Done"], owner="acme-org", project_number=7,
+        map_={"Todo": "Backlog"},
+    )
+    field_calls: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, state="closed"))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, state="open"))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                field_calls.append(variables)
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [
+                        {"id": "opt-backlog", "name": "Backlog"},
+                        {"id": "opt-done", "name": "Done"},
+                    ],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().update_ticket(
+        _project(board), "t", "42", status="open",
+    )
+
+    assert len(field_calls) == 1
+    assert field_calls[0]["value"] == {"singleSelectOptionId": "opt-backlog"}
 
 
 def test_update_ticket_custom_fields_no_board_raises(
