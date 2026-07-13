@@ -1167,6 +1167,39 @@ def _ref_to_relation(
     )
 
 
+def _fetch_duplicate_of_relation(
+    client: httpx.Client,
+    project: ProjectConfig,
+    owner: str | None,
+    repo: str | None,
+    num: int,
+) -> Relation:
+    """Build a fully-hydrated `duplicate_of` Relation via a live GET.
+
+    Unlike `closes`/`mentions` (which stay thin via `_ref_to_relation`),
+    `duplicate_of` is meant to read the same way `parent`/`child` do:
+    `resolved=True` plus the target's real `title`/`state`. This does the
+    extra REST fetch of the target issue and maps it through the same
+    `_map_relation_from_sub_issue` reference-implementation helper parent/
+    child use.
+
+    Degrades gracefully to the thin `_ref_to_relation` sentinel (same
+    `ticket_id`/`url`, so `_dedupe_relations` still matches it) on any
+    fetch failure — 404/410 "not found", other GitHub API errors, or a
+    transport-level failure — rather than raising and breaking the whole
+    `get_ticket` call over one dangling reference.
+    """
+    if owner and repo:
+        repo_path = f"/repos/{owner}/{repo}"
+    else:
+        repo_path = _repo_path(project)
+    try:
+        raw = _fetch_issue_payload(client, repo_path, str(num))
+    except (ProviderError, httpx.HTTPError, OSError):
+        return _ref_to_relation(owner, repo, num, project, "duplicate_of")
+    return _map_relation_from_sub_issue(raw, project, "duplicate_of")
+
+
 # ---------- GraphQL helpers ------------------------------------------------
 
 
@@ -2054,9 +2087,8 @@ def _fetch_relations(
             m.group("owner"), m.group("repo"), num
         ):
             relations.append(
-                _ref_to_relation(
-                    m.group("owner"), m.group("repo"), num,
-                    project, "duplicate_of",
+                _fetch_duplicate_of_relation(
+                    client, project, m.group("owner"), m.group("repo"), num,
                 )
             )
 
