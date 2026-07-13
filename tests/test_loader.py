@@ -577,3 +577,44 @@ class TestDefaultBranchField:
         configured = [p for p in result.projects if p.source == "config"]
         assert len(configured) == 1
         assert configured[0].default_branch == "main"
+
+
+class TestAreaPathField:
+    """`ProjectConfig.area_path` (ticket #172, Azure-DevOps-only scoping)
+    round-trips through the YAML loader."""
+
+    def test_area_path_loaded_from_yaml(self, tmp_path: Path) -> None:
+        """YAML entry with `area_path:` is preserved on load."""
+        _make_git_repo(tmp_path)
+        cfg = tmp_path / ".seretos" / "project-issues.yml"
+        _write(cfg, r"""
+            version: 1
+            projects:
+              - id: a
+                provider: azuredevops
+                path: acme-org/acme-project/acme-repo
+                area_path: acme-project\Team A
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        configured = [p for p in result.projects if p.source == "config"]
+        assert len(configured) == 1
+        assert configured[0].area_path == "acme-project\\Team A"
+
+    def test_area_path_defaults_to_none_when_omitted(self, tmp_path: Path) -> None:
+        """YAML entry without `area_path` defaults to `None` (backward compat) —
+        preserves today's unscoped behaviour for existing configs."""
+        _make_git_repo(tmp_path)
+        cfg = tmp_path / ".seretos" / "project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: a
+                provider: azuredevops
+                path: acme-org/acme-project/acme-repo
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        configured = [p for p in result.projects if p.source == "config"]
+        assert len(configured) == 1
+        assert configured[0].area_path is None

@@ -304,6 +304,16 @@ class ProjectConfig(BaseModel):
     # default once per project (Issue → Bug → User Story → Product
     # Backlog Item → Requirement). Ignored by github/gitlab.
     default_work_item_type: str | None = None
+    # Azure DevOps only (ticket #172). Scopes work-item read/write paths
+    # (list_tickets, list_labels, create_ticket) to a `System.AreaPath`
+    # sub-tree, so two wrapper `ProjectConfig`s that share the same
+    # `organization/ado_project` (differing only in the unused
+    # `repository` path segment) can be genuinely scope-isolated rather
+    # than both resolving to the same team project. Unset (the default)
+    # preserves today's unscoped behaviour exactly. An explicit
+    # `TicketFilters.area_path` on a `list_tickets` call still overrides
+    # this config-level default entirely. Ignored by github/gitlab.
+    area_path: str | None = None
     # Default branch for this project. Consumers use this as the base
     # branch for PRs and comparisons. Defaults to "main" for backward
     # compatibility.
