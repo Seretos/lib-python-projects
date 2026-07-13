@@ -52,6 +52,7 @@ def _project(
     board: Board | None = None,
     default_type: str | None = None,
     path: str = "acme-org/acme-project/acme-repo",
+    area_path: str | None = None,
 ) -> ProjectConfig:
     return ProjectConfig(
         id="acme",
@@ -60,6 +61,7 @@ def _project(
         token_env="AZURE_TOKEN",
         default_work_item_type=default_type,
         board=board,
+        area_path=area_path,
     )
 
 
@@ -418,6 +420,38 @@ def test_wiql_board_column_combined_with_other_filters(
     assert "[System.State] IN (" in wiql
     # All clauses are AND-ed into the single WHERE expression.
     assert wiql.count(" AND ") >= 4
+
+
+def test_wiql_board_column_combined_with_config_area_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #172: a `board_column` filter AND a config-level
+    `project.area_path` both appear, AND-ed, in the same WIQL — the
+    board-column clause-builder and the area-path resolver must compose
+    rather than one silently dropping the other."""
+    board = _board(["Doing"])
+    bt = _basic_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(
+        _project(board, default_type="Issue", area_path="acme-project\\Team A"),
+        token="t",
+        filters=TicketFilters(board_column="Doing", status="any"),
+    )
+    wiql = captured["wiql"]
+    assert "[System.BoardColumn] = 'Doing'" in wiql
+    assert "[System.AreaPath] UNDER 'acme-project\\Team A'" in wiql
+    assert " AND " in wiql
 
 
 def test_wiql_unknown_board_column_raises(monkeypatch: pytest.MonkeyPatch) -> None:

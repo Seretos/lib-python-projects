@@ -1167,6 +1167,39 @@ def _ref_to_relation(
     )
 
 
+def _fetch_duplicate_of_relation(
+    client: httpx.Client,
+    project: ProjectConfig,
+    owner: str | None,
+    repo: str | None,
+    num: int,
+) -> Relation:
+    """Build a fully-hydrated `duplicate_of` Relation via a live GET.
+
+    Unlike `closes`/`mentions` (which stay thin via `_ref_to_relation`),
+    `duplicate_of` is meant to read the same way `parent`/`child` do:
+    `resolved=True` plus the target's real `title`/`state`. This does the
+    extra REST fetch of the target issue and maps it through the same
+    `_map_relation_from_sub_issue` reference-implementation helper parent/
+    child use.
+
+    Degrades gracefully to the thin `_ref_to_relation` sentinel (same
+    `ticket_id`/`url`, so `_dedupe_relations` still matches it) on any
+    fetch failure — 404/410 "not found", other GitHub API errors, or a
+    transport-level failure — rather than raising and breaking the whole
+    `get_ticket` call over one dangling reference.
+    """
+    if owner and repo:
+        repo_path = f"/repos/{owner}/{repo}"
+    else:
+        repo_path = _repo_path(project)
+    try:
+        raw = _fetch_issue_payload(client, repo_path, str(num))
+    except (ProviderError, httpx.HTTPError, OSError):
+        return _ref_to_relation(owner, repo, num, project, "duplicate_of")
+    return _map_relation_from_sub_issue(raw, project, "duplicate_of")
+
+
 # ---------- GraphQL helpers ------------------------------------------------
 
 
@@ -2054,9 +2087,8 @@ def _fetch_relations(
             m.group("owner"), m.group("repo"), num
         ):
             relations.append(
-                _ref_to_relation(
-                    m.group("owner"), m.group("repo"), num,
-                    project, "duplicate_of",
+                _fetch_duplicate_of_relation(
+                    client, project, m.group("owner"), m.group("repo"), num,
                 )
             )
 
@@ -3000,6 +3032,17 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         attempted, so there's no "was the issue even created" ambiguity
         to name a partial-failure type for.
 
+        A non-empty `custom_fields` write can cascade REST-visible issue
+        state server-side (e.g. a board automation that closes the issue
+        when its Status column moves to "Done"). To keep the returned
+        `Ticket` consistent with an immediate read-back, whenever
+        `custom_fields` is non-empty this method re-GETs the issue after
+        the board write and maps that fresh snapshot instead of the
+        pre-write REST payload (ticket #178). A `milestone`-only board
+        write does not trigger this extra round trip: the iteration field
+        has no REST-visible effect on the issue. The pure-REST path (no
+        `custom_fields`, no `milestone`) makes no extra requests either.
+
         Optional `milestone` (ticket #151, keyword-only): mirrors
         `create_ticket`'s `milestone=` — requires `github-projects-v2` +
         `iteration_field` configured (`ValueError` otherwise), writes via
@@ -3008,17 +3051,22 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         omitted (`_UNSET`) issues no milestone write at all. A failed
         board write raises a plain `GitHubError`, same as `custom_fields`.
 
-        `status` changes only the REST issue state (`state`/
-        `state_reason` via the PATCH below) — it never touches the
-        Projects-v2 board's Status field (ticket #175). In particular,
-        reopening a ticket (`status="open"`) that was previously moved
-        to a terminal board column (e.g. "Done") leaves that column
-        unchanged: there is no configured default/open column in the
-        board binding for this method to reset it to, and guessing one
-        would be non-deterministic. Callers who need the board column
-        reset on a status change must pass
-        `custom_fields={"Status": "<column>"}` in the same
-        `update_ticket` call.
+        `status` normally changes only the REST issue state (`state`/
+        `state_reason` via the PATCH below) and does not touch the
+        Projects-v2 board's Status field. The one exception (ticket
+        #175): reopening a ticket (`status="open"`) that was previously
+        closed **and** whose bound board has moved it into a terminal
+        column resets that column back to the board's first configured
+        column (`project.board.columns[0]`, resolved through
+        `Board.resolve` so a `binding.map` alias is honored). This only
+        fires when a `github-projects-v2` board is configured (an
+        `azure-boards` binding, or no board at all, is a silent no-op —
+        Azure's status/column model is out of scope here) and only when
+        the caller did **not** already pass an explicit value for the
+        board's `status_field` via `custom_fields` in the same call —
+        an explicit caller value always wins and no reset write happens
+        on top of it. A failed reset write raises `GitHubError`, same
+        as any other board write in this method.
         """
         _validate_label_lists(labels_add, labels_remove)
         binding = None
@@ -3056,6 +3104,19 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     f"with milestone"
                 )
             binding = milestone_binding
+        # ticket #175: on a closed→open transition, reset a terminal
+        # board column back to the board's first column. Only fires for
+        # a `github-projects-v2` board — an `azure-boards` binding, or no
+        # board at all, is a silent no-op here — and only when the
+        # caller hasn't already passed an explicit value for the
+        # board's status_field via `custom_fields` in this same call
+        # (checked below, once `custom_fields` is known to be valid).
+        reopen_binding: Any = None
+        if (
+            project.board is not None
+            and project.board.binding.kind == "github-projects-v2"
+        ):
+            reopen_binding = project.board.binding
         with _client(token) as client:
             r0 = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
             try:
@@ -3070,6 +3131,16 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             current_labels = {lbl["name"] for lbl in (current.get("labels") or [])}
             current_assignees = {a["login"] for a in (current.get("assignees") or [])}
             markers = _marker_set(project)
+
+            def _reget_issue() -> Ticket:
+                # A board write via `_write_custom_fields_to_board` can
+                # cascade REST-visible issue state server-side (e.g. a
+                # Status:"Done" column write auto-closing the issue via a
+                # workflow) — re-GET so the returned Ticket reflects that
+                # cascade rather than a pre-write snapshot (ticket #178).
+                rr = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
+                _check(rr)
+                return _map_issue(rr.json())
 
             if labels_add:
                 _assert_labels_exist(client, project, labels_add)
@@ -3132,6 +3203,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 new_assignees.difference_update(assignees_remove)
 
             payload: dict[str, Any] = {}
+            state: str | None = None
             if title is not None:
                 payload["title"] = title
             if body is not None:
@@ -3158,6 +3230,31 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             if new_assignees != current_assignees:
                 payload["assignees"] = sorted(new_assignees)
 
+            # ticket #175: reopening (closed→open) a ticket whose bound
+            # `github-projects-v2` board has it parked in a terminal
+            # column resets that column back to the board's first
+            # configured column — unless the caller already passed an
+            # explicit value for the board's status_field via
+            # `custom_fields` in this same call, in which case the
+            # caller's value wins and no reset write happens on top of
+            # it. Reuses the same case-insensitive key scan as the
+            # `on_move_to` auto-label lookup above to detect an explicit
+            # override.
+            should_reset_board_column = False
+            if (
+                reopen_binding is not None
+                and current.get("state") == "closed"
+                and state == "open"
+            ):
+                status_field = reopen_binding.status_field
+                explicit_override = False
+                if custom_fields:
+                    for key in custom_fields:
+                        if key.lower() == status_field.lower():
+                            explicit_override = True
+                            break
+                should_reset_board_column = not explicit_override
+
             if not payload:
                 # Nothing to do via REST — still honor a pending board
                 # write, then return the current state.
@@ -3181,6 +3278,8 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                             f"missing 'node_id'; cannot write milestone",
                         )
                     _write_milestone_to_board(client, binding, content_id, milestone)
+                if custom_fields:
+                    return _reget_issue()
                 return _map_issue(current)
 
             r = client.patch(f"{_repo_path(project)}/issues/{ticket_id}", json=payload)
@@ -3206,6 +3305,23 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         f"'node_id'; cannot write milestone",
                     )
                 _write_milestone_to_board(client, binding, content_id, milestone)
+            if should_reset_board_column:
+                content_id = raw.get("node_id")
+                if not content_id:
+                    raise GitHubError(
+                        500,
+                        f"ticket '{project.id}#{ticket_id}' payload missing "
+                        f"'node_id'; cannot reset board column on reopen",
+                    )
+                reset_value = project.board.resolve(project.board.columns[0])  # type: ignore[union-attr]
+                _write_custom_fields_to_board(
+                    client,
+                    reopen_binding,
+                    content_id,
+                    {reopen_binding.status_field: reset_value},
+                )
+            if custom_fields or should_reset_board_column:
+                return _reget_issue()
             return _map_issue(raw)
 
     def bulk_update_tickets(

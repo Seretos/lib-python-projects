@@ -22,12 +22,13 @@ import pytest
 from lib_python_projects import AutoLabels, ProjectConfig
 from lib_python_projects.providers import azuredevops as azure_mod
 from lib_python_projects.providers.azuredevops import (
+    REVIEW_COMMIT_SHA_PROPERTY_KEY,
     AzureDevOpsError,
     AzureDevOpsProvider,
     _basic_auth_header,
     _cache_clear_all,
 )
-from lib_python_projects.providers.base import PRFilters
+from lib_python_projects.providers.base import PRFilters, normalize_timestamp
 
 
 REPO_ID = "da0d7da0-6a8c-4958-aad3-be17cbf806eb"
@@ -1512,6 +1513,7 @@ def test_submit_pr_review_tags_body_thread_with_property(
             captured["thread"] = json.loads(req.content.decode("utf-8"))
             return _json({
                 "id": 77,
+                "publishedDate": "2026-06-01T12:00:00.000Z",
                 "comments": [
                     {"id": 1, "content": "<p>x</p>", "commentType": "text"}
                 ],
@@ -1538,9 +1540,124 @@ def test_submit_pr_review_tags_body_thread_with_property(
     # mirroring GitHub's user.login and GitLab's username.
     assert review.author == "alice@example.com"
     assert review.author != "user-guid"  # never the bare GUID
-    assert review.submitted_at  # not empty
+    # submitted_at (ticket #178) comes from the posted body thread's
+    # `publishedDate`, not a fabricated "now" -- so it must match what an
+    # immediate read-back via `list_pr_reviews` would recover from the
+    # same thread.
+    assert review.submitted_at == normalize_timestamp("2026-06-01T12:00:00.000Z")
     assert review.id != "user-guid"  # synthesized, not the reviewer GUID
     assert ":10:" in review.id  # vote-encoded
+
+
+def test_submit_pr_review_submitted_at_matches_list_pr_reviews_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #178: `submit_pr_review`'s returned `submitted_at` must
+    equal what an immediate `list_pr_reviews` call reads back from the
+    same review-body thread — both are sourced from the thread's
+    `publishedDate`, not a fabricated "now"."""
+    published = "2026-06-01T12:00:00.000Z"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if path.endswith("/_apis/connectionData"):
+            return _json({
+                "authenticatedUser": {
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                }
+            })
+        if req.method == "PUT" and "/reviewers/user-guid" in path:
+            return _json({"id": "user-guid", "vote": 10})
+        if req.method == "POST" and path.endswith("/threads"):
+            return _json({
+                "id": 77,
+                "publishedDate": published,
+                "comments": [
+                    {"id": 1, "content": "<p>lgtm</p>", "commentType": "text"}
+                ],
+            })
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[{
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                    "vote": 10,
+                }],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 77,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": published,
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "user-guid"},
+                                "content": "<p>lgtm</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    review = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="approve", body="lgtm",
+    )
+    reviews = AzureDevOpsProvider().list_pr_reviews(
+        _project(), token="t", pr_id="7"
+    )
+    assert len(reviews) == 1
+    expected = normalize_timestamp(published)
+    assert review.submitted_at == expected
+    assert reviews[0].submitted_at == expected
+
+
+def test_submit_pr_review_no_body_has_empty_submitted_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #178: with no `body`, no review-body thread is posted, so
+    there is no `publishedDate` to source a timestamp from —
+    `submitted_at` must be `""` rather than a fabricated current UTC
+    time that no read-back could reproduce."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if path.endswith("/_apis/connectionData"):
+            return _json({
+                "authenticatedUser": {
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                }
+            })
+        if req.method == "PUT" and "/reviewers/user-guid" in path:
+            return _json({"id": "user-guid", "vote": 10})
+        raise AssertionError(
+            f"unexpected {req.method} {path}; no thread POST expected "
+            f"without a body"
+        )
+
+    _install_mock(monkeypatch, handler)
+    review = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="approve",
+    )
+    assert review.submitted_at == ""
 
 
 def test_get_pr_filters_review_body_threads(
@@ -1669,6 +1786,55 @@ def test_merge_pr_waits_for_both_status_and_merge_to_settle(
     )
     assert pr.merged is True
     assert pr.status == "merged"
+
+
+def test_merge_pr_docstring_records_reviewer_non_claim() -> None:
+    """Ticket #180: the disputed claim that completing a PR adds the
+    merging user to `requested_reviewers` as a native ADO side effect
+    does not exist anywhere in this codebase. Guard the docstring so a
+    future edit can't silently reintroduce that claim without a test
+    catching it."""
+    doc = AzureDevOpsProvider.merge_pr.__doc__
+    assert doc is not None
+    assert "requested_reviewers" in doc
+    assert "does not add" in doc
+
+
+def test_merge_pr_does_not_populate_requested_reviewers(
+    monkeypatch: pytest.MonkeyPatch, fast_merge_settle: None
+) -> None:
+    """Completing a PR must not populate `requested_reviewers` — ADO
+    does not add the merging user to the PR's reviewers. The settled
+    PR payload's `reviewers` defaults to `[]` (single-account merge),
+    and the mapped PullRequest must reflect that."""
+    state: dict = {"poll": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            state["poll"] += 1
+            if state["poll"] <= 1:
+                # Pre-PATCH GET: PR not yet completed.
+                return _json(_pr_payload(7, status="active", mergeStatus="notSet"))
+            return _json(
+                _pr_payload(7, status="completed", mergeStatus="succeeded")
+            )
+        if req.method == "PATCH" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(7, status="active", mergeStatus="queued"))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr = AzureDevOpsProvider().merge_pr(
+        _project(), token="t", pr_id="7", merge_method="merge"
+    )
+    assert pr.merged is True
+    assert pr.requested_reviewers == []
 
 
 def test_get_pr_fetches_labels_separately(
@@ -1913,6 +2079,217 @@ def test_review_comment_original_line_and_commit_sha(
     assert rc.commit_sha is None or isinstance(rc.commit_sha, str)
     # And critically, never an integer offset.
     assert rc.commit_sha != 1
+
+
+def test_add_pr_review_comment_persists_commit_sha_roundtrip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #175 (reopened after re-test — the prior "fixed" state was
+    doc-only and rejected): a caller-supplied `commit_sha` on a new
+    diff-anchored thread must be persisted as a thread-level property
+    (`REVIEW_COMMIT_SHA_PROPERTY_KEY`) so a later `list_pr_review_comments`
+    re-read gets it back instead of `None` — not just echoed into the
+    immediate create-time return."""
+    item_stub = _items_handler_for_file(line_count=50)
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        items_resp = item_stub(req)
+        if items_resp is not None:
+            return items_resp
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/pullrequests/7/threads"):
+            captured["body"] = json.loads(req.content.decode("utf-8"))
+            return _json({
+                "id": 100,
+                "threadContext": captured["body"]["threadContext"],
+                "comments": [
+                    {
+                        "id": 1, "parentCommentId": 0,
+                        "content": captured["body"]["comments"][0]["content"],
+                        "commentType": "text",
+                    }
+                ],
+            })
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 100,
+                        "threadContext": captured["body"]["threadContext"],
+                        "properties": captured["body"].get("properties"),
+                        "comments": [
+                            {
+                                "id": 1, "parentCommentId": 0,
+                                "content": captured["body"]["comments"][0]["content"],
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    rc = AzureDevOpsProvider().add_pr_review_comment(
+        _project(), token="t", pr_id="7",
+        body="check this", path="/file.py", line=5, side="RIGHT",
+        commit_sha="abc1234",
+    )
+    assert captured["body"]["properties"] == {
+        REVIEW_COMMIT_SHA_PROPERTY_KEY: {
+            "$type": "System.String", "$value": "abc1234",
+        },
+    }
+    assert rc.commit_sha == "abc1234"
+
+    rcs = AzureDevOpsProvider().list_pr_review_comments(
+        _project(), token="t", pr_id="7",
+    )
+    assert len(rcs) == 1
+    assert rcs[0].commit_sha == "abc1234"
+
+
+def test_add_pr_review_comment_no_commit_sha_writes_no_property(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting `commit_sha` must not add a `properties` key to the
+    create payload at all — a thread without the property still reads
+    back as `commit_sha=None` (the pre-existing no-op path)."""
+    item_stub = _items_handler_for_file(line_count=50)
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        items_resp = item_stub(req)
+        if items_resp is not None:
+            return items_resp
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            # No commit_sha supplied -> `_validate_pr_diff_line` fetches
+            # the PR to resolve the commit to validate the line against.
+            return _json(_pr_payload(7))
+        if req.method == "POST" and path.endswith("/pullrequests/7/threads"):
+            captured["body"] = json.loads(req.content.decode("utf-8"))
+            return _json({
+                "id": 101,
+                "threadContext": captured["body"]["threadContext"],
+                "comments": [
+                    {"id": 1, "parentCommentId": 0, "content": "<p>x</p>", "commentType": "text"}
+                ],
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    rc = AzureDevOpsProvider().add_pr_review_comment(
+        _project(), token="t", pr_id="7",
+        body="check this", path="/file.py", line=5, side="RIGHT",
+    )
+    assert "properties" not in captured["body"]
+    assert rc.commit_sha is None
+
+
+def test_list_pr_review_comments_commit_sha_decodes_envelope_and_flat_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_thread_property_value` must handle both shapes ADO returns for
+    thread properties inconsistently: the `{"$value": ...}` envelope and
+    a flat string — both decode to the same `commit_sha` on read."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 10,
+                        "threadContext": {
+                            "filePath": "/a.py", "rightFileStart": {"line": 1},
+                        },
+                        "properties": {
+                            REVIEW_COMMIT_SHA_PROPERTY_KEY: {
+                                "$type": "System.String", "$value": "envelope-sha",
+                            },
+                        },
+                        "comments": [
+                            {"id": 1, "parentCommentId": 0, "content": "<p>a</p>", "commentType": "text"}
+                        ],
+                    },
+                    {
+                        "id": 11,
+                        "threadContext": {
+                            "filePath": "/b.py", "rightFileStart": {"line": 2},
+                        },
+                        "properties": {
+                            REVIEW_COMMIT_SHA_PROPERTY_KEY: "flat-sha",
+                        },
+                        "comments": [
+                            {"id": 1, "parentCommentId": 0, "content": "<p>b</p>", "commentType": "text"}
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError
+
+    _install_mock(monkeypatch, handler)
+    rcs = AzureDevOpsProvider().list_pr_review_comments(
+        _project(), token="t", pr_id="7",
+    )
+    by_path = {rc.path: rc.commit_sha for rc in rcs}
+    assert by_path == {"/a.py": "envelope-sha", "/b.py": "flat-sha"}
+
+
+def test_add_pr_review_comment_reply_inherits_parent_thread_commit_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reply (`in_reply_to`) doesn't write a `commit_sha` property of
+    its own — on read it inherits whatever is stored on its parent
+    thread, since the property lives at the thread level, not per
+    comment. The caller-supplied `commit_sha` on the reply call is only
+    an echo fallback and must NOT override an already-populated value
+    from the thread."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/threads/5/comments"):
+            return _json({
+                "id": 2, "parentCommentId": 1, "content": "<p>reply</p>",
+                "commentType": "text",
+            })
+        if req.method == "GET" and path.endswith("/threads/5"):
+            return _json({
+                "id": 5,
+                "threadContext": {
+                    "filePath": "/a.py", "rightFileStart": {"line": 1},
+                },
+                "properties": {
+                    REVIEW_COMMIT_SHA_PROPERTY_KEY: {
+                        "$type": "System.String", "$value": "parent-sha",
+                    },
+                },
+                "comments": [
+                    {"id": 1, "parentCommentId": 0, "content": "<p>orig</p>", "commentType": "text"},
+                    {"id": 2, "parentCommentId": 1, "content": "<p>reply</p>", "commentType": "text"},
+                ],
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    rc = AzureDevOpsProvider().add_pr_review_comment(
+        _project(), token="t", pr_id="7",
+        body="reply", in_reply_to="5", commit_sha="ignored-on-reply",
+    )
+    assert rc.commit_sha == "parent-sha"
 
 
 # ---------- list_prs closed status -------------------------------------------

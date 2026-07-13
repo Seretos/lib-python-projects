@@ -106,6 +106,75 @@ class TestDefaultBranchField:
         assert d["default_branch"] == "main"
 
 
+class TestAreaPathField:
+    """`area_path` is new in ticket #172 — Azure-DevOps-only scoping field,
+    defaults to `None`, so existing `projects.yml` entries (any provider)
+    behave exactly as before."""
+
+    def test_area_path_defaults_to_none(self) -> None:
+        p = ProjectConfig(
+            id="x", provider="azuredevops", path="acme-org/acme-project/acme-repo"
+        )
+        assert p.area_path is None
+
+    def test_area_path_round_trips_when_provided(self) -> None:
+        p = ProjectConfig(
+            id="x",
+            provider="azuredevops",
+            path="acme-org/acme-project/acme-repo",
+            area_path="acme-project\\Team A",
+        )
+        assert p.area_path == "acme-project\\Team A"
+
+    def test_area_path_appears_in_model_dump(self) -> None:
+        p = ProjectConfig(
+            id="x",
+            provider="azuredevops",
+            path="acme-org/acme-project/acme-repo",
+            area_path="acme-project\\Team A",
+        )
+        d = p.model_dump()
+        assert d["area_path"] == "acme-project\\Team A"
+
+    def test_area_path_survives_dump_and_reload_round_trip(self) -> None:
+        """Serializing via `model_dump()` and reconstructing (the same
+        shape the YAML loader round-trips through) preserves `area_path`."""
+        p = ProjectConfig(
+            id="x",
+            provider="azuredevops",
+            path="acme-org/acme-project/acme-repo",
+            area_path="acme-project\\Team A",
+        )
+        reloaded = ProjectConfig(**p.model_dump(exclude={"token_available"}))
+        assert reloaded.area_path == "acme-project\\Team A"
+
+    def test_area_path_ignored_by_github(self) -> None:
+        """`area_path` is accepted (schema-wide field) but documented as
+        ignored by non-Azure providers; it should not affect github's
+        derived properties or validation."""
+        p = ProjectConfig(
+            id="x",
+            provider="github",
+            path="acme/backend",
+            area_path="some-area",
+        )
+        assert p.area_path == "some-area"
+        assert p.owner == "acme"
+        assert p.repo == "backend"
+
+    def test_unknown_field_still_forbidden_alongside_area_path(self) -> None:
+        """`area_path` is whitelisted — other unknown keys must still be
+        rejected (`extra="forbid"` on the model)."""
+        with pytest.raises(ValidationError):
+            ProjectConfig(
+                id="x",
+                provider="azuredevops",
+                path="acme-org/acme-project/acme-repo",
+                area_path="acme-project\\Team A",
+                bogus_field="nope",  # type: ignore[call-arg]
+            )
+
+
 class TestAutoLabels:
     """`auto_labels` is new in ticket #153 — per-project AI-attribution
     names, defaulting to the module-level `ai-generated`/`ai-modified`

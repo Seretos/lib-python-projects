@@ -30,6 +30,7 @@ from lib_python_projects.providers.base import Label, LabelOperationUnsupported
 def _project(
     path: str = "seredos/azure-tests/azure-tests",
     base_url: str | None = None,
+    area_path: str | None = None,
 ) -> ProjectConfig:
     return ProjectConfig(
         id="azure-tests",
@@ -37,6 +38,7 @@ def _project(
         path=path,
         base_url=base_url,
         token_env="AZURE_TOKEN",
+        area_path=area_path,
     )
 
 
@@ -176,6 +178,96 @@ def test_list_labels_empty_tags_contribute_nothing(monkeypatch: pytest.MonkeyPat
         Label(name="bug", color="", description=""),
         Label(name="urgent", color="", description=""),
     ]
+
+
+# ---------- list_labels config-level area_path scoping (ticket #172) --------
+
+
+def test_list_labels_config_area_path_scopes_wiql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (ticket #172): `project.area_path`, when set, scopes the
+    WIQL `list_labels` issues with an `[System.AreaPath] UNDER '...'`
+    clause appended after `[System.TeamProject] = @project` — so two
+    wrapper `ProjectConfig`s sharing organization/ado_project (differing
+    only in `repository`) but configured with distinct `area_path` values
+    query genuinely different WIQL scopes rather than sharing one
+    in-use-tag universe."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json(_wiql_payload([]))
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_labels(
+        _project(area_path="acme-project\\Team A"), token="t"
+    )
+    wiql = captured["wiql"]
+    assert "[System.TeamProject] = @project" in wiql
+    assert "[System.AreaPath] UNDER 'acme-project\\Team A'" in wiql
+    assert " AND " in wiql
+
+
+def test_list_labels_two_wrappers_same_org_project_distinct_area_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two wrappers sharing organization/ado_project (differing only in
+    `repository`) but configured with distinct `area_path` values issue
+    distinct WIQL queries — and, end to end, return distinct tag sets."""
+    captured: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path.endswith("/_apis/wit/wiql"):
+            query = json.loads(req.content.decode("utf-8"))["query"]
+            captured.append(query)
+            if "Team A" in query:
+                return _json(_wiql_payload([1]))
+            return _json(_wiql_payload([2]))
+        if req.method == "POST" and req.url.path.endswith("/_apis/wit/workitemsbatch"):
+            body = json.loads(req.content.decode("utf-8"))
+            if body["ids"] == [1]:
+                return _json(
+                    {"value": [{"id": 1, "fields": {"System.Tags": "from-team-a"}}]}
+                )
+            return _json(
+                {"value": [{"id": 2, "fields": {"System.Tags": "from-team-b"}}]}
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    labels_a = AzureDevOpsProvider().list_labels(
+        _project(path="seredos/acme-project/repo-a", area_path="acme-project\\Team A"),
+        token="t",
+    )
+    labels_b = AzureDevOpsProvider().list_labels(
+        _project(path="seredos/acme-project/repo-b", area_path="acme-project\\Team B"),
+        token="t",
+    )
+    assert captured[0] != captured[1]
+    assert labels_a == [Label(name="from-team-a", color="", description="")]
+    assert labels_b == [Label(name="from-team-b", color="", description="")]
+
+
+def test_list_labels_no_area_path_wiql_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`project.area_path` unset (the default) → the WIQL is byte-identical
+    to before ticket #172 — no `System.AreaPath` clause at all."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json(_wiql_payload([]))
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_labels(_project(), token="t")
+    assert (
+        captured["wiql"]
+        == "SELECT [System.Id] FROM workitems WHERE [System.TeamProject] = @project"
+    )
 
 
 # ---------- _tags_string_from_labels (ticket #172 bug 1: validate-and-reject) -

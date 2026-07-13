@@ -476,6 +476,40 @@ def _org_scope(project: ProjectConfig) -> str:
     return f"/{quote(org, safe='')}"
 
 
+def _area_path_clause(area: str | None, recursive: bool) -> str | None:
+    """Build the `[System.AreaPath]` WIQL clause for *area*, or `None`.
+
+    `recursive=True` emits `UNDER` (includes sub-areas); `False` emits an
+    exact `=` match. Returns `None` when `area` is falsy so callers can
+    unconditionally append the result without an extra `if`.
+    """
+    if not area:
+        return None
+    if recursive:
+        return f"[System.AreaPath] UNDER '{_escape_wiql(area)}'"
+    return f"[System.AreaPath] = '{_escape_wiql(area)}'"
+
+
+def _effective_area_path(
+    project: ProjectConfig, filters: TicketFilters
+) -> tuple[str | None, bool]:
+    """Resolve the area path (+ recursion flag) actually in effect.
+
+    An explicit `filters.area_path` always wins outright — including its
+    own `filters.area_path_recursive` flag. When no per-call filter is
+    given, `project.area_path` (ticket #172) is used as a config-level
+    default scope, always with `UNDER` (recursive) semantics — an exact
+    config-level default would silently drop work items filed under
+    sub-areas, which is rarely what operators configuring a static
+    default want. Returns `(None, True)` when neither is set.
+    """
+    if filters.area_path:
+        return filters.area_path, filters.area_path_recursive
+    if project.area_path:
+        return project.area_path, True
+    return None, True
+
+
 def _api_version_params(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build the common query-param dict, defaulting `api-version` to 7.1."""
     params: dict[str, Any] = {"api-version": API_VERSION}
@@ -1209,15 +1243,19 @@ def _map_thread_comment_for_review(
     discussion_id = str(thread_id) if thread_id is not None else None
     in_reply_to = str(thread_id) if parent_id else None
 
-    # ADO exposes no commit SHA on a thread at all — there's no field on
-    # the thread or comment payload that carries one, so `commit_sha` is
-    # always None here on read (ticket #175). `add_pr_review_comment`
-    # echoes back the caller-supplied `commit_sha` into the object it
-    # returns, but that's a create-time convenience only: it is never
-    # persisted server-side, so a subsequent `get_pr`/
-    # `list_pr_review_comments` re-read of the same comment goes through
-    # this function and comes back with `commit_sha=None`.
-    commit_sha = None
+    # `commit_sha` is persisted as a thread-level property
+    # (`REVIEW_COMMIT_SHA_PROPERTY_KEY`) by `add_pr_review_comment`'s
+    # new-thread branch (ticket #175): a subsequent `get_pr`/
+    # `list_pr_review_comments` re-read goes through this function and
+    # reads that property back via `_thread_property_value`, which
+    # handles both the `{"$value": ...}` envelope and flat shapes ADO
+    # returns inconsistently. Threads created before this fix (or
+    # created without a caller-supplied `commit_sha`) carry no such
+    # property and resolve to `None`, same as before. The property is
+    # stored at the thread level, not per-comment, so a reply
+    # (`in_reply_to`) inherits whatever `commit_sha` is stored on its
+    # parent thread rather than carrying its own.
+    commit_sha = _thread_property_value(thread, REVIEW_COMMIT_SHA_PROPERTY_KEY)
 
     return ReviewComment(
         id=_format_thread_comment_id(thread_id, comment_id),
@@ -1279,6 +1317,11 @@ def _format_thread_comment_id(thread_id: int | str | None, comment_id: int | str
 
 REVIEW_BODY_PROPERTY_KEY = "projectIssues.kind"
 REVIEW_BODY_PROPERTY_VALUE = "review_body"
+# Thread-level property carrying a caller-supplied `commit_sha` for a new
+# diff-anchored review-comment thread (ticket #175) — mirrors
+# `REVIEW_BODY_PROPERTY_KEY`'s envelope shape so it round-trips through the
+# same `_thread_property_value` reader.
+REVIEW_COMMIT_SHA_PROPERTY_KEY = "projectIssues.commitSha"
 
 # Work-item and comment ids are .NET Int32; anything beyond
 # `2_147_483_647` triggers an opaque ADO 400 (System.OverflowException).
@@ -2117,19 +2160,20 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             clauses.append(f"[System.ChangedDate] >= '{_escape_wiql(filters.updated_after)}'")
         if filters.updated_before:
             clauses.append(f"[System.ChangedDate] <= '{_escape_wiql(filters.updated_before)}'")
-        if filters.area_path:
-            # No validation against classification nodes here — that would
-            # require an extra API round-trip and is out of scope. ADO's
-            # WIQL endpoint 404s (TF51011) for an unrecognised area path
-            # rather than returning zero rows; `list_tickets` swallows
-            # that specific response into an empty result (see
-            # `_is_area_path_not_found`), so the "invalid area path
-            # simply yields zero matching work items" contract holds
-            # without an extra validation round-trip.
-            if filters.area_path_recursive:
-                clauses.append(f"[System.AreaPath] UNDER '{_escape_wiql(filters.area_path)}'")
-            else:
-                clauses.append(f"[System.AreaPath] = '{_escape_wiql(filters.area_path)}'")
+        # No validation against classification nodes here — that would
+        # require an extra API round-trip and is out of scope. ADO's WIQL
+        # endpoint 404s (TF51011) for an unrecognised area path rather than
+        # returning zero rows; `list_tickets` swallows that specific
+        # response into an empty result (see `_is_area_path_not_found`), so
+        # the "invalid area path simply yields zero matching work items"
+        # contract holds without an extra validation round-trip. The
+        # effective area (an explicit `filters.area_path` overriding the
+        # config-level `project.area_path` default — ticket #172) is
+        # resolved by `_effective_area_path`.
+        area, area_recursive = _effective_area_path(project, filters)
+        area_clause = _area_path_clause(area, area_recursive)
+        if area_clause:
+            clauses.append(area_clause)
 
         if filters.board_column:
             clauses.extend(_board_column_wiql_clauses(project, filters.board_column))
@@ -2185,8 +2229,12 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         # instead of returning an empty result set when `area_path`
         # doesn't resolve. Swallow only that specific, gated case — any
         # other 4xx (missing project, malformed query, etc.) still
-        # surfaces via `_check` below.
-        if filters.area_path and _is_area_path_not_found(resp):
+        # surfaces via `_check` below. Gated on the *effective* area
+        # (ticket #172): either an explicit `filters.area_path` or a
+        # config-level `project.area_path` default, so an invalid
+        # config-level area also yields `[], False` rather than raising.
+        effective_area, _ = _effective_area_path(project, filters)
+        if effective_area and _is_area_path_not_found(resp):
             return [], False
         _check(resp)
         ids = [
@@ -2488,26 +2536,76 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         Returns a `{id: (title, state)}` map. Missing ids (deleted /
         invisible work items) are absent from the map so the caller can
         default to empty strings.
+
+        ADO's `workitemsbatch` defaults to `errorPolicy: "Fail"`, which
+        fails the *entire* multi-id request if even one id in the batch
+        is momentarily unresolvable — silently blanking title/state for
+        every relation in that batch, not just the poison id (#179). We
+        request `errorPolicy: "Omit"` so resolvable ids still come back,
+        and additionally fall back to per-id requests if the batch call
+        itself fails outright (non-success response or a transport
+        error), so one bad id can never blank its batch-mates.
         """
         if not ids:
             return {}
-        body = {
-            "ids": [int(i) for i in ids if i.isdigit()],
-            "fields": ["System.Title", "System.State"],
-        }
-        if not body["ids"]:
+        numeric_ids = [int(i) for i in ids if i.isdigit()]
+        if not numeric_ids:
             return {}
+        result = self._fetch_work_item_title_state_batch(project, token, numeric_ids)
+        if result is not None:
+            return result
+        log.warning(
+            "workitemsbatch request failed for ids=%s; retrying individually",
+            numeric_ids,
+        )
+        if len(numeric_ids) == 1:
+            # Already a single-id request — retrying it again would just
+            # repeat the same failure. Best-effort: empty titles beat
+            # blowing up the whole get_ticket path.
+            return {}
+        # Per-id fallback: a batch of >1 id failed outright, so retry each
+        # id as its own single-id request and merge whatever succeeds.
+        # This guarantees a single poison/failing id can't blank its
+        # batch-mates. These single-id calls never recurse into this
+        # fallback (see the `len(numeric_ids) == 1` branch above).
+        merged: dict[str, tuple[str, str]] = {}
+        for wid in numeric_ids:
+            single = self._fetch_work_item_title_state_batch(project, token, [wid])
+            if single is None:
+                log.warning(
+                    "workitemsbatch per-id fallback failed for id=%s", wid
+                )
+                continue
+            merged.update(single)
+        return merged
+
+    def _fetch_work_item_title_state_batch(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        numeric_ids: list[int],
+    ) -> dict[str, tuple[str, str]] | None:
+        """Issue a single `workitemsbatch` POST for the given ids.
+
+        Returns the `{id: (title, state)}` map on success (missing ids are
+        simply absent), or `None` if the request itself failed (non-success
+        response or a transport error) so the caller can decide whether to
+        retry.
+        """
+        body = {
+            "ids": numeric_ids,
+            "fields": ["System.Title", "System.State"],
+            "errorPolicy": "Omit",
+        }
         path = f"{_project_scope(project)}/_apis/wit/workitemsbatch"
         try:
             with _client(project, token) as c:
                 resp = c.post(path, params=_api_version_params(), json=body)
             if not resp.is_success:
-                # Best-effort: empty titles beat blowing up the whole
-                # get_ticket path. The relation array still surfaces.
-                return {}
+                return None
             value = (resp.json() or {}).get("value") or []
         except httpx.HTTPError:
-            return {}
+            return None
         out: dict[str, tuple[str, str]] = {}
         for item in value:
             wid = item.get("id")
@@ -2657,6 +2755,21 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 "op": "add",
                 "path": "/fields/System.IterationPath",
                 "value": milestone,
+            })
+
+        # Config-level area-path scoping (ticket #172): when the project
+        # declares a default `area_path` and the caller hasn't already
+        # explicitly targeted `System.AreaPath` via `custom_fields`, scope
+        # the new work item there. Unlike `milestone` above (an explicit
+        # per-call argument that intentionally wins over `custom_fields`),
+        # `project.area_path` is a low-precedence config default — an
+        # explicit `custom_fields["System.AreaPath"]` always wins and no
+        # second op is emitted, so there's never a duplicate.
+        if project.area_path and "System.AreaPath" not in remaining_custom_fields:
+            patch.append({
+                "op": "add",
+                "path": "/fields/System.AreaPath",
+                "value": project.area_path,
             })
 
         path = f"{_project_scope(project)}/_apis/wit/workitems/${quote(wi_type, safe='')}"
@@ -3762,6 +3875,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         strategy server-side without returning an error. When the settled
         PR reports a different ``mergeStrategy`` than the one we sent, a
         warning is emitted so callers are aware of the discrepancy.
+
+        Note: completing a PR does not alter its reviewer set — ADO does not add the merging user to the PR's reviewers, so the returned PullRequest.requested_reviewers reflects only reviewers already assigned (empty if none); see test_merge_pr_does_not_populate_requested_reviewers.
         """
         repo_id = self._resolve_repository_id(project, token)
         path = (
@@ -3937,14 +4052,20 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         thread (`path`+`line`) or as a reply to an existing thread
         (`in_reply_to`).
 
-        `commit_sha`, if provided, is echoed into the returned
-        `ReviewComment` as a create-time convenience (matching GitHub's
-        review-comment return shape) — it is NOT written to Azure
-        DevOps and is not persisted anywhere on the thread. A later
+        `commit_sha`, if provided on the new-thread path, is now
+        persisted as a thread-level property
+        (`REVIEW_COMMIT_SHA_PROPERTY_KEY`, ticket #175): a later
         `get_pr`/`list_pr_review_comments` re-read of this same comment
-        goes through `_map_thread_comment_for_review`, which always
-        reports `commit_sha=None` for Azure DevOps threads (ticket #175):
-        ADO simply doesn't expose a commit SHA on a thread.
+        goes through `_map_thread_comment_for_review`, which reads that
+        property back and reports the same `commit_sha` instead of
+        `None`. It is also still echoed into the `ReviewComment`
+        returned immediately here as a create-time convenience
+        (matching GitHub's review-comment return shape), which is a
+        harmless no-op fallback once the property round-trips. The
+        reply (`in_reply_to`) path does not write the property itself —
+        a reply comment inherits whatever `commit_sha` is already
+        stored on its parent thread when read back, since the property
+        lives at the thread level, not per-comment.
         """
         # Validate before doing any network I/O so callers fail fast.
         if not in_reply_to and (not path or line is None):
@@ -4017,7 +4138,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             thread_context["rightFileStart"] = {"line": line, "offset": 1}
             thread_context["rightFileEnd"] = {"line": line, "offset": 1}
 
-        payload = {
+        payload: dict[str, Any] = {
             "comments": [
                 {
                     "parentCommentId": 0,
@@ -4028,6 +4149,19 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             "status": "active",
             "threadContext": thread_context,
         }
+        if commit_sha:
+            # Persist the caller-supplied commit_sha as a thread-level
+            # property (ticket #175) so a later re-read through
+            # `_map_thread_comment_for_review` gets it back instead of
+            # `None`. Mirrors `submit_pr_review`'s REVIEW_BODY_PROPERTY_KEY
+            # envelope shape so both round-trip through the same
+            # `_thread_property_value` reader.
+            payload["properties"] = {
+                REVIEW_COMMIT_SHA_PROPERTY_KEY: {
+                    "$type": "System.String",
+                    "$value": commit_sha,
+                },
+            }
         threads_path = (
             f"{_project_scope(project)}/_apis/git/repositories/"
             f"{quote(repo_id, safe='')}/pullrequests/{quote(str(pr_id), safe='')}/threads"
@@ -4150,12 +4284,21 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         `get_pr().comments[]` or `list_comments` — matching GitHub's
         separation of review bodies vs ordinary PR comments.
 
-        Identity, timestamp, and id are synthesized to match the
-        cross-provider `Review` shape: `author` is the reviewer's
-        unique-name (UPN/email, the closest analogue of a GitHub login),
-        `submitted_at` is a current UTC ISO-8601, and `id` includes the
+        Identity and id are synthesized to match the cross-provider
+        `Review` shape: `author` is the reviewer's unique-name (UPN/email,
+        the closest analogue of a GitHub login), and `id` includes the
         vote + ms-timestamp so consecutive `comment + approve` calls
         from the same reviewer don't collide.
+
+        ADO's vote API has no timestamp field, so `submitted_at` cannot
+        be synthesized the way `id` is — a fabricated "now" would not
+        match what an immediate read-back via `list_pr_reviews` recovers
+        (ticket #178). Instead, when `body` is supplied, `submitted_at`
+        is the `publishedDate` of the review-body thread just posted
+        (normalized via `normalize_timestamp`) — the same value
+        `list_pr_reviews` reads back from that thread. When no `body` is
+        supplied there is no thread to source a timestamp from, so
+        `submitted_at` is `""`.
         """
         repo_id = self._resolve_repository_id(project, token)
         vote = {"approve": 10, "request_changes": -10, "comment": 0}.get(state, 0)
@@ -4207,6 +4350,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         body_with_marker = (
             ensure_comment_prefix(body, markers=_marker_set(project)) if body else ""
         )
+        submitted_at = ""
         if body:
             threads_path = (
                 f"{_project_scope(project)}/_apis/git/repositories/"
@@ -4232,11 +4376,13 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             with _client(project, token) as c:
                 tresp = c.post(threads_path, params=_api_version_params(), json=payload)
             _check(tresp)
+            submitted_at = normalize_timestamp(
+                (tresp.json() or {}).get("publishedDate") or ""
+            )
 
         normalized_state: Any = (
             state if state in ("approve", "request_changes", "comment") else "comment"
         )
-        submitted_at = _utc_iso_now()
         synthesized_id = (
             f"{reviewer_id}:{vote}:{int(time.time() * 1000)}"
         )
@@ -5039,19 +5185,26 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
 
         Note: two wrapper `ProjectConfig`s that map to the same
         organization/ado_project (differing only by `repository`) share
-        one ADO team project and therefore legitimately share work items
-        — and this in-use tag list — since ADO has no finer scope than
-        the team project for tags/work items (`ProjectConfig` has no
-        `area_path` field to narrow further). That sharing is expected
-        behaviour; what this method fixes is catalog-only tags leaking
-        in, not cross-repository tag sharing.
+        one ADO team project and therefore, absent further scoping, would
+        share work items — and this in-use tag list — since ADO has no
+        finer native scope than the team project for tags/work items.
+        `ProjectConfig.area_path` (ticket #172) closes that gap: when set,
+        it scopes this query to that `System.AreaPath` sub-tree (`UNDER`,
+        recursive) via the same `_effective_area_path` resolver
+        `list_tickets` uses, so two such wrappers configured with distinct
+        `area_path` values return distinct tag sets. Left unset, behaviour
+        is unchanged — the query still spans the whole team project.
 
         Best-effort: if the WIQL query or the batch fetch returns a
         non-success response, returns `[]` rather than raising. Each
         `Label` is returned with `color=""` and `description=""` because
         ADO tags have no such fields.
         """
+        area, area_recursive = _effective_area_path(project, TicketFilters())
+        area_clause = _area_path_clause(area, area_recursive)
         wiql = "SELECT [System.Id] FROM workitems WHERE [System.TeamProject] = @project"
+        if area_clause:
+            wiql += f" AND {area_clause}"
         with _client(project, token) as c:
             resp = c.post(
                 f"{_project_scope(project)}/_apis/wit/wiql",

@@ -42,6 +42,7 @@ def _project(
     path: str = "seredos/azure-tests/azure-tests",
     auto_labels: AutoLabels | None = None,
     board: Board | None = None,
+    area_path: str | None = None,
 ) -> ProjectConfig:
     return ProjectConfig(
         id="azure-tests",
@@ -51,6 +52,7 @@ def _project(
         default_work_item_type=default_type,
         auto_labels=auto_labels or AutoLabels(),
         board=board,
+        area_path=area_path,
     )
 
 
@@ -531,6 +533,181 @@ def test_list_tickets_area_path_round_trip_discovered_value_is_filterable(
         filters=TicketFilters(area_path=area_field.allowed_values[0]),
     )
     assert "[System.AreaPath] UNDER 'azure-tests'" in captured["wiql"]
+
+
+# ---------- config-level `project.area_path` scoping (ticket #172) ----------
+
+
+def _capture_wiql_for(
+    monkeypatch: pytest.MonkeyPatch, project: ProjectConfig, filters: TicketFilters
+) -> str:
+    bt = _basic_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(project, token="t", filters=filters)
+    return captured["wiql"]
+
+
+def test_list_tickets_config_area_path_scopes_wiql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (ticket #172): `project.area_path` alone (no per-call
+    `filters.area_path`) must still scope the WIQL — the config-level
+    default participates via `_effective_area_path`, defaulting to `UNDER`
+    (recursive) semantics."""
+    wiql = _capture_wiql_for(
+        monkeypatch,
+        _project(default_type="Issue", area_path="acme-project\\Team A"),
+        TicketFilters(),
+    )
+    assert "[System.AreaPath] UNDER 'acme-project\\Team A'" in wiql
+
+
+def test_list_tickets_two_wrappers_same_org_project_distinct_config_area_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Core regression for ticket #172: two `ProjectConfig` wrappers that
+    share `organization/ado_project` (differing only in the unused
+    `repository` path segment) must resolve to genuinely different WIQL
+    scopes when configured with distinct `area_path` values — the previous
+    behaviour made both wrappers indistinguishable for `list_tickets`."""
+    wiql_a = _capture_wiql_for(
+        monkeypatch,
+        _project(
+            default_type="Issue",
+            path="acme-org/acme-project/repo-a",
+            area_path="acme-project\\Team A",
+        ),
+        TicketFilters(),
+    )
+    wiql_b = _capture_wiql_for(
+        monkeypatch,
+        _project(
+            default_type="Issue",
+            path="acme-org/acme-project/repo-b",
+            area_path="acme-project\\Team B",
+        ),
+        TicketFilters(),
+    )
+    assert "[System.AreaPath] UNDER 'acme-project\\Team A'" in wiql_a
+    assert "[System.AreaPath] UNDER 'acme-project\\Team B'" in wiql_b
+    assert wiql_a != wiql_b
+
+
+def test_list_tickets_explicit_filter_area_path_overrides_config_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit `filters.area_path` on the call entirely overrides
+    `project.area_path` — the config value must not also appear."""
+    wiql = _capture_wiql_for(
+        monkeypatch,
+        _project(default_type="Issue", area_path="acme-project\\Team A"),
+        TicketFilters(area_path="acme-project\\Team B"),
+    )
+    assert "[System.AreaPath] UNDER 'acme-project\\Team B'" in wiql
+    assert "Team A" not in wiql
+
+
+def test_list_tickets_explicit_filter_recursive_false_overrides_config_recursive_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The config-level fallback always uses `UNDER`, but an explicit
+    `filters.area_path` keeps its own `area_path_recursive` flag even when
+    a (different) config default is also present."""
+    wiql = _capture_wiql_for(
+        monkeypatch,
+        _project(default_type="Issue", area_path="acme-project\\Team A"),
+        TicketFilters(area_path="acme-project\\Team B", area_path_recursive=False),
+    )
+    assert "[System.AreaPath] = 'acme-project\\Team B'" in wiql
+    assert "UNDER" not in wiql
+
+
+def test_list_tickets_no_config_area_path_byte_identical_to_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`project.area_path` unset (the default) → no `System.AreaPath`
+    clause at all, matching pre-#172 behaviour exactly."""
+    wiql = _capture_wiql_for(
+        monkeypatch, _project(default_type="Issue"), TicketFilters(labels=["bug"])
+    )
+    assert "[System.AreaPath]" not in wiql
+
+
+def test_list_tickets_invalid_config_area_path_swallowed_to_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (ticket #172): an invalid *config-level* `area_path`
+    (no per-call `filters.area_path`) must be swallowed into `[], False`
+    under the same "invalid area path yields zero matches" contract as an
+    invalid `filters.area_path` — gating on the effective area, not just
+    `filters.area_path`, is what makes this work. Fails (raises
+    AzureDevOpsError) if the swallow guard is only gated on
+    `filters.area_path`."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            return _json(
+                {
+                    "message": (
+                        "TF51011: The specified area path "
+                        "acme-project\\Bogus does not exist."
+                    ),
+                },
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    tickets, has_more = AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue", area_path="acme-project\\Bogus"),
+        token="t",
+        filters=TicketFilters(),
+    )
+    assert tickets == []
+    assert has_more is False
+
+
+def test_list_tickets_config_area_path_non_area_404_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The config-level swallow is narrowly anchored, same as the
+    `filters.area_path` case: a 404 with an unrelated message must still
+    surface even though `project.area_path` is set."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            return _json(
+                {"message": "TF200016: The following project does not exist"},
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(azure_mod.AzureDevOpsError):
+        AzureDevOpsProvider().list_tickets(
+            _project(default_type="Issue", area_path="acme-project\\Team A"),
+            token="t",
+            filters=TicketFilters(),
+        )
 
 
 def test_list_tickets_state_open_filters_by_categories(
@@ -3179,6 +3356,245 @@ def test_get_ticket_populates_parent_id_from_hierarchy_reverse_relation(
     assert [r.ticket_id for r in relations if r.kind == "parent"] == ["#3"]
 
 
+def test_get_ticket_multi_relation_hydrates_when_batchmate_unresolvable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #179: a work item with TWO relations (parent + child) issues
+    a single multi-id `workitemsbatch` call for both target ids. Before the
+    fix, that call omitted `errorPolicy`, so ADO's default `"Fail"` policy
+    means the *entire* batch fails if it's a multi-id request — even when
+    every id is perfectly resolvable — and both relations silently degrade
+    to empty title/state. This handler models exactly that: multi-id
+    batches without `errorPolicy: "Omit"` 404; single-id batches and
+    Omit-flagged multi-id batches succeed. Must fail against the pre-fix
+    code (no errorPolicy sent -> 404 -> both relations blank) and pass
+    after the fix (errorPolicy "Omit" sent -> 200 -> both relations
+    hydrated)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/59" in path and "/comments" not in path:
+            payload = _work_item_payload(59)
+            payload["relations"] = [
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/58",
+                    "attributes": {"name": "Parent"},
+                },
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Forward",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/65",
+                    "attributes": {"name": "Child"},
+                },
+            ]
+            return _json(payload)
+        if path.endswith("/_apis/wit/workItems/59/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            body = json.loads(req.content.decode("utf-8"))
+            ids = body["ids"]
+            if len(ids) > 1 and body.get("errorPolicy") != "Omit":
+                return _json({"message": "one or more ids could not be resolved"}, status_code=404)
+            return _json({
+                "value": [
+                    {
+                        "id": wid,
+                        "fields": {
+                            "System.Title": f"work item {wid}",
+                            "System.State": "Active",
+                        },
+                    }
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    _ticket, _c, relations, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="59"
+    )
+    by_kind = {r.kind: r for r in relations}
+    assert by_kind["parent"].ticket_id == "#58"
+    assert by_kind["parent"].title == "work item 58"
+    assert by_kind["parent"].state == "Active"
+    assert by_kind["child"].ticket_id == "#65"
+    assert by_kind["child"].title == "work item 65"
+    assert by_kind["child"].state == "Active"
+
+
+def test_get_ticket_multi_relation_partial_value_degrades_missing_id_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Edge case: ADO returns 200 with `errorPolicy: "Omit"` honoured —
+    i.e. a genuinely partial `value` array that simply omits an
+    unresolvable id — rather than failing the request outright. The
+    resolvable id must still hydrate; only the missing one degrades to
+    empty title/state, and no exception is raised."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/59" in path and "/comments" not in path:
+            payload = _work_item_payload(59)
+            payload["relations"] = [
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/58",
+                    "attributes": {"name": "Parent"},
+                },
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Forward",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/65",
+                    "attributes": {"name": "Child"},
+                },
+            ]
+            return _json(payload)
+        if path.endswith("/_apis/wit/workItems/59/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            body = json.loads(req.content.decode("utf-8"))
+            ids = body["ids"]
+            assert body.get("errorPolicy") == "Omit"
+            # Only id 58 resolves; 65 is silently omitted from `value`,
+            # exactly what ADO's own `errorPolicy: "Omit"` semantics do.
+            return _json({
+                "value": [
+                    {
+                        "id": wid,
+                        "fields": {
+                            "System.Title": f"work item {wid}",
+                            "System.State": "Active",
+                        },
+                    }
+                    for wid in ids
+                    if wid == 58
+                ]
+            })
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    _ticket, _c, relations, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="59"
+    )
+    by_kind = {r.kind: r for r in relations}
+    assert by_kind["parent"].ticket_id == "#58"
+    assert by_kind["parent"].title == "work item 58"
+    assert by_kind["parent"].state == "Active"
+    assert by_kind["child"].ticket_id == "#65"
+    assert by_kind["child"].title == ""
+    assert by_kind["child"].state == ""
+
+
+def test_get_ticket_multi_relation_falls_back_to_per_id_requests_on_batch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Edge case: the multi-id batch call fails outright (non-success),
+    regardless of `errorPolicy`. The fix must retry each id as its own
+    single-id request rather than blanking the whole set, and the mock
+    must observe those follow-up single-id calls actually happening."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/59" in path and "/comments" not in path:
+            payload = _work_item_payload(59)
+            payload["relations"] = [
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/58",
+                    "attributes": {"name": "Parent"},
+                },
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Forward",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/65",
+                    "attributes": {"name": "Child"},
+                },
+            ]
+            return _json(payload)
+        if path.endswith("/_apis/wit/workItems/59/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            body = json.loads(req.content.decode("utf-8"))
+            ids = body["ids"]
+            if len(ids) > 1:
+                return _json({"message": "batch unavailable"}, status_code=500)
+            return _json({
+                "value": [
+                    {
+                        "id": wid,
+                        "fields": {
+                            "System.Title": f"work item {wid}",
+                            "System.State": "Active",
+                        },
+                    }
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    _ticket, _c, relations, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="59"
+    )
+    by_kind = {r.kind: r for r in relations}
+    assert by_kind["parent"].ticket_id == "#58"
+    assert by_kind["parent"].title == "work item 58"
+    assert by_kind["parent"].state == "Active"
+    assert by_kind["child"].ticket_id == "#65"
+    assert by_kind["child"].title == "work item 65"
+    assert by_kind["child"].state == "Active"
+
+    batch_bodies = [
+        json.loads(r.content.decode("utf-8"))
+        for r in seen
+        if r.url.path.endswith("/_apis/wit/workitemsbatch")
+    ]
+    single_id_batches = [b["ids"] for b in batch_bodies if len(b["ids"]) == 1]
+    assert [58] in single_id_batches
+    assert [65] in single_id_batches
+
+
+def test_get_ticket_multi_relation_total_batch_failure_degrades_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Edge case: every `workitemsbatch` call fails, including the
+    per-id fallback retries. `get_ticket` must still return relations
+    with the correct ticket ids and empty title/state — no exception."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/59" in path and "/comments" not in path:
+            payload = _work_item_payload(59)
+            payload["relations"] = [
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/58",
+                    "attributes": {"name": "Parent"},
+                },
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Forward",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/65",
+                    "attributes": {"name": "Child"},
+                },
+            ]
+            return _json(payload)
+        if path.endswith("/_apis/wit/workItems/59/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            return _json({"message": "unavailable"}, status_code=500)
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    _ticket, _c, relations, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="59"
+    )
+    by_kind = {r.kind: r for r in relations}
+    assert by_kind["parent"].ticket_id == "#58"
+    assert by_kind["parent"].title == ""
+    assert by_kind["parent"].state == ""
+    assert by_kind["child"].ticket_id == "#65"
+    assert by_kind["child"].title == ""
+    assert by_kind["child"].state == ""
+
+
 def test_get_ticket_parent_id_none_without_hierarchy_relation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3331,6 +3747,99 @@ def test_create_ticket_milestone_omitted_issues_no_patch(
     )
     assert not any(
         op["path"] == "/fields/System.IterationPath" for op in captured["patch"]
+    )
+
+
+# ---------- create_ticket config-level `area_path` scoping (ticket #172) ----
+
+
+def test_create_ticket_config_area_path_emits_patch_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (ticket #172): with `project.area_path` set and no
+    `custom_fields`, `create_ticket`'s JSON-Patch body carries a
+    `/fields/System.AreaPath` "add" op with the configured value."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(
+                8, **{"System.AreaPath": "acme-project\\Team A"},
+            ))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(area_path="acme-project\\Team A"),
+        token="t", title="t", body="b", labels=[], assignees=[],
+    )
+    op = next(
+        op for op in captured["patch"] if op["path"] == "/fields/System.AreaPath"
+    )
+    assert op["op"] == "add"
+    assert op["value"] == "acme-project\\Team A"
+
+
+def test_create_ticket_explicit_custom_fields_area_path_wins_no_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With `project.area_path` set AND an explicit
+    `custom_fields={"System.AreaPath": ...}`, the explicit value wins and
+    exactly one `/fields/System.AreaPath` op is emitted (no duplicate) —
+    unlike `milestone`, the config default must not also append its own
+    op when the caller already targeted the field explicitly."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(
+                9, **{"System.AreaPath": "acme-project\\Team B"},
+            ))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(area_path="acme-project\\Team A"),
+        token="t", title="t", body="b", labels=[], assignees=[],
+        custom_fields={"System.AreaPath": "acme-project\\Team B"},
+    )
+    area_ops = [
+        op for op in captured["patch"] if op["path"] == "/fields/System.AreaPath"
+    ]
+    assert len(area_ops) == 1, "explicit custom_fields value must win with no duplicate op"
+    assert area_ops[0]["value"] == "acme-project\\Team B"
+
+
+def test_create_ticket_area_path_unset_byte_identical_to_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`project.area_path` unset (the default) → create's JSON-Patch body
+    is unchanged: no `/fields/System.AreaPath` op at all."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(10))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(), token="t", title="t", body="b", labels=[], assignees=[],
+    )
+    assert not any(
+        op["path"] == "/fields/System.AreaPath" for op in captured["patch"]
     )
 
 
