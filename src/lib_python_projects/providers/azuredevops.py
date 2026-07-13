@@ -37,7 +37,7 @@ import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from html import escape as html_escape, unescape as html_unescape
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 import httpx
@@ -3343,9 +3343,10 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         # advertises labels consistently.
         pr.labels = self._fetch_pr_labels(project, token, repo_id, pr_id)
         # Synthesize reviews from the vote data already present on `raw`
-        # (ticket #148) — no extra round trip. `pr.reviewers` is left
-        # untouched (`_map_pr` already sets it via `_identity_display_name`).
-        reviews = self._reviews_from_votes(raw, project, pr_id)
+        # (ticket #148), matching each reviewer against their review-body
+        # thread so `body`/`submitted_at`/comment-state reviews read back
+        # consistently with `list_pr_reviews` (ticket #178).
+        reviews = self._reviews_from_votes(raw, project, pr_id, token, repo_id)
         pr.reviews = reviews
         pr.review_decision = review_decision_from_states(
             [rv.state for rv in _latest_reviews_by_author(reviews)]
@@ -3457,78 +3458,21 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         -5: "comment",
     }
 
-    def _reviews_from_votes(
-        self, raw: dict, project: ProjectConfig, pr_id: str
-    ) -> list[Review]:
-        """Synthesize `Review` objects from `raw["reviewers"]` vote data.
-
-        Lighter-weight sibling of `list_pr_reviews`: reuses the same
-        vote -> state mapping (`_VOTE_STATE_MAP`) and identity resolution
-        (`_identity_login_or_display`), but skips the extra thread fetch
-        `list_pr_reviews` performs to recover a review body — `get_pr` is
-        on the single-PR read path and shouldn't pay for an extra round
-        trip just to populate `Review.body`. `body` is always `""` and
-        `url` is the PR URL (via `_build_pr_url`) for every entry.
-        Reviewers with a `0` (not-yet-voted) vote are skipped, matching
-        `list_pr_reviews`.
-        """
-        out: list[Review] = []
-        for reviewer in raw.get("reviewers") or []:
-            vote = reviewer.get("vote") or 0
-            state = self._VOTE_STATE_MAP.get(vote)
-            if state is None:
-                continue
-            reviewer_id = reviewer.get("id") or ""
-            out.append(
-                Review(
-                    id=f"{reviewer_id}:{vote}",
-                    state=state,
-                    author=_identity_login_or_display(reviewer),
-                    body="",
-                    url=_build_pr_url(project, pr_id),
-                    submitted_at="",
-                )
-            )
-        return out
-
-    def list_pr_reviews(
+    def _review_body_thread_matcher(
         self,
         project: ProjectConfig,
         token: str | None,
         pr_id: str,
-    ) -> list[Review]:
-        """List reviews on a PR, synthesized from reviewer votes.
+        repo_id: str,
+    ) -> Callable[[str], dict | None]:
+        """Fetch review-body threads once and return a reviewer-id matcher.
 
-        ADO models a review as a per-reviewer `vote` on the PR resource
-        rather than a distinct review object (mirrors `submit_pr_review`'s
-        write path). This fetches the PR (the same GET `get_pr` uses) and
-        emits one `Review` per reviewer with a non-zero vote:
-
-          - `10` (approved) / `5` (approved-with-suggestions) -> `"approve"`
-          - `-10` (rejected) -> `"request_changes"`
-          - `-5` (waiting-for-author) -> `"comment"`
-          - `0` (merely requested, hasn't voted) -> skipped, matching the
-            reviewers/requested split already applied in `_map_pr`.
-
-        Bodies aren't attached to the vote itself, so this best-effort
-        matches each review to the review-body thread (tagged via
-        `_is_review_body_thread`) whose first comment's author id equals
-        the reviewer's id. When matched, `body`/`submitted_at` come from
-        that thread; otherwise both fall back to `""` (there is no
-        review-specific body/timestamp to report on Azure DevOps, and
-        GitHub/Azure both emit `str` rather than `None` for `Review.body`
-        per the shared convention documented on the dataclass).
+        Bodies aren't attached to a vote itself, so both `get_pr` (via
+        `_reviews_from_votes`) and `list_pr_reviews` recover a review's
+        `body`/`submitted_at` by matching it to the review-body thread
+        (tagged via `_is_review_body_thread`) whose first comment's
+        author id equals the reviewer's id.
         """
-        repo_id = self._resolve_repository_id(project, token)
-        path = (
-            f"{_project_scope(project)}/_apis/git/repositories/"
-            f"{quote(repo_id, safe='')}/pullrequests/{quote(str(pr_id), safe='')}"
-        )
-        with _client(project, token) as c:
-            resp = c.get(path, params=_api_version_params())
-        _check(resp)
-        raw = resp.json()
-
         review_body_threads = [
             t
             for t in self._list_pr_threads(project, token, pr_id, repo_id)
@@ -3545,32 +3489,126 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                     return thread
             return None
 
-        out: list[Review] = []
-        for reviewer in raw.get("reviewers") or []:
-            vote = reviewer.get("vote") or 0
+        return _matching_thread
+
+    def _review_from_reviewer(
+        self,
+        reviewer: dict,
+        project: ProjectConfig,
+        pr_id: str,
+        match_thread: Callable[[str], dict | None],
+    ) -> Review | None:
+        """Build a `Review` from one `raw["reviewers"]` entry, or `None`.
+
+        Single source of truth for the vote -> state mapping and the
+        body/timestamp recovery rule, shared by `get_pr` (via
+        `_reviews_from_votes`) and `list_pr_reviews` (ticket #178):
+
+          - `10` (approved) / `5` (approved-with-suggestions) -> `"approve"`
+          - `-10` (rejected) -> `"request_changes"`
+          - `-5` (waiting-for-author) -> `"comment"`
+          - `0` is ambiguous on its own: a `comment`-state review
+            submitted via `submit_pr_review` votes `0`, but so does a
+            reviewer who was merely *requested* and hasn't voted. We
+            disambiguate by looking for that reviewer's review-body
+            thread (present only when a `comment` review was actually
+            submitted with a body): a match surfaces `state="comment"`;
+            no match means this is just a requested-but-not-yet-voted
+            reviewer, so `None` is returned (skipped, matching the
+            reviewers/requested split already applied in `_map_pr` — it
+            must NOT become a phantom comment review).
+
+        When a review-body thread matches (any state, not just `0`),
+        `body`/`submitted_at` come from that thread; otherwise both fall
+        back to `""` (there is no review-specific body/timestamp to
+        report on Azure DevOps otherwise, and GitHub/Azure both emit
+        `str` rather than `None` for `Review.body` per the shared
+        convention documented on the dataclass).
+        """
+        vote = reviewer.get("vote") or 0
+        reviewer_id = reviewer.get("id") or ""
+        thread = match_thread(reviewer_id)
+        if vote != 0:
             state = self._VOTE_STATE_MAP.get(vote)
             if state is None:
-                continue
-            reviewer_id = reviewer.get("id") or ""
-            thread = _matching_thread(reviewer_id)
-            if thread is not None:
-                body = _html_to_markdown(
-                    (thread.get("comments") or [{}])[0].get("content") or ""
-                )
-                submitted_at = normalize_timestamp(thread.get("publishedDate") or "")
-            else:
-                body = ""
-                submitted_at = ""
-            out.append(
-                Review(
-                    id=f"{reviewer_id}:{vote}",
-                    state=state,
-                    author=_identity_login_or_display(reviewer),
-                    body=body,
-                    url=_build_pr_url(project, pr_id),
-                    submitted_at=submitted_at,
-                )
+                return None
+        elif thread is not None:
+            state = "comment"
+        else:
+            return None
+        if thread is not None:
+            body = _html_to_markdown(
+                (thread.get("comments") or [{}])[0].get("content") or ""
             )
+            submitted_at = normalize_timestamp(thread.get("publishedDate") or "")
+        else:
+            body = ""
+            submitted_at = ""
+        return Review(
+            id=f"{reviewer_id}:{vote}",
+            state=state,
+            author=_identity_login_or_display(reviewer),
+            body=body,
+            url=_build_pr_url(project, pr_id),
+            submitted_at=submitted_at,
+        )
+
+    def _reviews_from_votes(
+        self, raw: dict, project: ProjectConfig, pr_id: str,
+        token: str | None, repo_id: str,
+    ) -> list[Review]:
+        """Synthesize `Review` objects from `raw["reviewers"]` vote data.
+
+        Shares the vote -> state mapping, identity resolution, and
+        review-body-thread recovery with `list_pr_reviews` via
+        `_review_from_reviewer`/`_review_body_thread_matcher` (ticket
+        #178) — `get_pr` previously hardcoded `body=""`/`submitted_at=""`
+        and dropped `vote:0` "comment" reviews entirely, which made a
+        `submit_pr_review(state="comment", ...)` read-back disappear
+        from `get_pr().reviews[]`. This now costs one extra threads round
+        trip on the `get_pr` path (previously zero), matching the cost
+        `list_pr_reviews` already paid.
+        """
+        match_thread = self._review_body_thread_matcher(project, token, pr_id, repo_id)
+        out: list[Review] = []
+        for reviewer in raw.get("reviewers") or []:
+            review = self._review_from_reviewer(reviewer, project, pr_id, match_thread)
+            if review is not None:
+                out.append(review)
+        return out
+
+    def list_pr_reviews(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        pr_id: str,
+    ) -> list[Review]:
+        """List reviews on a PR, synthesized from reviewer votes.
+
+        ADO models a review as a per-reviewer `vote` on the PR resource
+        rather than a distinct review object (mirrors `submit_pr_review`'s
+        write path). This fetches the PR (the same GET `get_pr` uses) and
+        emits one `Review` per reviewer via `_review_from_reviewer` — see
+        that method's docstring for the vote -> state mapping and the
+        `vote:0` comment-vs-merely-requested disambiguation.
+        """
+        repo_id = self._resolve_repository_id(project, token)
+        path = (
+            f"{_project_scope(project)}/_apis/git/repositories/"
+            f"{quote(repo_id, safe='')}/pullrequests/{quote(str(pr_id), safe='')}"
+        )
+        with _client(project, token) as c:
+            resp = c.get(path, params=_api_version_params())
+        _check(resp)
+        raw = resp.json()
+
+        match_thread = self._review_body_thread_matcher(project, token, pr_id, repo_id)
+
+        out: list[Review] = []
+        for reviewer in raw.get("reviewers") or []:
+            review = self._review_from_reviewer(reviewer, project, pr_id, match_thread)
+            if review is not None:
+                out.append(review)
         return out
 
     # ---------- pull requests — write -------------------------------------

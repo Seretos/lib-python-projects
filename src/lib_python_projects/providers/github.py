@@ -2415,6 +2415,19 @@ def _map_permissions_to_capabilities(perms: dict) -> TokenCapabilities:
     )
 
 
+# ticket #178: after a board write that may cascade into a REST-visible
+# issue state change (e.g. Status:"Done" auto-closing the issue via a
+# workflow), the cascade is asynchronous server-side. A single re-GET can
+# still observe the pre-cascade snapshot. `_reget_sleep` is a mockable
+# indirection so tests can replace the backoff with a no-op.
+_REGET_POLL_MAX_ATTEMPTS = 4
+_REGET_POLL_BACKOFFS = (0.05, 0.1, 0.2)
+
+
+def _reget_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 class GitHubProvider(TokenProjectDiscoveryProvider):
     def probe_token_capabilities(
         self, project: ProjectConfig, token: str
@@ -3132,15 +3145,29 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             current_assignees = {a["login"] for a in (current.get("assignees") or [])}
             markers = _marker_set(project)
 
-            def _reget_issue() -> Ticket:
+            def _reget_issue(prev_state: str | None) -> Ticket:
                 # A board write via `_write_custom_fields_to_board` can
                 # cascade REST-visible issue state server-side (e.g. a
                 # Status:"Done" column write auto-closing the issue via a
-                # workflow) — re-GET so the returned Ticket reflects that
-                # cascade rather than a pre-write snapshot (ticket #178).
-                rr = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
-                _check(rr)
-                return _map_issue(rr.json())
+                # workflow) — but that cascade is ASYNC, so a single
+                # re-GET can still observe the pre-cascade snapshot
+                # (ticket #178). Poll a bounded number of times, stopping
+                # as soon as `state` differs from `prev_state` (the
+                # cascade landed). If the cap is reached without a
+                # change, return the last snapshot fetched — this is the
+                # correct, best-effort outcome when the write legitimately
+                # doesn't cascade (e.g. a custom_fields write that isn't
+                # bound to an auto-close workflow).
+                last: dict[str, Any] | None = None
+                for attempt in range(_REGET_POLL_MAX_ATTEMPTS):
+                    rr = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
+                    _check(rr)
+                    last = rr.json()
+                    if last.get("state") != prev_state:
+                        break
+                    if attempt < _REGET_POLL_MAX_ATTEMPTS - 1:
+                        _reget_sleep(_REGET_POLL_BACKOFFS[attempt])
+                return _map_issue(last)
 
             if labels_add:
                 _assert_labels_exist(client, project, labels_add)
@@ -3279,7 +3306,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         )
                     _write_milestone_to_board(client, binding, content_id, milestone)
                 if custom_fields:
-                    return _reget_issue()
+                    return _reget_issue(current.get("state"))
                 return _map_issue(current)
 
             r = client.patch(f"{_repo_path(project)}/issues/{ticket_id}", json=payload)
@@ -3321,7 +3348,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                     {reopen_binding.status_field: reset_value},
                 )
             if custom_fields or should_reset_board_column:
-                return _reget_issue()
+                # Use the PRE-write state (`current`, captured before the
+                # PATCH above) as the poll's baseline — not `raw["state"]`
+                # — so a state-changing PATCH in this same call (e.g. an
+                # explicit `status=` reopen) doesn't mask detection of the
+                # async board-cascade state change layered on top of it.
+                return _reget_issue(current.get("state"))
             return _map_issue(raw)
 
     def bulk_update_tickets(

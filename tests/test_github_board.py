@@ -1745,6 +1745,7 @@ def test_update_ticket_custom_fields_board_only_reflects_cascade(
                 )
         raise AssertionError(f"unexpected request {req.method} {path}")
 
+    monkeypatch.setattr(github_provider, "_reget_sleep", lambda seconds: None)
     _install_mock(monkeypatch, handler)
     ticket = GitHubProvider().update_ticket(
         _project(board), "t", "42", custom_fields={"Status": "Done"},
@@ -1805,6 +1806,7 @@ def test_update_ticket_custom_fields_combined_with_rest_field_reflects_cascade(
                 )
         raise AssertionError(f"unexpected request {req.method} {path}")
 
+    monkeypatch.setattr(github_provider, "_reget_sleep", lambda seconds: None)
     _install_mock(monkeypatch, handler)
     ticket = GitHubProvider().update_ticket(
         _project(board), "t", "42",
@@ -1813,6 +1815,160 @@ def test_update_ticket_custom_fields_combined_with_rest_field_reflects_cascade(
     assert get_count["n"] == 2
     assert ticket.title == "new title"
     assert ticket.status == "closed:completed"
+
+
+def test_update_ticket_custom_fields_poll_reflects_delayed_cascade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #178 (reopened): the board->issue auto-close cascade is
+    ASYNC server-side — a single re-GET immediately after the board
+    write can still observe the pre-cascade snapshot. `update_ticket`
+    must poll (bounded) until the cascade lands rather than returning
+    the first stale re-GET."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    get_count = {"n": 0}
+    # Pre-write GET (n=1) + two stale re-GETs (n=2,3) still "open",
+    # then the cascade lands on the third re-GET (n=4).
+    SETTLE_AT = 4
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            get_count["n"] += 1
+            if get_count["n"] < SETTLE_AT:
+                return _json(_ai_issue_payload(42, state="open"))
+            return _json(_ai_issue_payload(
+                42, state="closed", state_reason="completed",
+                updated_at="2024-06-01T00:00:00Z",
+            ))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    monkeypatch.setattr(github_provider, "_reget_sleep", lambda seconds: None)
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": "Done"},
+    )
+    assert ticket.status == "closed:completed"
+    assert ticket.updated_at == "2024-06-01T00:00:00Z"
+    # 1 pre-write GET + 3 re-GETs (2 stale + 1 that observes the cascade).
+    assert get_count["n"] == SETTLE_AT
+    assert get_count["n"] > 2
+
+
+def test_update_ticket_custom_fields_poll_never_settles_returns_last_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the cascade never lands within the poll's bounded attempts
+    (e.g. the board write legitimately doesn't trigger an auto-close
+    workflow), `update_ticket` must not raise — it returns the last
+    snapshot fetched, best-effort, after exhausting the cap."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    get_count = {"n": 0}
+    reget_sleep_calls: list[float] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            get_count["n"] += 1
+            return _json(_ai_issue_payload(42, state="open"))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    monkeypatch.setattr(
+        github_provider, "_reget_sleep", lambda seconds: reget_sleep_calls.append(seconds)
+    )
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": "Done"},
+    )
+    # No raise; returns the last (still-open) snapshot.
+    assert ticket.status == "open"
+    # 1 pre-write GET + exactly `_REGET_POLL_MAX_ATTEMPTS` re-GETs.
+    assert get_count["n"] == 1 + github_provider._REGET_POLL_MAX_ATTEMPTS
+    # Backoff sleeps between re-GETs, but not after the final attempt.
+    assert len(reget_sleep_calls) == github_provider._REGET_POLL_MAX_ATTEMPTS - 1
+
+
+def test_update_ticket_pure_rest_path_does_not_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pure-REST update (no `custom_fields`, no `milestone`) never
+    enters the poll at all: exactly one GET (pre-write), no re-GET, and
+    `_reget_sleep` is never called."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    get_count = {"n": 0}
+    reget_sleep_calls: list[float] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            get_count["n"] += 1
+            return _json(_ai_issue_payload(42, title="old title"))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, title="new title"))
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    monkeypatch.setattr(
+        github_provider, "_reget_sleep", lambda seconds: reget_sleep_calls.append(seconds)
+    )
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", title="new title",
+    )
+    assert get_count["n"] == 1
+    assert ticket.title == "new title"
+    assert reget_sleep_calls == []
 
 
 def test_update_ticket_pure_rest_fast_path_no_extra_round_trip(
@@ -1946,6 +2102,80 @@ def test_update_ticket_reopen_resets_board_column(
     assert ticket.status == "open"
 
 
+def test_update_ticket_reopen_delayed_board_column_reset_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Twin of `test_update_ticket_custom_fields_poll_reflects_delayed_cascade`
+    for the #175 reopen/board-column-reset path: the PATCH lands the
+    REST `state` change immediately, but re-GETs right after can still
+    observe a stale snapshot before eventual consistency catches up.
+    `_reget_issue` polls using the PRE-write state as its baseline
+    (`current["state"]` == "closed"), not the PATCH response's `"open"`,
+    so it doesn't stop on the very first re-GET only to find a stale
+    board-column value."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    get_count = {"n": 0}
+    SETTLE_AT = 3
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            get_count["n"] += 1
+            if get_count["n"] == 1:
+                return _json(_ai_issue_payload(42, state="closed"))
+            if get_count["n"] < SETTLE_AT:
+                # Still-stale re-GET: eventual consistency hasn't caught
+                # up to the PATCH's state change yet.
+                return _json(_ai_issue_payload(42, state="closed"))
+            return _json(_ai_issue_payload(
+                42, state="open", updated_at="2024-06-02T00:00:00Z",
+            ))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, state="open"))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query = body["query"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [
+                        {"id": "opt-todo", "name": "Todo"},
+                        {"id": "opt-done", "name": "Done"},
+                    ],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    monkeypatch.setattr(github_provider, "_reget_sleep", lambda seconds: None)
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", status="open",
+    )
+
+    assert ticket.status == "open"
+    assert ticket.updated_at == "2024-06-02T00:00:00Z"
+    # 1 pre-write GET + 2 re-GETs (1 stale-but-already-"open"-in-PATCH,
+    # then the one where eventual consistency catches up).
+    assert get_count["n"] == SETTLE_AT
+
+
 def test_update_ticket_reopen_already_open_does_not_reset_board_column(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2023,6 +2253,7 @@ def test_update_ticket_reopen_explicit_custom_fields_override_wins(
                 )
         raise AssertionError(f"unexpected request {req.method} {path}")
 
+    monkeypatch.setattr(github_provider, "_reget_sleep", lambda seconds: None)
     _install_mock(monkeypatch, handler)
     GitHubProvider().update_ticket(
         _project(board), "t", "42",
