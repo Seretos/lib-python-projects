@@ -27,7 +27,7 @@ from lib_python_projects.providers.azuredevops import (
     _basic_auth_header,
     _cache_clear_all,
 )
-from lib_python_projects.providers.base import PRFilters
+from lib_python_projects.providers.base import PRFilters, normalize_timestamp
 
 
 REPO_ID = "da0d7da0-6a8c-4958-aad3-be17cbf806eb"
@@ -1512,6 +1512,7 @@ def test_submit_pr_review_tags_body_thread_with_property(
             captured["thread"] = json.loads(req.content.decode("utf-8"))
             return _json({
                 "id": 77,
+                "publishedDate": "2026-06-01T12:00:00.000Z",
                 "comments": [
                     {"id": 1, "content": "<p>x</p>", "commentType": "text"}
                 ],
@@ -1538,9 +1539,124 @@ def test_submit_pr_review_tags_body_thread_with_property(
     # mirroring GitHub's user.login and GitLab's username.
     assert review.author == "alice@example.com"
     assert review.author != "user-guid"  # never the bare GUID
-    assert review.submitted_at  # not empty
+    # submitted_at (ticket #178) comes from the posted body thread's
+    # `publishedDate`, not a fabricated "now" -- so it must match what an
+    # immediate read-back via `list_pr_reviews` would recover from the
+    # same thread.
+    assert review.submitted_at == normalize_timestamp("2026-06-01T12:00:00.000Z")
     assert review.id != "user-guid"  # synthesized, not the reviewer GUID
     assert ":10:" in review.id  # vote-encoded
+
+
+def test_submit_pr_review_submitted_at_matches_list_pr_reviews_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #178: `submit_pr_review`'s returned `submitted_at` must
+    equal what an immediate `list_pr_reviews` call reads back from the
+    same review-body thread — both are sourced from the thread's
+    `publishedDate`, not a fabricated "now"."""
+    published = "2026-06-01T12:00:00.000Z"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if path.endswith("/_apis/connectionData"):
+            return _json({
+                "authenticatedUser": {
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                }
+            })
+        if req.method == "PUT" and "/reviewers/user-guid" in path:
+            return _json({"id": "user-guid", "vote": 10})
+        if req.method == "POST" and path.endswith("/threads"):
+            return _json({
+                "id": 77,
+                "publishedDate": published,
+                "comments": [
+                    {"id": 1, "content": "<p>lgtm</p>", "commentType": "text"}
+                ],
+            })
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[{
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                    "vote": 10,
+                }],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 77,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": published,
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "user-guid"},
+                                "content": "<p>lgtm</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    review = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="approve", body="lgtm",
+    )
+    reviews = AzureDevOpsProvider().list_pr_reviews(
+        _project(), token="t", pr_id="7"
+    )
+    assert len(reviews) == 1
+    expected = normalize_timestamp(published)
+    assert review.submitted_at == expected
+    assert reviews[0].submitted_at == expected
+
+
+def test_submit_pr_review_no_body_has_empty_submitted_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #178: with no `body`, no review-body thread is posted, so
+    there is no `publishedDate` to source a timestamp from —
+    `submitted_at` must be `""` rather than a fabricated current UTC
+    time that no read-back could reproduce."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if path.endswith("/_apis/connectionData"):
+            return _json({
+                "authenticatedUser": {
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                }
+            })
+        if req.method == "PUT" and "/reviewers/user-guid" in path:
+            return _json({"id": "user-guid", "vote": 10})
+        raise AssertionError(
+            f"unexpected {req.method} {path}; no thread POST expected "
+            f"without a body"
+        )
+
+    _install_mock(monkeypatch, handler)
+    review = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="approve",
+    )
+    assert review.submitted_at == ""
 
 
 def test_get_pr_filters_review_body_threads(

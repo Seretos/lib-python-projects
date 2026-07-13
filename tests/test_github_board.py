@@ -1695,6 +1695,158 @@ def test_update_ticket_custom_fields_combined_with_status_and_title(
     assert board_write_seen == {"add_item": True, "update_field": True}
 
 
+def test_update_ticket_custom_fields_board_only_reflects_cascade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #178: a board-only write (no REST fields, just
+    `custom_fields`) can cascade the issue closed server-side (e.g. a
+    workflow that auto-closes on Status -> "Done"). The returned
+    `Ticket` must reflect that cascade, not the pre-write GET snapshot —
+    so `update_ticket` re-GETs the issue after the board write when
+    `custom_fields` was written."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    get_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            get_count["n"] += 1
+            if get_count["n"] == 1:
+                return _json(_ai_issue_payload(42, state="open"))
+            return _json(_ai_issue_payload(
+                42, state="closed", state_reason="completed",
+                updated_at="2024-06-01T00:00:00Z",
+            ))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": "Done"},
+    )
+    assert get_count["n"] == 2
+    assert ticket.status == "closed:completed"
+    assert ticket.updated_at == "2024-06-01T00:00:00Z"
+
+
+def test_update_ticket_custom_fields_combined_with_rest_field_reflects_cascade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Twin-path of the above: a single call carries a REST field
+    (`title=`) AND a cascading `custom_fields` write. The PATCH response
+    is captured before the board write runs, so it's necessarily stale
+    once the board write cascades the issue closed — `update_ticket`
+    must re-GET and return the post-cascade state, not the PATCH body."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    get_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            get_count["n"] += 1
+            if get_count["n"] == 1:
+                return _json(_ai_issue_payload(42, title="old title", state="open"))
+            return _json(_ai_issue_payload(
+                42, title="new title", state="closed", state_reason="completed",
+            ))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            # Captured BEFORE the board write runs -- still "open".
+            return _json(_ai_issue_payload(42, title="new title", state="open"))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query = body["query"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42",
+        title="new title", custom_fields={"Status": "Done"},
+    )
+    assert get_count["n"] == 2
+    assert ticket.title == "new title"
+    assert ticket.status == "closed:completed"
+
+
+def test_update_ticket_pure_rest_fast_path_no_extra_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pure-REST update (no `custom_fields`, no `milestone`) must stay
+    at zero extra round trips: exactly one GET (pre-write) and one
+    PATCH, no re-GET. The returned `Ticket` maps the PATCH response."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    get_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            get_count["n"] += 1
+            if get_count["n"] > 1:
+                raise AssertionError(
+                    "no second GET expected for a pure-REST update"
+                )
+            return _json(_ai_issue_payload(42, title="old title"))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, title="new title"))
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", title="new title",
+    )
+    assert get_count["n"] == 1
+    assert ticket.title == "new title"
+    patch_requests = [r for r in seen if r.method == "PATCH"]
+    assert len(patch_requests) == 1
+
+
 def test_update_ticket_custom_fields_none_or_empty_is_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
