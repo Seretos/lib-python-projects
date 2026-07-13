@@ -476,6 +476,40 @@ def _org_scope(project: ProjectConfig) -> str:
     return f"/{quote(org, safe='')}"
 
 
+def _area_path_clause(area: str | None, recursive: bool) -> str | None:
+    """Build the `[System.AreaPath]` WIQL clause for *area*, or `None`.
+
+    `recursive=True` emits `UNDER` (includes sub-areas); `False` emits an
+    exact `=` match. Returns `None` when `area` is falsy so callers can
+    unconditionally append the result without an extra `if`.
+    """
+    if not area:
+        return None
+    if recursive:
+        return f"[System.AreaPath] UNDER '{_escape_wiql(area)}'"
+    return f"[System.AreaPath] = '{_escape_wiql(area)}'"
+
+
+def _effective_area_path(
+    project: ProjectConfig, filters: TicketFilters
+) -> tuple[str | None, bool]:
+    """Resolve the area path (+ recursion flag) actually in effect.
+
+    An explicit `filters.area_path` always wins outright — including its
+    own `filters.area_path_recursive` flag. When no per-call filter is
+    given, `project.area_path` (ticket #172) is used as a config-level
+    default scope, always with `UNDER` (recursive) semantics — an exact
+    config-level default would silently drop work items filed under
+    sub-areas, which is rarely what operators configuring a static
+    default want. Returns `(None, True)` when neither is set.
+    """
+    if filters.area_path:
+        return filters.area_path, filters.area_path_recursive
+    if project.area_path:
+        return project.area_path, True
+    return None, True
+
+
 def _api_version_params(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build the common query-param dict, defaulting `api-version` to 7.1."""
     params: dict[str, Any] = {"api-version": API_VERSION}
@@ -2117,19 +2151,20 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             clauses.append(f"[System.ChangedDate] >= '{_escape_wiql(filters.updated_after)}'")
         if filters.updated_before:
             clauses.append(f"[System.ChangedDate] <= '{_escape_wiql(filters.updated_before)}'")
-        if filters.area_path:
-            # No validation against classification nodes here — that would
-            # require an extra API round-trip and is out of scope. ADO's
-            # WIQL endpoint 404s (TF51011) for an unrecognised area path
-            # rather than returning zero rows; `list_tickets` swallows
-            # that specific response into an empty result (see
-            # `_is_area_path_not_found`), so the "invalid area path
-            # simply yields zero matching work items" contract holds
-            # without an extra validation round-trip.
-            if filters.area_path_recursive:
-                clauses.append(f"[System.AreaPath] UNDER '{_escape_wiql(filters.area_path)}'")
-            else:
-                clauses.append(f"[System.AreaPath] = '{_escape_wiql(filters.area_path)}'")
+        # No validation against classification nodes here — that would
+        # require an extra API round-trip and is out of scope. ADO's WIQL
+        # endpoint 404s (TF51011) for an unrecognised area path rather than
+        # returning zero rows; `list_tickets` swallows that specific
+        # response into an empty result (see `_is_area_path_not_found`), so
+        # the "invalid area path simply yields zero matching work items"
+        # contract holds without an extra validation round-trip. The
+        # effective area (an explicit `filters.area_path` overriding the
+        # config-level `project.area_path` default — ticket #172) is
+        # resolved by `_effective_area_path`.
+        area, area_recursive = _effective_area_path(project, filters)
+        area_clause = _area_path_clause(area, area_recursive)
+        if area_clause:
+            clauses.append(area_clause)
 
         if filters.board_column:
             clauses.extend(_board_column_wiql_clauses(project, filters.board_column))
@@ -2185,8 +2220,12 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         # instead of returning an empty result set when `area_path`
         # doesn't resolve. Swallow only that specific, gated case — any
         # other 4xx (missing project, malformed query, etc.) still
-        # surfaces via `_check` below.
-        if filters.area_path and _is_area_path_not_found(resp):
+        # surfaces via `_check` below. Gated on the *effective* area
+        # (ticket #172): either an explicit `filters.area_path` or a
+        # config-level `project.area_path` default, so an invalid
+        # config-level area also yields `[], False` rather than raising.
+        effective_area, _ = _effective_area_path(project, filters)
+        if effective_area and _is_area_path_not_found(resp):
             return [], False
         _check(resp)
         ids = [
@@ -2657,6 +2696,21 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
                 "op": "add",
                 "path": "/fields/System.IterationPath",
                 "value": milestone,
+            })
+
+        # Config-level area-path scoping (ticket #172): when the project
+        # declares a default `area_path` and the caller hasn't already
+        # explicitly targeted `System.AreaPath` via `custom_fields`, scope
+        # the new work item there. Unlike `milestone` above (an explicit
+        # per-call argument that intentionally wins over `custom_fields`),
+        # `project.area_path` is a low-precedence config default — an
+        # explicit `custom_fields["System.AreaPath"]` always wins and no
+        # second op is emitted, so there's never a duplicate.
+        if project.area_path and "System.AreaPath" not in remaining_custom_fields:
+            patch.append({
+                "op": "add",
+                "path": "/fields/System.AreaPath",
+                "value": project.area_path,
             })
 
         path = f"{_project_scope(project)}/_apis/wit/workitems/${quote(wi_type, safe='')}"
@@ -5039,19 +5093,26 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
 
         Note: two wrapper `ProjectConfig`s that map to the same
         organization/ado_project (differing only by `repository`) share
-        one ADO team project and therefore legitimately share work items
-        — and this in-use tag list — since ADO has no finer scope than
-        the team project for tags/work items (`ProjectConfig` has no
-        `area_path` field to narrow further). That sharing is expected
-        behaviour; what this method fixes is catalog-only tags leaking
-        in, not cross-repository tag sharing.
+        one ADO team project and therefore, absent further scoping, would
+        share work items — and this in-use tag list — since ADO has no
+        finer native scope than the team project for tags/work items.
+        `ProjectConfig.area_path` (ticket #172) closes that gap: when set,
+        it scopes this query to that `System.AreaPath` sub-tree (`UNDER`,
+        recursive) via the same `_effective_area_path` resolver
+        `list_tickets` uses, so two such wrappers configured with distinct
+        `area_path` values return distinct tag sets. Left unset, behaviour
+        is unchanged — the query still spans the whole team project.
 
         Best-effort: if the WIQL query or the batch fetch returns a
         non-success response, returns `[]` rather than raising. Each
         `Label` is returned with `color=""` and `description=""` because
         ADO tags have no such fields.
         """
+        area, area_recursive = _effective_area_path(project, TicketFilters())
+        area_clause = _area_path_clause(area, area_recursive)
         wiql = "SELECT [System.Id] FROM workitems WHERE [System.TeamProject] = @project"
+        if area_clause:
+            wiql += f" AND {area_clause}"
         with _client(project, token) as c:
             resp = c.post(
                 f"{_project_scope(project)}/_apis/wit/wiql",

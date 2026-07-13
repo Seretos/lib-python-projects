@@ -42,6 +42,7 @@ def _project(
     path: str = "seredos/azure-tests/azure-tests",
     auto_labels: AutoLabels | None = None,
     board: Board | None = None,
+    area_path: str | None = None,
 ) -> ProjectConfig:
     return ProjectConfig(
         id="azure-tests",
@@ -51,6 +52,7 @@ def _project(
         default_work_item_type=default_type,
         auto_labels=auto_labels or AutoLabels(),
         board=board,
+        area_path=area_path,
     )
 
 
@@ -531,6 +533,181 @@ def test_list_tickets_area_path_round_trip_discovered_value_is_filterable(
         filters=TicketFilters(area_path=area_field.allowed_values[0]),
     )
     assert "[System.AreaPath] UNDER 'azure-tests'" in captured["wiql"]
+
+
+# ---------- config-level `project.area_path` scoping (ticket #172) ----------
+
+
+def _capture_wiql_for(
+    monkeypatch: pytest.MonkeyPatch, project: ProjectConfig, filters: TicketFilters
+) -> str:
+    bt = _basic_template_handler()
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            captured["wiql"] = json.loads(req.content.decode("utf-8"))["query"]
+            return _json({"workItems": []})
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_tickets(project, token="t", filters=filters)
+    return captured["wiql"]
+
+
+def test_list_tickets_config_area_path_scopes_wiql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (ticket #172): `project.area_path` alone (no per-call
+    `filters.area_path`) must still scope the WIQL — the config-level
+    default participates via `_effective_area_path`, defaulting to `UNDER`
+    (recursive) semantics."""
+    wiql = _capture_wiql_for(
+        monkeypatch,
+        _project(default_type="Issue", area_path="acme-project\\Team A"),
+        TicketFilters(),
+    )
+    assert "[System.AreaPath] UNDER 'acme-project\\Team A'" in wiql
+
+
+def test_list_tickets_two_wrappers_same_org_project_distinct_config_area_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Core regression for ticket #172: two `ProjectConfig` wrappers that
+    share `organization/ado_project` (differing only in the unused
+    `repository` path segment) must resolve to genuinely different WIQL
+    scopes when configured with distinct `area_path` values — the previous
+    behaviour made both wrappers indistinguishable for `list_tickets`."""
+    wiql_a = _capture_wiql_for(
+        monkeypatch,
+        _project(
+            default_type="Issue",
+            path="acme-org/acme-project/repo-a",
+            area_path="acme-project\\Team A",
+        ),
+        TicketFilters(),
+    )
+    wiql_b = _capture_wiql_for(
+        monkeypatch,
+        _project(
+            default_type="Issue",
+            path="acme-org/acme-project/repo-b",
+            area_path="acme-project\\Team B",
+        ),
+        TicketFilters(),
+    )
+    assert "[System.AreaPath] UNDER 'acme-project\\Team A'" in wiql_a
+    assert "[System.AreaPath] UNDER 'acme-project\\Team B'" in wiql_b
+    assert wiql_a != wiql_b
+
+
+def test_list_tickets_explicit_filter_area_path_overrides_config_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit `filters.area_path` on the call entirely overrides
+    `project.area_path` — the config value must not also appear."""
+    wiql = _capture_wiql_for(
+        monkeypatch,
+        _project(default_type="Issue", area_path="acme-project\\Team A"),
+        TicketFilters(area_path="acme-project\\Team B"),
+    )
+    assert "[System.AreaPath] UNDER 'acme-project\\Team B'" in wiql
+    assert "Team A" not in wiql
+
+
+def test_list_tickets_explicit_filter_recursive_false_overrides_config_recursive_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The config-level fallback always uses `UNDER`, but an explicit
+    `filters.area_path` keeps its own `area_path_recursive` flag even when
+    a (different) config default is also present."""
+    wiql = _capture_wiql_for(
+        monkeypatch,
+        _project(default_type="Issue", area_path="acme-project\\Team A"),
+        TicketFilters(area_path="acme-project\\Team B", area_path_recursive=False),
+    )
+    assert "[System.AreaPath] = 'acme-project\\Team B'" in wiql
+    assert "UNDER" not in wiql
+
+
+def test_list_tickets_no_config_area_path_byte_identical_to_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`project.area_path` unset (the default) → no `System.AreaPath`
+    clause at all, matching pre-#172 behaviour exactly."""
+    wiql = _capture_wiql_for(
+        monkeypatch, _project(default_type="Issue"), TicketFilters(labels=["bug"])
+    )
+    assert "[System.AreaPath]" not in wiql
+
+
+def test_list_tickets_invalid_config_area_path_swallowed_to_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (ticket #172): an invalid *config-level* `area_path`
+    (no per-call `filters.area_path`) must be swallowed into `[], False`
+    under the same "invalid area path yields zero matches" contract as an
+    invalid `filters.area_path` — gating on the effective area, not just
+    `filters.area_path`, is what makes this work. Fails (raises
+    AzureDevOpsError) if the swallow guard is only gated on
+    `filters.area_path`."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            return _json(
+                {
+                    "message": (
+                        "TF51011: The specified area path "
+                        "acme-project\\Bogus does not exist."
+                    ),
+                },
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    tickets, has_more = AzureDevOpsProvider().list_tickets(
+        _project(default_type="Issue", area_path="acme-project\\Bogus"),
+        token="t",
+        filters=TicketFilters(),
+    )
+    assert tickets == []
+    assert has_more is False
+
+
+def test_list_tickets_config_area_path_non_area_404_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The config-level swallow is narrowly anchored, same as the
+    `filters.area_path` case: a 404 with an unrelated message must still
+    surface even though `project.area_path` is set."""
+    bt = _basic_template_handler()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = bt(req)
+        if cached is not None:
+            return cached
+        if req.url.path.endswith("/_apis/wit/wiql"):
+            return _json(
+                {"message": "TF200016: The following project does not exist"},
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected path {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(azure_mod.AzureDevOpsError):
+        AzureDevOpsProvider().list_tickets(
+            _project(default_type="Issue", area_path="acme-project\\Team A"),
+            token="t",
+            filters=TicketFilters(),
+        )
 
 
 def test_list_tickets_state_open_filters_by_categories(
@@ -3331,6 +3508,99 @@ def test_create_ticket_milestone_omitted_issues_no_patch(
     )
     assert not any(
         op["path"] == "/fields/System.IterationPath" for op in captured["patch"]
+    )
+
+
+# ---------- create_ticket config-level `area_path` scoping (ticket #172) ----
+
+
+def test_create_ticket_config_area_path_emits_patch_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (ticket #172): with `project.area_path` set and no
+    `custom_fields`, `create_ticket`'s JSON-Patch body carries a
+    `/fields/System.AreaPath` "add" op with the configured value."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(
+                8, **{"System.AreaPath": "acme-project\\Team A"},
+            ))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(area_path="acme-project\\Team A"),
+        token="t", title="t", body="b", labels=[], assignees=[],
+    )
+    op = next(
+        op for op in captured["patch"] if op["path"] == "/fields/System.AreaPath"
+    )
+    assert op["op"] == "add"
+    assert op["value"] == "acme-project\\Team A"
+
+
+def test_create_ticket_explicit_custom_fields_area_path_wins_no_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With `project.area_path` set AND an explicit
+    `custom_fields={"System.AreaPath": ...}`, the explicit value wins and
+    exactly one `/fields/System.AreaPath` op is emitted (no duplicate) —
+    unlike `milestone`, the config default must not also append its own
+    op when the caller already targeted the field explicitly."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(
+                9, **{"System.AreaPath": "acme-project\\Team B"},
+            ))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(area_path="acme-project\\Team A"),
+        token="t", title="t", body="b", labels=[], assignees=[],
+        custom_fields={"System.AreaPath": "acme-project\\Team B"},
+    )
+    area_ops = [
+        op for op in captured["patch"] if op["path"] == "/fields/System.AreaPath"
+    ]
+    assert len(area_ops) == 1, "explicit custom_fields value must win with no duplicate op"
+    assert area_ops[0]["value"] == "acme-project\\Team B"
+
+
+def test_create_ticket_area_path_unset_byte_identical_to_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`project.area_path` unset (the default) → create's JSON-Patch body
+    is unchanged: no `/fields/System.AreaPath` op at all."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        if "/_apis/wit/workitems/$Issue" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _json(_work_item_payload(10))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().create_ticket(
+        _project(), token="t", title="t", body="b", labels=[], assignees=[],
+    )
+    assert not any(
+        op["path"] == "/fields/System.AreaPath" for op in captured["patch"]
     )
 
 
