@@ -4299,6 +4299,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         `list_pr_reviews` reads back from that thread. When no `body` is
         supplied there is no thread to source a timestamp from, so
         `submitted_at` is `""`.
+
+        Note: casting a vote has a server-side side effect on the PR's reviewer set — ADO enrolls the voting (current) user as a participant. An 'approve'/'request_changes' vote places that user in the PR's 'reviewers'; a 'comment' vote (vote=0) transiently surfaces them in 'requested_reviewers'. This is ADO server behavior triggered by the PUT to /reviewers/{reviewerId} below, not a mutation this method makes to the returned Review (which carries no reviewer list); a subsequent get_pr reflects it. See test_submit_pr_review_docstring_records_reviewer_side_effect.
         """
         repo_id = self._resolve_repository_id(project, token)
         vote = {"approve": 10, "request_changes": -10, "comment": 0}.get(state, 0)
