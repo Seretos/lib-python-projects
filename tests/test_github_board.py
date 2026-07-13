@@ -1881,13 +1881,18 @@ def test_update_ticket_custom_fields_poll_reflects_delayed_cascade(
     assert get_count["n"] > 2
 
 
-def test_update_ticket_custom_fields_poll_never_settles_returns_last_snapshot(
+def test_update_ticket_custom_fields_poll_exhausted_returns_stale_snapshot_best_effort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When the cascade never lands within the poll's bounded attempts
     (e.g. the board write legitimately doesn't trigger an auto-close
-    workflow), `update_ticket` must not raise — it returns the last
-    snapshot fetched, best-effort, after exhausting the cap."""
+    workflow, or a slow cascade just hasn't landed yet), `update_ticket`
+    must not raise — it returns the last snapshot fetched, best-effort,
+    after exhausting the cap. This encodes the documented contract
+    (ticket #185): the return is a best-effort snapshot that MAY be
+    stale, and it stays REST-only (`custom_fields` is always `None`
+    here) regardless of the board write — see the `update_ticket`
+    docstring."""
     board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
     get_count = {"n": 0}
     reget_sleep_calls: list[float] = []
@@ -1938,6 +1943,121 @@ def test_update_ticket_custom_fields_poll_never_settles_returns_last_snapshot(
     assert get_count["n"] == 1 + github_provider._REGET_POLL_MAX_ATTEMPTS
     # Backoff sleeps between re-GETs, but not after the final attempt.
     assert len(reget_sleep_calls) == github_provider._REGET_POLL_MAX_ATTEMPTS - 1
+    # Q2 (ticket #185): the return stays REST-only regardless of the
+    # board write -- custom_fields is always None from update_ticket.
+    assert ticket.custom_fields is None
+
+
+def test_update_ticket_custom_fields_slow_cascade_is_best_effort_get_ticket_sees_settled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #185 (the 3rd reopening of #178 point 1): repro of the
+    reported race. The board->issue auto-close cascade doesn't land
+    within `update_ticket`'s bounded poll budget at all -- every GET
+    issued during `update_ticket` (pre-write + all re-GETs) still sees
+    `state="open"`. Per the documented best-effort contract,
+    `update_ticket` must NOT raise and must NOT block indefinitely: it
+    returns the last (stale) snapshot with `status == "open"` and
+    `custom_fields is None` (REST-only return). A follow-up
+    `get_ticket(..., include_custom_fields=True)` issued immediately
+    after -- once the cascade has since landed server-side -- must see
+    the settled `closed:completed` state. This proves the documented
+    remedy: callers needing guaranteed post-cascade state re-`get_ticket`."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+    get_count = {"n": 0}
+    # Every GET issued *during* update_ticket (pre-write GET #1 through
+    # the final poll attempt) sees "open" -- the cascade hasn't landed
+    # within the poll budget. Only the GET issued by the follow-up
+    # get_ticket call (after update_ticket has already returned) sees
+    # the settled "closed"/"completed" state.
+    UPDATE_TICKET_GET_COUNT = 1 + github_provider._REGET_POLL_MAX_ATTEMPTS
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            get_count["n"] += 1
+            if get_count["n"] <= UPDATE_TICKET_GET_COUNT:
+                return _json(_ai_issue_payload(42, state="open"))
+            return _json(_ai_issue_payload(
+                42, state="closed", state_reason="completed",
+                updated_at="2024-06-01T00:00:00Z",
+            ))
+        if req.method == "GET" and path.endswith("/issues/42/comments"):
+            return _json([])
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+            if "repository(owner:$owner,name:$repo)" in query:
+                assert variables == {
+                    "owner": "acme", "repo": "backend", "number": 42,
+                }
+                return _json({
+                    "data": {
+                        "repository": {
+                            "issue": {
+                                "projectItems": {
+                                    "nodes": [
+                                        {
+                                            "project": {"number": 7},
+                                            "fieldValues": {
+                                                "nodes": [
+                                                    {
+                                                        "name": "Done",
+                                                        "field": {"name": "Status"},
+                                                    },
+                                                ]
+                                            },
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                })
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    monkeypatch.setattr(github_provider, "_reget_sleep", lambda seconds: None)
+    _install_mock(monkeypatch, handler)
+
+    # (1) update_ticket: best-effort, stale snapshot, does not raise.
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": "Done"},
+    )
+    assert ticket.status == "open"
+    assert ticket.custom_fields is None
+    assert get_count["n"] == UPDATE_TICKET_GET_COUNT
+
+    # (2) Follow-up get_ticket: the documented remedy sees the settled
+    # state that landed after update_ticket's poll budget was exhausted.
+    settled, _comments, _relations, _truncated = GitHubProvider().get_ticket(
+        _project(board), "t", "42",
+        include_relations=False, include_custom_fields=True,
+    )
+    assert settled.status == "closed:completed"
+    assert settled.updated_at == "2024-06-01T00:00:00Z"
 
 
 def test_update_ticket_pure_rest_path_does_not_poll(

@@ -2418,8 +2418,12 @@ def _map_permissions_to_capabilities(perms: dict) -> TokenCapabilities:
 # ticket #178: after a board write that may cascade into a REST-visible
 # issue state change (e.g. Status:"Done" auto-closing the issue via a
 # workflow), the cascade is asynchronous server-side. A single re-GET can
-# still observe the pre-cascade snapshot. `_reget_sleep` is a mockable
-# indirection so tests can replace the backoff with a no-op.
+# still observe the pre-cascade snapshot. The bounded poll below is a
+# BEST-EFFORT fast path — there is no GitHub API to await a pending
+# Projects-v2 workflow, so an exhausted poll returns the last (possibly
+# stale) snapshot rather than raising; callers needing the guaranteed
+# settled state must issue a follow-up `get_ticket`. `_reget_sleep` is a
+# mockable indirection so tests can replace the backoff with a no-op.
 _REGET_POLL_MAX_ATTEMPTS = 4
 _REGET_POLL_BACKOFFS = (0.05, 0.1, 0.2)
 
@@ -3047,14 +3051,27 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
 
         A non-empty `custom_fields` write can cascade REST-visible issue
         state server-side (e.g. a board automation that closes the issue
-        when its Status column moves to "Done"). To keep the returned
-        `Ticket` consistent with an immediate read-back, whenever
-        `custom_fields` is non-empty this method re-GETs the issue after
-        the board write and maps that fresh snapshot instead of the
-        pre-write REST payload (ticket #178). A `milestone`-only board
-        write does not trigger this extra round trip: the iteration field
-        has no REST-visible effect on the issue. The pure-REST path (no
-        `custom_fields`, no `milestone`) makes no extra requests either.
+        when its Status column moves to "Done"), and that cascade runs
+        asynchronously on GitHub's side — there is no API to await it.
+        Whenever `custom_fields` is non-empty this method re-GETs the
+        issue after the board write and maps that fresh snapshot instead
+        of the pre-write REST payload (ticket #178), polling a bounded
+        number of times to give a fast cascade a chance to land. This is
+        a **best-effort** optimization, not a guarantee: if the cascade
+        lands after the poll budget is exhausted, the returned `Ticket`
+        reflects the last snapshot observed and MAY LAG the eventual
+        settled state (open/unchanged rather than the closed:completed
+        the automation will still produce moments later). Callers that
+        need guaranteed post-cascade state must issue a follow-up
+        `get_ticket` after `update_ticket` returns. Independently of
+        cascade timing, the returned `Ticket.custom_fields` is always
+        `None` here — this method's return is REST-only; board/custom
+        fields are surfaced only by
+        `get_ticket(..., include_custom_fields=True)`. A `milestone`-only
+        board write does not trigger this extra round trip: the iteration
+        field has no REST-visible effect on the issue. The pure-REST path
+        (no `custom_fields`, no `milestone`) makes no extra requests
+        either.
 
         Optional `milestone` (ticket #151, keyword-only): mirrors
         `create_ticket`'s `milestone=` — requires `github-projects-v2` +
@@ -3153,11 +3170,18 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 # re-GET can still observe the pre-cascade snapshot
                 # (ticket #178). Poll a bounded number of times, stopping
                 # as soon as `state` differs from `prev_state` (the
-                # cascade landed). If the cap is reached without a
-                # change, return the last snapshot fetched — this is the
-                # correct, best-effort outcome when the write legitimately
-                # doesn't cascade (e.g. a custom_fields write that isn't
-                # bound to an auto-close workflow).
+                # cascade landed). This is a BEST-EFFORT fast path, not a
+                # guarantee: GitHub exposes no API to await a pending
+                # Projects-v2 workflow, so if the cap is reached without a
+                # change, return the last snapshot fetched as-is. That
+                # exhausted-poll return is the correct outcome both when
+                # the write legitimately doesn't cascade (e.g. a
+                # custom_fields write that isn't bound to an auto-close
+                # workflow) AND when it does cascade but hasn't landed
+                # yet — in the latter case the returned snapshot is
+                # documented as potentially stale (see the #178 paragraph
+                # in `update_ticket`'s docstring); it is never an error,
+                # and callers needing the settled state must re-`get_ticket`.
                 last: dict[str, Any] | None = None
                 for attempt in range(_REGET_POLL_MAX_ATTEMPTS):
                     rr = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
