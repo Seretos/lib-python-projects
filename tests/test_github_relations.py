@@ -2089,6 +2089,91 @@ def test_duplicate_of_from_body_with_state_reason_duplicate(
     )
 
 
+# ---------- Regression (ticket #182): bare-marker body, no doubled marker ---
+
+
+def test_add_relation_duplicate_of_bare_marker_body_no_double_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #182: when the source issue's body is exactly
+    the bare canonical marker (`"#ai-generated"`, no trailing newline —
+    what `apply_body_marker` writes for an empty body), `add_relation`
+    ('duplicate_of') must strip that marker before splicing in the
+    'Duplicate of #N' line, not leave it behind and stamp a second one."""
+    patched_bodies: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/143" and req.method == "GET":
+            return _json(_issue_payload(143, id=14301))
+        if path == "/repos/acme/backend/issues/5" and req.method == "GET":
+            return _json(_issue_payload(
+                5, id=501,
+                body="#ai-generated",
+                labels=[{"name": "ai-generated"}],
+            ))
+        if path == "/repos/acme/backend/issues/5" and req.method == "PATCH":
+            import json as _json_mod
+            payload = _json_mod.loads(req.content)
+            patched_bodies.append(payload.get("body", ""))
+            return _json(_issue_payload(
+                5, state="closed", body=payload.get("body", ""),
+            ))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().add_relation(
+        _project(), token="t", ticket_id="5", kind="duplicate_of", target="#143",
+    )
+
+    assert patched_bodies, "expected at least one PATCH body"
+    final_body = patched_bodies[-1]
+    assert final_body == "#ai-generated\n\nDuplicate of #143"
+    assert final_body.count("#ai-generated") == 1
+
+
+def test_remove_relation_duplicate_of_bare_marker_body_no_double_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for ticket #182: removing 'duplicate_of' from a body that
+    strips down to nothing but the marker must PATCH the bare canonical
+    marker (no trailing newline) with no doubling."""
+    original_body = "#ai-generated\n\nDuplicate of #143"
+    patched_bodies: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/143" and req.method == "GET":
+            return _json(_issue_payload(143, id=14301))
+        if path == "/repos/acme/backend/issues/5" and req.method == "GET":
+            return _json(_issue_payload(
+                5, id=501,
+                body=original_body,
+                state="closed",
+                state_reason="duplicate",
+                labels=[{"name": "ai-generated"}],
+            ))
+        if path == "/repos/acme/backend/issues/5" and req.method == "PATCH":
+            import json as _json_mod
+            payload = _json_mod.loads(req.content)
+            patched_bodies.append(payload.get("body", ""))
+            return _json(_issue_payload(
+                5, state="open", body=payload.get("body", ""),
+            ))
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().remove_relation(
+        _project(), token="t", ticket_id="5", kind="duplicate_of", target="#143",
+    )
+    assert result == {"removed": True}
+
+    assert patched_bodies, "expected at least one PATCH body"
+    final_body = patched_bodies[-1]
+    assert final_body == "#ai-generated"
+    assert final_body.count("#ai-generated") == 1
+
+
 # ---------- Regression: remove_relation("duplicate_of") strips body marker ----
 
 
