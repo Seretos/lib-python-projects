@@ -582,6 +582,66 @@ def test_list_pr_reviews_no_reviewers_returns_empty_list(
     assert reviews == []
 
 
+def test_list_pr_reviews_surfaces_comment_review_with_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #178 (reopened): `submit_pr_review(state="comment", ...)`
+    votes `0` -- the same vote a merely-requested-but-not-yet-voted
+    reviewer carries. A `vote:0` reviewer with a MATCHING review-body
+    thread must surface as a `"comment"` review (not be dropped like a
+    requested reviewer), with body/submitted_at recovered from that
+    thread."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[
+                    {
+                        "id": "reviewer-comment",
+                        "displayName": "Carol Commenter",
+                        "uniqueName": "carol@example.com",
+                        "vote": 0,
+                    },
+                ],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 10,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": "2026-06-01T12:00:00Z",
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "reviewer-comment"},
+                                "content": "<p>needs work</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    reviews = AzureDevOpsProvider().list_pr_reviews(
+        _project(), token="t", pr_id="7"
+    )
+    assert len(reviews) == 1
+    review = reviews[0]
+    assert review.state == "comment"
+    assert review.author == "carol@example.com"
+    assert review.body == "needs work"
+    assert review.submitted_at == normalize_timestamp("2026-06-01T12:00:00Z")
+
+
 # ---------- get_pr reviews (ticket #148) ------------------------------------
 
 
@@ -665,6 +725,197 @@ def test_get_pr_no_votes_leaves_reviews_and_decision_empty(
     pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
     assert pr.reviews == []
     assert pr.review_decision is None
+
+
+def test_get_pr_requested_reviewer_without_thread_is_not_phantom_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Extends `test_get_pr_no_votes_leaves_reviews_and_decision_empty`:
+    a reviewer with `vote:0` and NO matching review-body thread is
+    merely *requested*, not a `comment` review — it must NOT appear in
+    `pr.reviews[]` and must not affect `pr.review_decision` (ticket
+    #178: `_VOTE_STATE_MAP` intentionally has no `0` key, since blanket-
+    mapping `0 -> "comment"` would turn every requested-but-unvoted
+    reviewer into a phantom comment review)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[
+                    {
+                        "id": "reviewer-requested",
+                        "displayName": "Dana Requested",
+                        "uniqueName": "dana@example.com",
+                        "vote": 0,
+                    },
+                ],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+    assert pr.reviews == []
+    assert pr.review_decision is None
+
+
+def test_get_pr_surfaces_comment_review_with_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #178 (reopened): a `submit_pr_review(state="comment", ...)`
+    read-back via `get_pr().reviews[]` must not disappear. `vote:0` with
+    a matching review-body thread surfaces as a `"comment"` review with
+    body/submitted_at recovered from that thread — mirroring
+    `list_pr_reviews`'s behavior for the same reviewer/thread pair."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[
+                    {
+                        "id": "reviewer-comment",
+                        "displayName": "Carol Commenter",
+                        "uniqueName": "carol@example.com",
+                        "vote": 0,
+                    },
+                ],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 10,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": "2026-06-01T12:00:00Z",
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "reviewer-comment"},
+                                "content": "<p>needs work</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+    assert len(pr.reviews) == 1
+    review = pr.reviews[0]
+    assert review.state == "comment"
+    assert review.author == "carol@example.com"
+    assert review.body == "needs work"
+    assert review.submitted_at == normalize_timestamp("2026-06-01T12:00:00Z")
+    # A "comment" review is non-blocking -- no decision signal.
+    assert pr.review_decision is None
+
+
+def test_get_pr_review_body_and_submitted_at_match_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #178 (reopened): `get_pr().reviews[0].body`/`.submitted_at`
+    must match what `submit_pr_review` itself returned for the same
+    review-body thread -- previously `_reviews_from_votes` hardcoded
+    `body=""`/`submitted_at=""` for every entry, so an immediate
+    `get_pr` read-back after `submit_pr_review` silently dropped both
+    fields even though `list_pr_reviews` recovered them correctly."""
+    published = "2026-06-01T12:00:00.000Z"
+    posted: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if path.endswith("/_apis/connectionData"):
+            return _json({
+                "authenticatedUser": {
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                }
+            })
+        if req.method == "PUT" and "/reviewers/user-guid" in path:
+            return _json({"id": "user-guid", "vote": 10})
+        if req.method == "POST" and path.endswith("/threads"):
+            # Echo back the exact HTML the write posted, so the
+            # subsequent read-back below sees the same (marker-prefixed)
+            # content `submit_pr_review` itself returned -- rather than
+            # a canned constant that would falsely diverge from it.
+            payload = json.loads(req.content.decode("utf-8"))
+            posted["content"] = payload["comments"][0]["content"]
+            return _json({
+                "id": 77,
+                "publishedDate": published,
+                "comments": [
+                    {"id": 1, "content": posted["content"], "commentType": "text"}
+                ],
+            })
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[{
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                    "vote": 10,
+                }],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 77,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": published,
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "user-guid"},
+                                "content": posted["content"],
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    submitted = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="approve", body="lgtm",
+    )
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+
+    assert len(pr.reviews) == 1
+    readback = pr.reviews[0]
+    assert readback.submitted_at == submitted.submitted_at
+    assert readback.body == submitted.body
+    assert "lgtm" in readback.body
 
 
 # ---------- create_pr -------------------------------------------------------
