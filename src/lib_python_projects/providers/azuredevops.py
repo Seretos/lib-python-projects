@@ -4256,12 +4256,21 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         `get_pr().comments[]` or `list_comments` — matching GitHub's
         separation of review bodies vs ordinary PR comments.
 
-        Identity, timestamp, and id are synthesized to match the
-        cross-provider `Review` shape: `author` is the reviewer's
-        unique-name (UPN/email, the closest analogue of a GitHub login),
-        `submitted_at` is a current UTC ISO-8601, and `id` includes the
+        Identity and id are synthesized to match the cross-provider
+        `Review` shape: `author` is the reviewer's unique-name (UPN/email,
+        the closest analogue of a GitHub login), and `id` includes the
         vote + ms-timestamp so consecutive `comment + approve` calls
         from the same reviewer don't collide.
+
+        ADO's vote API has no timestamp field, so `submitted_at` cannot
+        be synthesized the way `id` is — a fabricated "now" would not
+        match what an immediate read-back via `list_pr_reviews` recovers
+        (ticket #178). Instead, when `body` is supplied, `submitted_at`
+        is the `publishedDate` of the review-body thread just posted
+        (normalized via `normalize_timestamp`) — the same value
+        `list_pr_reviews` reads back from that thread. When no `body` is
+        supplied there is no thread to source a timestamp from, so
+        `submitted_at` is `""`.
         """
         repo_id = self._resolve_repository_id(project, token)
         vote = {"approve": 10, "request_changes": -10, "comment": 0}.get(state, 0)
@@ -4313,6 +4322,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         body_with_marker = (
             ensure_comment_prefix(body, markers=_marker_set(project)) if body else ""
         )
+        submitted_at = ""
         if body:
             threads_path = (
                 f"{_project_scope(project)}/_apis/git/repositories/"
@@ -4338,11 +4348,13 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             with _client(project, token) as c:
                 tresp = c.post(threads_path, params=_api_version_params(), json=payload)
             _check(tresp)
+            submitted_at = normalize_timestamp(
+                (tresp.json() or {}).get("publishedDate") or ""
+            )
 
         normalized_state: Any = (
             state if state in ("approve", "request_changes", "comment") else "comment"
         )
-        submitted_at = _utc_iso_now()
         synthesized_id = (
             f"{reviewer_id}:{vote}:{int(time.time() * 1000)}"
         )

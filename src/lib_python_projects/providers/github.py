@@ -3032,6 +3032,17 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         attempted, so there's no "was the issue even created" ambiguity
         to name a partial-failure type for.
 
+        A non-empty `custom_fields` write can cascade REST-visible issue
+        state server-side (e.g. a board automation that closes the issue
+        when its Status column moves to "Done"). To keep the returned
+        `Ticket` consistent with an immediate read-back, whenever
+        `custom_fields` is non-empty this method re-GETs the issue after
+        the board write and maps that fresh snapshot instead of the
+        pre-write REST payload (ticket #178). A `milestone`-only board
+        write does not trigger this extra round trip: the iteration field
+        has no REST-visible effect on the issue. The pure-REST path (no
+        `custom_fields`, no `milestone`) makes no extra requests either.
+
         Optional `milestone` (ticket #151, keyword-only): mirrors
         `create_ticket`'s `milestone=` — requires `github-projects-v2` +
         `iteration_field` configured (`ValueError` otherwise), writes via
@@ -3102,6 +3113,16 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             current_labels = {lbl["name"] for lbl in (current.get("labels") or [])}
             current_assignees = {a["login"] for a in (current.get("assignees") or [])}
             markers = _marker_set(project)
+
+            def _reget_issue() -> Ticket:
+                # A board write via `_write_custom_fields_to_board` can
+                # cascade REST-visible issue state server-side (e.g. a
+                # Status:"Done" column write auto-closing the issue via a
+                # workflow) — re-GET so the returned Ticket reflects that
+                # cascade rather than a pre-write snapshot (ticket #178).
+                rr = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
+                _check(rr)
+                return _map_issue(rr.json())
 
             if labels_add:
                 _assert_labels_exist(client, project, labels_add)
@@ -3213,6 +3234,8 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                             f"missing 'node_id'; cannot write milestone",
                         )
                     _write_milestone_to_board(client, binding, content_id, milestone)
+                if custom_fields:
+                    return _reget_issue()
                 return _map_issue(current)
 
             r = client.patch(f"{_repo_path(project)}/issues/{ticket_id}", json=payload)
@@ -3238,6 +3261,8 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         f"'node_id'; cannot write milestone",
                     )
                 _write_milestone_to_board(client, binding, content_id, milestone)
+            if custom_fields:
+                return _reget_issue()
             return _map_issue(raw)
 
     def bulk_update_tickets(
