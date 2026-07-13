@@ -1671,6 +1671,55 @@ def test_merge_pr_waits_for_both_status_and_merge_to_settle(
     assert pr.status == "merged"
 
 
+def test_merge_pr_docstring_records_reviewer_non_claim() -> None:
+    """Ticket #180: the disputed claim that completing a PR adds the
+    merging user to `requested_reviewers` as a native ADO side effect
+    does not exist anywhere in this codebase. Guard the docstring so a
+    future edit can't silently reintroduce that claim without a test
+    catching it."""
+    doc = AzureDevOpsProvider.merge_pr.__doc__
+    assert doc is not None
+    assert "requested_reviewers" in doc
+    assert "does not add" in doc
+
+
+def test_merge_pr_does_not_populate_requested_reviewers(
+    monkeypatch: pytest.MonkeyPatch, fast_merge_settle: None
+) -> None:
+    """Completing a PR must not populate `requested_reviewers` — ADO
+    does not add the merging user to the PR's reviewers. The settled
+    PR payload's `reviewers` defaults to `[]` (single-account merge),
+    and the mapped PullRequest must reflect that."""
+    state: dict = {"poll": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            state["poll"] += 1
+            if state["poll"] <= 1:
+                # Pre-PATCH GET: PR not yet completed.
+                return _json(_pr_payload(7, status="active", mergeStatus="notSet"))
+            return _json(
+                _pr_payload(7, status="completed", mergeStatus="succeeded")
+            )
+        if req.method == "PATCH" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(7, status="active", mergeStatus="queued"))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr = AzureDevOpsProvider().merge_pr(
+        _project(), token="t", pr_id="7", merge_method="merge"
+    )
+    assert pr.merged is True
+    assert pr.requested_reviewers == []
+
+
 def test_get_pr_fetches_labels_separately(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
