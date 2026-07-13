@@ -3816,6 +3816,8 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         strategy server-side without returning an error. When the settled
         PR reports a different ``mergeStrategy`` than the one we sent, a
         warning is emitted so callers are aware of the discrepancy.
+
+        Note: completing a PR does not alter its reviewer set — ADO does not add the merging user to the PR's reviewers, so the returned PullRequest.requested_reviewers reflects only reviewers already assigned (empty if none); see test_merge_pr_does_not_populate_requested_reviewers.
         """
         repo_id = self._resolve_repository_id(project, token)
         path = (
