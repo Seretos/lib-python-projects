@@ -1798,6 +1798,12 @@ def test_merge_pr_docstring_records_reviewer_non_claim() -> None:
     assert doc is not None
     assert "requested_reviewers" in doc
     assert "does not add" in doc
+    assert "native side effect" not in doc, (
+        "backwards claim reintroduced: 'native side effect'"
+    )
+    assert "adds the merging user" not in doc, (
+        "backwards claim reintroduced: 'adds the merging user'"
+    )
 
 
 def test_merge_pr_does_not_populate_requested_reviewers(
@@ -1835,6 +1841,51 @@ def test_merge_pr_does_not_populate_requested_reviewers(
     )
     assert pr.merged is True
     assert pr.requested_reviewers == []
+
+
+def test_merge_pr_preserves_preassigned_requested_reviewer(
+    monkeypatch: pytest.MonkeyPatch, fast_merge_settle: None
+) -> None:
+    """Ticket #180: a reviewer assigned to the PR *before* merge (vote
+    still 0/no-action) must remain visible in `requested_reviewers` on
+    the merged PR. This is the mirror case of
+    test_merge_pr_does_not_populate_requested_reviewers — completing
+    the PR must not clear pre-existing requested reviewers, and must
+    not miscategorize a vote-0 reviewer into `reviewers`."""
+    state: dict = {"poll": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            state["poll"] += 1
+            if state["poll"] <= 1:
+                # Pre-PATCH GET: PR not yet completed.
+                return _json(_pr_payload(7, status="active", mergeStatus="notSet"))
+            return _json(
+                _pr_payload(
+                    7,
+                    status="completed",
+                    mergeStatus="succeeded",
+                    reviewers=[{"displayName": "Bob", "vote": 0}],
+                )
+            )
+        if req.method == "PATCH" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(7, status="active", mergeStatus="queued"))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr = AzureDevOpsProvider().merge_pr(
+        _project(), token="t", pr_id="7", merge_method="merge"
+    )
+    assert pr.merged is True
+    assert pr.requested_reviewers == ["Bob"]
+    assert pr.reviewers == []
 
 
 def test_get_pr_fetches_labels_separately(
