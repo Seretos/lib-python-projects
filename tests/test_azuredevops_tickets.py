@@ -3356,6 +3356,245 @@ def test_get_ticket_populates_parent_id_from_hierarchy_reverse_relation(
     assert [r.ticket_id for r in relations if r.kind == "parent"] == ["#3"]
 
 
+def test_get_ticket_multi_relation_hydrates_when_batchmate_unresolvable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #179: a work item with TWO relations (parent + child) issues
+    a single multi-id `workitemsbatch` call for both target ids. Before the
+    fix, that call omitted `errorPolicy`, so ADO's default `"Fail"` policy
+    means the *entire* batch fails if it's a multi-id request — even when
+    every id is perfectly resolvable — and both relations silently degrade
+    to empty title/state. This handler models exactly that: multi-id
+    batches without `errorPolicy: "Omit"` 404; single-id batches and
+    Omit-flagged multi-id batches succeed. Must fail against the pre-fix
+    code (no errorPolicy sent -> 404 -> both relations blank) and pass
+    after the fix (errorPolicy "Omit" sent -> 200 -> both relations
+    hydrated)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/59" in path and "/comments" not in path:
+            payload = _work_item_payload(59)
+            payload["relations"] = [
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/58",
+                    "attributes": {"name": "Parent"},
+                },
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Forward",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/65",
+                    "attributes": {"name": "Child"},
+                },
+            ]
+            return _json(payload)
+        if path.endswith("/_apis/wit/workItems/59/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            body = json.loads(req.content.decode("utf-8"))
+            ids = body["ids"]
+            if len(ids) > 1 and body.get("errorPolicy") != "Omit":
+                return _json({"message": "one or more ids could not be resolved"}, status_code=404)
+            return _json({
+                "value": [
+                    {
+                        "id": wid,
+                        "fields": {
+                            "System.Title": f"work item {wid}",
+                            "System.State": "Active",
+                        },
+                    }
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    _ticket, _c, relations, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="59"
+    )
+    by_kind = {r.kind: r for r in relations}
+    assert by_kind["parent"].ticket_id == "#58"
+    assert by_kind["parent"].title == "work item 58"
+    assert by_kind["parent"].state == "Active"
+    assert by_kind["child"].ticket_id == "#65"
+    assert by_kind["child"].title == "work item 65"
+    assert by_kind["child"].state == "Active"
+
+
+def test_get_ticket_multi_relation_partial_value_degrades_missing_id_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Edge case: ADO returns 200 with `errorPolicy: "Omit"` honoured —
+    i.e. a genuinely partial `value` array that simply omits an
+    unresolvable id — rather than failing the request outright. The
+    resolvable id must still hydrate; only the missing one degrades to
+    empty title/state, and no exception is raised."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/59" in path and "/comments" not in path:
+            payload = _work_item_payload(59)
+            payload["relations"] = [
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/58",
+                    "attributes": {"name": "Parent"},
+                },
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Forward",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/65",
+                    "attributes": {"name": "Child"},
+                },
+            ]
+            return _json(payload)
+        if path.endswith("/_apis/wit/workItems/59/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            body = json.loads(req.content.decode("utf-8"))
+            ids = body["ids"]
+            assert body.get("errorPolicy") == "Omit"
+            # Only id 58 resolves; 65 is silently omitted from `value`,
+            # exactly what ADO's own `errorPolicy: "Omit"` semantics do.
+            return _json({
+                "value": [
+                    {
+                        "id": wid,
+                        "fields": {
+                            "System.Title": f"work item {wid}",
+                            "System.State": "Active",
+                        },
+                    }
+                    for wid in ids
+                    if wid == 58
+                ]
+            })
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    _ticket, _c, relations, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="59"
+    )
+    by_kind = {r.kind: r for r in relations}
+    assert by_kind["parent"].ticket_id == "#58"
+    assert by_kind["parent"].title == "work item 58"
+    assert by_kind["parent"].state == "Active"
+    assert by_kind["child"].ticket_id == "#65"
+    assert by_kind["child"].title == ""
+    assert by_kind["child"].state == ""
+
+
+def test_get_ticket_multi_relation_falls_back_to_per_id_requests_on_batch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Edge case: the multi-id batch call fails outright (non-success),
+    regardless of `errorPolicy`. The fix must retry each id as its own
+    single-id request rather than blanking the whole set, and the mock
+    must observe those follow-up single-id calls actually happening."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/59" in path and "/comments" not in path:
+            payload = _work_item_payload(59)
+            payload["relations"] = [
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/58",
+                    "attributes": {"name": "Parent"},
+                },
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Forward",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/65",
+                    "attributes": {"name": "Child"},
+                },
+            ]
+            return _json(payload)
+        if path.endswith("/_apis/wit/workItems/59/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            body = json.loads(req.content.decode("utf-8"))
+            ids = body["ids"]
+            if len(ids) > 1:
+                return _json({"message": "batch unavailable"}, status_code=500)
+            return _json({
+                "value": [
+                    {
+                        "id": wid,
+                        "fields": {
+                            "System.Title": f"work item {wid}",
+                            "System.State": "Active",
+                        },
+                    }
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    _ticket, _c, relations, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="59"
+    )
+    by_kind = {r.kind: r for r in relations}
+    assert by_kind["parent"].ticket_id == "#58"
+    assert by_kind["parent"].title == "work item 58"
+    assert by_kind["parent"].state == "Active"
+    assert by_kind["child"].ticket_id == "#65"
+    assert by_kind["child"].title == "work item 65"
+    assert by_kind["child"].state == "Active"
+
+    batch_bodies = [
+        json.loads(r.content.decode("utf-8"))
+        for r in seen
+        if r.url.path.endswith("/_apis/wit/workitemsbatch")
+    ]
+    single_id_batches = [b["ids"] for b in batch_bodies if len(b["ids"]) == 1]
+    assert [58] in single_id_batches
+    assert [65] in single_id_batches
+
+
+def test_get_ticket_multi_relation_total_batch_failure_degrades_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Edge case: every `workitemsbatch` call fails, including the
+    per-id fallback retries. `get_ticket` must still return relations
+    with the correct ticket ids and empty title/state — no exception."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/59" in path and "/comments" not in path:
+            payload = _work_item_payload(59)
+            payload["relations"] = [
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/58",
+                    "attributes": {"name": "Parent"},
+                },
+                {
+                    "rel": "System.LinkTypes.Hierarchy-Forward",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/65",
+                    "attributes": {"name": "Child"},
+                },
+            ]
+            return _json(payload)
+        if path.endswith("/_apis/wit/workItems/59/comments"):
+            return _json({"comments": [], "continuationToken": None})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            return _json({"message": "unavailable"}, status_code=500)
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    _ticket, _c, relations, _t = AzureDevOpsProvider().get_ticket(
+        _project(), token="t", ticket_id="59"
+    )
+    by_kind = {r.kind: r for r in relations}
+    assert by_kind["parent"].ticket_id == "#58"
+    assert by_kind["parent"].title == ""
+    assert by_kind["parent"].state == ""
+    assert by_kind["child"].ticket_id == "#65"
+    assert by_kind["child"].title == ""
+    assert by_kind["child"].state == ""
+
+
 def test_get_ticket_parent_id_none_without_hierarchy_relation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
