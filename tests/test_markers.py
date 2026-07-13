@@ -122,6 +122,68 @@ def test_strip_leading_ai_marker_none_body_returns_empty():
     assert strip_leading_ai_marker(None) == ""
 
 
+# ---------- ticket #182: bare-marker body (no trailing newline) -------------
+
+
+def test_apply_body_marker_idempotent_on_bare_empty_body_output():
+    """`apply_body_marker` canonicalizes an empty body to the bare marker
+    line with no trailing newline (`"#ai-generated"`). Feeding that output
+    straight back into `apply_body_marker` must strip it correctly rather
+    than stacking a second marker on top."""
+    once = apply_body_marker(None, will_be_ai_generated=True)
+    assert once == "#ai-generated"
+    twice = apply_body_marker(once, will_be_ai_generated=True)
+    assert twice == "#ai-generated"
+    assert twice.count("#ai-generated") == 1
+
+
+def test_apply_body_marker_idempotent_on_bare_empty_body_output_custom_set():
+    ms = MarkerSet("robot-made", "robot-touched")
+    once = apply_body_marker(None, will_be_ai_generated=True, markers=ms)
+    assert once == "#robot-made"
+    twice = apply_body_marker(once, will_be_ai_generated=True, markers=ms)
+    assert twice == "#robot-made"
+    assert twice.count("#robot-made") == 1
+
+
+def test_strip_leading_ai_marker_strips_bare_marker_no_newline():
+    assert strip_leading_ai_marker("#ai-generated") == ""
+
+
+def test_strip_leading_ai_marker_strips_bare_marker_no_newline_custom_set():
+    ms = MarkerSet("robot-made", "robot-touched")
+    assert strip_leading_ai_marker("#robot-made", markers=ms) == ""
+
+
+def test_apply_body_marker_transition_on_bare_marker_no_stacking():
+    """generated -> modified transition on a bare (no-trailing-newline)
+    body must not stack: the old marker is stripped, not left behind."""
+    out = apply_body_marker("#ai-generated", will_be_ai_generated=False)
+    assert out == "#ai-modified"
+    assert "ai-generated" not in out
+
+
+def test_strip_leading_ai_marker_marker_plus_inline_text_not_stripped():
+    """A marker followed by inline text on the same line (no newline, EOF)
+    is NOT a bare marker line — it must be left untouched."""
+    assert strip_leading_ai_marker("#ai-generated done") == "#ai-generated done"
+
+
+def test_strip_leading_ai_marker_generic_kebab_marker_no_newline():
+    """A generic `#ai-<kebab>` marker line with no trailing newline still
+    collapses to empty (whole-line strip, not just the configured names)."""
+    assert strip_leading_ai_marker("#ai-generated-v2") == ""
+
+
+def test_strip_leading_ai_marker_empty_and_none_still_empty():
+    assert strip_leading_ai_marker("") == ""
+    assert strip_leading_ai_marker(None) == ""
+
+
+def test_strip_leading_ai_marker_trailing_spaces_no_newline():
+    assert strip_leading_ai_marker("#ai-generated   ") == ""
+
+
 # ---------- has_ai_generated_marker: no cross-project false positives -------
 
 

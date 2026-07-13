@@ -117,7 +117,7 @@ class MarkerSet:
         one.
         """
         names = "|".join(re.escape(n) for n in (self.generated, self.modified))
-        return re.compile(rf"\A\s*#(?:{names}|ai-[a-z][a-z0-9-]*)\s*\n+")
+        return re.compile(rf"\A\s*#(?:{names}|ai-[a-z][a-z0-9-]*)\s*(?:\n+|\Z)")
 
 
 DEFAULT_MARKERS = MarkerSet(AI_GENERATED_LABEL, AI_MODIFIED_LABEL)
