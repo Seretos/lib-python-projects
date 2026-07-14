@@ -1911,6 +1911,371 @@ def test_submit_pr_review_no_body_has_empty_submitted_at(
     assert review.submitted_at == ""
 
 
+def test_submit_pr_review_id_matches_get_pr_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #187: `submit_pr_review`'s returned `id` must equal what an
+    immediate `get_pr().reviews[]` read-back recovers for the same
+    review -- both must derive the ms-suffix from the same review-body
+    thread `publishedDate` rather than write-side `time.time()`, which
+    a read-back can never reproduce."""
+    published = "2026-06-01T12:00:00.000Z"
+    posted: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if path.endswith("/_apis/connectionData"):
+            return _json({
+                "authenticatedUser": {
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                }
+            })
+        if req.method == "PUT" and "/reviewers/user-guid" in path:
+            return _json({"id": "user-guid", "vote": 10})
+        if req.method == "POST" and path.endswith("/threads"):
+            payload = json.loads(req.content.decode("utf-8"))
+            posted["content"] = payload["comments"][0]["content"]
+            return _json({
+                "id": 77,
+                "publishedDate": published,
+                "comments": [
+                    {"id": 1, "content": posted["content"], "commentType": "text"}
+                ],
+            })
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[{
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                    "vote": 10,
+                }],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 77,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": published,
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "user-guid"},
+                                "content": posted["content"],
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    submitted = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="approve", body="lgtm",
+    )
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+
+    assert len(pr.reviews) == 1
+    assert pr.reviews[0].id == submitted.id
+    assert ":10:" in submitted.id
+
+
+def test_submit_pr_review_id_matches_list_pr_reviews_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #187: same correlation as
+    `test_submit_pr_review_id_matches_get_pr_readback`, against
+    `list_pr_reviews` instead of `get_pr`."""
+    published = "2026-06-01T12:00:00.000Z"
+    posted: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if path.endswith("/_apis/connectionData"):
+            return _json({
+                "authenticatedUser": {
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                }
+            })
+        if req.method == "PUT" and "/reviewers/user-guid" in path:
+            return _json({"id": "user-guid", "vote": 10})
+        if req.method == "POST" and path.endswith("/threads"):
+            payload = json.loads(req.content.decode("utf-8"))
+            posted["content"] = payload["comments"][0]["content"]
+            return _json({
+                "id": 77,
+                "publishedDate": published,
+                "comments": [
+                    {"id": 1, "content": posted["content"], "commentType": "text"}
+                ],
+            })
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[{
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                    "vote": 10,
+                }],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 77,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": published,
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "user-guid"},
+                                "content": posted["content"],
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    submitted = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="approve", body="lgtm",
+    )
+    reviews = AzureDevOpsProvider().list_pr_reviews(
+        _project(), token="t", pr_id="7"
+    )
+
+    assert len(reviews) == 1
+    assert reviews[0].id == submitted.id
+    assert ":10:" in submitted.id
+
+
+def test_submit_pr_review_bodyless_id_matches_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #187 edge case: with no `body` there is no review-body
+    thread, so neither the write nor the read-back has a `publishedDate`
+    to source a suffix from -- both ids must be the bare
+    `f"{reviewer_id}:{vote}"` shape, with no ms-suffix at all."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if path.endswith("/_apis/connectionData"):
+            return _json({
+                "authenticatedUser": {
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                }
+            })
+        if req.method == "PUT" and "/reviewers/user-guid" in path:
+            return _json({"id": "user-guid", "vote": 10})
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[{
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                    "vote": 10,
+                }],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    submitted = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="approve",
+    )
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+
+    assert submitted.id == "user-guid:10"
+    assert len(pr.reviews) == 1
+    assert pr.reviews[0].id == "user-guid:10"
+
+
+def test_submit_pr_review_comment_vote_id_matches_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #187 edge case: a `comment` review (vote 0, the
+    ambiguous-on-its-own branch at `_review_from_reviewer` lines
+    ~3535-3536) must also get parity between the write's id and the
+    read-back's id, sourced from the same `publishedDate`."""
+    published = "2026-06-01T12:00:00.000Z"
+    posted: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if path.endswith("/_apis/connectionData"):
+            return _json({
+                "authenticatedUser": {
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                }
+            })
+        if req.method == "PUT" and "/reviewers/user-guid" in path:
+            return _json({"id": "user-guid", "vote": 0})
+        if req.method == "POST" and path.endswith("/threads"):
+            payload = json.loads(req.content.decode("utf-8"))
+            posted["content"] = payload["comments"][0]["content"]
+            return _json({
+                "id": 77,
+                "publishedDate": published,
+                "comments": [
+                    {"id": 1, "content": posted["content"], "commentType": "text"}
+                ],
+            })
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[{
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                    "vote": 0,
+                }],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 77,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": published,
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "user-guid"},
+                                "content": posted["content"],
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    submitted = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="comment", body="needs work",
+    )
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+
+    assert len(pr.reviews) == 1
+    assert pr.reviews[0].state == "comment"
+    assert pr.reviews[0].id == submitted.id
+    assert ":0:" in submitted.id
+
+
+def test_submit_pr_review_ids_disambiguate_consecutive_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #187: distinct `publishedDate`s from two consecutive
+    `submit_pr_review` calls (each posting a body) must still yield
+    distinct ids, and an approve-then-request-changes pair must differ
+    on the `:{vote}` segment -- the parity fix must not regress the
+    id's disambiguation purpose."""
+    responses = iter([
+        "2026-06-01T12:00:00.000Z",
+        "2026-06-01T12:00:01.500Z",
+    ])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if path.endswith("/_apis/connectionData"):
+            return _json({
+                "authenticatedUser": {
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                }
+            })
+        if req.method == "PUT" and "/reviewers/user-guid" in path:
+            vote = json.loads(req.content.decode("utf-8"))["vote"]
+            return _json({"id": "user-guid", "vote": vote})
+        if req.method == "POST" and path.endswith("/threads"):
+            return _json({
+                "id": 77,
+                "publishedDate": next(responses),
+                "comments": [
+                    {"id": 1, "content": "<p>x</p>", "commentType": "text"}
+                ],
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    first = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="approve", body="lgtm",
+    )
+    second = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="request_changes", body="fix it",
+    )
+    assert first.id != second.id
+    # Differ on the vote segment: approve=10 vs request_changes=-10.
+    assert first.id.split(":")[1] == "10"
+    assert second.id.split(":")[1] == "-10"
+
+
+def test_synthesize_review_id_preserves_sub_second_precision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #187: the id suffix must be derived by parsing the raw
+    `publishedDate` directly to epoch-ms rather than routing through
+    `normalize_timestamp` (which truncates to second precision) -- two
+    `publishedDate`s within the same wall-clock second but different
+    milliseconds must not collapse to the same suffix."""
+    id_a = azure_mod._synthesize_review_id(
+        "user-guid", 10, "2026-06-01T12:00:00.100Z"
+    )
+    id_b = azure_mod._synthesize_review_id(
+        "user-guid", 10, "2026-06-01T12:00:00.900Z"
+    )
+    assert id_a != id_b
+    # Sanity: normalize_timestamp WOULD collapse these to the same value,
+    # confirming the helper deliberately bypasses it.
+    assert normalize_timestamp("2026-06-01T12:00:00.100Z") == normalize_timestamp(
+        "2026-06-01T12:00:00.900Z"
+    )
+
+
 def test_get_pr_filters_review_body_threads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

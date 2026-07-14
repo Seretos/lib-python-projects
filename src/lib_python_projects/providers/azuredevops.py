@@ -1385,6 +1385,38 @@ def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _synthesize_review_id(
+    reviewer_id: str, vote: int, published_date_raw: str | None
+) -> str:
+    """Build a `Review.id` in the shape shared by write and read-back paths.
+
+    Single source of truth for the id shape used by both
+    `submit_pr_review` (write) and `_review_from_reviewer` (read-back
+    via `get_pr`/`list_pr_reviews`), so an agent correlating a write's
+    returned id against a later read-back never sees a mismatch
+    (ticket #187).
+
+    Both sides source the disambiguating suffix from the SAME
+    recoverable value: the matched review-body thread's `publishedDate`
+    (present only when a body was posted with the review). Deliberately
+    parses the raw ISO string directly to epoch-ms rather than routing
+    through `normalize_timestamp`, which truncates to second precision
+    and would collapse two distinct same-second `publishedDate`s into
+    the same suffix.
+
+    When `published_date_raw` is falsy (no body/thread), the id has no
+    suffix at all: `f"{reviewer_id}:{vote}"`.
+    """
+    if not published_date_raw:
+        return f"{reviewer_id}:{vote}"
+    try:
+        parsed = datetime.fromisoformat(published_date_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return f"{reviewer_id}:{vote}"
+    epoch_ms = int(parsed.timestamp() * 1000)
+    return f"{reviewer_id}:{vote}:{epoch_ms}"
+
+
 def _parse_thread_id_from_alias(value: str | None) -> str | None:
     """Pull the thread-id prefix out of a comment id alias.
 
@@ -3524,6 +3556,14 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         report on Azure DevOps otherwise, and GitHub/Azure both emit
         `str` rather than `None` for `Review.body` per the shared
         convention documented on the dataclass).
+
+        `id` is built by `_synthesize_review_id` (ticket #187): when a
+        review-body thread matches, the id is
+        `f"{reviewer_id}:{vote}:{epoch_ms}"` where `epoch_ms` is derived
+        from that thread's raw `publishedDate` — the same shared source
+        `submit_pr_review` uses on the write path, so a write's returned
+        id matches this read-back's id for the same review. With no
+        matching thread the id has no suffix: `f"{reviewer_id}:{vote}"`.
         """
         vote = reviewer.get("vote") or 0
         reviewer_id = reviewer.get("id") or ""
@@ -3545,7 +3585,9 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             body = ""
             submitted_at = ""
         return Review(
-            id=f"{reviewer_id}:{vote}",
+            id=_synthesize_review_id(
+                reviewer_id, vote, thread.get("publishedDate") if thread is not None else None
+            ),
             state=state,
             author=_identity_login_or_display(reviewer),
             body=body,
@@ -4329,14 +4371,24 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         from the same reviewer don't collide.
 
         ADO's vote API has no timestamp field, so `submitted_at` cannot
-        be synthesized the way `id` is — a fabricated "now" would not
-        match what an immediate read-back via `list_pr_reviews` recovers
-        (ticket #178). Instead, when `body` is supplied, `submitted_at`
-        is the `publishedDate` of the review-body thread just posted
-        (normalized via `normalize_timestamp`) — the same value
-        `list_pr_reviews` reads back from that thread. When no `body` is
-        supplied there is no thread to source a timestamp from, so
-        `submitted_at` is `""`.
+        be synthesized from "now" — a fabricated value would not match
+        what an immediate read-back via `list_pr_reviews`/`get_pr`
+        recovers (ticket #178). Instead, when `body` is supplied,
+        `submitted_at` is the `publishedDate` of the review-body thread
+        just posted (normalized via `normalize_timestamp`) — the same
+        value `list_pr_reviews` reads back from that thread. When no
+        `body` is supplied there is no thread to source a timestamp
+        from, so `submitted_at` is `""`.
+
+        `id`'s ms-timestamp suffix has the same constraint (ticket
+        #187): it is built by `_synthesize_review_id` from that same
+        review-body thread's raw `publishedDate` (parsed straight to
+        epoch-ms, bypassing `normalize_timestamp`'s second-precision
+        truncation so two same-second bodies still disambiguate) —
+        never from wall-clock `time.time()`, which a read-back could
+        never recover. When no `body` is supplied there is no thread,
+        so the id has no suffix: `f"{reviewer_id}:{vote}"`, matching
+        the bodyless read-back shape from `_review_from_reviewer`.
 
         Note: casting a vote has a server-side side effect on the PR's reviewer set — ADO enrolls the voting (current) user as a participant. An 'approve'/'request_changes' vote places that user in the PR's 'reviewers'; a 'comment' vote (vote=0) transiently surfaces them in 'requested_reviewers'. This is ADO server behavior triggered by the PUT to /reviewers/{reviewerId} below, not a mutation this method makes to the returned Review (which carries no reviewer list); a subsequent get_pr reflects it. See test_submit_pr_review_docstring_records_reviewer_side_effect.
         """
@@ -4391,6 +4443,7 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             ensure_comment_prefix(body, markers=_marker_set(project)) if body else ""
         )
         submitted_at = ""
+        raw_published_date: str | None = None
         if body:
             threads_path = (
                 f"{_project_scope(project)}/_apis/git/repositories/"
@@ -4416,16 +4469,13 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             with _client(project, token) as c:
                 tresp = c.post(threads_path, params=_api_version_params(), json=payload)
             _check(tresp)
-            submitted_at = normalize_timestamp(
-                (tresp.json() or {}).get("publishedDate") or ""
-            )
+            raw_published_date = (tresp.json() or {}).get("publishedDate")
+            submitted_at = normalize_timestamp(raw_published_date or "")
 
         normalized_state: Any = (
             state if state in ("approve", "request_changes", "comment") else "comment"
         )
-        synthesized_id = (
-            f"{reviewer_id}:{vote}:{int(time.time() * 1000)}"
-        )
+        synthesized_id = _synthesize_review_id(reviewer_id, vote, raw_published_date)
         return Review(
             id=synthesized_id,
             state=normalized_state,
