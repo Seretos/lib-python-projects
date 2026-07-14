@@ -1385,6 +1385,32 @@ def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _published_epoch_ms(raw: str | None) -> int | None:
+    """Parse a raw ISO `publishedDate` string to epoch milliseconds.
+
+    Single source of truth for turning a review-body thread's raw
+    `publishedDate` into a comparable/embeddable integer, shared by
+    `_synthesize_review_id` (id suffix, ticket #187) and
+    `_review_body_thread_matcher` (newest-thread selection, ticket
+    #189) so the two can never disagree about how a `publishedDate`
+    orders or identifies a thread.
+
+    Deliberately parses the raw ISO string directly to epoch-ms rather
+    than routing through `normalize_timestamp`, which truncates to
+    second precision and would collapse two distinct same-second
+    `publishedDate`s into the same value.
+
+    Returns `None` when `raw` is falsy or fails to parse as ISO-8601.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(parsed.timestamp() * 1000)
+
+
 def _synthesize_review_id(
     reviewer_id: str, vote: int, published_date_raw: str | None
 ) -> str:
@@ -1398,22 +1424,15 @@ def _synthesize_review_id(
 
     Both sides source the disambiguating suffix from the SAME
     recoverable value: the matched review-body thread's `publishedDate`
-    (present only when a body was posted with the review). Deliberately
-    parses the raw ISO string directly to epoch-ms rather than routing
-    through `normalize_timestamp`, which truncates to second precision
-    and would collapse two distinct same-second `publishedDate`s into
-    the same suffix.
+    (present only when a body was posted with the review), parsed via
+    the shared `_published_epoch_ms` helper.
 
-    When `published_date_raw` is falsy (no body/thread), the id has no
+    When `published_date_raw` is falsy or unparseable, the id has no
     suffix at all: `f"{reviewer_id}:{vote}"`.
     """
-    if not published_date_raw:
+    epoch_ms = _published_epoch_ms(published_date_raw)
+    if epoch_ms is None:
         return f"{reviewer_id}:{vote}"
-    try:
-        parsed = datetime.fromisoformat(published_date_raw.replace("Z", "+00:00"))
-    except ValueError:
-        return f"{reviewer_id}:{vote}"
-    epoch_ms = int(parsed.timestamp() * 1000)
     return f"{reviewer_id}:{vote}:{epoch_ms}"
 
 
@@ -3504,6 +3523,19 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         `body`/`submitted_at` by matching it to the review-body thread
         (tagged via `_is_review_body_thread`) whose first comment's
         author id equals the reviewer's id.
+
+        Azure DevOps tracks exactly one *current vote* per reviewer, but
+        a re-review does NOT replace the reviewer's earlier review-body
+        thread — it appends a brand-new thread instead, and
+        `_list_pr_threads` returns threads oldest-first. When a reviewer
+        has submitted more than one review-body thread (ticket #189),
+        the matcher must resolve to that reviewer's NEWEST thread by
+        `publishedDate` (via the shared `_published_epoch_ms` helper),
+        not simply the first one encountered in list order. A thread
+        with a valid, parseable `publishedDate` always outranks one with
+        a missing/unparseable date; among ties (equal dates, or all
+        missing), the earlier thread in list order wins, preserving
+        today's single-thread/no-date behaviour unchanged.
         """
         review_body_threads = [
             t
@@ -3512,14 +3544,26 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         ]
 
         def _matching_thread(reviewer_id: str) -> dict | None:
+            best_thread: dict | None = None
+            best_epoch_ms: int | None = None
             for thread in review_body_threads:
                 comments = thread.get("comments") or []
                 if not comments:
                     continue
                 author_id = (comments[0].get("author") or {}).get("id")
-                if author_id == reviewer_id:
-                    return thread
-            return None
+                if author_id != reviewer_id:
+                    continue
+                epoch_ms = _published_epoch_ms(thread.get("publishedDate"))
+                if best_thread is None:
+                    best_thread = thread
+                    best_epoch_ms = epoch_ms
+                    continue
+                if epoch_ms is not None and (
+                    best_epoch_ms is None or epoch_ms > best_epoch_ms
+                ):
+                    best_thread = thread
+                    best_epoch_ms = epoch_ms
+            return best_thread
 
         return _matching_thread
 
@@ -3555,7 +3599,13 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         back to `""` (there is no review-specific body/timestamp to
         report on Azure DevOps otherwise, and GitHub/Azure both emit
         `str` rather than `None` for `Review.body` per the shared
-        convention documented on the dataclass).
+        convention documented on the dataclass). A reviewer who
+        re-reviews appends a NEW review-body thread rather than
+        replacing the old one, so `match_thread` (built by
+        `_review_body_thread_matcher`) always resolves to that
+        reviewer's NEWEST thread (ticket #189) — this method itself
+        needs no extra logic for that, it just consumes whatever single
+        thread `match_thread` hands back.
 
         `id` is built by `_synthesize_review_id` (ticket #187): when a
         review-body thread matches, the id is
@@ -4389,6 +4439,18 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
         never recover. When no `body` is supplied there is no thread,
         so the id has no suffix: `f"{reviewer_id}:{vote}"`, matching
         the bodyless read-back shape from `_review_from_reviewer`.
+
+        Azure DevOps tracks exactly one CURRENT VOTE per reviewer (the
+        PUT below overwrites it), but a review-body thread is never
+        overwritten — a reviewer who submits a second review (e.g.
+        `comment` then later `approve`) appends a brand-new thread
+        alongside their earlier one rather than replacing it. Read-back
+        via `get_pr`/`list_pr_reviews` (`_review_body_thread_matcher`,
+        ticket #189) resolves `body`/`submitted_at`/`id` from that
+        reviewer's NEWEST review-body thread by `publishedDate`, so this
+        method's own `submitted_at`/`id` (sourced from the thread it
+        just created) always matches what an immediate read-back
+        recovers, even when the reviewer had reviewed before.
 
         Note: casting a vote has a server-side side effect on the PR's reviewer set — ADO enrolls the voting (current) user as a participant. An 'approve'/'request_changes' vote places that user in the PR's 'reviewers'; a 'comment' vote (vote=0) transiently surfaces them in 'requested_reviewers'. This is ADO server behavior triggered by the PUT to /reviewers/{reviewerId} below, not a mutation this method makes to the returned Review (which carries no reviewer list); a subsequent get_pr reflects it. See test_submit_pr_review_docstring_records_reviewer_side_effect.
         """

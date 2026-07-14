@@ -918,6 +918,297 @@ def test_get_pr_review_body_and_submitted_at_match_readback(
     assert "lgtm" in readback.body
 
 
+# ---------- get_pr reviews: newest-thread resolution (ticket #189) ---------
+
+
+def test_get_pr_reviewer_second_review_uses_newest_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #189: a reviewer who submits a second review-body thread
+    is NOT reflected by `get_pr().reviews[]` using the oldest thread in
+    list order (ADO returns threads oldest-first) -- it must resolve to
+    that reviewer's NEWEST thread by `publishedDate` for `body`,
+    `submitted_at`, and the synthesized `id`'s epoch-ms suffix."""
+    newest_published = "2026-06-02T09:30:00.000Z"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[{
+                    "id": "reviewer-1",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                    "vote": 10,
+                }],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    # Oldest thread returned FIRST, mirroring real ADO order.
+                    {
+                        "id": 10,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": "2026-06-01T12:00:00.000Z",
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "reviewer-1"},
+                                "content": "<p>first pass</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                    {
+                        "id": 11,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": newest_published,
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "reviewer-1"},
+                                "content": "<p>second pass</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+
+    assert len(pr.reviews) == 1
+    review = pr.reviews[0]
+    assert review.body == "second pass"
+    assert review.submitted_at == normalize_timestamp(newest_published)
+    expected_epoch_ms = azure_mod._published_epoch_ms(newest_published)
+    assert review.id == f"reviewer-1:10:{expected_epoch_ms}"
+
+
+def test_list_pr_reviews_reviewer_second_review_uses_newest_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same newest-thread resolution as
+    `test_get_pr_reviewer_second_review_uses_newest_thread`, exercised
+    through `list_pr_reviews` (which shares `_review_body_thread_matcher`
+    with `get_pr`)."""
+    newest_published = "2026-06-02T09:30:00.000Z"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[{
+                    "id": "reviewer-1",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                    "vote": 10,
+                }],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 10,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": "2026-06-01T12:00:00.000Z",
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "reviewer-1"},
+                                "content": "<p>first pass</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                    {
+                        "id": 11,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": newest_published,
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "reviewer-1"},
+                                "content": "<p>second pass</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    reviews = AzureDevOpsProvider().list_pr_reviews(
+        _project(), token="t", pr_id="7"
+    )
+
+    assert len(reviews) == 1
+    assert reviews[0].body == "second pass"
+    assert reviews[0].submitted_at == normalize_timestamp(newest_published)
+
+
+def test_get_pr_vote_state_unaffected_by_newest_thread_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #189: the vote -> state mapping comes from an independent
+    source (`reviewer.vote`, via a separate PUT-driven data path) and
+    must not regress when the matcher is changed to prefer the newest
+    review-body thread -- `state` stays derived from the vote regardless
+    of which thread is picked for body/id."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[{
+                    "id": "reviewer-1",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                    "vote": -10,  # request_changes
+                }],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 10,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": "2026-06-01T12:00:00.000Z",
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "reviewer-1"},
+                                "content": "<p>first pass</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                    {
+                        "id": 11,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": "2026-06-02T09:30:00.000Z",
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "reviewer-1"},
+                                "content": "<p>second pass</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+
+    assert len(pr.reviews) == 1
+    review = pr.reviews[0]
+    assert review.state == "request_changes"  # unaffected by thread selection
+    assert review.body == "second pass"  # still resolves to the newest thread
+
+
+def test_get_pr_reviewer_thread_with_valid_date_beats_missing_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #189: a thread with a missing/blank `publishedDate` must
+    rank OLDEST regardless of its position in list order -- a thread
+    with a valid, parseable date always outranks one without, even when
+    the undated thread is last (i.e. would look "newest" by position)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[{
+                    "id": "reviewer-1",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                    "vote": 10,
+                }],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({
+                "value": [
+                    {
+                        "id": 10,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": "2026-06-01T12:00:00.000Z",
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "reviewer-1"},
+                                "content": "<p>dated pass</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                    {
+                        "id": 11,
+                        "threadContext": None,
+                        "properties": {"projectIssues.kind": "review_body"},
+                        "publishedDate": "",
+                        "comments": [
+                            {
+                                "id": 1,
+                                "author": {"id": "reviewer-1"},
+                                "content": "<p>undated pass</p>",
+                                "commentType": "text",
+                            }
+                        ],
+                    },
+                ]
+            })
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+
+    assert len(pr.reviews) == 1
+    review = pr.reviews[0]
+    assert review.body == "dated pass"
+    assert review.submitted_at == normalize_timestamp("2026-06-01T12:00:00.000Z")
+    # id stays parseable/sane: the epoch-ms suffix is still present since
+    # the chosen thread has a valid publishedDate.
+    assert len(review.id.split(":")) == 3
+
+
 # ---------- create_pr -------------------------------------------------------
 
 
@@ -2254,6 +2545,105 @@ def test_submit_pr_review_ids_disambiguate_consecutive_calls(
     assert second.id.split(":")[1] == "-10"
 
 
+def test_submit_pr_review_readback_reflects_second_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #189: a re-review from the same reviewer appends a NEW
+    review-body thread rather than replacing the old one -- an
+    immediate `get_pr`/`list_pr_reviews` read-back after TWO
+    `submit_pr_review` calls from the same reviewer must reflect the
+    SECOND submission's id/body/submitted_at, not the first."""
+    first_published = "2026-06-01T12:00:00.000Z"
+    second_published = "2026-06-02T09:30:00.000Z"
+    posted_threads: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if path.endswith("/_apis/connectionData"):
+            return _json({
+                "authenticatedUser": {
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                }
+            })
+        if req.method == "PUT" and "/reviewers/user-guid" in path:
+            vote = json.loads(req.content.decode("utf-8"))["vote"]
+            return _json({"id": "user-guid", "vote": vote})
+        if req.method == "POST" and path.endswith("/threads"):
+            payload = json.loads(req.content.decode("utf-8"))
+            content = payload["comments"][0]["content"]
+            published = first_published if not posted_threads else second_published
+            thread_id = 100 + len(posted_threads)
+            posted_threads.append({
+                "id": thread_id,
+                "threadContext": None,
+                "properties": {"projectIssues.kind": "review_body"},
+                "publishedDate": published,
+                "comments": [
+                    {
+                        "id": 1,
+                        "author": {"id": "user-guid"},
+                        "content": content,
+                        "commentType": "text",
+                    }
+                ],
+            })
+            return _json({
+                "id": thread_id,
+                "publishedDate": published,
+                "comments": [{"id": 1, "content": content, "commentType": "text"}],
+            })
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(
+                7,
+                reviewers=[{
+                    "id": "user-guid",
+                    "displayName": "Alice Builder",
+                    "uniqueName": "alice@example.com",
+                    "vote": 10,
+                }],
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/7/threads"):
+            return _json({"value": list(posted_threads)})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    first = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="comment", body="first pass",
+    )
+    second = AzureDevOpsProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="approve", body="second pass",
+    )
+    assert first.body != second.body
+    assert first.id != second.id
+
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+    reviews = AzureDevOpsProvider().list_pr_reviews(
+        _project(), token="t", pr_id="7"
+    )
+
+    assert len(pr.reviews) == 1
+    get_pr_readback = pr.reviews[0]
+    assert get_pr_readback.id == second.id
+    assert get_pr_readback.body == second.body
+    assert get_pr_readback.submitted_at == second.submitted_at
+    assert get_pr_readback.id != first.id
+    assert get_pr_readback.body != first.body
+
+    assert len(reviews) == 1
+    list_readback = reviews[0]
+    assert list_readback.id == second.id
+    assert list_readback.body == second.body
+    assert list_readback.submitted_at == second.submitted_at
+
+
 def test_synthesize_review_id_preserves_sub_second_precision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2445,6 +2835,25 @@ def test_submit_pr_review_docstring_records_reviewer_side_effect() -> None:
     )
     assert "triggered by the PUT to /reviewers/{reviewerId}" in doc, (
         "PUT /reviewers/{reviewerId} attribution dropped from docstring"
+    )
+
+
+def test_submit_pr_review_docstring_documents_newest_thread_resolution() -> None:
+    """Ticket #189: guard that the docstring documents Azure DevOps's
+    one-current-vote-per-reviewer semantics, that a re-review appends a
+    NEW review-body thread instead of replacing the old one, and that
+    read-back resolves to the reviewer's NEWEST thread -- so a future
+    edit can't silently drop this explanation."""
+    doc = AzureDevOpsProvider.submit_pr_review.__doc__
+    assert doc is not None
+    assert "one CURRENT VOTE per reviewer" in doc, (
+        "one-vote-per-reviewer semantics dropped from docstring"
+    )
+    assert "appends a brand-new thread" in doc, (
+        "append-only review-body-thread semantics dropped from docstring"
+    )
+    assert "NEWEST review-body thread" in doc, (
+        "newest-thread-wins re-review resolution dropped from docstring"
     )
 
 
