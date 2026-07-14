@@ -2435,6 +2435,17 @@ def test_submit_pr_review_docstring_records_reviewer_side_effect() -> None:
     assert "does not add" not in doc, (
         "merge_pr's non-claim negation leaked into submit_pr_review's docstring"
     )
+    # Lock the distinguishing side-effect details so a future edit can't
+    # strip the enumeration while leaving the loose keywords above intact.
+    assert "'approve'/'request_changes' vote places that user in the PR's 'reviewers'" in doc, (
+        "approve/request_changes -> reviewers mapping dropped from docstring"
+    )
+    assert "transiently surfaces them in 'requested_reviewers'" in doc, (
+        "comment-vote transient requested_reviewers distinction dropped from docstring"
+    )
+    assert "triggered by the PUT to /reviewers/{reviewerId}" in doc, (
+        "PUT /reviewers/{reviewerId} attribution dropped from docstring"
+    )
 
 
 def test_merge_pr_does_not_populate_requested_reviewers(
