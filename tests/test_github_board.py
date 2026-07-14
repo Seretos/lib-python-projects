@@ -871,6 +871,45 @@ def _rest_issue_payload(number: int, **overrides) -> dict:
     return base
 
 
+def _project_items_read_response(
+    project_number: int = 7,
+    field_value_nodes: list[dict] | None = None,
+    *,
+    no_item: bool = False,
+) -> dict:
+    """Mock response for the `repository(owner:$owner,name:$repo)`
+    `projectItems` GraphQL query that `_populate_board_fields` issues on
+    the board-write path's re-GET (ticket #185) — the same read
+    `get_ticket(..., include_custom_fields=True)` performs.
+
+    Defaults to a single `Status: "Done"` field value on the matching
+    project item. Pass `no_item=True` to simulate "issue has no item on
+    this project" (empty `nodes`).
+    """
+    if no_item:
+        return {"data": {"repository": {"issue": {"projectItems": {"nodes": []}}}}}
+    return {
+        "data": {
+            "repository": {
+                "issue": {
+                    "projectItems": {
+                        "nodes": [
+                            {
+                                "project": {"number": project_number},
+                                "fieldValues": {
+                                    "nodes": field_value_nodes
+                                    if field_value_nodes is not None
+                                    else [{"name": "Done", "field": {"name": "Status"}}],
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+
 def test_get_ticket_include_custom_fields_returns_populated_map(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1530,6 +1569,11 @@ def test_update_ticket_custom_fields_writes_via_project_v2_mutations(
             body = _graphql_body(req)
             query, variables = body["query"], body["variables"]
             calls.append((query, variables))
+            if "repository(owner:$owner,name:$repo)" in query:
+                return _json(_project_items_read_response(field_value_nodes=[
+                    {"name": "Done", "field": {"name": "Status"}},
+                    {"number": 3, "field": {"name": "Points"}},
+                ]))
             if "addProjectV2ItemById" in query:
                 assert variables == {
                     "projectId": "proj-node-id", "contentId": "issue-node-42",
@@ -1609,6 +1653,8 @@ def test_update_ticket_custom_fields_single_select_case_insensitive_match(
                         }
                     }
                 })
+            if "repository(owner:$owner,name:$repo)" in query:
+                return _json(_project_items_read_response())
             if "ProjectV2FieldCommon" in query:
                 owner_field = _owner_field(query)
                 return _json({"data": {owner_field: {"projectV2": {"field": {
@@ -1668,6 +1714,8 @@ def test_update_ticket_custom_fields_combined_with_status_and_title(
                         }
                     }
                 })
+            if "repository(owner:$owner,name:$repo)" in query:
+                return _json(_project_items_read_response())
             if "ProjectV2FieldCommon" in query:
                 owner_field = _owner_field(query)
                 return _json({"data": {owner_field: {"projectV2": {"field": {
@@ -1732,6 +1780,8 @@ def test_update_ticket_custom_fields_board_only_reflects_cascade(
                         }
                     }
                 })
+            if "repository(owner:$owner,name:$repo)" in query:
+                return _json(_project_items_read_response())
             if "ProjectV2FieldCommon" in query:
                 owner_field = _owner_field(query)
                 return _json({"data": {owner_field: {"projectV2": {"field": {
@@ -1793,6 +1843,8 @@ def test_update_ticket_custom_fields_combined_with_rest_field_reflects_cascade(
                         }
                     }
                 })
+            if "repository(owner:$owner,name:$repo)" in query:
+                return _json(_project_items_read_response())
             if "ProjectV2FieldCommon" in query:
                 owner_field = _owner_field(query)
                 return _json({"data": {owner_field: {"projectV2": {"field": {
@@ -1856,6 +1908,8 @@ def test_update_ticket_custom_fields_poll_reflects_delayed_cascade(
                         }
                     }
                 })
+            if "repository(owner:$owner,name:$repo)" in query:
+                return _json(_project_items_read_response())
             if "ProjectV2FieldCommon" in query:
                 owner_field = _owner_field(query)
                 return _json({"data": {owner_field: {"projectV2": {"field": {
@@ -1889,10 +1943,10 @@ def test_update_ticket_custom_fields_poll_exhausted_returns_stale_snapshot_best_
     workflow, or a slow cascade just hasn't landed yet), `update_ticket`
     must not raise — it returns the last snapshot fetched, best-effort,
     after exhausting the cap. This encodes the documented contract
-    (ticket #185): the return is a best-effort snapshot that MAY be
-    stale, and it stays REST-only (`custom_fields` is always `None`
-    here) regardless of the board write — see the `update_ticket`
-    docstring."""
+    (ticket #185, Q1=A + Q2=B): the returned REST `status` is a
+    best-effort value that MAY be stale, but `custom_fields`/`milestone`
+    are still populated from the board read-back regardless of the REST
+    poll's outcome — see the `update_ticket` docstring."""
     board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
     get_count = {"n": 0}
     reget_sleep_calls: list[float] = []
@@ -1917,6 +1971,8 @@ def test_update_ticket_custom_fields_poll_exhausted_returns_stale_snapshot_best_
                         }
                     }
                 })
+            if "repository(owner:$owner,name:$repo)" in query:
+                return _json(_project_items_read_response())
             if "ProjectV2FieldCommon" in query:
                 owner_field = _owner_field(query)
                 return _json({"data": {owner_field: {"projectV2": {"field": {
@@ -1937,15 +1993,18 @@ def test_update_ticket_custom_fields_poll_exhausted_returns_stale_snapshot_best_
     ticket = GitHubProvider().update_ticket(
         _project(board), "t", "42", custom_fields={"Status": "Done"},
     )
-    # No raise; returns the last (still-open) snapshot.
+    # No raise; returns the last (still-open) snapshot. This is the
+    # best-effort STATE contract (Q1=A) -- it stays even though the
+    # cascade's REST state never lands within the poll budget.
     assert ticket.status == "open"
     # 1 pre-write GET + exactly `_REGET_POLL_MAX_ATTEMPTS` re-GETs.
     assert get_count["n"] == 1 + github_provider._REGET_POLL_MAX_ATTEMPTS
     # Backoff sleeps between re-GETs, but not after the final attempt.
     assert len(reget_sleep_calls) == github_provider._REGET_POLL_MAX_ATTEMPTS - 1
-    # Q2 (ticket #185): the return stays REST-only regardless of the
-    # board write -- custom_fields is always None from update_ticket.
-    assert ticket.custom_fields is None
+    # Q2=B (ticket #185): independently of the REST-state staleness above,
+    # custom_fields IS populated from the board read-back on this path --
+    # it is no longer always None from update_ticket.
+    assert ticket.custom_fields == {"Status": "Done"}
 
 
 def test_update_ticket_custom_fields_slow_cascade_is_best_effort_get_ticket_sees_settled(
@@ -1955,14 +2014,16 @@ def test_update_ticket_custom_fields_slow_cascade_is_best_effort_get_ticket_sees
     reported race. The board->issue auto-close cascade doesn't land
     within `update_ticket`'s bounded poll budget at all -- every GET
     issued during `update_ticket` (pre-write + all re-GETs) still sees
-    `state="open"`. Per the documented best-effort contract,
+    `state="open"`. Per the documented best-effort contract (Q1=A),
     `update_ticket` must NOT raise and must NOT block indefinitely: it
-    returns the last (stale) snapshot with `status == "open"` and
-    `custom_fields is None` (REST-only return). A follow-up
-    `get_ticket(..., include_custom_fields=True)` issued immediately
-    after -- once the cascade has since landed server-side -- must see
-    the settled `closed:completed` state. This proves the documented
-    remedy: callers needing guaranteed post-cascade state re-`get_ticket`."""
+    returns the last (stale) snapshot with `status == "open"`.
+    Independently (Q2=B), `custom_fields` IS populated from the board
+    read-back on this path regardless of the REST-state staleness. A
+    follow-up `get_ticket(..., include_custom_fields=True)` issued
+    immediately after -- once the cascade has since landed server-side --
+    must see the settled `closed:completed` state. This proves the
+    documented remedy for REST-state staleness: callers needing
+    guaranteed post-cascade REST state re-`get_ticket`."""
     board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
     get_count = {"n": 0}
     # Every GET issued *during* update_ticket (pre-write GET #1 through
@@ -1999,17 +2060,6 @@ def test_update_ticket_custom_fields_slow_cascade_is_best_effort_get_ticket_sees
                         }
                     }
                 })
-            if "ProjectV2FieldCommon" in query:
-                owner_field = _owner_field(query)
-                return _json({"data": {owner_field: {"projectV2": {"field": {
-                    "id": "field-status", "name": "Status",
-                    "options": [{"id": "opt-done", "name": "Done"}],
-                }}}}})
-            if "projectV2(number:$number){id}" in query:
-                owner_field = _owner_field(query)
-                return _json(
-                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
-                )
             if "repository(owner:$owner,name:$repo)" in query:
                 assert variables == {
                     "owner": "acme", "repo": "backend", "number": 42,
@@ -2037,6 +2087,17 @@ def test_update_ticket_custom_fields_slow_cascade_is_best_effort_get_ticket_sees
                         }
                     }
                 })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
         raise AssertionError(f"unexpected request {req.method} {path}")
 
     monkeypatch.setattr(github_provider, "_reget_sleep", lambda seconds: None)
@@ -2047,7 +2108,7 @@ def test_update_ticket_custom_fields_slow_cascade_is_best_effort_get_ticket_sees
         _project(board), "t", "42", custom_fields={"Status": "Done"},
     )
     assert ticket.status == "open"
-    assert ticket.custom_fields is None
+    assert ticket.custom_fields == {"Status": "Done"}
     assert get_count["n"] == UPDATE_TICKET_GET_COUNT
 
     # (2) Follow-up get_ticket: the documented remedy sees the settled
@@ -2058,6 +2119,192 @@ def test_update_ticket_custom_fields_slow_cascade_is_best_effort_get_ticket_sees
     )
     assert settled.status == "closed:completed"
     assert settled.updated_at == "2024-06-01T00:00:00Z"
+
+
+def test_update_ticket_custom_fields_return_carries_board_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #185 (Q2=B), fail-first regression: after a `custom_fields`
+    board write, `update_ticket`'s returned `Ticket.custom_fields` AND
+    `.milestone` are populated from the same Projects-v2 `projectItems`
+    GraphQL read `get_ticket` uses -- matching an immediate
+    `get_ticket(..., include_custom_fields=True)`, not left at `None`.
+    This must FAIL against the pre-#185 code (which always returned
+    `custom_fields=None`/`milestone=None` from `update_ticket`) and PASS
+    once the board-write path reads back through `_populate_board_fields`.
+
+    Also covers the edge case that `milestone` is populated even though
+    the caller passed no `milestone=` to this call -- it is read back
+    from the board's current iteration value, not request-derived."""
+    board = _board(
+        ["Todo", "Done"], owner="acme-org", project_number=7,
+        iteration_field="Sprint",
+    )
+    graphql_calls: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query, variables = body["query"], body["variables"]
+            graphql_calls.append(body)
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "repository(owner:$owner,name:$repo)" in query:
+                assert variables == {
+                    "owner": "acme", "repo": "backend", "number": 42,
+                }
+                return _json(_project_items_read_response(field_value_nodes=[
+                    {"name": "Done", "field": {"name": "Status"}},
+                    {"title": "Sprint 3", "field": {"name": "Sprint"}},
+                ]))
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": "Done"},
+    )
+    assert ticket.custom_fields == {"Status": "Done", "Sprint": "Sprint 3"}
+    assert ticket.milestone == "Sprint 3"
+    assert any(
+        "repository(owner:$owner,name:$repo)" in c["query"] for c in graphql_calls
+    )
+
+
+def test_update_ticket_custom_fields_no_item_on_board_returns_empty_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #185 edge case: mirrors `get_ticket`'s "bound but no item"
+    semantics on the update path too -- if the board read-back finds no
+    matching `projectItems` node, `custom_fields` comes back `{}`, not
+    `None`, and `milestone` stays `None`."""
+    board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query = body["query"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "repository(owner:$owner,name:$repo)" in query:
+                return _json(_project_items_read_response(no_item=True))
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", custom_fields={"Status": "Done"},
+    )
+    assert ticket.custom_fields == {}
+    assert ticket.milestone is None
+
+
+def test_update_ticket_milestone_only_write_issues_no_project_items_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #185 scope guard: a `milestone`-only write (no
+    `custom_fields`, no reopen board-column reset) must NOT enter
+    `_reget_issue` at all, so it issues NO
+    `repository(owner:$owner,name:$repo)` `projectItems` read -- the
+    returned `Ticket` keeps `custom_fields=None`/`milestone=None`
+    (REST-only), proving the extra round trip ticket #185 introduces is
+    confined to the `custom_fields`/board-status-write path."""
+    board = _board(
+        ["Todo", "Done"], owner="acme-org", project_number=7,
+        iteration_field="Sprint",
+    )
+    graphql_calls: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42))
+        if path == "/graphql":
+            body = _graphql_body(req)
+            query = body["query"]
+            graphql_calls.append(body)
+            assert "repository(owner:$owner,name:$repo)" not in query, (
+                "milestone-only write must not read back board fields"
+            )
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {"id": "item-1"},
+                        }
+                    }
+                })
+            if "ProjectV2IterationField" in query:
+                owner_field = _owner_field(query)
+                return _json(_iteration_field_response(
+                    owner_field, [{"id": "iter-4", "title": "Sprint 4"}],
+                ))
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", milestone="Sprint 4",
+    )
+    assert ticket.custom_fields is None
+    assert ticket.milestone is None
+    assert not any(
+        "repository(owner:$owner,name:$repo)" in c["query"] for c in graphql_calls
+    )
 
 
 def test_update_ticket_pure_rest_path_does_not_poll(
@@ -2160,7 +2407,10 @@ def test_update_ticket_reopen_resets_board_column(
     first configured column ("Todo"), not merely PATCH the REST issue
     state and leave the column untouched. The returned `Ticket` reflects
     the post-write re-GET, mirroring the #178 cascade-consistency
-    behavior any other board write already gets."""
+    behavior any other board write already gets. Also locks ticket #185
+    (Q2=B) for the reset-only path: the returned `custom_fields` reflects
+    the reset first-column value even though the caller passed no
+    `custom_fields` of their own."""
     board = _board(["Todo", "Done"], owner="acme-org", project_number=7)
     get_count = {"n": 0}
     patch_payloads: list[dict] = []
@@ -2192,6 +2442,10 @@ def test_update_ticket_reopen_resets_board_column(
                         }
                     }
                 })
+            if "repository(owner:$owner,name:$repo)" in query:
+                return _json(_project_items_read_response(field_value_nodes=[
+                    {"name": "Todo", "field": {"name": "Status"}},
+                ]))
             if "ProjectV2FieldCommon" in query:
                 owner_field = _owner_field(query)
                 return _json({"data": {owner_field: {"projectV2": {"field": {
@@ -2220,6 +2474,10 @@ def test_update_ticket_reopen_resets_board_column(
     }]
     assert get_count["n"] == 2, "expected a #178-style re-GET after the board write"
     assert ticket.status == "open"
+    # Q2=B (ticket #185): the reset-only path (no caller custom_fields)
+    # still populates the returned custom_fields from the board, and it
+    # reflects the reset first-column value.
+    assert ticket.custom_fields == {"Status": "Todo"}
 
 
 def test_update_ticket_reopen_delayed_board_column_reset_poll(
@@ -2267,6 +2525,10 @@ def test_update_ticket_reopen_delayed_board_column_reset_poll(
                         }
                     }
                 })
+            if "repository(owner:$owner,name:$repo)" in query:
+                return _json(_project_items_read_response(field_value_nodes=[
+                    {"name": "Todo", "field": {"name": "Status"}},
+                ]))
             if "ProjectV2FieldCommon" in query:
                 owner_field = _owner_field(query)
                 return _json({"data": {owner_field: {"projectV2": {"field": {
@@ -2357,6 +2619,10 @@ def test_update_ticket_reopen_explicit_custom_fields_override_wins(
                         }
                     }
                 })
+            if "repository(owner:$owner,name:$repo)" in query:
+                return _json(_project_items_read_response(field_value_nodes=[
+                    {"name": "Todo", "field": {"name": "Status"}},
+                ]))
             if "ProjectV2FieldCommon" in query:
                 owner_field = _owner_field(query)
                 return _json({"data": {owner_field: {"projectV2": {"field": {
@@ -2375,13 +2641,17 @@ def test_update_ticket_reopen_explicit_custom_fields_override_wins(
 
     monkeypatch.setattr(github_provider, "_reget_sleep", lambda seconds: None)
     _install_mock(monkeypatch, handler)
-    GitHubProvider().update_ticket(
+    ticket = GitHubProvider().update_ticket(
         _project(board), "t", "42",
         status="open", custom_fields={"Status": "Todo"},
     )
 
     assert len(field_calls) == 1
     assert field_calls[0]["value"] == {"singleSelectOptionId": "opt-todo"}
+    # Q2=B (ticket #185): custom_fields is still non-empty here, so the
+    # board read-back fires even though the explicit override, not the
+    # #175 reset, is what actually wrote the board.
+    assert ticket.custom_fields == {"Status": "Todo"}
 
 
 def test_update_ticket_reopen_no_board_configured_rest_only(
@@ -2473,6 +2743,10 @@ def test_update_ticket_reopen_mapped_columns_resets_to_resolved_native_value(
                         }
                     }
                 })
+            if "repository(owner:$owner,name:$repo)" in query:
+                return _json(_project_items_read_response(field_value_nodes=[
+                    {"name": "Backlog", "field": {"name": "Status"}},
+                ]))
             if "ProjectV2FieldCommon" in query:
                 owner_field = _owner_field(query)
                 return _json({"data": {owner_field: {"projectV2": {"field": {
@@ -2490,12 +2764,13 @@ def test_update_ticket_reopen_mapped_columns_resets_to_resolved_native_value(
         raise AssertionError(f"unexpected request {req.method} {path}")
 
     _install_mock(monkeypatch, handler)
-    GitHubProvider().update_ticket(
+    ticket = GitHubProvider().update_ticket(
         _project(board), "t", "42", status="open",
     )
 
     assert len(field_calls) == 1
     assert field_calls[0]["value"] == {"singleSelectOptionId": "opt-backlog"}
+    assert ticket.custom_fields == {"Status": "Backlog"}
 
 
 def test_update_ticket_custom_fields_no_board_raises(
@@ -3218,6 +3493,13 @@ def _board_write_graphql_handler(
             raise AssertionError(f"unexpected non-graphql request {req.method} {path}")
         body = _graphql_body(req)
         query, variables = body["query"], body["variables"]
+        if "repository(owner:$owner,name:$repo)" in query:
+            # ticket #185: the board-write path's post-write re-GET also
+            # reads back custom_fields/milestone via this query. Its
+            # content is irrelevant to these `on_move_to` tests (none of
+            # them assert on the returned Ticket's custom_fields), so a
+            # fixed generic response is enough to satisfy the read.
+            return _json(_project_items_read_response())
         if "addProjectV2ItemById" in query:
             return _json(
                 {"data": {"addProjectV2ItemById": {"item": {"id": "item-1"}}}}

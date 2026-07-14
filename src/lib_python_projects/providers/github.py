@@ -1493,6 +1493,49 @@ def _extract_iteration_value(item: dict, iteration_field: str | None) -> str | N
     return None
 
 
+def _populate_board_fields(
+    client: httpx.Client,
+    ticket: Ticket,
+    *,
+    repo_owner: str,
+    repo: str,
+    issue_number: int,
+    binding: Any,
+    include_custom_fields: bool,
+) -> None:
+    """Populate `ticket.milestone` (and, when `include_custom_fields` is
+    True, `ticket.custom_fields`) from a single shared `projectItems`
+    GraphQL read (ticket #151/#185).
+
+    This is the board-bound assembly `get_ticket` performs inline, factored
+    out so `update_ticket`'s post-board-write re-GET (`_reget_issue`) can
+    reuse it too — after a `custom_fields` write or a reopen board-column
+    reset, the returned `Ticket` should report the same board-derived
+    `custom_fields`/`milestone` shape an immediate
+    `get_ticket(..., include_custom_fields=True)` would (ticket #185).
+
+    Mirrors `get_ticket`'s board-bound branch exactly: `milestone` is
+    always set (`None` when the issue has no item on the project);
+    `custom_fields` is set only when `include_custom_fields` is True
+    (`{}`, not `None`, when the issue has no item — "bound but empty").
+    """
+    item = _fetch_issue_project_item_via_graphql(
+        client,
+        repo_owner=repo_owner,
+        repo=repo,
+        issue_number=issue_number,
+        project_number=binding.project_number,
+    )
+    ticket.milestone = (
+        _extract_iteration_value(item, binding.iteration_field)
+        if item is not None else None
+    )
+    if include_custom_fields:
+        ticket.custom_fields = (
+            _extract_project_field_values(item) if item is not None else {}
+        )
+
+
 def _board_field_write_query(owner_field: str) -> str:
     """Like `_board_columns_query`, but exposes the field's own `id`
     for *every* field type (via the `ProjectV2FieldCommon` interface),
@@ -2421,9 +2464,13 @@ def _map_permissions_to_capabilities(perms: dict) -> TokenCapabilities:
 # still observe the pre-cascade snapshot. The bounded poll below is a
 # BEST-EFFORT fast path — there is no GitHub API to await a pending
 # Projects-v2 workflow, so an exhausted poll returns the last (possibly
-# stale) snapshot rather than raising; callers needing the guaranteed
-# settled state must issue a follow-up `get_ticket`. `_reget_sleep` is a
-# mockable indirection so tests can replace the backoff with a no-op.
+# stale) REST `state`/`state_reason` snapshot rather than raising; callers
+# needing the guaranteed settled REST state must issue a follow-up
+# `get_ticket`. `_reget_sleep` is a mockable indirection so tests can
+# replace the backoff with a no-op. This poll is about REST `state` only —
+# ticket #185's `custom_fields`/`milestone` read-back (see
+# `_populate_board_fields`) is a separate, non-polled GraphQL read that
+# always reflects the board's current value at the time it fires.
 _REGET_POLL_MAX_ATTEMPTS = 4
 _REGET_POLL_BACKOFFS = (0.05, 0.1, 0.2)
 
@@ -2759,21 +2806,15 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 and binding.project_number
             )
             if board_bound:
-                item = _fetch_issue_project_item_via_graphql(
+                _populate_board_fields(
                     client,
+                    ticket,
                     repo_owner=project.owner,
                     repo=project.repo,
                     issue_number=int(ticket_id),
-                    project_number=binding.project_number,
+                    binding=binding,
+                    include_custom_fields=include_custom_fields,
                 )
-                ticket.milestone = (
-                    _extract_iteration_value(item, binding.iteration_field)
-                    if item is not None else None
-                )
-                if include_custom_fields:
-                    ticket.custom_fields = (
-                        _extract_project_field_values(item) if item is not None else {}
-                    )
             elif include_custom_fields:
                 ticket.custom_fields = None
             c = client.get(
@@ -3053,25 +3094,36 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         state server-side (e.g. a board automation that closes the issue
         when its Status column moves to "Done"), and that cascade runs
         asynchronously on GitHub's side — there is no API to await it.
-        Whenever `custom_fields` is non-empty this method re-GETs the
-        issue after the board write and maps that fresh snapshot instead
-        of the pre-write REST payload (ticket #178), polling a bounded
-        number of times to give a fast cascade a chance to land. This is
-        a **best-effort** optimization, not a guarantee: if the cascade
-        lands after the poll budget is exhausted, the returned `Ticket`
+        Whenever `custom_fields` is non-empty (or a reopen resets the
+        board column — see the `status` paragraph below), this method
+        re-GETs the issue after the board write and maps that fresh
+        snapshot instead of the pre-write REST payload (ticket #178),
+        polling a bounded number of times to give a fast cascade a chance
+        to land. The polled REST `state`/`state_reason` is a
+        **best-effort** value, not a guarantee: if the cascade lands
+        after the poll budget is exhausted, the returned `Ticket`
         reflects the last snapshot observed and MAY LAG the eventual
         settled state (open/unchanged rather than the closed:completed
         the automation will still produce moments later). Callers that
-        need guaranteed post-cascade state must issue a follow-up
-        `get_ticket` after `update_ticket` returns. Independently of
-        cascade timing, the returned `Ticket.custom_fields` is always
-        `None` here — this method's return is REST-only; board/custom
-        fields are surfaced only by
-        `get_ticket(..., include_custom_fields=True)`. A `milestone`-only
-        board write does not trigger this extra round trip: the iteration
-        field has no REST-visible effect on the issue. The pure-REST path
-        (no `custom_fields`, no `milestone`) makes no extra requests
-        either.
+        need guaranteed post-cascade REST state must issue a follow-up
+        `get_ticket` after `update_ticket` returns.
+
+        Independently of that REST-state staleness, on the SAME
+        board-write path this method also reads back `Ticket.custom_fields`
+        and `Ticket.milestone` from the board (ticket #185): after a
+        `custom_fields` write or a reopen board-column reset, the
+        returned `custom_fields`/`milestone` are populated from the same
+        Projects-v2 `projectItems` GraphQL read `get_ticket` uses, so the
+        return matches an immediate
+        `get_ticket(..., include_custom_fields=True)` — at the cost of
+        one extra round trip, confined to this path. A `milestone`-only
+        board write does not trigger any of this (neither the state poll
+        nor the board read-back): the iteration field has no REST-visible
+        effect on the issue, so the returned `custom_fields` and
+        `milestone` both stay `None` — call `get_ticket` for those. The
+        pure-REST path (no `custom_fields`, no `milestone`, no reopen
+        reset) makes no extra requests either and likewise returns
+        `custom_fields`/`milestone` as `None`.
 
         Optional `milestone` (ticket #151, keyword-only): mirrors
         `create_ticket`'s `milestone=` — requires `github-projects-v2` +
@@ -3096,7 +3148,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         board's `status_field` via `custom_fields` in the same call —
         an explicit caller value always wins and no reset write happens
         on top of it. A failed reset write raises `GitHubError`, same
-        as any other board write in this method.
+        as any other board write in this method. Per the `custom_fields`
+        paragraph above (ticket #185), this reset write also puts
+        `update_ticket` on the board read-back path: the returned
+        `Ticket.custom_fields` reflects the reset first-column value
+        (and `Ticket.milestone` is populated too), even when the caller
+        passed no `custom_fields` of their own.
         """
         _validate_label_lists(labels_add, labels_remove)
         binding = None
@@ -3162,7 +3219,9 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
             current_assignees = {a["login"] for a in (current.get("assignees") or [])}
             markers = _marker_set(project)
 
-            def _reget_issue(prev_state: str | None) -> Ticket:
+            def _reget_issue(
+                prev_state: str | None, board_binding: Any = None
+            ) -> Ticket:
                 # A board write via `_write_custom_fields_to_board` can
                 # cascade REST-visible issue state server-side (e.g. a
                 # Status:"Done" column write auto-closing the issue via a
@@ -3178,10 +3237,11 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 # the write legitimately doesn't cascade (e.g. a
                 # custom_fields write that isn't bound to an auto-close
                 # workflow) AND when it does cascade but hasn't landed
-                # yet — in the latter case the returned snapshot is
-                # documented as potentially stale (see the #178 paragraph
-                # in `update_ticket`'s docstring); it is never an error,
-                # and callers needing the settled state must re-`get_ticket`.
+                # yet — in the latter case the returned snapshot's REST
+                # `status` is documented as potentially stale (see the
+                # #178 paragraph in `update_ticket`'s docstring); it is
+                # never an error, and callers needing the settled REST
+                # state must re-`get_ticket`.
                 last: dict[str, Any] | None = None
                 for attempt in range(_REGET_POLL_MAX_ATTEMPTS):
                     rr = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
@@ -3191,7 +3251,29 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         break
                     if attempt < _REGET_POLL_MAX_ATTEMPTS - 1:
                         _reget_sleep(_REGET_POLL_BACKOFFS[attempt])
-                return _map_issue(last)
+                ticket = _map_issue(last)
+                # ticket #185: on a board-write path (`board_binding` set
+                # whenever `custom_fields` was written OR a reopen reset
+                # the board column — see the two call sites below), also
+                # read back `custom_fields`/`milestone` from the SAME
+                # Projects-v2 GraphQL read `get_ticket` uses, so this
+                # return matches an immediate
+                # `get_ticket(..., include_custom_fields=True)`. This is
+                # ONE extra round trip, confined to the board-write path —
+                # a milestone-only write never reaches `_reget_issue` at
+                # all (see `update_ticket`'s docstring), so it still
+                # returns `custom_fields=None`/`milestone=None`.
+                if board_binding is not None:
+                    _populate_board_fields(
+                        client,
+                        ticket,
+                        repo_owner=project.owner,
+                        repo=project.repo,
+                        issue_number=int(ticket_id),
+                        binding=board_binding,
+                        include_custom_fields=True,
+                    )
+                return ticket
 
             if labels_add:
                 _assert_labels_exist(client, project, labels_add)
@@ -3330,7 +3412,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                         )
                     _write_milestone_to_board(client, binding, content_id, milestone)
                 if custom_fields:
-                    return _reget_issue(current.get("state"))
+                    return _reget_issue(current.get("state"), binding or reopen_binding)
                 return _map_issue(current)
 
             r = client.patch(f"{_repo_path(project)}/issues/{ticket_id}", json=payload)
@@ -3377,7 +3459,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 # — so a state-changing PATCH in this same call (e.g. an
                 # explicit `status=` reopen) doesn't mask detection of the
                 # async board-cascade state change layered on top of it.
-                return _reget_issue(current.get("state"))
+                return _reget_issue(current.get("state"), binding or reopen_binding)
             return _map_issue(raw)
 
     def bulk_update_tickets(
