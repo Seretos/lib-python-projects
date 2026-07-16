@@ -72,16 +72,17 @@ jobs:
         run: |
           CONSUMER="Seretos/agent-project-issues"
 
-          # Idempotency: skip if an open issue with this exact title already exists.
+          # Idempotency: skip if an open issue with this exact title already
+          # exists — reuse its URL instead of creating a duplicate.
           # --paginate follows all pages; jq filter excludes pull requests.
-          EXISTING=$(gh api --paginate "repos/${CONSUMER}/issues?state=open&per_page=100" \
-            --jq 'map(select(.pull_request|not)) | .[].title' 2>/dev/null || true)
-          if echo "$EXISTING" | grep -qxF "$TITLE"; then
+          ISSUE_URL=$(gh api --paginate "repos/${CONSUMER}/issues?state=open&per_page=100" \
+            --jq --arg t "$TITLE" 'map(select((.pull_request|not) and (.title==$t))) | .[0].html_url // empty' 2>/dev/null || true)
+          if [ -n "$ISSUE_URL" ]; then
             echo "Issue already exists in ${CONSUMER}, skipping."
           else
             # Attempt creation with the 'dependencies' label; fall back
             # without it if the label does not exist in the consumer repo.
-            gh issue create \
+            ISSUE_URL=$(gh issue create \
               --repo "$CONSUMER" \
               --title "$TITLE" \
               --body "$BODY" \
@@ -89,9 +90,19 @@ jobs:
             || gh issue create \
               --repo "$CONSUMER" \
               --title "$TITLE" \
-              --body "$BODY"
-            echo "Ticket opened in ${CONSUMER}."
+              --body "$BODY")
+            echo "Ticket opened in ${CONSUMER}: ${ISSUE_URL}"
           fi
+          echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Add agent-project-issues ticket to project board
+        if: steps.file_projects.outputs.issue_url != ''
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN }}
+        run: |
+          gh project item-add 2 --owner Seretos --url "${{ steps.file_projects.outputs.issue_url }}"
 
       - name: Open dependency-update ticket in workboard
         id: file_workboard
@@ -123,16 +134,17 @@ jobs:
         run: |
           CONSUMER="Seretos/workboard"
 
-          # Idempotency: skip if an open issue with this exact title already exists.
+          # Idempotency: skip if an open issue with this exact title already
+          # exists — reuse its URL instead of creating a duplicate.
           # --paginate follows all pages; jq filter excludes pull requests.
-          EXISTING=$(gh api --paginate "repos/${CONSUMER}/issues?state=open&per_page=100" \
-            --jq 'map(select(.pull_request|not)) | .[].title' 2>/dev/null || true)
-          if echo "$EXISTING" | grep -qxF "$TITLE"; then
+          ISSUE_URL=$(gh api --paginate "repos/${CONSUMER}/issues?state=open&per_page=100" \
+            --jq --arg t "$TITLE" 'map(select((.pull_request|not) and (.title==$t))) | .[0].html_url // empty' 2>/dev/null || true)
+          if [ -n "$ISSUE_URL" ]; then
             echo "Issue already exists in ${CONSUMER}, skipping."
           else
             # Attempt creation with the 'dependencies' label; fall back
             # without it if the label does not exist in the consumer repo.
-            gh issue create \
+            ISSUE_URL=$(gh issue create \
               --repo "$CONSUMER" \
               --title "$TITLE" \
               --body "$BODY" \
@@ -140,9 +152,19 @@ jobs:
             || gh issue create \
               --repo "$CONSUMER" \
               --title "$TITLE" \
-              --body "$BODY"
-            echo "Ticket opened in ${CONSUMER}."
+              --body "$BODY")
+            echo "Ticket opened in ${CONSUMER}: ${ISSUE_URL}"
           fi
+          echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Add workboard ticket to project board
+        if: steps.file_workboard.outputs.issue_url != ''
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN }}
+        run: |
+          gh project item-add 2 --owner Seretos --url "${{ steps.file_workboard.outputs.issue_url }}"
 
       - name: Report consumer failures
         if: always()
