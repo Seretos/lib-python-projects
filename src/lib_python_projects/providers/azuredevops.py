@@ -83,6 +83,8 @@ from lib_python_projects.providers.base import (
     TokenCapabilities,
     TokenCapabilityProvider,
     TokenProjectDiscoveryProvider,
+    ViewerIdentity,
+    ViewerIdentityProvider,
     WRITABLE_RELATION_KINDS,
     normalize_timestamp,
     _assert_not_self_relation,
@@ -1762,7 +1764,9 @@ def _resolve_ado_tag(
 # ---------- the provider class ----------------------------------------------
 
 
-class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
+class AzureDevOpsProvider(
+    TokenCapabilityProvider, TokenProjectDiscoveryProvider, ViewerIdentityProvider
+):
     """Azure DevOps provider.
 
     Implements the same surface as `GitHubProvider` and `GitLabProvider`
@@ -5246,6 +5250,64 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             pulls_create=True,
             pulls_modify=True,
             pulls_merge=True,
+        )
+
+    # ---------- viewer identity ------------------------------------------
+
+    def resolve_viewer_login(
+        self, project: ProjectConfig, token: str
+    ) -> ViewerIdentity:
+        """Resolve which account `token` authenticates as via
+        `GET {org}/_apis/connectionData`'s `authenticatedUser` field.
+
+        Reuses the same connectionData call `probe_token_capabilities`
+        makes — the `_http_cache` transport already dedupes the GET, so
+        no additional caching is added here. Failure modes are returned
+        (not raised) so callers can degrade gracefully:
+
+          - empty/falsy token           -> `"bad_credentials"` (no HTTP
+            call made, mirrors the probe's empty-token guard)
+          - 401                         -> `"bad_credentials"`
+          - 403/404                     -> `"repo_invisible_to_token"`
+          - other non-2xx               -> `"http_{status}"`
+          - empty `authenticatedUser` or
+            no resolvable login field    -> `"identity_field_missing"`
+          - non-JSON body               -> `"identity_field_missing"`
+          - JSON body that isn't an
+            object (e.g. a list)        -> `"identity_field_missing"`
+          - transport failure           -> `"network_error"`
+        """
+        if not token:
+            return ViewerIdentity(provider="azuredevops", reason="bad_credentials")
+        try:
+            with _client(project, token) as c:
+                resp = c.get(
+                    f"{_org_scope(project)}/_apis/connectionData",
+                    params={"api-version": "7.1-preview.1"},
+                )
+        except httpx.HTTPError:
+            return ViewerIdentity(reason="network_error")
+        if resp.status_code == 401:
+            return ViewerIdentity(reason="bad_credentials")
+        if resp.status_code in (403, 404):
+            return ViewerIdentity(reason="repo_invisible_to_token")
+        if not resp.is_success:
+            return ViewerIdentity(reason=f"http_{resp.status_code}")
+        try:
+            body = resp.json()
+        except ValueError:
+            return ViewerIdentity(reason="identity_field_missing")
+        if not isinstance(body, dict):
+            return ViewerIdentity(reason="identity_field_missing")
+        identity = body.get("authenticatedUser") or {}
+        login = _identity_login_or_display(identity) or None
+        if not identity or not login:
+            return ViewerIdentity(reason="identity_field_missing")
+        display_name = _identity_display_name(identity) or None
+        return ViewerIdentity(
+            login=login,
+            display_name=display_name,
+            provider="azuredevops",
         )
 
     # ---------- token project discovery --------------------------------------

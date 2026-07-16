@@ -72,6 +72,8 @@ from lib_python_projects.providers.base import (
     TokenCapabilities,
     TokenCapabilityProvider,
     TokenProjectDiscoveryProvider,
+    ViewerIdentity,
+    ViewerIdentityProvider,
     _assert_not_self_relation,
     _extract_parent_id,
     _validate_label_lists,
@@ -1773,7 +1775,9 @@ def _fetch_pipeline_failure(
 # ---------- provider ---------------------------------------------------------
 
 
-class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
+class GitLabProvider(
+    TokenCapabilityProvider, TokenProjectDiscoveryProvider, ViewerIdentityProvider
+):
     """GitLab REST v4 provider.
 
     Method bodies are filled in incrementally — see the task list in
@@ -1830,6 +1834,49 @@ class GitLabProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider):
                 reason=None,
             )
         return TokenCapabilities(reason="insufficient_scope")
+
+    # ---------- viewer identity (ViewerIdentityProvider) -----------------------
+
+    def resolve_viewer_login(
+        self, project: ProjectConfig, token: str
+    ) -> ViewerIdentity:
+        """Resolve which account `token` authenticates as via
+        `GET /user`.
+
+        Failure modes are returned (not raised) so callers can degrade
+        gracefully:
+          - 401                            -> `"bad_credentials"`
+          - 404 on `/user`                 -> `"bad_credentials"` (mirrors
+            `probe_token_capabilities`'s treatment of `/self`: `/user`
+            succeeds on any valid token, so a 404 here means the token
+            itself is invalid, not that a resource is missing)
+          - other non-2xx                  -> `"http_{status}"`
+          - non-JSON body or missing
+            `username` field                -> `"identity_field_missing"`
+          - transport failure               -> `"network_error"`
+        """
+        try:
+            with _client(project, token) as client:
+                r = client.get("/user")
+        except httpx.HTTPError:
+            return ViewerIdentity(reason="network_error")
+        if r.status_code == 401:
+            return ViewerIdentity(reason="bad_credentials")
+        if r.status_code == 404:
+            return ViewerIdentity(reason="bad_credentials")
+        if not r.is_success:
+            return ViewerIdentity(reason=f"http_{r.status_code}")
+        try:
+            body = r.json()
+        except Exception:
+            return ViewerIdentity(reason="identity_field_missing")
+        if not isinstance(body, dict) or not body.get("username"):
+            return ViewerIdentity(reason="identity_field_missing")
+        return ViewerIdentity(
+            login=body["username"],
+            display_name=body.get("name"),
+            provider="gitlab",
+        )
 
     # ---------- project discovery (TokenProjectDiscoveryProvider) -------------
 
