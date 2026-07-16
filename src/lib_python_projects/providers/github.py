@@ -1558,6 +1558,30 @@ _BOARD_FIELD_WRITE_ORG_QUERY = _board_field_write_query("organization")
 _BOARD_FIELD_WRITE_USER_QUERY = _board_field_write_query("user")
 
 
+def _board_field_options_query(owner_field: str) -> str:
+    """Like `_board_columns_query`, but additionally selects each option's
+    `color`/`description` — `ensure_board_column` (ticket #192) needs the
+    full option payload to round-trip every existing option through the
+    `updateProjectV2Field` mutation without losing data.
+
+    Kept as its own template (not folded into `_board_columns_query` or
+    `_board_field_write_query`) so each query keeps selecting exactly what
+    its one caller needs.
+    """
+    return (
+        "query($owner:String!,$number:Int!,$fieldName:String!){"
+        f"{owner_field}(login:$owner){{projectV2(number:$number){{"
+        "field(name:$fieldName){"
+        "...on ProjectV2SingleSelectField{id name options{id name color description}}"
+        "}"
+        "}}}"
+    )
+
+
+_BOARD_FIELD_OPTIONS_ORG_QUERY = _board_field_options_query("organization")
+_BOARD_FIELD_OPTIONS_USER_QUERY = _board_field_options_query("user")
+
+
 def _board_project_id_query(owner_field: str) -> str:
     return (
         "query($owner:String!,$number:Int!){"
@@ -1578,6 +1602,11 @@ _UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION = (
     "mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){"
     "updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,"
     "fieldId:$fieldId,value:$value}){projectV2Item{id}}}"
+)
+_UPDATE_PROJECT_V2_FIELD_OPTIONS_MUTATION = (
+    "mutation($fieldId:ID!,$options:[ProjectV2SingleSelectFieldOptionInput!]!){"
+    "updateProjectV2Field(input:{fieldId:$fieldId,singleSelectOptions:$options})"
+    "{projectV2Field{...on ProjectV2SingleSelectField{id}}}}"
 )
 
 
@@ -1610,6 +1639,90 @@ def _resolve_project_field_for_write(
             f"project #{binding.project_number} for owner {binding.owner!r}"
         )
     return field
+
+
+def _ensure_single_select_option(
+    client: httpx.Client, binding: Any, field_name: str, option_name: str,
+) -> bool:
+    """Fetch `field_name`'s live single-select options and, if `option_name`
+    isn't already present (case-insensitively), add it via
+    `updateProjectV2Field` (ticket #192 — `ensure_board_column`).
+
+    Every existing option is round-tripped (`id`/`name`/`color`/
+    `description`) in the mutation's `$options` array so GitHub preserves
+    stable option ids and existing item assignments — the mutation is
+    non-clobbering. `color`/`description` fall back to `"GRAY"`/`""`
+    respectively if the API response omits them, since
+    `ProjectV2SingleSelectFieldOptionInput` requires non-null values for
+    both. The new option is sent without an `id` (GitHub assigns one) and
+    defaults to `color="GRAY"`, `description=""`.
+
+    Returns `True` if the mutation was issued (option created), `False`
+    if the option already existed and no mutation was sent (idempotent
+    no-op).
+
+    Raises `ValueError` when `field_name` doesn't resolve to a
+    single-select field on the board — mirrors `list_board_columns`'s
+    field-not-found error. Unlike `list_board_columns`, an *empty*
+    `options` list is valid here: a brand-new Status field with zero
+    options must still accept its first column.
+    """
+    project_v2 = _fetch_projects_v2_via_graphql(
+        client,
+        owner=binding.owner,
+        project_number=binding.project_number,
+        org_query=_BOARD_FIELD_OPTIONS_ORG_QUERY,
+        user_query=_BOARD_FIELD_OPTIONS_USER_QUERY,
+        variables={
+            "owner": binding.owner,
+            "number": binding.project_number,
+            "fieldName": field_name,
+        },
+    )
+    field = project_v2.get("field")
+    if not field or not field.get("id"):
+        raise ValueError(
+            f"GitHub Projects v2 field {field_name!r} was not found (or is "
+            f"not a single-select field) on project #{binding.project_number} "
+            f"for owner {binding.owner!r}"
+        )
+    options = field.get("options") or []
+    by_lower_name = {opt["name"].lower(): opt for opt in options}
+    if option_name.lower() in by_lower_name:
+        return False
+    new_options = [
+        {
+            "id": opt["id"],
+            "name": opt["name"],
+            "color": opt.get("color") or "GRAY",
+            "description": opt.get("description") or "",
+        }
+        for opt in options
+    ]
+    new_options.append({"name": option_name, "color": "GRAY", "description": ""})
+    r = client.post(
+        "/graphql",
+        json={
+            "query": _UPDATE_PROJECT_V2_FIELD_OPTIONS_MUTATION,
+            "variables": {"fieldId": field["id"], "options": new_options},
+        },
+    )
+    _check(r)
+    body = r.json()
+    if body.get("errors"):
+        raise GitHubError(
+            400,
+            f"GraphQL error adding board column {option_name!r} to field "
+            f"{field_name!r}: {body['errors']}",
+        )
+    updated_field = (
+        (body.get("data") or {}).get("updateProjectV2Field") or {}
+    ).get("projectV2Field")
+    if not updated_field:
+        raise GitHubError(
+            500, "updateProjectV2Field did not return a projectV2Field"
+        )
+    return True
 
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -3632,6 +3745,48 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
                 BoardColumnSpec(logical=col, native=native, option_id=opt["id"])
             )
         return result
+
+    def ensure_board_column(
+        self, project: ProjectConfig, token: str | None, column_name: str,
+    ) -> bool:
+        """Idempotently provision `column_name` as an option on the live
+        GitHub Projects v2 board's Status field (ticket #192).
+
+        Reads the current `binding.status_field` single-select field and,
+        if `column_name` is already present among its options
+        (case-insensitively), no-ops and returns `False`. Otherwise adds
+        it via an `updateProjectV2Field` mutation that round-trips every
+        existing option so no columns are destroyed, and returns `True`.
+
+        GitHub only — the Azure DevOps counterpart is a separate ticket
+        (#193). Raises `ValueError` under the same conditions as
+        `list_board_columns`: `project.board` is unset; the binding isn't
+        `kind="github-projects-v2"`; the binding is missing `owner`/
+        `project_number`; or the named status field doesn't exist (or
+        isn't a single-select field).
+        """
+        board = project.board
+        if board is None:
+            raise ValueError(
+                f"project {project.id!r} has no 'board' configuration — "
+                f"add one to projects.yml before calling ensure_board_column"
+            )
+        binding = board.binding
+        if binding.kind != "github-projects-v2":
+            raise ValueError(
+                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"not 'github-projects-v2' — ensure_board_column is GitHub-only"
+            )
+        if not binding.owner or not binding.project_number:
+            raise ValueError(
+                f"project {project.id!r} board binding is missing "
+                f"'owner' and/or 'project_number' — both are required to "
+                f"resolve a GitHub Projects v2 board"
+            )
+        with _client(token) as client:
+            return _ensure_single_select_option(
+                client, binding, binding.status_field, column_name,
+            )
 
     def add_comment(
         self,
