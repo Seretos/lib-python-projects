@@ -18,6 +18,7 @@ import pytest
 from lib_python_projects import AzureBoardsBinding, Board, GithubProjectsV2Binding, ProjectConfig
 from lib_python_projects.providers import azuredevops as azure_mod
 from lib_python_projects.providers.azuredevops import (
+    AzureDevOpsError,
     AzureDevOpsProvider,
     _basic_auth_header,
     _cache_clear_all,
@@ -530,3 +531,276 @@ def test_list_tickets_board_column_empty_result_set(
     )
     assert tickets == []
     assert has_more is False
+
+
+# ---------- ensure_board_column — happy paths ---------------------------------
+
+
+def test_ensure_board_column_creates_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #193: when the target column is absent from the live board,
+    `ensure_board_column` reads the current columns, splices a new
+    inProgress column in immediately before the trailing `outgoing`
+    column, and PUTs the full array back."""
+    board = _board(["Todo", "Doing", "Done"])
+    live_columns = [
+        _column(id_="c1", name="New", column_type="incoming"),
+        _column(id_="c2", name="Active", column_type="inProgress"),
+        _column(id_="c3", name="Closed", column_type="outgoing"),
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/acme-org/acme-project/acme-team/_apis/work/boards/Stories/columns"
+        assert req.url.params["api-version"] == "7.1"
+        if req.method == "GET":
+            return _json({"value": live_columns})
+        if req.method == "PUT":
+            body = json.loads(req.content.decode("utf-8"))
+            response = [
+                {**col, "id": "c4"} if col["name"] == "Doing" else col
+                for col in body
+            ]
+            return _json({"value": response})
+        raise AssertionError(f"unexpected method {req.method}")
+
+    seen = _install_mock(monkeypatch, handler)
+    spec = AzureDevOpsProvider().ensure_board_column(_project(board), "t", "Doing")
+
+    assert [r.method for r in seen] == ["GET", "PUT"]
+    put_body = json.loads(seen[1].content.decode("utf-8"))
+    assert [c["name"] for c in put_body] == ["New", "Active", "Doing", "Closed"]
+    new_col = put_body[2]
+    assert new_col == {
+        "name": "Doing",
+        "columnType": "inProgress",
+        "itemLimit": 0,
+        "stateMappings": {},
+        "isSplit": False,
+    }
+    assert spec == BoardColumnSpec(
+        logical="Doing", native="Doing", option_id="c4", states=(), is_split=False,
+    )
+
+
+def test_ensure_board_column_noop_when_present_case_insensitive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live board already has the column under different casing —
+    must be a pure no-op: no PUT, spec built from the live column."""
+    board = _board(["Doing"])
+    live_columns = [
+        _column(id_="c1", name="New", column_type="incoming"),
+        _column(
+            id_="c2", name="DOING", column_type="inProgress",
+            state_mappings={"Issue": "Doing"},
+        ),
+        _column(id_="c3", name="Closed", column_type="outgoing"),
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT":
+            raise AssertionError("no PUT expected when column already exists")
+        return _json({"value": live_columns})
+
+    seen = _install_mock(monkeypatch, handler)
+    spec = AzureDevOpsProvider().ensure_board_column(_project(board), "t", "doing")
+
+    assert len(seen) == 1
+    assert seen[0].method == "GET"
+    assert spec == BoardColumnSpec(
+        logical="doing", native="DOING", option_id="c2", states=("Doing",), is_split=False,
+    )
+
+
+def test_ensure_board_column_creates_split_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Doing"])
+    live_columns = [
+        _column(id_="c1", name="New", column_type="incoming"),
+        _column(id_="c2", name="Active", column_type="inProgress"),
+        _column(id_="c3", name="Closed", column_type="outgoing"),
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET":
+            return _json({"value": live_columns})
+        if req.method == "PUT":
+            body = json.loads(req.content.decode("utf-8"))
+            response = [
+                {**col, "id": "c4"} if col["name"] == "Doing" else col
+                for col in body
+            ]
+            return _json({"value": response})
+        raise AssertionError(f"unexpected method {req.method}")
+
+    seen = _install_mock(monkeypatch, handler)
+    spec = AzureDevOpsProvider().ensure_board_column(
+        _project(board), "t", "Doing", is_split=True,
+    )
+
+    put_body = json.loads(seen[1].content.decode("utf-8"))
+    new_col = next(c for c in put_body if c["name"] == "Doing")
+    assert new_col["isSplit"] is True
+    assert spec.is_split is True
+
+
+def test_ensure_board_column_existing_split_not_rewritten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live column already exists AND is a split column — calling
+    with `is_split=False` (the default) must not rewrite it; the
+    returned spec reflects the live split state, not the argument."""
+    board = _board(["Doing"])
+    live_columns = [
+        _column(id_="c1", name="New", column_type="incoming"),
+        _column(id_="c2", name="Doing", column_type="inProgress", is_split=True),
+        _column(id_="c3", name="Closed", column_type="outgoing"),
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT":
+            raise AssertionError("no PUT expected when column already exists")
+        return _json({"value": live_columns})
+
+    seen = _install_mock(monkeypatch, handler)
+    spec = AzureDevOpsProvider().ensure_board_column(_project(board), "t", "Doing")
+
+    assert len(seen) == 1
+    assert spec.is_split is True
+
+
+def test_ensure_board_column_appends_when_no_outgoing_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No column has `columnType == "outgoing"` — the new column is
+    appended at the end rather than spliced before a (nonexistent)
+    trailing outgoing column."""
+    board = _board(["Doing"])
+    live_columns = [
+        _column(id_="c1", name="New", column_type="incoming"),
+        _column(id_="c2", name="Active", column_type="inProgress"),
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET":
+            return _json({"value": live_columns})
+        if req.method == "PUT":
+            body = json.loads(req.content.decode("utf-8"))
+            response = [
+                {**col, "id": "c4"} if col["name"] == "Doing" else col
+                for col in body
+            ]
+            return _json({"value": response})
+        raise AssertionError(f"unexpected method {req.method}")
+
+    seen = _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().ensure_board_column(_project(board), "t", "Doing")
+
+    put_body = json.loads(seen[1].content.decode("utf-8"))
+    assert [c["name"] for c in put_body] == ["New", "Active", "Doing"]
+
+
+def test_ensure_board_column_create_falls_back_when_put_echoes_no_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The create-path `PUT` succeeds (2xx) but the provider echoes back
+    an empty/unparseable body — `created_columns` parsing then yields
+    nothing to match against, so `ensure_board_column` must fall back to
+    the synthetic `new_column` it spliced in rather than raising or
+    returning a stale/empty spec. The fallback has no `id`, so
+    `option_id` is `""`."""
+    board = _board(["Doing"])
+    live_columns = [
+        _column(id_="c1", name="New", column_type="incoming"),
+        _column(id_="c3", name="Closed", column_type="outgoing"),
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET":
+            return _json({"value": live_columns})
+        if req.method == "PUT":
+            # Empty body: `.json()` raises, so the implementation must
+            # treat this the same as an unparseable/absent echo.
+            return httpx.Response(status_code=200, content=b"")
+        raise AssertionError(f"unexpected method {req.method}")
+
+    seen = _install_mock(monkeypatch, handler)
+    spec = AzureDevOpsProvider().ensure_board_column(
+        _project(board), "t", "Doing", is_split=True,
+    )
+
+    assert [r.method for r in seen] == ["GET", "PUT"]
+    assert spec == BoardColumnSpec(
+        logical="Doing", native="Doing", option_id="", states=(), is_split=True,
+    )
+
+
+# ---------- ensure_board_column — error paths ---------------------------------
+
+
+def test_ensure_board_column_put_error_wrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing `PUT` (create path) surfaces as `AzureDevOpsError`, not
+    a raw HTTP error."""
+    board = _board(["Doing"])
+    live_columns = [
+        _column(id_="c1", name="New", column_type="incoming"),
+        _column(id_="c3", name="Closed", column_type="outgoing"),
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET":
+            return _json({"value": live_columns})
+        if req.method == "PUT":
+            return _json(
+                {"message": "Something went wrong", "typeKey": "SomeException"},
+                status_code=400,
+            )
+        raise AssertionError(f"unexpected method {req.method}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError):
+        AzureDevOpsProvider().ensure_board_column(_project(board), "t", "Doing")
+
+
+def test_ensure_board_column_raises_without_board(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected when project has no board")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="no 'board' configuration"):
+        AzureDevOpsProvider().ensure_board_column(_project(None), "t", "Doing")
+
+
+def test_ensure_board_column_raises_wrong_binding_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = Board(
+        columns=["Doing"],
+        binding=GithubProjectsV2Binding(kind="github-projects-v2", owner="x", project_number=1),
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for a non-Azure-Boards binding")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="not 'azure-boards'"):
+        AzureDevOpsProvider().ensure_board_column(_project(board), "t", "Doing")
+
+
+def test_ensure_board_column_raises_missing_team_or_board(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Doing"], team=None, board_name=None)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected without team/board")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="'team' and/or 'board'"):
+        AzureDevOpsProvider().ensure_board_column(_project(board), "t", "Doing")

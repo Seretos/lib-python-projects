@@ -2373,6 +2373,125 @@ class AzureDevOpsProvider(TokenCapabilityProvider, TokenProjectDiscoveryProvider
             )
         return result
 
+    def ensure_board_column(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        column_name: str,
+        *,
+        is_split: bool = False,
+    ) -> BoardColumnSpec:
+        """Idempotently create a column on the bound team's Azure Boards
+        board (ticket #193, the Azure-side counterpart to #192's GitHub
+        Projects v2 write path).
+
+        Azure Boards has no per-column create endpoint — the columns
+        collection is read and, when the target is missing, replaced
+        wholesale via `PUT` with the new column spliced in immediately
+        before the trailing `outgoing` column (or appended, if none is
+        found). When a column with the same name already exists
+        (case-insensitively), this is a pure no-op: no `PUT` is issued and
+        the returned spec reflects the LIVE column's state (including its
+        actual `is_split`), not the `is_split` argument.
+
+        Raises `ValueError` when: `project.board` is unset; the binding
+        isn't `kind="azure-boards"`; the binding is missing `team`/`board`.
+        Any provider error from the `PUT` is surfaced as
+        `AzureDevOpsError` — no raw HTTP exception escapes.
+        """
+        board = project.board
+        if board is None:
+            raise ValueError(
+                f"project {project.id!r} has no 'board' configuration — "
+                f"add one to projects.yml before calling ensure_board_column"
+            )
+        binding = board.binding
+        if binding.kind != "azure-boards":
+            raise ValueError(
+                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"not 'azure-boards' — ensure_board_column is "
+                f"Azure-Boards-only"
+            )
+        if not binding.team or not binding.board:
+            raise ValueError(
+                f"project {project.id!r} azure-boards binding is missing "
+                f"'team' and/or 'board' — both are required to resolve a "
+                f"live Azure Boards board (Azure Boards boards are bound "
+                f"to a team + backlog level)"
+            )
+        path = (
+            f"{_project_scope(project)}/{quote(binding.team, safe='')}"
+            f"/_apis/work/boards/{quote(binding.board, safe='')}/columns"
+        )
+        with _client(project, token) as c:
+            resp = c.get(path, params=_api_version_params())
+            _check(resp)
+            live_columns = resp.json().get("value") or []
+            by_lower_name = {
+                str(col.get("name") or "").lower(): col for col in live_columns
+            }
+            live = by_lower_name.get(column_name.lower())
+            if live is not None:
+                state_mappings = live.get("stateMappings") or {}
+                return BoardColumnSpec(
+                    logical=column_name,
+                    native=str(live.get("name") or column_name),
+                    option_id=str(live.get("id") or ""),
+                    states=tuple(dict.fromkeys(state_mappings.values())),
+                    is_split=bool(live.get("isSplit")),
+                )
+            new_column = {
+                "name": column_name,
+                "columnType": "inProgress",
+                "itemLimit": 0,
+                "stateMappings": {},
+                "isSplit": is_split,
+            }
+            updated_columns = list(live_columns)
+            outgoing_index = next(
+                (
+                    i
+                    for i, col in enumerate(updated_columns)
+                    if col.get("columnType") == "outgoing"
+                ),
+                None,
+            )
+            if outgoing_index is None:
+                updated_columns.append(new_column)
+            else:
+                updated_columns.insert(outgoing_index, new_column)
+            put_resp = c.put(
+                path, params=_api_version_params(), json=updated_columns,
+            )
+            _check(put_resp)
+        try:
+            put_body = put_resp.json()
+        except ValueError:
+            put_body = None
+        if isinstance(put_body, list):
+            created_columns = put_body
+        elif isinstance(put_body, dict):
+            created_columns = put_body.get("value") or []
+        else:
+            created_columns = []
+        created = next(
+            (
+                col
+                for col in created_columns
+                if str(col.get("name") or "").lower() == column_name.lower()
+            ),
+            None,
+        )
+        if created is None:
+            created = new_column
+        return BoardColumnSpec(
+            logical=column_name,
+            native=column_name,
+            option_id=str(created.get("id") or ""),
+            states=(),
+            is_split=is_split,
+        )
+
     def _fetch_work_items_batch(
         self,
         project: ProjectConfig,
