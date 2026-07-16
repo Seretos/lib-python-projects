@@ -942,6 +942,62 @@ class TokenCapabilityProvider:
         raise NotImplementedError
 
 
+# ---------- viewer identity / whoami (ticket #191) --------------------------
+
+
+@dataclass
+class ViewerIdentity:
+    """Result of `resolve_viewer_login` — the provider-native identity of
+    the account a given token authenticates as ("whoami").
+
+    - `login` — the provider-native username/handle (GitHub `login`,
+      GitLab `username`, Azure DevOps a login-shaped identity field).
+    - `display_name` — human-readable display name, when the provider
+      exposes one.
+    - `provider` — the `Provider` literal value (`"github"`, `"gitlab"`,
+      `"azuredevops"`) that produced this result.
+
+    `reason` is `None` on the happy path. On any failure mode `login` and
+    `display_name` stay `None` and `reason` carries a stable string
+    identifier so the caller (and tests) can branch on it without parsing
+    free-form text:
+
+    - `"bad_credentials"`         — 401 from the provider.
+    - `"network_error"`           — transport-level failure (DNS,
+      connection refused, timeout, ...).
+    - `"http_<code>"`             — any other unexpected non-2xx status.
+    - `"identity_field_missing"`  — request succeeded but the response
+      didn't carry a usable identity (non-JSON body, missing field).
+
+    When `reason` is not `None`, `login` and `display_name` must be
+    `None` — the caller must not act on a partial/failed identity probe.
+    """
+
+    login: str | None = None
+    display_name: str | None = None
+    provider: str | None = None
+    reason: str | None = None
+
+
+class ViewerIdentityProvider:
+    """Mixin/interface: providers that can resolve which account a token
+    authenticates as ("whoami") implement this method.
+
+    Implementations MUST NOT raise on expected failure modes (401,
+    network error, missing identity field) — they must return a
+    `ViewerIdentity` with `reason` set and `login`/`display_name` both
+    `None` so the caller can degrade gracefully. Only programming errors
+    (bad project shape, etc.) should propagate. See `ViewerIdentity.reason`
+    for the stable failure identifiers; Azure DevOps additionally uses
+    `"repo_invisible_to_token"` for 403/404 responses.
+    """
+
+    def resolve_viewer_login(
+        self, project, token: str
+    ) -> ViewerIdentity:
+        raise NotImplementedError
+
+
 # ---------- token project discovery (ticket #80) ----------
 
 

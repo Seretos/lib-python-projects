@@ -541,6 +541,53 @@ def _make_pr(**overrides):
     return PullRequest(**base)
 
 
+# ---------- ticket #191: ViewerIdentity / ViewerIdentityProvider -------------
+
+
+class TestViewerIdentity:
+    """`ViewerIdentity` dataclass construction and defaults (ticket #191)."""
+
+    def test_all_fields_default_to_none(self):
+        from lib_python_projects.providers.base import ViewerIdentity
+
+        vi = ViewerIdentity()
+        assert vi.login is None
+        assert vi.display_name is None
+        assert vi.provider is None
+        assert vi.reason is None
+
+    def test_field_set_is_exactly_login_display_name_provider_reason(self):
+        from lib_python_projects.providers.base import ViewerIdentity
+
+        field_names = {f.name for f in dataclasses.fields(ViewerIdentity)}
+        assert field_names == {"login", "display_name", "provider", "reason"}
+
+    def test_is_dataclass(self):
+        from lib_python_projects.providers.base import ViewerIdentity
+
+        assert dataclasses.is_dataclass(ViewerIdentity)
+
+    def test_all_fields_round_trip(self):
+        from lib_python_projects.providers.base import ViewerIdentity
+
+        vi = ViewerIdentity(
+            login="octocat", display_name="The Octocat", provider="github",
+        )
+        assert vi.login == "octocat"
+        assert vi.display_name == "The Octocat"
+        assert vi.provider == "github"
+        assert vi.reason is None
+
+
+class TestViewerIdentityProvider:
+    def test_base_raises_not_implemented(self):
+        from lib_python_projects.providers.base import ViewerIdentityProvider
+
+        provider = ViewerIdentityProvider()
+        with pytest.raises(NotImplementedError):
+            provider.resolve_viewer_login(project=object(), token="x")
+
+
 class TestPullRequestReviewsField:
     """`PullRequest.reviews` (ticket #148) defaults to an empty list that
     is independent per instance — the classic mutable-default-argument
