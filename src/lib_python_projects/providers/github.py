@@ -52,6 +52,8 @@ from lib_python_projects.providers.base import (
     TicketFilters,
     TokenCapabilities,
     TokenProjectDiscoveryProvider,
+    ViewerIdentity,
+    ViewerIdentityProvider,
     _assert_not_self_relation,
     _extract_parent_id,
     _validate_label_lists,
@@ -2592,7 +2594,7 @@ def _reget_sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-class GitHubProvider(TokenProjectDiscoveryProvider):
+class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
     def probe_token_capabilities(
         self, project: ProjectConfig, token: str
     ) -> TokenCapabilities:
@@ -2627,6 +2629,43 @@ class GitHubProvider(TokenProjectDiscoveryProvider):
         if not isinstance(perms, dict):
             return TokenCapabilities(reason="permissions_field_missing")
         return _map_permissions_to_capabilities(perms)
+
+    def resolve_viewer_login(
+        self, project: ProjectConfig, token: str
+    ) -> ViewerIdentity:
+        """Resolve which account `token` authenticates as via
+        `GET /user`.
+
+        Failure modes are returned (not raised) so callers can degrade
+        gracefully. See `ViewerIdentity.reason` for the stable failure
+        identifiers:
+
+        - 401                        -> `"bad_credentials"`
+        - other non-2xx              -> `"http_{status}"`
+        - non-JSON body or missing
+          `login` field              -> `"identity_field_missing"`
+        - transport failure          -> `"network_error"`
+        """
+        try:
+            with _client(token) as client:
+                r = client.get("/user")
+        except httpx.HTTPError:
+            return ViewerIdentity(reason="network_error")
+        if r.status_code == 401:
+            return ViewerIdentity(reason="bad_credentials")
+        if not r.is_success:
+            return ViewerIdentity(reason=f"http_{r.status_code}")
+        try:
+            body = r.json()
+        except ValueError:
+            return ViewerIdentity(reason="identity_field_missing")
+        if not isinstance(body, dict) or not body.get("login"):
+            return ViewerIdentity(reason="identity_field_missing")
+        return ViewerIdentity(
+            login=body["login"],
+            display_name=body.get("name"),
+            provider="github",
+        )
 
     def list_tickets(
         self,
