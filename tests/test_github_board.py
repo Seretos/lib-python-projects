@@ -3888,3 +3888,274 @@ def test_create_ticket_on_move_to_does_not_fire(
     )
     assert ticket.id == "99"
     assert "deployed" not in created_payload.get("labels", [])
+
+
+# ---------- ticket #192: ensure_board_column (Status field option write) ----
+#
+# `ensure_board_column` provisions a missing board column (a Projects v2
+# Status single-select option) via `updateProjectV2Field`, idempotently.
+# The read side reuses the org/user fallback dance via
+# `_fetch_projects_v2_via_graphql`; the read query is recognised by its
+# `options{id name color description}` selection (distinct from
+# `list_board_columns`'s plainer `options{id name}`).
+
+
+def _options_read_response(owner_field: str, options: list[dict] | None, *, field_id: str | None = "field-status") -> dict:
+    if field_id is None:
+        return {"data": {owner_field: {"projectV2": {"field": None}}}}
+    return {
+        "data": {
+            owner_field: {
+                "projectV2": {
+                    "field": {
+                        "id": field_id,
+                        "name": "Status",
+                        "options": options if options is not None else [],
+                    }
+                }
+            }
+        }
+    }
+
+
+def test_ensure_board_column_creates_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo", "Done", "In Progress"], owner="acme-org", project_number=7)
+    existing_options = [
+        {"id": "opt-todo", "name": "Todo", "color": "BLUE", "description": "todo desc"},
+        {"id": "opt-done", "name": "Done", "color": "GREEN", "description": ""},
+    ]
+    mutation_calls: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _graphql_body(req)
+        query, variables = body["query"], body["variables"]
+        if "updateProjectV2Field" in query:
+            mutation_calls.append(variables)
+            return _json(
+                {"data": {"updateProjectV2Field": {"projectV2Field": {"id": "field-status"}}}}
+            )
+        if "options{id name color description}" in query:
+            owner_field = _owner_field(query)
+            return _json(_options_read_response(owner_field, existing_options))
+        raise AssertionError(f"unexpected graphql query: {query!r}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().ensure_board_column(_project(board), "t", "In Progress")
+
+    assert result is True
+    assert len(mutation_calls) == 1
+    assert mutation_calls[0]["fieldId"] == "field-status"
+    options_sent = mutation_calls[0]["options"]
+    assert len(options_sent) == 3
+    assert {
+        "id": "opt-todo", "name": "Todo", "color": "BLUE", "description": "todo desc",
+    } in options_sent
+    assert {
+        "id": "opt-done", "name": "Done", "color": "GREEN", "description": "",
+    } in options_sent
+    assert {
+        "name": "In Progress", "color": "GRAY", "description": "",
+    } in options_sent
+
+
+def test_ensure_board_column_creates_first_option_on_empty_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo"], owner="acme-org", project_number=7)
+    mutation_calls: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _graphql_body(req)
+        query, variables = body["query"], body["variables"]
+        if "updateProjectV2Field" in query:
+            mutation_calls.append(variables)
+            return _json(
+                {"data": {"updateProjectV2Field": {"projectV2Field": {"id": "field-status"}}}}
+            )
+        if "options{id name color description}" in query:
+            owner_field = _owner_field(query)
+            return _json(_options_read_response(owner_field, []))
+        raise AssertionError(f"unexpected graphql query: {query!r}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().ensure_board_column(_project(board), "t", "Todo")
+
+    assert result is True
+    assert len(mutation_calls) == 1
+    assert mutation_calls[0]["options"] == [
+        {"name": "Todo", "color": "GRAY", "description": ""}
+    ]
+
+
+def test_ensure_board_column_noop_when_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo", "In Progress"], owner="acme-org", project_number=7)
+    existing_options = [
+        {"id": "opt-todo", "name": "Todo", "color": "BLUE", "description": ""},
+        {"id": "opt-ip", "name": "In Progress", "color": "YELLOW", "description": ""},
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _graphql_body(req)
+        query = body["query"]
+        if "updateProjectV2Field" in query:
+            raise AssertionError("no mutation expected when option already exists")
+        if "options{id name color description}" in query:
+            owner_field = _owner_field(query)
+            return _json(_options_read_response(owner_field, existing_options))
+        raise AssertionError(f"unexpected graphql query: {query!r}")
+
+    seen = _install_mock(monkeypatch, handler)
+    result = GitHubProvider().ensure_board_column(_project(board), "t", "In Progress")
+
+    assert result is False
+    assert len(seen) == 1, "only the read query should fire, no mutation"
+
+
+def test_ensure_board_column_noop_case_insensitive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo", "In Progress"], owner="acme-org", project_number=7)
+    existing_options = [
+        {"id": "opt-ip", "name": "In Progress", "color": "YELLOW", "description": ""},
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _graphql_body(req)
+        query = body["query"]
+        if "updateProjectV2Field" in query:
+            raise AssertionError("no mutation expected when option already exists")
+        if "options{id name color description}" in query:
+            owner_field = _owner_field(query)
+            return _json(_options_read_response(owner_field, existing_options))
+        raise AssertionError(f"unexpected graphql query: {query!r}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().ensure_board_column(_project(board), "t", "in progress")
+
+    assert result is False
+
+
+def test_ensure_board_column_no_board_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected when project has no board")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="no 'board' configuration"):
+        GitHubProvider().ensure_board_column(_project(None), "t", "In Progress")
+
+
+def test_ensure_board_column_wrong_binding_kind_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = Board(
+        columns=["Todo"],
+        binding=AzureBoardsBinding(kind="azure-boards"),
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for a non-GitHub binding")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="not 'github-projects-v2'"):
+        GitHubProvider().ensure_board_column(_project(board), "t", "In Progress")
+
+
+def test_ensure_board_column_missing_owner_or_number_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo"], owner=None, project_number=None)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected without owner/project_number")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="owner.*project_number|missing"):
+        GitHubProvider().ensure_board_column(_project(board), "t", "In Progress")
+
+
+def test_ensure_board_column_field_not_found_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo"], owner="acme-org", project_number=7)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _graphql_body(req)
+        query = body["query"]
+        if "options{id name color description}" in query:
+            owner_field = _owner_field(query)
+            return _json(_options_read_response(owner_field, None, field_id=None))
+        raise AssertionError(f"unexpected graphql query: {query!r}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="was not found"):
+        GitHubProvider().ensure_board_column(_project(board), "t", "In Progress")
+
+
+def test_ensure_board_column_mutation_graphql_error_raises_github_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo"], owner="acme-org", project_number=7)
+    existing_options = [
+        {"id": "opt-todo", "name": "Todo", "color": "BLUE", "description": ""},
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _graphql_body(req)
+        query = body["query"]
+        if "updateProjectV2Field" in query:
+            return _json({"errors": [{"message": "field is not editable"}]})
+        if "options{id name color description}" in query:
+            owner_field = _owner_field(query)
+            return _json(_options_read_response(owner_field, existing_options))
+        raise AssertionError(f"unexpected graphql query: {query!r}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc_info:
+        GitHubProvider().ensure_board_column(_project(board), "t", "In Progress")
+    assert exc_info.value.status == 400
+
+
+def test_ensure_board_column_falls_back_to_user_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(["Todo"], owner="acme-org", project_number=7)
+    existing_options = [
+        {"id": "opt-todo", "name": "Todo", "color": "BLUE", "description": ""},
+    ]
+    call_owner_fields: list[str] = []
+    mutation_calls: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _graphql_body(req)
+        query, variables = body["query"], body["variables"]
+        if "updateProjectV2Field" in query:
+            mutation_calls.append(variables)
+            return _json(
+                {"data": {"updateProjectV2Field": {"projectV2Field": {"id": "field-status"}}}}
+            )
+        if "options{id name color description}" in query:
+            owner_field = _owner_field(query)
+            call_owner_fields.append(owner_field)
+            if owner_field == "organization":
+                return _json(_org_not_resolved_response())
+            return _json(_options_read_response(owner_field, existing_options))
+        raise AssertionError(f"unexpected graphql query: {query!r}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().ensure_board_column(_project(board), "t", "In Progress")
+
+    assert result is True
+    assert call_owner_fields == ["organization", "user"]
+    assert len(mutation_calls) == 1
+
+
+def test_ensure_board_column_query_and_mutation_are_brace_balanced() -> None:
+    _assert_brace_balanced(github_provider._board_field_options_query("organization"))
+    _assert_brace_balanced(github_provider._board_field_options_query("user"))
+    _assert_brace_balanced(github_provider._BOARD_FIELD_OPTIONS_ORG_QUERY)
+    _assert_brace_balanced(github_provider._BOARD_FIELD_OPTIONS_USER_QUERY)
+    _assert_brace_balanced(github_provider._UPDATE_PROJECT_V2_FIELD_OPTIONS_MUTATION)
