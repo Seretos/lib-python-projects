@@ -51,9 +51,10 @@ jobs:
         # A YAML block scalar holds the markdown verbatim and ${{ }} still
         # expands. Bash just references "$TITLE"/"$BODY".
         env:
-          # PROJECTS_TICKET_TOKEN needs Issues:write on the consumer repo and,
-          # additionally, account-level Projects:write so the board-add step
-          # below can reuse this same token (no separate board secret).
+          # PROJECTS_TICKET_TOKEN must be a classic PAT with the `repo` scope
+          # (Issues:write on the consumer repo) and the `project` scope, so
+          # the board-add step below can reuse this same token — fine-grained
+          # PATs have no Projects permission at all (no separate board secret).
           GH_TOKEN: ${{ secrets.PROJECTS_TICKET_TOKEN }}
           TITLE: "chore(deps): bump lib-python-projects to v${{ inputs.version }}"
           BODY: |
@@ -99,8 +100,8 @@ jobs:
           echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Add agent-project-issues ticket to project board
-        # Reuses PROJECTS_TICKET_TOKEN, which also carries account-level
-        # Projects:write, so no separate board secret is needed.
+        # Reuses PROJECTS_TICKET_TOKEN: a classic PAT carrying both `repo`
+        # and `project` scopes, so no separate board secret is needed.
         if: steps.file_projects.outputs.issue_url != ''
         continue-on-error: true
         shell: bash
@@ -118,9 +119,10 @@ jobs:
         # A YAML block scalar holds the markdown verbatim and ${{ }} still
         # expands. Bash just references "$TITLE"/"$BODY".
         env:
-          # WORKBOARD_TICKET_TOKEN needs Issues:write on the consumer repo and,
-          # additionally, account-level Projects:write so the board-add step
-          # below can reuse this same token (no separate board secret).
+          # WORKBOARD_TICKET_TOKEN must be a classic PAT with the `repo` scope
+          # (Issues:write on the consumer repo) and the `project` scope, so
+          # the board-add step below can reuse this same token — fine-grained
+          # PATs have no Projects permission at all (no separate board secret).
           GH_TOKEN: ${{ secrets.WORKBOARD_TICKET_TOKEN }}
           TITLE: "chore(deps): bump lib-python-projects to v${{ inputs.version }}"
           BODY: |
@@ -166,8 +168,8 @@ jobs:
           echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Add workboard ticket to project board
-        # Reuses WORKBOARD_TICKET_TOKEN, which also carries account-level
-        # Projects:write, so no separate board secret is needed.
+        # Reuses WORKBOARD_TICKET_TOKEN: a classic PAT carrying both `repo`
+        # and `project` scopes, so no separate board secret is needed.
         if: steps.file_workboard.outputs.issue_url != ''
         continue-on-error: true
         shell: bash
