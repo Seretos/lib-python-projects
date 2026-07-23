@@ -307,6 +307,21 @@ def test_permissions_empty_defaults_all_false():
     assert perms.pulls.create is False
     assert perms.pulls.modify is False
     assert perms.pulls.merge is False
+    assert perms.board.manage is False
+
+
+def test_permissions_board_nested_form_loads_correctly():
+    """The nested form is the canonical (and only) shape."""
+    perms = Permissions.model_validate({"board": {"manage": True}})
+    assert perms.board.manage is True
+    assert perms.model_dump()["board"]["manage"] is True
+
+
+def test_permissions_board_rejects_unknown_key():
+    """`extra='forbid'` on BoardPermissions guards against typos."""
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        Permissions.model_validate({"board": {"bogus": True}})
 
 
 # ---------- ConfigDocument model directly -----------------------------------

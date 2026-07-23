@@ -39,6 +39,11 @@ class PullsPermissions(BaseModel):
     merge: bool = False
 
 
+class BoardPermissions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    manage: bool = False
+
+
 class Permissions(BaseModel):
     """Nested permissions namespace.
 
@@ -49,6 +54,7 @@ class Permissions(BaseModel):
     model_config = ConfigDict(extra="forbid")
     issues: IssuesPermissions = Field(default_factory=IssuesPermissions)
     pulls: PullsPermissions = Field(default_factory=PullsPermissions)
+    board: BoardPermissions = Field(default_factory=BoardPermissions)
 
 
 class AutoLabels(BaseModel):
