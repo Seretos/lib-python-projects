@@ -62,8 +62,8 @@ Immediately after each ticket step, a follow-up step adds that issue to the
 `users/Seretos/projects/2` board via `gh project item-add`, reusing that same
 consumer's ticket token (`PROJECTS_TICKET_TOKEN` or `WORKBOARD_TICKET_TOKEN`),
 so bump tickets show up on the board without manual triage. No separate board
-token is needed — each per-consumer token also carries account-level
-**Projects: write**. The board-add step is skipped cleanly if the ticket step
+token is needed — each per-consumer token is a classic PAT that also carries
+the `project` scope. The board-add step is skipped cleanly if the ticket step
 produced no issue URL.
 
 **If the automatic step was skipped or failed**, re-file manually by running
@@ -78,22 +78,23 @@ title before creating one, so running it twice is safe.
 
 **Human prerequisite — `PROJECTS_TICKET_TOKEN`:**
 This must be a repository secret (Settings → Secrets → Actions) containing a
-fine-grained PAT with **Issues: write** permission on
-`Seretos/agent-project-issues` and, additionally, account-level
-**Projects: write** so the follow-up board-add step can reuse this same token.
-(A classic PAT works too: `repo` scope for the issue plus `project` scope for
-the board.) `GITHUB_TOKEN` cannot open cross-repo issues. Creating/rotating
+**classic PAT** (Settings → Developer settings → Personal access tokens →
+**Tokens (classic)**) with the **`repo`** scope (covers Issues: write on
+`Seretos/agent-project-issues`) and the **`project`** scope, so the follow-up
+board-add step can reuse this same token. Fine-grained PATs cannot be used
+here — they have no "Projects" permission at all, a hard GitHub platform
+limitation. `GITHUB_TOKEN` cannot open cross-repo issues. Creating/rotating
 this token is a human task that must be done once before the first release.
 
 **Human prerequisite — `WORKBOARD_TICKET_TOKEN`:**
 This must be a repository secret (Settings → Secrets → Actions) containing a
-fine-grained PAT with **Issues: write** permission on `Seretos/workboard`
-and, additionally, account-level **Projects: write** so the follow-up
-board-add step can reuse this same token. (A classic PAT works too: `repo`
-scope for the issue plus `project` scope for the board.) `GITHUB_TOKEN` cannot
-open cross-repo issues. Creating/rotating this token is a human task that must
-be done once before the first release.
+**classic PAT** with the **`repo`** scope (covers Issues: write on
+`Seretos/workboard`) and the **`project`** scope, so the follow-up board-add
+step can reuse this same token. Fine-grained PATs cannot be used here — they
+have no "Projects" permission at all. `GITHUB_TOKEN` cannot open cross-repo
+issues. Creating/rotating this token is a human task that must be done once
+before the first release.
 
-Without the account-level **Projects: write** permission on these tokens, the
-board-add step is silently skipped (`continue-on-error`) and the ticket still
-opens normally — it just won't appear on board `2`.
+Without the `project` scope on these tokens, the board-add step is silently
+skipped (`continue-on-error`) and the ticket still opens normally — it just
+won't appear on board `2`.
