@@ -308,6 +308,7 @@ def test_permissions_empty_defaults_all_false():
     assert perms.pulls.modify is False
     assert perms.pulls.merge is False
     assert perms.board.manage is False
+    assert perms.pipelines.trigger is False
 
 
 def test_permissions_board_nested_form_loads_correctly():
@@ -322,6 +323,26 @@ def test_permissions_board_rejects_unknown_key():
     from pydantic import ValidationError
     with pytest.raises(ValidationError):
         Permissions.model_validate({"board": {"bogus": True}})
+
+
+def test_permissions_pipelines_nested_form_loads_correctly():
+    """The nested form is the canonical (and only) shape (ticket #200)."""
+    perms = Permissions.model_validate({"pipelines": {"trigger": True}})
+    assert perms.pipelines.trigger is True
+    assert perms.model_dump()["pipelines"]["trigger"] is True
+
+
+def test_permissions_pipelines_rejects_unknown_key():
+    """`extra='forbid'` on PipelinesPermissions guards against typos."""
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        Permissions.model_validate({"pipelines": {"bogus": True}})
+
+
+def test_permissions_omitting_pipelines_still_loads_default():
+    """Omitting `pipelines` entirely stays valid and defaults to trigger=False."""
+    perms = Permissions.model_validate({"issues": {"create": True}})
+    assert perms.pipelines.trigger is False
 
 
 # ---------- ConfigDocument model directly -----------------------------------

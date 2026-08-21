@@ -45,6 +45,7 @@ from lib_python_projects.markers import (
     strip_leading_ai_marker,
 )
 from lib_python_projects.providers.base import (
+    apply_run_filters,
     BulkTicketResult,
     Comment,
     DiscoveredProject,
@@ -52,6 +53,7 @@ from lib_python_projects.providers.base import (
     FieldSpec,
     Label,
     normalize_timestamp,
+    now_utc,
     PipelineFailure,
     PipelineRun,
     PRFilters,
@@ -59,10 +61,14 @@ from lib_python_projects.providers.base import (
     ProviderError,
     PullRequest,
     RateLimitError,
+    Ref,
     Relation,
     RelationAlreadyExists,
     RelationKindUnsupported,
     RelationNotFound,
+    Release,
+    resolve_event_alias,
+    run_matches_ref,
     Review,
     ReviewComment,
     Status,
@@ -78,6 +84,7 @@ from lib_python_projects.providers.base import (
     _extract_parent_id,
     _validate_label_lists,
     _validate_limit,
+    _validate_since,
 )
 from lib_python_projects.providers._http_cache import make_cached_transport
 from lib_python_projects.providers import _idempotency
@@ -1681,12 +1688,20 @@ def _list_pipelines(
     token: str | None,
     extra_params: dict[str, Any],
     limit: int,
+    *,
+    event: str | None = None,
+    since: str | None = None,
 ) -> list[PipelineRun]:
     """Shared body for list_runs_for_branch/tag/commit.
 
     GitLab's `/projects/:id/pipelines` endpoint accepts `ref`, `sha`,
     `status`, `source`, etc. Callers pass the addressing param via
     `extra_params`; we add `per_page` and order.
+
+    `event` (ticket #200) is resolved to GitLab's `source` vocabulary and
+    pushed down as a query param; `since` is pushed down as
+    `updated_after`. Both are best-effort — the caller always re-applies
+    `apply_run_filters` afterwards as the authoritative final pass.
     """
     _validate_limit(limit)
     per_page = min(max(1, limit), 100)
@@ -1696,6 +1711,10 @@ def _list_pipelines(
         "sort": "desc",
         **extra_params,
     }
+    if event:
+        params["source"] = resolve_event_alias(event, "gitlab")
+    if since:
+        params["updated_after"] = _validate_since(since)
     with _client(project, token) as client:
         r = client.get(
             f"/projects/{_project_path(project)}/pipelines",
@@ -1770,6 +1789,17 @@ def _fetch_pipeline_failure(
             job_id=str(job_id or ""),
         ))
     return PipelineFailure(failing_jobs=failing, note=note)
+
+
+# ticket #200: polling seam for `wait_for_run` (and `trigger_pipeline`'s
+# internal delegation to it, on providers that need to poll). `_trigger_sleep`
+# is a mockable indirection so tests can replace the backoff with a no-op
+# and drive the retry loop deterministically without real wall-clock waits.
+_TRIGGER_POLL_BACKOFFS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
+
+
+def _trigger_sleep(seconds: float) -> None:
+    time.sleep(seconds)
 
 
 # ---------- provider ---------------------------------------------------------
@@ -3786,12 +3816,22 @@ class GitLabProvider(
         branch: str,
         status: str = "all",
         limit: int = 20,
+        *,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
         """List pipelines for `branch`.
 
         Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape:
         - ``([], [])`` — branch not found
         - ``(runs, [sha])`` — branch exists (runs may be empty)
+
+        `workflow`/`event`/`since` (ticket #200): `event` and `since` are
+        pushed down to the API (`source`/`updated_after`); `workflow` has
+        no GitLab-side equivalent (pipelines aren't named per-workflow)
+        and is matched client-side only. `apply_run_filters` always runs
+        as the final, authoritative pass — see its docstring.
         """
         _validate_limit(limit)
         path = _project_path(project)
@@ -3803,7 +3843,11 @@ class GitLabProvider(
         scope = _gitlab_pipeline_scope(status)
         if scope:
             params["scope"] = scope
-        runs = _list_pipelines(project, token, params, limit)
+        runs = _list_pipelines(project, token, params, limit, event=event, since=since)
+        runs = apply_run_filters(
+            runs, provider="gitlab", workflow=workflow, event=event,
+            since=since, limit=limit,
+        )
         return runs, [sha]
 
     def list_runs_for_commit(
@@ -3813,12 +3857,18 @@ class GitLabProvider(
         sha: str,
         status: str = "all",
         limit: int = 20,
+        *,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
         """List pipelines whose ``sha`` matches.
 
         Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape:
         - ``([], [])`` — commit not found
         - ``(runs, [sha])`` — commit exists (runs may be empty)
+
+        See `list_runs_for_branch` for `workflow`/`event`/`since` semantics.
         """
         _validate_limit(limit)
         path = _project_path(project)
@@ -3830,7 +3880,11 @@ class GitLabProvider(
         scope = _gitlab_pipeline_scope(status)
         if scope:
             params["scope"] = scope
-        runs = _list_pipelines(project, token, params, limit)
+        runs = _list_pipelines(project, token, params, limit, event=event, since=since)
+        runs = apply_run_filters(
+            runs, provider="gitlab", workflow=workflow, event=event,
+            since=since, limit=limit,
+        )
         return runs, [sha]
 
     def list_runs_for_tag(
@@ -3840,6 +3894,10 @@ class GitLabProvider(
         tag: str,
         status: str = "all",
         limit: int = 20,
+        *,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
         """GitLab does not distinguish branch/tag refs in the pipelines
         query — both go through the `ref` parameter. We pass through
@@ -3848,12 +3906,18 @@ class GitLabProvider(
 
         Returns `(runs, resolved_refs)` to match the GitHub signature
         (`resolved_refs` lists the single ref string we queried with).
+        See `list_runs_for_branch` for `workflow`/`event`/`since` semantics.
         """
         params: dict[str, Any] = {"ref": tag}
         scope = _gitlab_pipeline_scope(status)
         if scope:
             params["scope"] = scope
-        return _list_pipelines(project, token, params, limit), [tag]
+        runs = _list_pipelines(project, token, params, limit, event=event, since=since)
+        runs = apply_run_filters(
+            runs, provider="gitlab", workflow=workflow, event=event,
+            since=since, limit=limit,
+        )
+        return runs, [tag]
 
     def list_runs_for_ticket(
         self,
@@ -3862,11 +3926,15 @@ class GitLabProvider(
         ticket_id: str,
         status: str = "all",  # noqa: ARG002 — accepted for cross-provider symmetry
         limit: int = 20,
+        *,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
         """Issues do not trigger pipelines directly. Strategy:
         1. Fetch MRs linked to the issue (`.../issues/:iid/related_merge_requests`).
         2. For each MR, fetch its pipelines (`.../merge_requests/:iid/pipelines`).
-        3. Concatenate, sort by created_at desc, cap at `limit`.
+        3. Concatenate, sort by created_at desc, filter, cap at `limit`.
 
         Returns `(runs, resolved_refs)` — `resolved_refs` lists the
         MR iids (prefixed with `!`) we walked, mirroring the GitHub
@@ -3876,7 +3944,8 @@ class GitLabProvider(
         `status` is accepted for surface symmetry but not applied —
         the per-MR pipelines endpoint doesn't expose a usable scope
         filter for this aggregation path; client-side filtering would
-        be misleading here.
+        be misleading here. See `list_runs_for_branch` for
+        `workflow`/`event`/`since` semantics (ticket #200).
         """
         _validate_limit(limit)
         path = _project_path(project)
@@ -3904,7 +3973,11 @@ class GitLabProvider(
         collected.sort(
             key=lambda r: r.get("created_at", ""), reverse=True,
         )
-        runs = [_map_pipeline_run(it) for it in collected[:per_page]]
+        runs = apply_run_filters(
+            [_map_pipeline_run(it) for it in collected],
+            provider="gitlab", workflow=workflow, event=event,
+            since=since, limit=limit,
+        )
         return runs, resolved_refs
 
     def list_runs_recent(
@@ -3914,17 +3987,26 @@ class GitLabProvider(
         *,
         status: str = "all",
         limit: int = 20,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
         """List the most recent pipelines, unfiltered by ref.
 
         Returns ``(runs, [])`` — the empty ``resolved_refs`` signals that
-        no ref filter was applied.
+        no ref filter was applied. See `list_runs_for_branch` for
+        `workflow`/`event`/`since` semantics.
         """
         params: dict[str, Any] = {}
         scope = _gitlab_pipeline_scope(status)
         if scope:
             params["scope"] = scope
-        return _list_pipelines(project, token, params, limit), []
+        runs = _list_pipelines(project, token, params, limit, event=event, since=since)
+        runs = apply_run_filters(
+            runs, provider="gitlab", workflow=workflow, event=event,
+            since=since, limit=limit,
+        )
+        return runs, []
 
     def get_run(
         self,
@@ -3988,6 +4070,195 @@ class GitLabProvider(
             tr = client.get(f"/projects/{path}/jobs/{job_id}/trace")
             _check(tr)
             return tr.text
+
+    # ---------- pipeline trigger / ref / releases (ticket #200) ------------
+
+    def trigger_pipeline(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        workflow: str,
+        *,
+        ref: str = "main",
+        inputs: dict[str, str] | None = None,
+        wait: bool = True,
+        timeout: float = 60.0,
+    ) -> PipelineRun | None:
+        """Trigger a new pipeline on `ref` and return the resulting run.
+
+        GitLab has no per-workflow concept — a project runs a single
+        `.gitlab-ci.yml`. `workflow` is accepted (and validated as
+        non-empty) purely for cross-provider signature parity; it is
+        never sent to the API. `POST /projects/:id/pipeline` returns the
+        created pipeline object directly, so — unlike GitHub's
+        fire-and-forget dispatch — there is always an id to resolve:
+        `wait=False` returns the freshly mapped `PipelineRun` immediately;
+        `wait=True` (default) round-trips through `get_run` for a
+        consistent, fully populated result (matching what a follow-up
+        `get_run` call would return). A non-2xx response raises
+        `GitLabError` (via `_check`) rather than being swallowed.
+        """
+        if not workflow or not workflow.strip():
+            raise ValueError("workflow must not be empty")
+        if not ref or not ref.strip():
+            raise ValueError("ref must not be empty")
+        path = _project_path(project)
+        payload: dict[str, Any] = {"ref": ref}
+        if inputs:
+            payload["variables"] = [
+                {"key": k, "value": v} for k, v in inputs.items()
+            ]
+        with _client(project, token) as client:
+            r = client.post(f"/projects/{path}/pipeline", json=payload)
+            _check(r)
+            run = _map_pipeline_run(r.json())
+        if not wait:
+            return run
+        return self.get_run(project, token, run.id)
+
+    def wait_for_run(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        since: str,
+        workflow: str | None = None,
+        ref: str | None = None,
+        event: str | None = None,
+        timeout: float = 60.0,
+        poll_interval: float | None = None,
+    ) -> PipelineRun | None:
+        """Poll for the oldest run at/after `since` matching the filters.
+
+        Always polls `list_runs_recent` — which applies
+        `workflow`/`event`/`since` via `apply_run_filters` without
+        resolving `ref` as a branch — then, when `ref` is given, filters
+        the results client-side via `run_matches_ref`. `ref` is
+        deliberately NOT resolved through `list_runs_for_branch`/
+        `_resolve_gitlab_branch_sha`: GitLab pipeline creation accepts a
+        tag as `ref` too, and the branch-only resolution would return
+        `([], [])` for a tag, causing a spurious timeout even though the
+        run exists (ticket #200). Backs off per `_TRIGGER_POLL_BACKOFFS`
+        (overridable via a fixed `poll_interval`) until a match appears
+        or `timeout` elapses, in which case `None` is returned rather
+        than raising. `since` is required (keyword-only, no default) —
+        an unbounded wait would happily return a pre-existing run.
+        """
+        deadline = time.monotonic() + timeout
+        attempt = 0
+        while True:
+            runs, _ = self.list_runs_recent(
+                project, token, limit=50,
+                workflow=workflow, event=event, since=since,
+            )
+            if ref:
+                runs = [r for r in runs if run_matches_ref(r, ref)]
+            if runs:
+                return min(runs, key=lambda r: r.created_at)
+            if time.monotonic() >= deadline:
+                return None
+            backoff = (
+                poll_interval
+                if poll_interval is not None
+                else _TRIGGER_POLL_BACKOFFS[
+                    min(attempt, len(_TRIGGER_POLL_BACKOFFS) - 1)
+                ]
+            )
+            _trigger_sleep(backoff)
+            attempt += 1
+
+    def get_ref(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        ref: str,
+    ) -> Ref | None:
+        """Resolve `ref` (branch name, tag name, or commit sha) to a `Ref`.
+
+        Resolution order is branch -> tag -> commit, so a branch and a
+        tag sharing the same name resolve as the branch. `sha` is always
+        the peeled commit sha — GitLab's tag payload already carries the
+        dereferenced commit under `commit.id` (single hop, unlike
+        GitHub's annotated-tag double-hop). Returns `None` when `ref`
+        doesn't resolve as any of the three.
+        """
+        path = _project_path(project)
+        encoded = quote(ref, safe="")
+        with _client(project, token) as client:
+            br = client.get(f"/projects/{path}/repository/branches/{encoded}")
+            if br.status_code == 200:
+                commit = (br.json() or {}).get("commit") or {}
+                return Ref(
+                    name=ref, kind="branch", sha=commit.get("id") or "",
+                    url=commit.get("web_url") or "",
+                )
+            if br.status_code != 404:
+                _check(br)
+
+            tg = client.get(f"/projects/{path}/repository/tags/{encoded}")
+            if tg.status_code == 200:
+                raw = tg.json() or {}
+                commit = raw.get("commit") or {}
+                return Ref(
+                    name=ref, kind="tag", sha=commit.get("id") or "",
+                    url=commit.get("web_url") or "",
+                )
+            if tg.status_code != 404:
+                _check(tg)
+
+            cm = client.get(f"/projects/{path}/repository/commits/{encoded}")
+            if cm.status_code == 200:
+                raw = cm.json() or {}
+                return Ref(
+                    name=ref, kind="commit", sha=raw.get("id") or ref,
+                    url=raw.get("web_url") or "",
+                )
+            if cm.status_code != 404:
+                _check(cm)
+        return None
+
+    def list_releases(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        limit: int = 20,
+    ) -> list[Release]:
+        """List releases, most recent first.
+
+        `sha` comes from `commit.id`, already the dereferenced commit
+        (no separate peel step needed, unlike GitHub). `prerelease` is
+        always `False` — GitLab has no prerelease flag. `draft` reads
+        `draft`/`upcoming_release` where the API supplies either,
+        defaulting to `False`.
+        """
+        _validate_limit(limit)
+        per_page = min(max(1, limit), 100)
+        path = _project_path(project)
+        out: list[Release] = []
+        with _client(project, token) as client:
+            r = client.get(
+                f"/projects/{path}/releases", params={"per_page": per_page},
+            )
+            _check(r)
+            for raw in (r.json() or [])[:limit]:
+                commit = raw.get("commit") or {}
+                tag_name = raw.get("tag_name") or ""
+                draft = bool(raw.get("draft", raw.get("upcoming_release", False)))
+                out.append(Release(
+                    tag=tag_name,
+                    name=raw.get("name") or tag_name,
+                    sha=commit.get("id") or "",
+                    url=(raw.get("_links") or {}).get("self") or "",
+                    draft=draft,
+                    prerelease=False,
+                    created_at=normalize_timestamp(raw.get("created_at") or ""),
+                    published_at=normalize_timestamp(
+                        raw.get("released_at") or raw.get("created_at") or ""
+                    ),
+                    body=raw.get("description") or "",
+                ))
+        return out
 
     # ---------- label management ---------------------------------------------
 

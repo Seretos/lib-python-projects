@@ -602,3 +602,22 @@ class TestTokenAvailableField:
         d = p.model_dump()
         assert "token_available" in d
         assert d["token_available"] is False
+
+
+class TestPipelinesPermissions:
+    """`PipelinesPermissions` is new in ticket #200 — a `pipelines.trigger`
+    opt-in namespace, importable from the package root like its siblings.
+    """
+
+    def test_importable_from_package_root(self) -> None:
+        from lib_python_projects import PipelinesPermissions
+
+        perms = PipelinesPermissions()
+        assert perms.trigger is False
+
+    def test_permissions_default_includes_pipelines_namespace(self) -> None:
+        from lib_python_projects import Permissions, PipelinesPermissions
+
+        perms = Permissions()
+        assert isinstance(perms.pipelines, PipelinesPermissions)
+        assert perms.pipelines.trigger is False

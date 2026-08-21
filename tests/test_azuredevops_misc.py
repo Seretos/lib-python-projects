@@ -1357,6 +1357,61 @@ def test_list_runs_for_ticket_returns_tuple(
     assert resolved_refs == ["build/42"]
 
 
+def test_list_runs_for_ticket_limit_applied_after_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #200 fix-pass regression: a matching build outside the
+    naive first-`limit` slice of `build_ids` must still be found.
+
+    Three `build_ids` are walked (10, 11, 12) with `limit=2`. Only build
+    12 — the third, i.e. NOT in the naive `build_ids[:2]` slice — matches
+    `workflow="release"`; builds 10/11 are a different definition. If
+    `list_runs_for_ticket` truncated `build_ids` to `limit` BEFORE
+    fetching/filtering (the bug), build 12 would never be fetched and the
+    result would be falsely empty. The fix fetches/maps every build id
+    and lets `apply_run_filters` apply both the `workflow` filter and the
+    final `limit` slice.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/5" in path:
+            return _json({
+                "id": 5,
+                "relations": [
+                    {
+                        "rel": "ArtifactLink",
+                        "url": "vstfs:///Build/Build/10",
+                        "attributes": {"name": "Build"},
+                    },
+                    {
+                        "rel": "ArtifactLink",
+                        "url": "vstfs:///Build/Build/11",
+                        "attributes": {"name": "Build"},
+                    },
+                    {
+                        "rel": "ArtifactLink",
+                        "url": "vstfs:///Build/Build/12",
+                        "attributes": {"name": "Build"},
+                    },
+                ],
+            })
+        if path.endswith("/_apis/build/builds/10"):
+            return _json(_build_payload(10, definition={"name": "CI"}))
+        if path.endswith("/_apis/build/builds/11"):
+            return _json(_build_payload(11, definition={"name": "CI"}))
+        if path.endswith("/_apis/build/builds/12"):
+            return _json(_build_payload(12, definition={"name": "release"}))
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_for_ticket(
+        _project(), token="t", ticket_id="5", limit=2, workflow="release",
+    )
+    assert [r.id for r in runs] == ["12"]
+    assert resolved_refs == ["build/10", "build/11", "build/12"]
+
+
 def test_check_400_with_workitem_typekey_becomes_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2053,3 +2108,519 @@ def test_get_run_to_get_step_log_round_trip(
         _project(), token="t", run_id="101", job_id=resolved_job_id
     )
     assert result == full_log_text
+
+
+# ---------- ticket #200 -- run-listing filters (workflow/event/since) -------
+
+
+def test_list_runs_recent_pushes_reason_filter_and_min_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/builds"):
+            captured["params"] = dict(req.url.params)
+            return _json({"value": [
+                _build_payload(1, reason="manual", queueTime="2026-08-21T09:30:00Z"),
+            ]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = AzureDevOpsProvider().list_runs_recent(
+        _project(), token="t", event="manual", since="2026-08-21T09:00:00Z",
+    )
+    assert captured["params"]["reasonFilter"] == "manual"
+    assert captured["params"]["minTime"] == "2026-08-21T09:00:00Z"
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_recent_workflow_numeric_id_pushes_definitions_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/definitions"):
+            raise AssertionError("numeric workflow must not trigger a definitions lookup")
+        if req.url.path.endswith("/_apis/build/builds"):
+            captured["params"] = dict(req.url.params)
+            return _json({"value": [_build_payload(1, definition={"name": "CI"})]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = AzureDevOpsProvider().list_runs_recent(_project(), token="t", workflow="42")
+    assert captured["params"]["definitions"] == "42"
+    # Numeric workflow has no run.name equivalent — apply_run_filters
+    # must NOT re-reject the already-scoped result client-side.
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_recent_workflow_name_resolves_to_definition_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/definitions"):
+            assert req.url.params.get("name") == "Release"
+            return _json({"value": [{"id": 7, "name": "Release"}]})
+        if req.url.path.endswith("/_apis/build/builds"):
+            captured["params"] = dict(req.url.params)
+            return _json({"value": [_build_payload(1, definition={"name": "Release"})]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = AzureDevOpsProvider().list_runs_recent(
+        _project(), token="t", workflow="Release",
+    )
+    assert captured["params"]["definitions"] == "7"
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_recent_workflow_unresolved_name_falls_back_client_side(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/definitions"):
+            return _json({"value": []})  # no match
+        if req.url.path.endswith("/_apis/build/builds"):
+            assert "definitions" not in req.url.params
+            return _json({"value": [
+                _build_payload(1, definition={"name": "Release"}),
+                _build_payload(2, definition={"name": "CI"}),
+            ]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = AzureDevOpsProvider().list_runs_recent(
+        _project(), token="t", workflow="Release",
+    )
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_for_branch_accepts_filter_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in req.url.path:
+            return _json({"count": 1, "value": [{"name": "refs/heads/main"}]})
+        if req.url.path.endswith("/_apis/build/definitions"):
+            return _json({"value": [{"id": 7, "name": "Release"}]})
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": [
+                _build_payload(1, definition={"name": "Release"}),
+                _build_payload(2, definition={"name": "CI"}),
+            ]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, refs = AzureDevOpsProvider().list_runs_for_branch(
+        _project(), token="t", ref="main", workflow="Release",
+    )
+    assert refs == ["main"]
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_for_commit_limit_applied_after_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/definitions"):
+            return _json({"value": [{"id": 7, "name": "Release"}]})
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": [
+                _build_payload(1, sourceVersion="deadbeef", definition={"name": "CI"}),
+                _build_payload(2, sourceVersion="deadbeef", definition={"name": "Release"}),
+                _build_payload(3, sourceVersion="deadbeef", definition={"name": "Release"}),
+            ]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, refs = AzureDevOpsProvider().list_runs_for_commit(
+        _project(), token="t", sha="deadbeef", workflow="Release", limit=1,
+    )
+    assert refs == ["deadbeef"]
+    assert [r.id for r in runs] == ["2"]
+
+
+# ---------- ticket #200 -- trigger_pipeline / wait_for_run -------------------
+
+
+def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(azure_mod, "_trigger_sleep", lambda seconds: None)
+
+
+def test_trigger_pipeline_numeric_workflow_posts_and_round_trips_get_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    post_calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/_apis/build/builds"):
+            post_calls.append(req)
+            return _json(_build_payload(555, reason="manual"))
+        if path.endswith("/_apis/build/builds/555"):
+            return _json(_build_payload(555, reason="manual"))
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    run = AzureDevOpsProvider().trigger_pipeline(
+        _project(), token="t", workflow="42", ref="main",
+    )
+    assert len(post_calls) == 1
+    assert run is not None
+    assert run.id == "555"
+    body = json.loads(post_calls[0].content)
+    assert body["definition"]["id"] == 42
+    assert body["sourceBranch"] == "refs/heads/main"
+
+
+def test_trigger_pipeline_wait_false_returns_mapped_run_without_get_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return _json(_build_payload(555, reason="manual"))
+
+    _install_mock(monkeypatch, handler)
+    run = AzureDevOpsProvider().trigger_pipeline(
+        _project(), token="t", workflow="42", ref="main", wait=False,
+    )
+    assert run is not None
+    assert run.id == "555"
+    assert len(calls) == 1  # only the POST — no follow-up get_run
+
+
+def test_trigger_pipeline_non_2xx_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Bad Request"}, status_code=400)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError):
+        AzureDevOpsProvider().trigger_pipeline(_project(), token="t", workflow="42", ref="main")
+
+
+def test_trigger_pipeline_unresolvable_workflow_name_raises_404_before_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/definitions"):
+            return _json({"value": []})
+        raise AssertionError(f"no build POST expected: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError):
+        AzureDevOpsProvider().trigger_pipeline(
+            _project(), token="t", workflow="does-not-exist", ref="main",
+        )
+
+
+def test_trigger_pipeline_empty_workflow_raises_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for an empty workflow")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError):
+        AzureDevOpsProvider().trigger_pipeline(_project(), token="t", workflow="")
+
+
+def test_trigger_pipeline_empty_ref_raises_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for an empty ref")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError):
+        AzureDevOpsProvider().trigger_pipeline(_project(), token="t", workflow="42", ref="")
+
+
+def test_wait_for_run_standalone_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_sleep(monkeypatch)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in req.url.path:
+            return _json({"count": 1, "value": [{"name": "refs/heads/main"}]})
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": [_build_payload(1, queueTime="2026-08-21T10:05:00Z")]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    run = AzureDevOpsProvider().wait_for_run(
+        _project(), token="t", since="2026-08-21T10:00:00Z", ref="main",
+    )
+    assert run is not None
+    assert run.id == "1"
+
+
+def test_wait_for_run_two_post_since_runs_oldest_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_sleep(monkeypatch)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in req.url.path:
+            return _json({"count": 1, "value": [{"name": "refs/heads/main"}]})
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": [
+                _build_payload(1, queueTime="2026-08-21T10:00:05Z"),
+                _build_payload(2, queueTime="2026-08-21T10:00:01Z"),
+            ]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    run = AzureDevOpsProvider().wait_for_run(
+        _project(), token="t", since="2026-08-21T10:00:00Z", ref="main",
+    )
+    assert run is not None
+    assert run.id == "2"
+
+
+def test_wait_for_run_timeout_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_sleep(monkeypatch)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in req.url.path:
+            return _json({"count": 1, "value": [{"name": "refs/heads/main"}]})
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    run = AzureDevOpsProvider().wait_for_run(
+        _project(), token="t", since="2026-08-21T10:00:00Z", ref="main", timeout=0.05,
+    )
+    assert run is None
+
+
+def test_wait_for_run_without_since_raises_type_error() -> None:
+    with pytest.raises(TypeError):
+        AzureDevOpsProvider().wait_for_run(_project(), token="t", ref="main")
+
+
+# ---------- ticket #200 -- get_ref -------------------------------------------
+
+
+def _refs_response(entries: list[dict]) -> httpx.Response:
+    return _json({"count": len(entries), "value": entries})
+
+
+def test_get_ref_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        path = req.url.path
+        if "/_apis/git/repositories/repo-guid/refs" in path:
+            filt = req.url.params.get("filter")
+            if filt == "heads/main":
+                return _refs_response([{"name": "refs/heads/main", "objectId": "branchsha1"}])
+            return _refs_response([])
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ref = AzureDevOpsProvider().get_ref(_project(), token="t", ref="main")
+    assert ref is not None
+    assert ref.kind == "branch"
+    assert ref.sha == "branchsha1"
+
+
+def test_get_ref_annotated_tag_uses_peeled_object_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in path:
+            filt = req.url.params.get("filter")
+            if filt == "heads/v2.0.0":
+                return _refs_response([])
+            if filt == "tags/v2.0.0":
+                return _refs_response([{
+                    "name": "refs/tags/v2.0.0",
+                    "objectId": "tagobjsha1",
+                    "peeledObjectId": "commitsha2",
+                }])
+            return _refs_response([])
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ref = AzureDevOpsProvider().get_ref(_project(), token="t", ref="v2.0.0")
+    assert ref is not None
+    assert ref.kind == "tag"
+    # sha must be the *peeled commit* sha, not the tag object's own sha.
+    assert ref.sha == "commitsha2"
+
+
+def test_get_ref_lightweight_tag_uses_object_id_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in path:
+            filt = req.url.params.get("filter")
+            if filt == "heads/v1.0.0":
+                return _refs_response([])
+            if filt == "tags/v1.0.0":
+                return _refs_response([{
+                    "name": "refs/tags/v1.0.0", "objectId": "commitsha1",
+                }])
+            return _refs_response([])
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ref = AzureDevOpsProvider().get_ref(_project(), token="t", ref="v1.0.0")
+    assert ref is not None
+    assert ref.kind == "tag"
+    assert ref.sha == "commitsha1"
+
+
+def test_get_ref_commit_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    sha = "c" * 40
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in path:
+            return _refs_response([])
+        if f"/_apis/git/repositories/repo-guid/commits/{sha}" in path:
+            return _json({"commitId": sha})
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ref = AzureDevOpsProvider().get_ref(_project(), token="t", ref=sha)
+    assert ref is not None
+    assert ref.kind == "commit"
+    assert ref.sha == sha
+
+
+def test_get_ref_unknown_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in path:
+            return _refs_response([])
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    ref = AzureDevOpsProvider().get_ref(_project(), token="t", ref="does-not-exist")
+    assert ref is None
+
+
+def test_get_ref_branch_shadows_same_named_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in path:
+            filt = req.url.params.get("filter")
+            if filt == "heads/shared":
+                return _refs_response([{
+                    "name": "refs/heads/shared", "objectId": "branchsha-shared",
+                }])
+            raise AssertionError("tag lookup must not fire when the branch matched")
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    ref = AzureDevOpsProvider().get_ref(_project(), token="t", ref="shared")
+    assert ref is not None
+    assert ref.kind == "branch"
+    assert ref.sha == "branchsha-shared"
+
+
+# ---------- ticket #200 -- list_releases -------------------------------------
+
+
+def test_list_releases_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in path:
+            return _refs_response([])
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    releases = AzureDevOpsProvider().list_releases(_project(), token="t")
+    assert releases == []
+
+
+def test_list_releases_annotated_tag_maps_message_and_date_hard_false_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in path:
+            return _refs_response([{
+                "name": "refs/tags/v1.0.0",
+                "objectId": "tagobjsha1",
+                "peeledObjectId": "commitsha3",
+            }])
+        if "/_apis/git/repositories/repo-guid/annotatedtags/tagobjsha1" in path:
+            return _json({
+                "objectId": "tagobjsha1",
+                "name": "v1.0.0",
+                "message": "Release notes here",
+                "taggedBy": {"date": "2026-01-01T00:00:00Z"},
+                "url": "https://dev.azure.com/annotatedtags/tagobjsha1",
+            })
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    releases = AzureDevOpsProvider().list_releases(_project(), token="t")
+    assert len(releases) == 1
+    rel = releases[0]
+    assert rel.tag == "v1.0.0"
+    assert rel.sha == "commitsha3"
+    assert rel.body == "Release notes here"
+    assert rel.created_at == "2026-01-01T00:00:00Z"
+    assert rel.published_at == "2026-01-01T00:00:00Z"
+    # Not representable on Azure DevOps — always False.
+    assert rel.draft is False
+    assert rel.prerelease is False
+
+
+def test_list_releases_lightweight_tag_has_empty_body_and_hard_false_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in path:
+            return _refs_response([{
+                "name": "refs/tags/v0.9.0", "objectId": "commitsha4",
+            }])
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    releases = AzureDevOpsProvider().list_releases(_project(), token="t")
+    assert len(releases) == 1
+    rel = releases[0]
+    assert rel.tag == "v0.9.0"
+    assert rel.sha == "commitsha4"
+    assert rel.body == ""
+    assert rel.draft is False
+    assert rel.prerelease is False
