@@ -43,7 +43,10 @@ do those phases by hand on the main thread — let the skill drive them.
 
 - **Language:** Python, src-layout under `src/`, package `lib_python_projects`.
 - **Tests:** `python -m pytest`. Install dev deps with
-  `pip install -e ".[test]"`.
+  `pip install -e ".[test]"`. Every test has a 60s timeout
+  (`pytest-timeout`, thread-based so it also interrupts blocking socket
+  I/O on Windows) — a legitimately slow test should get its timeout raised
+  (e.g. `@pytest.mark.timeout(120)`), not have the timeout removed.
 - **Branch discipline:** All feature work happens on a feature branch in a
   git worktree, never on `main`. Assume the worktree and branch already
   exist and that you are inside them.
