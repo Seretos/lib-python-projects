@@ -883,6 +883,304 @@ class PipelineRun:
     failure: PipelineFailure | None = None
 
 
+# ---------- pipeline trigger / run filtering (ticket #200) ------------------
+
+
+def now_utc() -> str:
+    """Return the current UTC time as an ISO-8601 string, `Z`-suffixed.
+
+    Includes microsecond fraction (from `datetime.isoformat()`) — callers
+    that need second precision matching `PipelineRun.created_at` should
+    run the result through `normalize_timestamp` (e.g. GitHub's
+    `trigger_pipeline` captures `t0 = normalize_timestamp(now_utc())`
+    before dispatching, then polls for a run created at/after `t0`).
+    """
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# Canonical event vocabulary. Each key maps to the provider-native string
+# for GitHub's `event`, GitLab's `source`, and Azure DevOps's `reason`
+# fields respectively. `"manual"` and `"workflow_dispatch"` are aliases of
+# each other — both resolve to the same row.
+EVENT_ALIASES: dict[str, dict[str, str]] = {
+    "manual": {
+        "github": "workflow_dispatch",
+        "gitlab": "web",
+        "azuredevops": "manual",
+    },
+    "workflow_dispatch": {
+        "github": "workflow_dispatch",
+        "gitlab": "web",
+        "azuredevops": "manual",
+    },
+    "push": {
+        "github": "push",
+        "gitlab": "push",
+        "azuredevops": "individualCI",
+    },
+    "schedule": {
+        "github": "schedule",
+        "gitlab": "schedule",
+        "azuredevops": "schedule",
+    },
+    "pull_request": {
+        "github": "pull_request",
+        "gitlab": "merge_request_event",
+        "azuredevops": "pullRequest",
+    },
+    "api": {
+        "github": "repository_dispatch",
+        "gitlab": "trigger",
+        "azuredevops": "userCreated",
+    },
+}
+
+
+def resolve_event_alias(event: str | None, provider: str) -> str | None:
+    """Resolve a canonical event name to `provider`'s native vocabulary.
+
+    Lookup against `EVENT_ALIASES` is case-insensitive on the canonical
+    key. Any string not found in the table — including provider-native
+    strings such as `"individualCI"`, `"merge_request_event"`, or
+    `"workflow_run"` — passes through **verbatim** so callers can always
+    fall back to a provider-native value. `event=None` returns `None`
+    unchanged (the caller's short-circuit for "no event filter"). Pure
+    and side-effect-free — no HTTP involved.
+    """
+    if event is None:
+        return None
+    row = EVENT_ALIASES.get(event.lower())
+    if row is None:
+        return event
+    return row.get(provider, event)
+
+
+_WORKFLOW_FILE_EXTENSIONS = (".yml", ".yaml")
+
+
+def _normalize_workflow_name(name: str) -> str:
+    """Lower-case `name` and strip a trailing `.yml`/`.yaml` extension.
+
+    Used by `apply_run_filters` so a `workflow=` filter matches whether
+    the caller passed a bare workflow name (`"release"`) or a workflow
+    file name (`"release.yml"` / `"release.yaml"`).
+    """
+    n = (name or "").strip().lower()
+    for ext in _WORKFLOW_FILE_EXTENSIONS:
+        if n.endswith(ext):
+            return n[: -len(ext)]
+    return n
+
+
+_ISO_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:?\d{2})?$"
+)
+
+
+def _validate_since(since: str) -> str:
+    """Normalize `since` via `normalize_timestamp` and validate the result
+    looks like an ISO-8601 timestamp.
+
+    Raises `ProviderError` for anything `normalize_timestamp` leaves in a
+    shape that isn't a valid timestamp — an unparseable `since` must fail
+    loudly rather than silently filtering every run out.
+    """
+    normalized = normalize_timestamp(since)
+    if not _ISO_TIMESTAMP_RE.match(normalized):
+        raise ProviderError(
+            400, f"since={since!r} is not a valid ISO-8601 timestamp"
+        )
+    return normalized
+
+
+def apply_run_filters(
+    runs: list[PipelineRun],
+    *,
+    provider: str,
+    workflow: str | None = None,
+    event: str | None = None,
+    since: str | None = None,
+    limit: int | None = None,
+) -> list[PipelineRun]:
+    """Client-side filter pass over already-mapped `PipelineRun`s.
+
+    This is the single shared implementation every provider's five
+    run-listing methods (and `wait_for_run`) call as the *final*, always-
+    authoritative pass — regardless of whether the provider also pushed
+    `workflow`/`event`/`since` down as server-side query params. Running
+    it unconditionally means a provider-native string the server ignored
+    or rejected still produces a correct result.
+
+    - `workflow`: matches `run.name` case-insensitively via
+      `_normalize_workflow_name`, so a bare name (`"release"`) and a
+      workflow file name (`"release.yml"`/`"release.yaml"`) are
+      equivalent on both sides of the comparison.
+    - `event`: resolved through `resolve_event_alias(event, provider)`
+      first, then compared case-insensitively against `run.event`.
+    - `since`: validated/normalized via `_validate_since` (raises
+      `ProviderError` if unparseable), then compared with a lexicographic
+      `>=` against each run's (already `normalize_timestamp`-shaped)
+      `created_at` — valid because both sides are `Z`-suffixed UTC
+      strings of the same shape.
+    - `limit`: applied **last**, after every filter — `limit=1` means
+      "one matching run", not "one of the recent runs, maybe filtered
+      away". `None` means unlimited.
+
+    Any of `workflow`/`event`/`since`/`limit` left as `None` is a no-op
+    for that filter. An empty `runs` list returns `[]` unchanged.
+    """
+    result = list(runs)
+    if workflow:
+        wf_norm = _normalize_workflow_name(workflow)
+        result = [r for r in result if _normalize_workflow_name(r.name) == wf_norm]
+    if event:
+        native_event = resolve_event_alias(event, provider) or ""
+        result = [r for r in result if (r.event or "").lower() == native_event.lower()]
+    if since:
+        since_norm = _validate_since(since)
+        result = [
+            r for r in result if normalize_timestamp(r.created_at) >= since_norm
+        ]
+    if limit is not None:
+        result = result[:limit]
+    return result
+
+
+def resolve_fetch_page_size(
+    limit: int,
+    *,
+    workflow: str | None = None,
+    event: str | None = None,
+    since: str | None = None,
+    max_page: int,
+) -> int:
+    """Return the raw server-side page/`$top` size a run-listing call
+    should request (ticket #200 round-2 finding 1).
+
+    `apply_run_filters` always runs client-side as the final,
+    authoritative pass over whatever raw page the provider actually
+    returned (see its docstring) — most notably for a bare workflow
+    *display* name, which several providers cannot filter on server-side
+    at all. If that raw page were sized to the caller's `limit`, a
+    genuine match sitting beyond the first `limit` raw results would be
+    silently discarded before the client-side filter ever got a chance
+    to look at it — the server already truncated the candidate set.
+
+    When any of `workflow`/`event`/`since` is passed (non-empty/non-
+    None), this returns `max_page` — the provider's own maximum page
+    size — so the client-side pass sees as large a raw page as the API
+    allows before `apply_run_filters`'s own `limit=` truncates the
+    *filtered* result at the end. With no filters requested there is
+    nothing for `apply_run_filters` to discard, so the page is sized to
+    `limit` exactly (clamped to `max_page`) to avoid unnecessary over-
+    fetching.
+
+    Callers that already know a given filter was pushed down as a
+    server-side-authoritative, exactly-scoped query (e.g. GitHub's
+    `_client_side_workflow_filter` returning `None` for a numeric
+    workflow id or `.yml`/`.yaml` filename, because the request already
+    hit the precisely-scoped `/actions/workflows/{id}/runs` endpoint)
+    should pass `None` for that filter here, not the raw value — passing
+    the raw value would over-fetch for no correctness benefit.
+
+    **`max_page` is an intentional, hard ceiling — it is never exceeded,
+    even when `limit` is larger (ticket #200 round-3 finding 1).** When a
+    client-side-only filter is active, this returns `max_page` outright
+    — not `min(limit, max_page)` — so a caller that passes e.g.
+    `limit=500` against Azure DevOps's `max_page=200` still only fetches
+    (and therefore only lets `apply_run_filters` consider) the first 200
+    raw, server-ordered results. A genuine match sitting beyond position
+    `max_page` in the provider's own ordering can be missed in that
+    combination — `limit > max_page` *and* a client-side-only filter
+    active. This mirrors Azure DevOps's `list_runs_for_commit`, which has
+    always hard-coded an unconditional `$top=200` for the same reason
+    (accepted as correct in ticket #200 round 1) and is deliberately
+    **not** lifted here: raising the cap or paginating past it would
+    require verifying each provider's real server-side page-size ceiling
+    against its live API, which cannot be done from a description alone.
+    Treat `max_page` as each provider's already-established pagination
+    ceiling (Azure DevOps uses 200 elsewhere too, e.g. comments
+    pagination) rather than a value to tune per call.
+    """
+    _validate_limit(limit)
+    if workflow or event or since:
+        return max_page
+    return min(max(1, limit), max_page)
+
+
+def run_matches_ref(run: PipelineRun, ref: str) -> bool:
+    """Return whether `run.branch` matches `ref` (ticket #200).
+
+    `wait_for_run` needs to resolve a triggering `ref` that may be
+    either a branch or a **tag** — GitHub `workflow_dispatch` and
+    GitLab pipeline creation both accept tags as `ref`, but the
+    branch-only listing endpoints (`list_runs_for_branch` and its
+    `_resolve_*_branch_sha`/`_resolve_ado_branch` resolution) return
+    `([], [])` immediately for a tag, so polling them for a tag ref
+    spuriously times out. This comparison is used instead, against
+    the unfiltered `list_runs_recent` results, so it works for either
+    ref kind without needing to know which one `ref` is.
+
+    Compares case-sensitively after stripping a leading
+    `refs/heads/`/`refs/tags/` from both sides, since providers differ
+    in whether `PipelineRun.branch` already has that prefix stripped
+    (GitHub's `head_branch` and GitLab's `ref` never carry it; Azure
+    DevOps's `sourceBranch` only has `refs/heads/` stripped by
+    `_map_build_run`, leaving a tag's `refs/tags/` prefix in place).
+    """
+    def _norm(value: str) -> str:
+        return (value or "").removeprefix("refs/heads/").removeprefix("refs/tags/")
+
+    return _norm(run.branch) == _norm(ref)
+
+
+@dataclass
+class Ref:
+    """Result of `get_ref` — resolves an arbitrary ref string (branch name,
+    tag name, or commit sha) to its commit sha and reports which kind it
+    resolved as.
+
+    `sha` is always the peeled **commit** sha — for an annotated tag this
+    is the commit the tag object ultimately points to, never the tag
+    object's own sha. Resolution order is branch -> tag -> commit, so
+    when a branch and a tag share the same name, the branch wins. `None`
+    (not this type) is returned by `get_ref` itself when nothing resolves.
+    """
+
+    name: str
+    kind: Literal["branch", "tag", "commit"]
+    sha: str
+    url: str
+
+
+@dataclass
+class Release:
+    """A published release, normalized across providers (ticket #200).
+
+    `sha` is always the peeled commit sha, consistent with `Ref.sha`.
+    `created_at` / `published_at` are normalized via `normalize_timestamp`,
+    matching `PipelineRun`.
+
+    Azure DevOps has no native "release" concept distinct from an
+    annotated Git tag — its `list_releases` maps annotated tags into this
+    shape. `draft` and `prerelease` are always `False` on Azure DevOps:
+    **not representable on Azure DevOps**. GitLab has no prerelease flag
+    either, so `prerelease` is always `False` there too.
+    """
+
+    tag: str
+    name: str
+    sha: str
+    url: str
+    draft: bool
+    prerelease: bool
+    created_at: str
+    published_at: str
+    body: str
+
+
 # ---------- token capabilities (ticket #32) ---------------------------------
 
 

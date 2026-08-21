@@ -627,3 +627,379 @@ def test_get_run_to_get_step_log_round_trip(
         _project(), "t", run_id="100", job_id=resolved_job_id,
     )
     assert result == full_trace
+
+
+# ---------- ticket #200 -- run-listing filters (workflow/event/since) -------
+
+
+def test_list_runs_recent_pushes_source_and_updated_after(monkeypatch):
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["source"] = req.url.params.get("source")
+        seen["updated_after"] = req.url.params.get("updated_after")
+        return _json([_pipeline(1, source="web", created_at="2026-08-21T09:30:00Z")])
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = GitLabProvider().list_runs_recent(
+        _project(), "t", event="manual", since="2026-08-21T09:00:00Z",
+    )
+    assert seen["source"] == "web"
+    assert seen["updated_after"] == "2026-08-21T09:00:00Z"
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_recent_event_filters_client_side_too(monkeypatch):
+    """Even if the server ignored/ returned extras, `apply_run_filters`
+    is the authoritative final pass."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json([_pipeline(1, source="web"), _pipeline(2, source="push")])
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = GitLabProvider().list_runs_recent(_project(), "t", event="manual")
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_recent_workflow_has_no_server_equivalent_matches_synthetic_name(
+    monkeypatch,
+):
+    """GitLab pipelines aren't named per-workflow — `PipelineRun.name` is
+    the synthetic `pipeline-{id}`. `workflow=` only matches client-side
+    against that synthetic name."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json([_pipeline(1), _pipeline(2)])
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = GitLabProvider().list_runs_recent(_project(), "t", workflow="pipeline-1")
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_recent_workflow_filter_sees_full_raw_page_before_limit(monkeypatch):
+    """Round-2 finding 1: `workflow` has no server-side equivalent on
+    GitLab at all (see `test_list_runs_recent_workflow_has_no_server_
+    equivalent_matches_synthetic_name`), so the raw page fetched from
+    the API must not be sized to the caller's `limit` — otherwise a
+    genuine match positioned beyond the first `limit` raw results is
+    silently missed, because the server already truncated the page
+    before `apply_run_filters` ever saw it. Unlike most mocks in this
+    file, this one actually honors `per_page` (mirroring the real
+    GitLab API) — that's what let this bug through the existing tests
+    unnoticed.
+    """
+    all_pipelines = [_pipeline(1), _pipeline(2), _pipeline(3)]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        per_page = int(req.url.params.get("per_page", "30"))
+        return _json(all_pipelines[:per_page])
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = GitLabProvider().list_runs_recent(
+        _project(), "t", workflow="pipeline-2", limit=1,
+    )
+    assert [r.id for r in runs] == ["2"]
+
+
+def test_list_runs_for_branch_accepts_filter_kwargs(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/repository/branches/" in str(req.url):
+            return _json({"commit": {"id": "sha-main"}})
+        assert req.url.params.get("source") == "push"
+        return _json([_pipeline(1, source="push"), _pipeline(2, source="web")])
+
+    _install_mock(monkeypatch, handler)
+    runs, refs = GitLabProvider().list_runs_for_branch(
+        _project(), "t", "main", event="push",
+    )
+    assert refs == ["sha-main"]
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_for_commit_limit_applied_after_filtering(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/repository/commits/" in str(req.url):
+            return _json({"id": "deadbeef"})
+        return _json([
+            _pipeline(1, source="push"),
+            _pipeline(2, source="web"),
+            _pipeline(3, source="web"),
+        ])
+
+    _install_mock(monkeypatch, handler)
+    runs, refs = GitLabProvider().list_runs_for_commit(
+        _project(), "t", "deadbeef", event="manual", limit=1,
+    )
+    assert refs == ["deadbeef"]
+    assert [r.id for r in runs] == ["2"]
+
+
+# ---------- ticket #200 -- trigger_pipeline / wait_for_run -------------------
+
+
+def _no_sleep(monkeypatch):
+    monkeypatch.setattr(gitlab_mod, "_trigger_sleep", lambda seconds: None)
+
+
+def test_trigger_pipeline_maps_response_and_round_trips_through_get_run(
+    monkeypatch,
+):
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "POST" and url.endswith("/pipeline"):
+            return _json(_pipeline(42, source="web"))
+        if "/pipelines/42" in url:
+            return _json(_pipeline(42, source="web"))
+        raise AssertionError(f"unexpected request: {url}")
+
+    _install_mock(monkeypatch, handler)
+    run = GitLabProvider().trigger_pipeline(
+        _project(), "t", "release", ref="main",
+    )
+    assert run is not None
+    assert run.id == "42"
+
+
+def test_trigger_pipeline_wait_false_returns_mapped_run_without_get_run(
+    monkeypatch,
+):
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return _json(_pipeline(42, source="web"))
+
+    _install_mock(monkeypatch, handler)
+    run = GitLabProvider().trigger_pipeline(
+        _project(), "t", "release", ref="main", wait=False,
+    )
+    assert run is not None
+    assert run.id == "42"
+    assert len(calls) == 1  # only the POST — no follow-up get_run
+
+
+def test_trigger_pipeline_non_2xx_raises(monkeypatch):
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Bad Request"}, status_code=400)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError):
+        GitLabProvider().trigger_pipeline(_project(), "t", "release", ref="main")
+
+
+def test_trigger_pipeline_empty_workflow_raises_before_http(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for an empty workflow")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError):
+        GitLabProvider().trigger_pipeline(_project(), "t", "")
+
+
+def test_trigger_pipeline_empty_ref_raises_before_http(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for an empty ref")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError):
+        GitLabProvider().trigger_pipeline(_project(), "t", "release", ref="")
+
+
+def test_wait_for_run_with_tag_ref_resolves_run(monkeypatch):
+    """Reviewer fix pass (ticket #200): GitLab pipeline creation accepts
+    a TAG as `ref`, not just a branch — `wait_for_run` must resolve the
+    resulting run without assuming `ref` is a branch (it must not hit
+    the branches endpoint at all, since a tag would 404 there and the
+    old code polled `list_runs_for_branch`, which returns `([], [])`
+    for a non-branch ref and spuriously times out)."""
+    _no_sleep(monkeypatch)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/repository/branches/" in url:
+            raise AssertionError(
+                "wait_for_run must not resolve ref as a branch — v1.2.3 is a tag"
+            )
+        return _json([_pipeline(1, ref="v1.2.3", created_at="2026-08-21T10:05:00Z")])
+
+    _install_mock(monkeypatch, handler)
+    run = GitLabProvider().wait_for_run(
+        _project(), "t", since="2026-08-21T10:00:00Z", ref="v1.2.3",
+    )
+    assert run is not None
+    assert run.id == "1"
+    assert run.branch == "v1.2.3"
+
+
+def test_wait_for_run_standalone_call(monkeypatch):
+    _no_sleep(monkeypatch)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/repository/branches/" in str(req.url):
+            return _json({"commit": {"id": "sha-main"}})
+        return _json([_pipeline(1, created_at="2026-08-21T10:05:00Z")])
+
+    _install_mock(monkeypatch, handler)
+    run = GitLabProvider().wait_for_run(
+        _project(), "t", since="2026-08-21T10:00:00Z", ref="main",
+    )
+    assert run is not None
+    assert run.id == "1"
+
+
+def test_wait_for_run_two_post_since_runs_oldest_wins(monkeypatch):
+    _no_sleep(monkeypatch)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/repository/branches/" in str(req.url):
+            return _json({"commit": {"id": "sha-main"}})
+        return _json([
+            _pipeline(1, created_at="2026-08-21T10:00:05Z"),
+            _pipeline(2, created_at="2026-08-21T10:00:01Z"),
+        ])
+
+    _install_mock(monkeypatch, handler)
+    run = GitLabProvider().wait_for_run(
+        _project(), "t", since="2026-08-21T10:00:00Z", ref="main",
+    )
+    assert run is not None
+    assert run.id == "2"
+
+
+def test_wait_for_run_timeout_returns_none(monkeypatch):
+    _no_sleep(monkeypatch)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/repository/branches/" in str(req.url):
+            return _json({"commit": {"id": "sha-main"}})
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    run = GitLabProvider().wait_for_run(
+        _project(), "t", since="2026-08-21T10:00:00Z", ref="main", timeout=0.05,
+    )
+    assert run is None
+
+
+def test_wait_for_run_without_since_raises_type_error():
+    with pytest.raises(TypeError):
+        GitLabProvider().wait_for_run(_project(), "t", ref="main")
+
+
+# ---------- ticket #200 -- get_ref -------------------------------------------
+
+
+def test_get_ref_branch(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert "/repository/branches/main" in str(req.url)
+        return _json({"commit": {"id": "branchsha1", "web_url": "u"}})
+
+    _install_mock(monkeypatch, handler)
+    ref = GitLabProvider().get_ref(_project(), "t", "main")
+    assert ref is not None
+    assert ref.kind == "branch"
+    assert ref.sha == "branchsha1"
+
+
+def test_get_ref_tag_single_hop_already_peeled(monkeypatch):
+    """GitLab's tag payload already carries the dereferenced commit —
+    no separate peel step is needed (unlike GitHub's annotated tags)."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/repository/branches/" in url:
+            return _json({"message": "404 Branch Not Found"}, status_code=404)
+        if "/repository/tags/" in url:
+            return _json({
+                "name": "v1.0.0",
+                "target": "tagobjsha1",
+                "commit": {"id": "commitsha1", "web_url": "u"},
+            })
+        raise AssertionError(f"unexpected request: {url}")
+
+    _install_mock(monkeypatch, handler)
+    ref = GitLabProvider().get_ref(_project(), "t", "v1.0.0")
+    assert ref is not None
+    assert ref.kind == "tag"
+    assert ref.sha == "commitsha1"
+
+
+def test_get_ref_commit_sha(monkeypatch):
+    sha = "c" * 40
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/repository/branches/" in url:
+            return _json({"message": "404"}, status_code=404)
+        if "/repository/tags/" in url:
+            return _json({"message": "404"}, status_code=404)
+        if "/repository/commits/" in url:
+            return _json({"id": sha})
+        raise AssertionError(f"unexpected request: {url}")
+
+    _install_mock(monkeypatch, handler)
+    ref = GitLabProvider().get_ref(_project(), "t", sha)
+    assert ref is not None
+    assert ref.kind == "commit"
+    assert ref.sha == sha
+
+
+def test_get_ref_unknown_returns_none(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "404"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    ref = GitLabProvider().get_ref(_project(), "t", "does-not-exist")
+    assert ref is None
+
+
+def test_get_ref_branch_shadows_same_named_tag(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/repository/branches/" in url:
+            return _json({"commit": {"id": "branchsha-shared", "web_url": "u"}})
+        raise AssertionError(f"tag lookup must not fire: {url}")
+
+    _install_mock(monkeypatch, handler)
+    ref = GitLabProvider().get_ref(_project(), "t", "shared")
+    assert ref is not None
+    assert ref.kind == "branch"
+    assert ref.sha == "branchsha-shared"
+
+
+# ---------- ticket #200 -- list_releases -------------------------------------
+
+
+def test_list_releases_empty(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert "/releases" in str(req.url)
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    releases = GitLabProvider().list_releases(_project(), "t")
+    assert releases == []
+
+
+def test_list_releases_maps_description_to_body(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json([{
+            "tag_name": "v1.0.0",
+            "name": "Version 1.0.0",
+            "description": "Release notes here",
+            "created_at": "2026-01-01T00:00:00Z",
+            "released_at": "2026-01-02T00:00:00Z",
+            "commit": {"id": "commitsha3"},
+            "_links": {"self": "https://gitlab.com/acme/backend/-/releases/v1.0.0"},
+        }])
+
+    _install_mock(monkeypatch, handler)
+    releases = GitLabProvider().list_releases(_project(), "t")
+    assert len(releases) == 1
+    rel = releases[0]
+    assert rel.tag == "v1.0.0"
+    assert rel.name == "Version 1.0.0"
+    assert rel.sha == "commitsha3"
+    assert rel.body == "Release notes here"
+    assert rel.prerelease is False
+    assert rel.draft is False
+    assert rel.created_at == "2026-01-01T00:00:00Z"
+    assert rel.published_at == "2026-01-02T00:00:00Z"

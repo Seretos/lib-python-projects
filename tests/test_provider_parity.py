@@ -1974,3 +1974,134 @@ def test_failing_job_dataclass_exposes_job_id():
         "populate it so callers can fetch a job's full log via "
         "Provider.get_step_log (ticket #168)."
     )
+
+
+# ---------- ticket #200: pipeline trigger / run filtering / ref / releases --
+
+
+_ALL_PROVIDER_CLASSES = None
+
+
+def _provider_classes():
+    global _ALL_PROVIDER_CLASSES
+    if _ALL_PROVIDER_CLASSES is None:
+        from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+        from lib_python_projects.providers.github import GitHubProvider
+        from lib_python_projects.providers.gitlab import GitLabProvider
+        _ALL_PROVIDER_CLASSES = (GitHubProvider, GitLabProvider, AzureDevOpsProvider)
+    return _ALL_PROVIDER_CLASSES
+
+
+def test_all_providers_expose_trigger_pipeline():
+    """All three providers must expose trigger_pipeline as a callable
+    with the shared signature: (project, token, workflow, *, ref="main",
+    inputs=None, wait=True, timeout=60.0). Static structural assertion."""
+    import inspect
+
+    for provider_cls in _provider_classes():
+        assert callable(getattr(provider_cls, "trigger_pipeline", None)), (
+            f"{provider_cls.__name__} is missing callable 'trigger_pipeline'"
+        )
+        sig = inspect.signature(provider_cls.trigger_pipeline)
+        for name in ("ref", "inputs", "wait", "timeout"):
+            assert name in sig.parameters, (
+                f"{provider_cls.__name__}.trigger_pipeline is missing {name!r}"
+            )
+            assert sig.parameters[name].kind == inspect.Parameter.KEYWORD_ONLY, (
+                f"{provider_cls.__name__}.trigger_pipeline.{name} must be keyword-only"
+            )
+        assert sig.parameters["ref"].default == "main"
+        assert sig.parameters["inputs"].default is None
+        assert sig.parameters["wait"].default is True
+        assert sig.parameters["timeout"].default == 60.0
+
+
+def test_all_providers_expose_wait_for_run():
+    """All three providers must expose wait_for_run as a callable with a
+    required keyword-only `since` (no default — an unbounded wait would
+    happily return a pre-existing run) plus the shared optional filter
+    kwargs. Static structural assertion."""
+    import inspect
+
+    for provider_cls in _provider_classes():
+        assert callable(getattr(provider_cls, "wait_for_run", None)), (
+            f"{provider_cls.__name__} is missing callable 'wait_for_run'"
+        )
+        sig = inspect.signature(provider_cls.wait_for_run)
+        assert "since" in sig.parameters
+        since_param = sig.parameters["since"]
+        assert since_param.kind == inspect.Parameter.KEYWORD_ONLY
+        assert since_param.default is inspect.Parameter.empty, (
+            f"{provider_cls.__name__}.wait_for_run.since must have no default"
+        )
+        for name in ("workflow", "ref", "event", "timeout", "poll_interval"):
+            assert name in sig.parameters, (
+                f"{provider_cls.__name__}.wait_for_run is missing {name!r}"
+            )
+            assert sig.parameters[name].kind == inspect.Parameter.KEYWORD_ONLY
+
+
+def test_all_providers_expose_get_ref():
+    """All three providers must expose get_ref as a callable. Static
+    structural assertion."""
+    for provider_cls in _provider_classes():
+        assert callable(getattr(provider_cls, "get_ref", None)), (
+            f"{provider_cls.__name__} is missing callable 'get_ref'"
+        )
+
+
+def test_all_providers_expose_list_releases():
+    """All three providers must expose list_releases as a callable.
+    Static structural assertion."""
+    for provider_cls in _provider_classes():
+        assert callable(getattr(provider_cls, "list_releases", None)), (
+            f"{provider_cls.__name__} is missing callable 'list_releases'"
+        )
+
+
+def test_all_run_listing_methods_accept_filter_kwargs():
+    """All 5 run-listing methods, on all 3 providers, must accept
+    `workflow`/`event`/`since` as keyword-only params defaulting to
+    `None` (ticket #200) — 5x3=15 signatures in total."""
+    import inspect
+
+    method_names = (
+        "list_runs_for_branch",
+        "list_runs_for_commit",
+        "list_runs_for_tag",
+        "list_runs_for_ticket",
+        "list_runs_recent",
+    )
+    for provider_cls in _provider_classes():
+        for method_name in method_names:
+            sig = inspect.signature(getattr(provider_cls, method_name))
+            for kwarg in ("workflow", "event", "since"):
+                assert kwarg in sig.parameters, (
+                    f"{provider_cls.__name__}.{method_name} is missing {kwarg!r}"
+                )
+                param = sig.parameters[kwarg]
+                assert param.kind == inspect.Parameter.KEYWORD_ONLY, (
+                    f"{provider_cls.__name__}.{method_name}.{kwarg} must be keyword-only"
+                )
+                assert param.default is None, (
+                    f"{provider_cls.__name__}.{method_name}.{kwarg} must default to None"
+                )
+
+
+def test_ref_dataclass_importable_from_base():
+    from lib_python_projects.providers.base import Ref
+    import dataclasses
+
+    field_names = {f.name for f in dataclasses.fields(Ref)}
+    assert field_names == {"name", "kind", "sha", "url"}
+
+
+def test_release_dataclass_importable_from_base():
+    from lib_python_projects.providers.base import Release
+    import dataclasses
+
+    field_names = {f.name for f in dataclasses.fields(Release)}
+    assert field_names == {
+        "tag", "name", "sha", "url", "draft", "prerelease",
+        "created_at", "published_at", "body",
+    }
