@@ -616,3 +616,284 @@ class TestPullRequestReviewsField:
         )
         pr = _make_pr(reviews=[rv])
         assert pr.reviews == [rv]
+
+
+# ---------- ticket #200 - event aliases / run filters / Ref / Release -------
+
+
+def _make_run(**kwargs):
+    from lib_python_projects.providers.base import PipelineRun
+
+    defaults = dict(
+        id="1",
+        name="CI",
+        branch="main",
+        head_sha="a" * 40,
+        event="push",
+        status="completed",
+        conclusion="success",
+        url="https://example.invalid/runs/1",
+        created_at="2026-08-21T10:00:00Z",
+        updated_at="2026-08-21T10:00:00Z",
+        run_attempt=1,
+    )
+    defaults.update(kwargs)
+    return PipelineRun(**defaults)
+
+
+class TestResolveEventAlias:
+    """resolve_event_alias (ticket #200) - pure, provider-keyed lookup
+    over the canonical D1 event vocabulary table."""
+
+    _TABLE = [
+        ("manual", "github", "workflow_dispatch"),
+        ("manual", "gitlab", "web"),
+        ("manual", "azuredevops", "manual"),
+        ("workflow_dispatch", "github", "workflow_dispatch"),
+        ("workflow_dispatch", "gitlab", "web"),
+        ("workflow_dispatch", "azuredevops", "manual"),
+        ("push", "github", "push"),
+        ("push", "gitlab", "push"),
+        ("push", "azuredevops", "individualCI"),
+        ("schedule", "github", "schedule"),
+        ("schedule", "gitlab", "schedule"),
+        ("schedule", "azuredevops", "schedule"),
+        ("pull_request", "github", "pull_request"),
+        ("pull_request", "gitlab", "merge_request_event"),
+        ("pull_request", "azuredevops", "pullRequest"),
+        ("api", "github", "repository_dispatch"),
+        ("api", "gitlab", "trigger"),
+        ("api", "azuredevops", "userCreated"),
+    ]
+
+    @pytest.mark.parametrize("canonical,provider,native", _TABLE)
+    def test_full_d1_table(self, canonical, provider, native):
+        from lib_python_projects.providers.base import resolve_event_alias
+
+        assert resolve_event_alias(canonical, provider) == native
+
+    @pytest.mark.parametrize("canonical,provider,native", _TABLE)
+    def test_case_insensitive_lookup(self, canonical, provider, native):
+        from lib_python_projects.providers.base import resolve_event_alias
+
+        assert resolve_event_alias(canonical.upper(), provider) == native
+
+    @pytest.mark.parametrize("provider", ["github", "gitlab", "azuredevops"])
+    def test_unmapped_string_passes_through_verbatim(self, provider):
+        from lib_python_projects.providers.base import resolve_event_alias
+
+        assert resolve_event_alias("workflow_run", provider) == "workflow_run"
+        assert resolve_event_alias("individualCI", provider) == "individualCI"
+        assert (
+            resolve_event_alias("merge_request_event", provider)
+            == "merge_request_event"
+        )
+
+    def test_event_none_short_circuits(self):
+        from lib_python_projects.providers.base import resolve_event_alias
+
+        assert resolve_event_alias(None, "github") is None
+
+
+class TestApplyRunFilters:
+    """apply_run_filters (ticket #200) - the shared client-side filter
+    pass all three providers' listing methods delegate to."""
+
+    def test_none_filters_are_a_no_op(self):
+        from lib_python_projects.providers.base import apply_run_filters
+
+        runs = [_make_run(id="1"), _make_run(id="2")]
+        assert apply_run_filters(runs, provider="github") == runs
+
+    def test_empty_list_returns_empty_list(self):
+        from lib_python_projects.providers.base import apply_run_filters
+
+        assert apply_run_filters([], provider="github", workflow="ci") == []
+
+    def test_all_filtered_out_returns_empty_list(self):
+        from lib_python_projects.providers.base import apply_run_filters
+
+        runs = [_make_run(name="CI")]
+        assert (
+            apply_run_filters(runs, provider="github", workflow="release") == []
+        )
+
+    def test_workflow_matches_case_insensitively(self):
+        from lib_python_projects.providers.base import apply_run_filters
+
+        runs = [_make_run(id="1", name="Release"), _make_run(id="2", name="CI")]
+        result = apply_run_filters(runs, provider="github", workflow="release")
+        assert [r.id for r in result] == ["1"]
+
+    @pytest.mark.parametrize("workflow_arg", ["release.yml", "release.yaml", "release"])
+    def test_workflow_filename_equivalence(self, workflow_arg):
+        from lib_python_projects.providers.base import apply_run_filters
+
+        runs = [_make_run(id="1", name="release"), _make_run(id="2", name="CI")]
+        result = apply_run_filters(runs, provider="github", workflow=workflow_arg)
+        assert [r.id for r in result] == ["1"]
+
+    def test_event_filter_resolves_alias_then_matches(self):
+        from lib_python_projects.providers.base import apply_run_filters
+
+        runs = [
+            _make_run(id="1", event="workflow_dispatch"),
+            _make_run(id="2", event="push"),
+        ]
+        result = apply_run_filters(runs, provider="github", event="manual")
+        assert [r.id for r in result] == ["1"]
+
+    def test_event_filter_provider_native_string_still_works(self):
+        from lib_python_projects.providers.base import apply_run_filters
+
+        runs = [
+            _make_run(id="1", event="individualCI"),
+            _make_run(id="2", event="push"),
+        ]
+        result = apply_run_filters(runs, provider="azuredevops", event="individualCI")
+        assert [r.id for r in result] == ["1"]
+
+    def test_since_filters_out_older_runs(self):
+        from lib_python_projects.providers.base import apply_run_filters
+
+        runs = [
+            _make_run(id="old", created_at="2026-08-21T09:00:00Z"),
+            _make_run(id="new", created_at="2026-08-21T11:00:00Z"),
+        ]
+        result = apply_run_filters(runs, provider="github", since="2026-08-21T10:00:00Z")
+        assert [r.id for r in result] == ["new"]
+
+    def test_since_boundary_is_inclusive(self):
+        from lib_python_projects.providers.base import apply_run_filters
+
+        runs = [_make_run(id="exact", created_at="2026-08-21T10:00:00Z")]
+        result = apply_run_filters(runs, provider="github", since="2026-08-21T10:00:00Z")
+        assert [r.id for r in result] == ["exact"]
+
+    def test_unparseable_since_raises_provider_error(self):
+        from lib_python_projects.providers.base import ProviderError, apply_run_filters
+
+        with pytest.raises(ProviderError):
+            apply_run_filters([_make_run()], provider="github", since="not-a-timestamp")
+
+    def test_limit_applied_after_filtering(self):
+        """limit=1 means "one matching run", not "one of the recent runs,
+        maybe filtered away" - the filter must run before the limit slice."""
+        from lib_python_projects.providers.base import apply_run_filters
+
+        runs = [
+            _make_run(id="1", name="CI"),
+            _make_run(id="2", name="Release"),
+            _make_run(id="3", name="Release"),
+        ]
+        result = apply_run_filters(runs, provider="github", workflow="release", limit=1)
+        assert [r.id for r in result] == ["2"]
+
+    def test_limit_none_is_unbounded(self):
+        from lib_python_projects.providers.base import apply_run_filters
+
+        runs = [_make_run(id="1"), _make_run(id="2")]
+        assert len(apply_run_filters(runs, provider="github", limit=None)) == 2
+
+
+class TestRunMatchesRef:
+    """run_matches_ref (ticket #200 round-2 finding 3) — the direct unit
+    test this helper previously had none of. The two existing indirect
+    exercises (GitHub's and GitLab's `wait_for_run` tag tests) compare a
+    bare tag string against itself on both sides, so they never actually
+    exercised the `refs/heads/`/`refs/tags/` prefix-stripping logic —
+    these cases do.
+    """
+
+    def test_bare_branch_matches_refs_heads_prefixed(self):
+        from lib_python_projects.providers.base import run_matches_ref
+
+        run = _make_run(branch="main")
+        assert run_matches_ref(run, "refs/heads/main") is True
+
+    def test_bare_tag_matches_refs_tags_prefixed(self):
+        from lib_python_projects.providers.base import run_matches_ref
+
+        run = _make_run(branch="v1.2.3")
+        assert run_matches_ref(run, "refs/tags/v1.2.3") is True
+
+    def test_refs_tags_prefixed_run_matches_bare_tag(self):
+        """Azure DevOps's `sourceBranch` keeps a tag's `refs/tags/`
+        prefix in place (only `refs/heads/` is stripped by
+        `_map_build_run`) — the reverse direction of the previous case."""
+        from lib_python_projects.providers.base import run_matches_ref
+
+        run = _make_run(branch="refs/tags/v1.2.3")
+        assert run_matches_ref(run, "v1.2.3") is True
+
+    def test_genuine_mismatch_returns_false(self):
+        from lib_python_projects.providers.base import run_matches_ref
+
+        run = _make_run(branch="main")
+        assert run_matches_ref(run, "refs/heads/develop") is False
+
+
+class TestNowUtc:
+    def test_returns_z_suffixed_string(self):
+        from lib_python_projects.providers.base import now_utc
+
+        assert now_utc().endswith("Z")
+
+    def test_normalize_timestamp_of_now_utc_is_second_precision(self):
+        from lib_python_projects.providers.base import normalize_timestamp, now_utc
+
+        normalized = normalize_timestamp(now_utc())
+        assert normalized.endswith("Z")
+        assert "." not in normalized
+
+
+class TestRefDataclass:
+    def test_is_dataclass(self):
+        from lib_python_projects.providers.base import Ref
+
+        assert dataclasses.is_dataclass(Ref)
+
+    def test_field_set(self):
+        from lib_python_projects.providers.base import Ref
+
+        field_names = {f.name for f in dataclasses.fields(Ref)}
+        assert field_names == {"name", "kind", "sha", "url"}
+
+    def test_round_trip(self):
+        from lib_python_projects.providers.base import Ref
+
+        ref = Ref(name="main", kind="branch", sha="a" * 40, url="https://example.invalid")
+        assert ref.name == "main"
+        assert ref.kind == "branch"
+        assert ref.sha == "a" * 40
+        assert ref.url == "https://example.invalid"
+
+
+class TestReleaseDataclass:
+    def test_is_dataclass(self):
+        from lib_python_projects.providers.base import Release
+
+        assert dataclasses.is_dataclass(Release)
+
+    def test_field_set(self):
+        from lib_python_projects.providers.base import Release
+
+        field_names = {f.name for f in dataclasses.fields(Release)}
+        assert field_names == {
+            "tag", "name", "sha", "url", "draft", "prerelease",
+            "created_at", "published_at", "body",
+        }
+
+    def test_round_trip(self):
+        from lib_python_projects.providers.base import Release
+
+        rel = Release(
+            tag="v1.0.0", name="v1.0.0", sha="a" * 40,
+            url="https://example.invalid/releases/v1.0.0",
+            draft=False, prerelease=False,
+            created_at="2026-08-21T10:00:00Z",
+            published_at="2026-08-21T10:00:00Z",
+            body="Release notes",
+        )
+        assert rel.tag == "v1.0.0"
+        assert rel.body == "Release notes"

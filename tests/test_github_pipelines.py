@@ -15,7 +15,7 @@ import pytest
 
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import github as github_provider
-from lib_python_projects.providers.github import GitHubProvider
+from lib_python_projects.providers.github import GitHubError, GitHubProvider
 
 
 # ---------- helpers ----------------------------------------------------------
@@ -1210,3 +1210,523 @@ def test_get_run_to_get_step_log_round_trip(monkeypatch: pytest.MonkeyPatch) -> 
     )
     assert result == full_log_text
     assert requested_urls[-1] == f"/repos/acme/backend/actions/jobs/{job_id}/logs"
+
+
+# ---------- ticket #200 -- run-listing filters (workflow/event/since) -------
+
+
+def _run(run_id, name="CI", event="push", created_at="2026-08-21T10:00:00Z", head_sha="a" * 40):
+    return {
+        "id": run_id,
+        "name": name,
+        "head_sha": head_sha,
+        "head_branch": "main",
+        "event": event,
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": f"https://github.com/acme/backend/actions/runs/{run_id}",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "run_attempt": 1,
+        "display_title": name,
+    }
+
+
+def test_list_runs_recent_filters_by_workflow_client_side(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/actions/runs"
+        return _json({"workflow_runs": [
+            _run(1, name="release"),
+            _run(2, name="CI"),
+        ]})
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = GitHubProvider().list_runs_recent(_project(), token="t", workflow="release")
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_recent_pushes_event_and_since_as_query_params(monkeypatch):
+    seen: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["event"] = req.url.params.get("event")
+        seen["created"] = req.url.params.get("created")
+        return _json({"workflow_runs": [_run(1, event="workflow_dispatch")]})
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = GitHubProvider().list_runs_recent(
+        _project(), token="t", event="manual", since="2026-08-21T09:00:00Z",
+    )
+    assert seen["event"] == "workflow_dispatch"
+    assert seen["created"] == ">=2026-08-21T09:00:00Z"
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_recent_workflow_numeric_id_swaps_path(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/actions/workflows/123/runs"
+        return _json({"workflow_runs": [_run(1, name="release")]})
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = GitHubProvider().list_runs_recent(_project(), token="t", workflow="123")
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_recent_workflow_filename_swaps_path(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/actions/workflows/release.yml/runs"
+        return _json({"workflow_runs": [_run(1, name="release")]})
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = GitHubProvider().list_runs_recent(_project(), token="t", workflow="release.yml")
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_recent_workflow_bare_name_does_not_swap_path(monkeypatch):
+    """A bare workflow name (no id, no extension) isn't accepted by the
+    per-workflow endpoint, so the request stays on `/actions/runs` and
+    matching happens purely client-side via `apply_run_filters`."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/actions/runs"
+        return _json({"workflow_runs": [
+            _run(1, name="release"), _run(2, name="CI"),
+        ]})
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = GitHubProvider().list_runs_recent(_project(), token="t", workflow="release")
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_for_branch_accepts_filter_kwargs(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/branches/main":
+            return _json({"commit": {"sha": "branchsha1"}})
+        if path == "/repos/acme/backend/actions/runs":
+            assert req.url.params.get("branch") == "main"
+            return _json({"workflow_runs": [
+                _run(1, name="release"), _run(2, name="CI"),
+            ]})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, refs = GitHubProvider().list_runs_for_branch(
+        _project(), token="t", branch="main", workflow="release",
+    )
+    assert refs == ["branchsha1"]
+    assert [r.id for r in runs] == ["1"]
+
+
+def test_list_runs_recent_bare_workflow_filter_sees_full_raw_page_before_limit(monkeypatch):
+    """Round-2 finding 1: the raw page fetched from the API must not be
+    sized to the caller's `limit` when `workflow` can only be matched
+    client-side (a bare display name, no server-side equivalent for
+    `/actions/runs`) — otherwise a genuine match positioned beyond the
+    first `limit` raw results is silently missed, because the server
+    already truncated the page before `apply_run_filters` ever saw it.
+    Unlike most mocks in this file, this one actually honors `per_page`
+    (mirroring the real GitHub API) — that's what let this bug through
+    the existing tests unnoticed.
+    """
+    all_runs = [_run(1, name="CI"), _run(2, name="release"), _run(3, name="CI")]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        per_page = int(req.url.params.get("per_page", "30"))
+        return _json({"workflow_runs": all_runs[:per_page]})
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = GitHubProvider().list_runs_recent(
+        _project(), token="t", workflow="release", limit=1,
+    )
+    assert [r.id for r in runs] == ["2"]
+
+
+def test_list_runs_for_commit_limit_applied_after_filtering(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/commits/deadbeef":
+            return _json({"sha": "deadbeef"})
+        if path == "/repos/acme/backend/actions/runs":
+            return _json({"workflow_runs": [
+                _run(1, name="CI"), _run(2, name="release"), _run(3, name="release"),
+            ]})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, refs = GitHubProvider().list_runs_for_commit(
+        _project(), token="t", sha="deadbeef", workflow="release", limit=1,
+    )
+    assert refs == ["deadbeef"]
+    assert [r.id for r in runs] == ["2"]
+
+
+# ---------- ticket #200 -- trigger_pipeline / wait_for_run -------------------
+
+
+FIXED_NOW = "2026-08-21T10:00:00.123456Z"
+
+
+def _patch_now(monkeypatch, github_provider_mod):
+    monkeypatch.setattr(github_provider_mod, "now_utc", lambda: FIXED_NOW)
+
+
+def _no_sleep(monkeypatch, github_provider_mod):
+    monkeypatch.setattr(github_provider_mod, "_trigger_sleep", lambda seconds: None)
+
+
+def test_trigger_pipeline_dispatches_then_polls_and_skips_stale_run(monkeypatch):
+    """A run created before t0 (the dispatch time) must NOT be selected;
+    a run created after t0 must be."""
+    _patch_now(monkeypatch, github_provider)
+    _no_sleep(monkeypatch, github_provider)
+    dispatch_calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/actions/workflows/release.yml/dispatches":
+            dispatch_calls.append(req)
+            return httpx.Response(status_code=204)
+        if path == "/repos/acme/backend/branches/main":
+            return _json({"commit": {"sha": "branchsha1"}})
+        if path == "/repos/acme/backend/actions/workflows/release.yml/runs":
+            return _json({"workflow_runs": [
+                _run(1, name="release", event="workflow_dispatch",
+                     created_at="2026-08-21T09:59:00Z"),  # stale, pre-t0
+                _run(2, name="release", event="workflow_dispatch",
+                     created_at="2026-08-21T10:00:01Z"),  # fresh, post-t0
+            ]})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    run = GitHubProvider().trigger_pipeline(
+        _project(), token="t", workflow="release.yml", ref="main",
+    )
+    assert len(dispatch_calls) == 1
+    assert run is not None
+    assert run.id == "2"
+
+
+def test_trigger_pipeline_two_post_t0_runs_oldest_wins(monkeypatch):
+    _patch_now(monkeypatch, github_provider)
+    _no_sleep(monkeypatch, github_provider)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/actions/workflows/release.yml/dispatches":
+            return httpx.Response(status_code=204)
+        if path == "/repos/acme/backend/branches/main":
+            return _json({"commit": {"sha": "branchsha1"}})
+        if path == "/repos/acme/backend/actions/workflows/release.yml/runs":
+            return _json({"workflow_runs": [
+                _run(1, name="release", event="workflow_dispatch",
+                     created_at="2026-08-21T10:00:05Z"),
+                _run(2, name="release", event="workflow_dispatch",
+                     created_at="2026-08-21T10:00:01Z"),  # oldest post-t0
+            ]})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    run = GitHubProvider().trigger_pipeline(
+        _project(), token="t", workflow="release.yml", ref="main",
+    )
+    assert run is not None
+    assert run.id == "2"
+
+
+def test_trigger_pipeline_wait_false_returns_none_and_does_not_poll(monkeypatch):
+    dispatch_calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/actions/workflows/release.yml/dispatches":
+            dispatch_calls.append(req)
+            return httpx.Response(status_code=204)
+        raise AssertionError(f"unexpected request (wait=False must not poll): {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    run = GitHubProvider().trigger_pipeline(
+        _project(), token="t", workflow="release.yml", ref="main", wait=False,
+    )
+    assert run is None
+    assert len(dispatch_calls) == 1
+
+
+def test_trigger_pipeline_non_2xx_dispatch_raises(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError):
+        GitHubProvider().trigger_pipeline(
+            _project(), token="t", workflow="release.yml", ref="main",
+        )
+
+
+def test_trigger_pipeline_empty_workflow_raises_before_http(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for an empty workflow")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError):
+        GitHubProvider().trigger_pipeline(_project(), token="t", workflow="")
+
+
+def test_trigger_pipeline_empty_ref_raises_before_http(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for an empty ref")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError):
+        GitHubProvider().trigger_pipeline(_project(), token="t", workflow="release.yml", ref="")
+
+
+def test_trigger_pipeline_with_tag_ref_resolves_run(monkeypatch):
+    """Reviewer fix pass (ticket #200): `workflow_dispatch` accepts a TAG
+    as `ref`, not just a branch — `wait_for_run` must resolve the
+    resulting run without assuming `ref` is a branch (it must not call
+    the branches endpoint at all, since a tag would 404 there and the
+    old code polled `list_runs_for_branch`, which returns `([], [])`
+    for a non-branch ref and spuriously times out)."""
+    _patch_now(monkeypatch, github_provider)
+    _no_sleep(monkeypatch, github_provider)
+    dispatch_calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/actions/workflows/release.yml/dispatches":
+            dispatch_calls.append(req)
+            return httpx.Response(status_code=204)
+        if path == "/repos/acme/backend/branches/v1.2.3":
+            raise AssertionError(
+                "wait_for_run must not resolve ref as a branch — v1.2.3 is a tag"
+            )
+        if path == "/repos/acme/backend/actions/workflows/release.yml/runs":
+            return _json({"workflow_runs": [
+                {
+                    "id": 7,
+                    "name": "release",
+                    "head_sha": "b" * 40,
+                    "head_branch": "v1.2.3",
+                    "event": "workflow_dispatch",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "html_url": "https://github.com/acme/backend/actions/runs/7",
+                    "created_at": "2026-08-21T10:00:01Z",
+                    "updated_at": "2026-08-21T10:00:01Z",
+                    "run_attempt": 1,
+                    "display_title": "release",
+                },
+            ]})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    run = GitHubProvider().trigger_pipeline(
+        _project(), token="t", workflow="release.yml", ref="v1.2.3",
+    )
+    assert len(dispatch_calls) == 1
+    assert run is not None
+    assert run.id == "7"
+    assert run.branch == "v1.2.3"
+
+
+def test_trigger_pipeline_bare_workflow_name_raises_before_http(monkeypatch):
+    """`trigger_pipeline` requires a filename (`release.yml`) or numeric
+    workflow id — GitHub's dispatch endpoint 404s on a bare display name
+    like `"Release"`. Reviewer fix pass (ticket #200): this must raise a
+    clear `ValueError` up front instead of silently forwarding the bare
+    name to the dispatch URL and surfacing an opaque `GitHubError` from
+    the resulting 404."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for a bare workflow display name")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError):
+        GitHubProvider().trigger_pipeline(
+            _project(), token="t", workflow="Release", ref="main",
+        )
+
+
+def test_wait_for_run_standalone_call(monkeypatch):
+    _no_sleep(monkeypatch, github_provider)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/branches/main":
+            return _json({"commit": {"sha": "branchsha1"}})
+        if path == "/repos/acme/backend/actions/runs":
+            return _json({"workflow_runs": [_run(1, created_at="2026-08-21T10:05:00Z")]})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    run = GitHubProvider().wait_for_run(
+        _project(), token="t", since="2026-08-21T10:00:00Z", ref="main",
+    )
+    assert run is not None
+    assert run.id == "1"
+
+
+def test_wait_for_run_timeout_returns_none(monkeypatch):
+    _no_sleep(monkeypatch, github_provider)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/branches/main":
+            return _json({"commit": {"sha": "branchsha1"}})
+        if path == "/repos/acme/backend/actions/runs":
+            return _json({"workflow_runs": []})
+        if path == "/repos/acme/backend/actions/workflows":
+            return _json({"total_count": 1})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    run = GitHubProvider().wait_for_run(
+        _project(), token="t", since="2026-08-21T10:00:00Z", ref="main", timeout=0.05,
+    )
+    assert run is None
+
+
+def test_wait_for_run_without_since_raises_type_error():
+    with pytest.raises(TypeError):
+        GitHubProvider().wait_for_run(_project(), token="t", ref="main")
+
+
+# ---------- ticket #200 -- get_ref -------------------------------------------
+
+
+def test_get_ref_branch(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/repos/acme/backend/branches/main":
+            return _json({"commit": {"sha": "branchsha1"}})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    ref = GitHubProvider().get_ref(_project(), token="t", ref="main")
+    assert ref is not None
+    assert ref.kind == "branch"
+    assert ref.sha == "branchsha1"
+    assert ref.name == "main"
+
+
+def test_get_ref_lightweight_tag_single_hop(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/branches/v1.0.0":
+            return _json({"message": "Branch not found"}, status_code=404)
+        if path == "/repos/acme/backend/git/refs/tags/v1.0.0":
+            return _json({"object": {"sha": "commitsha1", "type": "commit"}})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    ref = GitHubProvider().get_ref(_project(), token="t", ref="v1.0.0")
+    assert ref is not None
+    assert ref.kind == "tag"
+    assert ref.sha == "commitsha1"
+
+
+def test_get_ref_annotated_tag_double_hop(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/branches/v2.0.0":
+            return _json({"message": "Branch not found"}, status_code=404)
+        if path == "/repos/acme/backend/git/refs/tags/v2.0.0":
+            return _json({"object": {"sha": "tagobjsha1", "type": "tag"}})
+        if path == "/repos/acme/backend/git/tags/tagobjsha1":
+            return _json({"object": {"sha": "commitsha2", "type": "commit"}})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    ref = GitHubProvider().get_ref(_project(), token="t", ref="v2.0.0")
+    assert ref is not None
+    assert ref.kind == "tag"
+    # sha must be the *peeled commit* sha, not the tag object's own sha.
+    assert ref.sha == "commitsha2"
+
+
+def test_get_ref_commit_sha(monkeypatch):
+    sha = "c" * 40
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == f"/repos/acme/backend/branches/{sha}":
+            return _json({"message": "Branch not found"}, status_code=404)
+        if path == f"/repos/acme/backend/git/refs/tags/{sha}":
+            return _json({"message": "Not Found"}, status_code=404)
+        if path == f"/repos/acme/backend/commits/{sha}":
+            return _json({"sha": sha})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    ref = GitHubProvider().get_ref(_project(), token="t", ref=sha)
+    assert ref is not None
+    assert ref.kind == "commit"
+    assert ref.sha == sha
+
+
+def test_get_ref_unknown_returns_none(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    ref = GitHubProvider().get_ref(_project(), token="t", ref="does-not-exist")
+    assert ref is None
+
+
+def test_get_ref_branch_shadows_same_named_tag(monkeypatch):
+    """When a branch and a tag share a name, the branch wins — the tag
+    lookup must never even fire."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/branches/shared":
+            return _json({"commit": {"sha": "branchsha-shared"}})
+        raise AssertionError(f"tag lookup must not fire: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    ref = GitHubProvider().get_ref(_project(), token="t", ref="shared")
+    assert ref is not None
+    assert ref.kind == "branch"
+    assert ref.sha == "branchsha-shared"
+
+
+# ---------- ticket #200 -- list_releases -------------------------------------
+
+
+def test_list_releases_empty(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/releases"
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    releases = GitHubProvider().list_releases(_project(), token="t")
+    assert releases == []
+
+
+def test_list_releases_maps_fields_and_resolves_peeled_sha(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/releases":
+            return _json([{
+                "tag_name": "v1.0.0",
+                "name": "Version 1.0.0",
+                "html_url": "https://github.com/acme/backend/releases/tag/v1.0.0",
+                "draft": False,
+                "prerelease": True,
+                "created_at": "2026-01-01T00:00:00Z",
+                "published_at": "2026-01-02T00:00:00Z",
+                "body": "Release notes",
+            }])
+        if path == "/repos/acme/backend/git/refs/tags/v1.0.0":
+            return _json({"object": {"sha": "commitsha3", "type": "commit"}})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    releases = GitHubProvider().list_releases(_project(), token="t")
+    assert len(releases) == 1
+    rel = releases[0]
+    assert rel.tag == "v1.0.0"
+    assert rel.name == "Version 1.0.0"
+    assert rel.sha == "commitsha3"
+    assert rel.draft is False
+    assert rel.prerelease is True
+    assert rel.body == "Release notes"
+    assert rel.created_at == "2026-01-01T00:00:00Z"
+    assert rel.published_at == "2026-01-02T00:00:00Z"

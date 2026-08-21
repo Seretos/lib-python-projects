@@ -29,6 +29,7 @@ Key Azure DevOps quirks (vs GitHub/GitLab) this module handles:
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import re
@@ -52,6 +53,7 @@ from lib_python_projects.markers import (
     strip_leading_ai_marker,
 )
 from lib_python_projects.providers.base import (
+    apply_run_filters,
     BoardColumnSpec,
     BulkTicketResult,
     Comment,
@@ -61,6 +63,7 @@ from lib_python_projects.providers.base import (
     FieldSpec,
     Label,
     LabelOperationUnsupported,
+    now_utc,
     PRFilters,
     PipelineFailure,
     PipelineRun,
@@ -68,10 +71,15 @@ from lib_python_projects.providers.base import (
     ProviderError,
     PullRequest,
     RateLimitError,
+    Ref,
     Relation,
     RelationAlreadyExists,
     RelationKindUnsupported,
     RelationNotFound,
+    Release,
+    resolve_event_alias,
+    resolve_fetch_page_size,
+    run_matches_ref,
     Review,
     review_decision_from_states,
     ReviewComment,
@@ -91,6 +99,7 @@ from lib_python_projects.providers.base import (
     _extract_parent_id,
     _validate_label_lists,
     _validate_limit,
+    _validate_since,
 )
 from lib_python_projects.providers._http_cache import make_cached_transport
 from lib_python_projects.providers import _idempotency
@@ -476,6 +485,18 @@ def _org_scope(project: ProjectConfig) -> str:
             f"{project.path!r}",
         )
     return f"/{quote(org, safe='')}"
+
+
+def _repo_web_base_url(project: ProjectConfig) -> str:
+    """Return the ADO web UI base URL for this project's Git repository
+    (ticket #200) — used by `get_ref` to build human-navigable ref URLs,
+    mirroring the pattern `_map_build_run` already uses as its web-URL
+    fallback."""
+    base = (project.base_url or "https://dev.azure.com").rstrip("/")
+    return (
+        f"{base}/{project.organization}/{project.ado_project}"
+        f"/_git/{project.repository}"
+    )
 
 
 def _area_path_clause(area: str | None, recursive: bool) -> str | None:
@@ -1742,7 +1763,9 @@ def _resolve_ado_tag(
 
     Uses the same refs filter endpoint as `_resolve_ado_branch`, filtering
     on `tags/<name>` instead of `heads/<name>`; non-success responses are
-    treated as ``False`` (best-effort).
+    treated as ``False`` (best-effort). Existing boolean contract —
+    `list_runs_for_tag` depends on it — left unchanged by ticket #200;
+    `_resolve_ado_ref_sha` below is the new, richer sibling for `get_ref`.
     """
     tag_ref = tag.removeprefix("refs/tags/")
     path = (
@@ -1759,6 +1782,68 @@ def _resolve_ado_tag(
         return (resp.json() or {}).get("count", 0) > 0
     except Exception:  # noqa: BLE001
         return False
+
+
+def _resolve_ado_ref_sha(
+    client: "httpx.Client",
+    project: "ProjectConfig",
+    repo_id: str,
+    ref_filter: str,
+) -> str | None:
+    """Resolve a `heads/<name>` or `tags/<name>` ref filter to its peeled
+    commit sha, or ``None`` when no ref matches (ticket #200).
+
+    Uses the same `refs?filter=` endpoint as `_resolve_ado_branch`/
+    `_resolve_ado_tag`, but reads `objectId` and — for an annotated tag —
+    `peeledObjectId` (the commit the tag object ultimately points to)
+    instead of just returning a boolean. For a branch or a lightweight
+    tag, `objectId` already IS the commit sha, so `peeledObjectId`
+    (when absent) falls back to it. Does **not** change
+    `_resolve_ado_tag`'s existing boolean contract — `list_runs_for_tag`
+    still calls that one unchanged.
+    """
+    path = f"{_project_scope(project)}/_apis/git/repositories/{repo_id}/refs"
+    try:
+        resp = client.get(path, params=_api_version_params({"filter": ref_filter}))
+    except Exception:  # noqa: BLE001
+        return None
+    if not resp.is_success:
+        return None
+    values = (resp.json() or {}).get("value") or []
+    if not values:
+        return None
+    entry = values[0]
+    object_id = entry.get("objectId") or ""
+    return entry.get("peeledObjectId") or object_id or None
+
+
+def _client_side_workflow_filter(workflow: str | None) -> str | None:
+    """Return the `workflow` value `apply_run_filters` should re-check.
+
+    Mirrors `github._client_side_workflow_filter`'s rationale: when
+    `workflow` is a purely numeric build-definition id, the request
+    already hit the exactly-scoped `definitions=` server-side filter
+    (see `_list_builds`) — re-checking client-side would incorrectly
+    reject every run because `PipelineRun.name` holds the definition's
+    *display name*, not its id (different identifier spaces). A
+    name-shaped `workflow` still gets the client-side check — it's
+    directly comparable to `run.name` and also acts as the sole filter
+    when `_resolve_definition_id` found no server-side match.
+    """
+    if workflow and workflow.strip().isdigit():
+        return None
+    return workflow
+
+
+# ticket #200: polling seam for `wait_for_run` — mirrors
+# `github._TRIGGER_POLL_BACKOFFS`/`_trigger_sleep`. `_trigger_sleep` is a
+# mockable indirection so tests can replace the backoff with a no-op and
+# drive the retry loop deterministically without real wall-clock waits.
+_TRIGGER_POLL_BACKOFFS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
+
+
+def _trigger_sleep(seconds: float) -> None:
+    time.sleep(seconds)
 
 
 # ---------- the provider class ----------------------------------------------
@@ -4943,12 +5028,21 @@ class AzureDevOpsProvider(
         ref: str,
         status: str = "all",
         limit: int = 20,
+        *,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
         """List builds filtered by branch.
 
         Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape:
         - ``([], [])`` — branch not found in repository
         - ``(runs, [ref])`` — branch exists (runs may be empty)
+
+        `workflow`/`event`/`since` (ticket #200) are pushed down where
+        supported (`definitions=`/`reasonFilter=`/`minTime=`) and
+        re-applied client-side via `apply_run_filters` as the
+        authoritative final pass — see that function's docstring.
         """
         _validate_limit(limit)
         repo_id = self._resolve_repository_id(project, token)
@@ -4957,8 +5051,33 @@ class AzureDevOpsProvider(
             exists = _resolve_ado_branch(c, project, repo_id, branch)
         if not exists:
             return [], []
-        params = _api_version_params({"branchName": branch, "$top": max(1, limit)})
-        runs = self._list_builds(project, token, params, status, limit)
+        definition_id, client_side_workflow = self._resolve_workflow_filters(
+            project, token, workflow,
+        )
+        # Round-2 finding 1: the raw `$top` page must not be sized to
+        # `limit` when a filter can only be resolved client-side, or a
+        # genuine match beyond the first `limit` raw results is silently
+        # discarded before `apply_run_filters` ever sees it. Round-3
+        # finding 1: this still caps the raw fetch at `max_page` (200)
+        # even when `limit` exceeds 200 — see `resolve_fetch_page_size`'s
+        # docstring for why that cap is an intentional, accepted
+        # limitation (mirrors `list_runs_for_commit`'s existing
+        # unconditional `$top=200`), not something this fix attempts to
+        # lift.
+        fetch_size = resolve_fetch_page_size(
+            limit, workflow=client_side_workflow, event=event, since=since,
+            max_page=200,
+        )
+        params = _api_version_params({"branchName": branch, "$top": fetch_size})
+        raw_runs = self._list_builds(
+            project, token, params, status, fetch_size,
+            event=event, since=since, definition_id=definition_id,
+        )
+        runs = apply_run_filters(
+            raw_runs, provider="azuredevops",
+            workflow=client_side_workflow, event=event,
+            since=since, limit=limit,
+        )
         return runs, [ref]
 
     def list_runs_for_commit(
@@ -4968,6 +5087,10 @@ class AzureDevOpsProvider(
         sha: str,
         status: str = "all",
         limit: int = 20,
+        *,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
         """List builds whose ``sourceVersion`` matches ``sha``.
 
@@ -4975,16 +5098,32 @@ class AzureDevOpsProvider(
         - ``([], [])`` — commit not found in the repository
         - ``([], [sha])`` — commit exists, no builds reference it
         - ``(runs, [sha])`` — commit exists and has matching builds
+
+        See `list_runs_for_branch` for `workflow`/`event`/`since` semantics.
         """
         _validate_limit(limit)
         # ADO doesn't filter by sourceVersion server-side on the public
-        # /builds list; fetch the last page and filter client-side.
+        # /builds list; fetch the last page and filter client-side. This
+        # $top=200 is the unconditional precedent finding-1 (round 3)
+        # cites for `resolve_fetch_page_size`'s own `max_page` cap on the
+        # other listing methods — it was already accepted (round 1) as
+        # correct to never fetch more than 200 raw builds here.
+        definition_id, client_side_workflow = self._resolve_workflow_filters(
+            project, token, workflow,
+        )
         params = _api_version_params({"$top": 200})
-        runs = self._list_builds(project, token, params, status, 200)
-        filtered = [r for r in runs if r.head_sha == sha]
-        result = filtered[: max(1, limit)]
-        if result:
-            return result, [sha]
+        raw_runs = self._list_builds(
+            project, token, params, status, 200,
+            event=event, since=since, definition_id=definition_id,
+        )
+        filtered_by_sha = [r for r in raw_runs if r.head_sha == sha]
+        runs = apply_run_filters(
+            filtered_by_sha, provider="azuredevops",
+            workflow=client_side_workflow, event=event,
+            since=since, limit=limit,
+        )
+        if runs:
+            return runs, [sha]
         repo_id = self._resolve_repository_id(project, token)
         with _client(project, token) as c:
             exists = _resolve_ado_commit(c, project, repo_id, sha)
@@ -4997,15 +5136,42 @@ class AzureDevOpsProvider(
         tag: str,
         status: str = "all",
         limit: int = 20,
+        *,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
         """Returns `(runs, resolved_refs)`:
         - ``([], [])`` — tag not found in the repository
         - ``([], [tag])`` — tag exists, no builds reference it
         - ``(runs, [tag])`` — tag exists and has matching builds
+
+        See `list_runs_for_branch` for `workflow`/`event`/`since` semantics.
         """
         branch = tag if tag.startswith("refs/") else f"refs/tags/{tag}"
-        params = _api_version_params({"branchName": branch, "$top": max(1, limit)})
-        runs = self._list_builds(project, token, params, status, limit)
+        definition_id, client_side_workflow = self._resolve_workflow_filters(
+            project, token, workflow,
+        )
+        # Round-2 finding 1: see `list_runs_for_branch` — the raw `$top`
+        # page must not be sized to `limit` when a filter can only be
+        # resolved client-side. Round-3 finding 1: still capped at
+        # `max_page` (200) even when `limit` exceeds it — see
+        # `resolve_fetch_page_size`'s docstring; this is an accepted,
+        # documented limitation, not something this fix lifts.
+        fetch_size = resolve_fetch_page_size(
+            limit, workflow=client_side_workflow, event=event, since=since,
+            max_page=200,
+        )
+        params = _api_version_params({"branchName": branch, "$top": fetch_size})
+        raw_runs = self._list_builds(
+            project, token, params, status, fetch_size,
+            event=event, since=since, definition_id=definition_id,
+        )
+        runs = apply_run_filters(
+            raw_runs, provider="azuredevops",
+            workflow=client_side_workflow, event=event,
+            since=since, limit=limit,
+        )
         if runs:
             return runs, [tag]
         repo_id = self._resolve_repository_id(project, token)
@@ -5020,10 +5186,28 @@ class AzureDevOpsProvider(
         ticket_id: str,
         status: str = "all",
         limit: int = 20,
+        *,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
         """Returns `(runs, resolved_refs)`. `resolved_refs` is the list of
         `build/{id}` markers we walked from the work item's
         ArtifactLink relations — mirrors GitLab's `!{iid}` shape.
+
+        `workflow`/`event`/`since` (ticket #200) are matched purely
+        client-side via `apply_run_filters` — this path fetches
+        individual builds by id from the work item's relations, so there
+        is no listing-endpoint query to push filters into.
+        `resolved_refs` still lists every `build/{id}` walked, regardless
+        of whether it matched the filters (it documents what was
+        queried, not what matched).
+
+        `limit` is applied only by `apply_run_filters` at the end, after
+        every `build_ids` entry has been fetched and filtered — it must
+        never truncate the candidate `build_ids` list up front, or a
+        matching run could be skipped simply because it wasn't among the
+        first `limit` relations walked.
         """
         _validate_limit(limit)
         # Walk the work item's relations for ArtifactLink entries pointing
@@ -5048,10 +5232,10 @@ class AzureDevOpsProvider(
                 build_ids.append(int(m.group(1)))
         if not build_ids:
             return [], []
-        runs: list[PipelineRun] = []
+        raw_runs: list[PipelineRun] = []
         resolved_refs: list[str] = []
         with _client(project, token) as c:
-            for bid in build_ids[: max(1, limit)]:
+            for bid in build_ids:
                 bresp = c.get(
                     f"{_project_scope(project)}/_apis/build/builds/{bid}",
                     params=_api_version_params(),
@@ -5059,8 +5243,12 @@ class AzureDevOpsProvider(
                 if bresp.status_code == 404:
                     continue
                 _check(bresp)
-                runs.append(_map_build_run(bresp.json(), project))
+                raw_runs.append(_map_build_run(bresp.json(), project))
                 resolved_refs.append(f"build/{bid}")
+        runs = apply_run_filters(
+            raw_runs, provider="azuredevops", workflow=workflow, event=event,
+            since=since, limit=limit,
+        )
         return runs, resolved_refs
 
     def list_runs_recent(
@@ -5070,15 +5258,110 @@ class AzureDevOpsProvider(
         *,
         status: str = "all",
         limit: int = 20,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
         """List the most recent builds, unfiltered by ref.
 
         Returns ``(runs, [])`` — the empty ``resolved_refs`` signals that
-        no ref filter was applied.
+        no ref filter was applied. See `list_runs_for_branch` for
+        `workflow`/`event`/`since` semantics.
         """
         _validate_limit(limit)
-        params = _api_version_params({"$top": max(1, limit)})
-        return self._list_builds(project, token, params, status, limit), []
+        definition_id, client_side_workflow = self._resolve_workflow_filters(
+            project, token, workflow,
+        )
+        # Round-2 finding 1: see `list_runs_for_branch` — the raw `$top`
+        # page must not be sized to `limit` when a filter can only be
+        # resolved client-side. Round-3 finding 1: still capped at
+        # `max_page` (200) even when `limit` exceeds it — see
+        # `resolve_fetch_page_size`'s docstring; this is an accepted,
+        # documented limitation, not something this fix lifts.
+        fetch_size = resolve_fetch_page_size(
+            limit, workflow=client_side_workflow, event=event, since=since,
+            max_page=200,
+        )
+        params = _api_version_params({"$top": fetch_size})
+        raw_runs = self._list_builds(
+            project, token, params, status, fetch_size,
+            event=event, since=since, definition_id=definition_id,
+        )
+        runs = apply_run_filters(
+            raw_runs, provider="azuredevops",
+            workflow=client_side_workflow, event=event,
+            since=since, limit=limit,
+        )
+        return runs, []
+
+    def _resolve_definition_id(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        workflow: str,
+    ) -> int | None:
+        """Resolve a build-definition name to its numeric id (ticket #200).
+
+        A purely numeric `workflow` is returned as-is (no HTTP call).
+        Otherwise queries `/_apis/build/definitions?name=<workflow>` for
+        an exact, case-insensitive name match. Returns `None` when
+        nothing matches — callers fall back to client-side
+        `apply_run_filters` matching against `run.name` instead of the
+        `definitions=` server-side push-down.
+        """
+        w = (workflow or "").strip()
+        if not w:
+            return None
+        if w.isdigit():
+            return int(w)
+        path = f"{_project_scope(project)}/_apis/build/definitions"
+        with _client(project, token) as c:
+            resp = c.get(path, params=_api_version_params({"name": w}))
+        if not resp.is_success:
+            return None
+        for d in (resp.json() or {}).get("value") or []:
+            if (d.get("name") or "").lower() == w.lower():
+                return d.get("id")
+        return None
+
+    def _resolve_workflow_filters(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        workflow: str | None,
+    ) -> tuple[int | None, str | None]:
+        """Resolve `workflow` to `(definition_id, client_side_workflow)`.
+
+        `definition_id` is the server-side `definitions=` push-down (see
+        `_resolve_definition_id`) — non-`None` whenever `workflow` was
+        numeric or successfully matched a build definition by name.
+
+        `client_side_workflow` is the value `apply_run_filters` /
+        `resolve_fetch_page_size` re-check against `run.name` — see
+        `_client_side_workflow_filter`. Deliberately computed
+        independently of whether `definition_id` resolved (round-3
+        finding 2, considered and **not** applied — see that helper's
+        docstring): `apply_run_filters` is documented as *the* final,
+        always-authoritative pass "regardless of whether the provider
+        also pushed `workflow`/`event`/`since` down as server-side query
+        params," specifically so a provider-native filter the server
+        silently ignored still yields a correct result. Making
+        `client_side_workflow` skip that re-check whenever
+        `definition_id` resolved would trade away that safety net for a
+        page-size optimization, and two existing tests
+        (`test_list_runs_for_branch_accepts_filter_kwargs`,
+        `test_list_runs_for_commit_limit_applied_after_filtering`)
+        concretely demonstrate the risk: their mocked `/builds` endpoint
+        returns runs from *every* definition regardless of the
+        `definitions=` param sent, and only the client-side re-check
+        narrows the result to the requested workflow.
+        """
+        definition_id = (
+            self._resolve_definition_id(project, token, workflow)
+            if workflow else None
+        )
+        client_side_workflow = _client_side_workflow_filter(workflow)
+        return definition_id, client_side_workflow
 
     def _list_builds(
         self,
@@ -5087,10 +5370,20 @@ class AzureDevOpsProvider(
         params: dict,
         status: str,
         limit: int,
+        *,
+        event: str | None = None,
+        since: str | None = None,
+        definition_id: int | None = None,
     ) -> list[PipelineRun]:
         _validate_limit(limit)
         if status and status != "all":
             params["statusFilter"] = status
+        if event:
+            params["reasonFilter"] = resolve_event_alias(event, "azuredevops")
+        if since:
+            params["minTime"] = _validate_since(since)
+        if definition_id:
+            params["definitions"] = definition_id
         path = f"{_project_scope(project)}/_apis/build/builds"
         with _client(project, token) as c:
             resp = c.get(path, params=params)
@@ -5162,6 +5455,232 @@ class AzureDevOpsProvider(
             resp = c.get(log_path, params=_api_version_params())
         _check(resp)
         return resp.text
+
+    # ---------- pipeline trigger / ref / releases (ticket #200) ------------
+
+    def trigger_pipeline(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        workflow: str,
+        *,
+        ref: str = "main",
+        inputs: dict[str, str] | None = None,
+        wait: bool = True,
+        timeout: float = 60.0,
+    ) -> PipelineRun | None:
+        """Queue a new build and return the resulting `PipelineRun`.
+
+        `workflow` may be a build-definition name or a numeric id;
+        resolved via `_resolve_definition_id` (the same lookup the
+        run-listing filters use for `definitions=` push-down). Unlike
+        GitHub's fire-and-forget dispatch, `POST /_apis/build/builds`
+        returns the created build directly, so there is always an id to
+        resolve: `wait=False` returns the freshly mapped `PipelineRun`
+        immediately; `wait=True` (default) round-trips through `get_run`
+        for a consistent, fully populated result. A non-2xx response
+        raises `AzureDevOpsError` (via `_check`) rather than being
+        swallowed; an unresolvable `workflow` also raises
+        `AzureDevOpsError(404, ...)` before any build is queued.
+        """
+        if not workflow or not workflow.strip():
+            raise ValueError("workflow must not be empty")
+        if not ref or not ref.strip():
+            raise ValueError("ref must not be empty")
+        definition_id = self._resolve_definition_id(project, token, workflow)
+        if definition_id is None:
+            raise AzureDevOpsError(
+                404,
+                f"build definition '{workflow}' not found in project "
+                f"'{project.organization}/{project.ado_project}'",
+            )
+        branch = ref if ref.startswith("refs/") else f"refs/heads/{ref}"
+        body: dict[str, Any] = {
+            "definition": {"id": definition_id},
+            "sourceBranch": branch,
+        }
+        if inputs:
+            body["parameters"] = json.dumps(inputs)
+        path = f"{_project_scope(project)}/_apis/build/builds"
+        with _client(project, token) as c:
+            r = c.post(path, params=_api_version_params(), json=body)
+            _check(r)
+            run = _map_build_run(r.json(), project)
+        if not wait:
+            return run
+        return self.get_run(project, token, run.id)
+
+    def wait_for_run(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        since: str,
+        workflow: str | None = None,
+        ref: str | None = None,
+        event: str | None = None,
+        timeout: float = 60.0,
+        poll_interval: float | None = None,
+    ) -> PipelineRun | None:
+        """Poll for the oldest run at/after `since` matching the filters.
+
+        Always polls `list_runs_recent` — which applies
+        `workflow`/`event`/`since` via `apply_run_filters` without
+        resolving `ref` as a branch — then, when `ref` is given, filters
+        the results client-side via `run_matches_ref`. `ref` is
+        deliberately NOT resolved through `list_runs_for_branch`/
+        `_resolve_ado_branch`: Azure DevOps builds can be queued against
+        a tag `sourceBranch` too, and the branch-only resolution would
+        return `([], [])` for a tag, causing a spurious timeout even
+        though the run exists (ticket #200). Backs off per
+        `_TRIGGER_POLL_BACKOFFS` (overridable via a fixed
+        `poll_interval`) until a match appears or `timeout` elapses, in
+        which case `None` is returned rather than raising. `since` is
+        required (keyword-only, no default) — an unbounded wait would
+        happily return a pre-existing run.
+        """
+        deadline = time.monotonic() + timeout
+        attempt = 0
+        while True:
+            runs, _ = self.list_runs_recent(
+                project, token, limit=50,
+                workflow=workflow, event=event, since=since,
+            )
+            if ref:
+                runs = [r for r in runs if run_matches_ref(r, ref)]
+            if runs:
+                return min(runs, key=lambda r: r.created_at)
+            if time.monotonic() >= deadline:
+                return None
+            backoff = (
+                poll_interval
+                if poll_interval is not None
+                else _TRIGGER_POLL_BACKOFFS[
+                    min(attempt, len(_TRIGGER_POLL_BACKOFFS) - 1)
+                ]
+            )
+            _trigger_sleep(backoff)
+            attempt += 1
+
+    def get_ref(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        ref: str,
+    ) -> Ref | None:
+        """Resolve `ref` (branch name, tag name, or commit sha) to a `Ref`.
+
+        Resolution order is branch -> tag -> commit, so a branch and a
+        tag sharing the same name resolve as the branch. `sha` is always
+        the peeled commit sha — `_resolve_ado_ref_sha` returns
+        `peeledObjectId` for an annotated tag, else `objectId` itself
+        (already the commit sha for a branch or a lightweight tag).
+        Returns `None` when `ref` doesn't resolve as any of the three.
+        Does not touch `_resolve_ado_tag`'s existing boolean contract —
+        `list_runs_for_tag` still uses that helper unchanged.
+        """
+        repo_id = self._resolve_repository_id(project, token)
+        base_url = _repo_web_base_url(project)
+        with _client(project, token) as c:
+            branch_sha = _resolve_ado_ref_sha(c, project, repo_id, f"heads/{ref}")
+            if branch_sha:
+                return Ref(
+                    name=ref, kind="branch", sha=branch_sha,
+                    url=f"{base_url}?version=GB{quote(ref, safe='')}",
+                )
+            tag_sha = _resolve_ado_ref_sha(c, project, repo_id, f"tags/{ref}")
+            if tag_sha:
+                return Ref(
+                    name=ref, kind="tag", sha=tag_sha,
+                    url=f"{base_url}?version=GT{quote(ref, safe='')}",
+                )
+            if _resolve_ado_commit(c, project, repo_id, ref):
+                return Ref(
+                    name=ref, kind="commit", sha=ref,
+                    url=f"{base_url}?version=GC{quote(ref, safe='')}",
+                )
+        return None
+
+    def list_releases(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        limit: int = 20,
+    ) -> list[Release]:
+        """List releases, most recent first, mapped from annotated Git tags.
+
+        Azure DevOps has no native "release" concept distinct from an
+        annotated Git tag; this lists `refs?filter=tags/` and, for each
+        annotated tag, fetches `.../annotatedtags/{objectId}` for the
+        tag message and tagger date. `draft` and `prerelease` are always
+        `False` — **not representable on Azure DevOps**. A lightweight
+        tag (no annotated tag object) yields an empty `body` and empty
+        `created_at`/`published_at`, with `sha` taken directly from the
+        ref's `objectId` (already the commit sha for a lightweight tag).
+
+        The `refs?filter=tags/` API gives no ordering guarantee, so
+        every tag is resolved (fetching its annotated-tag date where
+        one exists) before sorting by `created_at` descending and only
+        then truncating to `limit` (round-2 finding 2) — truncating
+        first would risk keeping an older tag over a newer one whenever
+        the raw ref order isn't already date-sorted. A lightweight tag
+        has no date evidence (`created_at == ""`) and sorts after every
+        dated release as a result.
+        """
+        _validate_limit(limit)
+        repo_id = self._resolve_repository_id(project, token)
+        path = f"{_project_scope(project)}/_apis/git/repositories/{repo_id}/refs"
+        out: list[Release] = []
+        with _client(project, token) as c:
+            resp = c.get(path, params=_api_version_params({"filter": "tags/"}))
+            _check(resp)
+            tag_refs = (resp.json() or {}).get("value") or []
+            for entry in tag_refs:
+                full_name = entry.get("name") or ""  # "refs/tags/v1.0.0"
+                tag_name = full_name.removeprefix("refs/tags/")
+                object_id = entry.get("objectId") or ""
+                peeled = entry.get("peeledObjectId")
+                if peeled:
+                    at_resp = c.get(
+                        f"{_project_scope(project)}/_apis/git/repositories"
+                        f"/{repo_id}/annotatedtags/{object_id}",
+                        params=_api_version_params(),
+                    )
+                    if at_resp.is_success:
+                        raw = at_resp.json() or {}
+                        tagged_by = raw.get("taggedBy") or {}
+                        tagged_date = normalize_timestamp(tagged_by.get("date") or "")
+                        out.append(Release(
+                            tag=tag_name,
+                            name=tag_name,
+                            sha=peeled,
+                            url=raw.get("url") or "",
+                            draft=False,
+                            prerelease=False,
+                            created_at=tagged_date,
+                            published_at=tagged_date,
+                            body=raw.get("message") or "",
+                        ))
+                        continue
+                # Lightweight tag (or the annotated-tag fetch failed) —
+                # no tag message/date to report.
+                out.append(Release(
+                    tag=tag_name,
+                    name=tag_name,
+                    sha=object_id,
+                    url="",
+                    draft=False,
+                    prerelease=False,
+                    created_at="",
+                    published_at="",
+                    body="",
+                ))
+        # Most recent first (round-2 finding 2): sort by created_at desc
+        # over every resolved tag, THEN truncate to limit — never the
+        # reverse. Lightweight tags (created_at == "") sort last.
+        out.sort(key=lambda r: r.created_at, reverse=True)
+        return out[:limit]
 
     def _fetch_build_failure_context(
         self,

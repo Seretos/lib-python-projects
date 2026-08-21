@@ -44,6 +44,11 @@ class BoardPermissions(BaseModel):
     manage: bool = False
 
 
+class PipelinesPermissions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    trigger: bool = False
+
+
 class Permissions(BaseModel):
     """Nested permissions namespace.
 
@@ -55,6 +60,7 @@ class Permissions(BaseModel):
     issues: IssuesPermissions = Field(default_factory=IssuesPermissions)
     pulls: PullsPermissions = Field(default_factory=PullsPermissions)
     board: BoardPermissions = Field(default_factory=BoardPermissions)
+    pipelines: PipelinesPermissions = Field(default_factory=PipelinesPermissions)
 
 
 class AutoLabels(BaseModel):

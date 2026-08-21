@@ -26,6 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 test = [
   "pytest>=8",
+  "pytest-timeout>=2.3",
 ]
 
 [tool.setuptools]
@@ -38,3 +39,8 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra --strict-markers"
+# thread-based timeout (not the "signal" default): signal-based timeouts
+# don't work on Windows and can't interrupt blocking socket I/O, thread-based
+# can. A blocked test is killed after 60s instead of hanging the whole suite.
+timeout = 60
+timeout_method = "thread"
