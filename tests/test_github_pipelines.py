@@ -1317,6 +1317,30 @@ def test_list_runs_for_branch_accepts_filter_kwargs(monkeypatch):
     assert [r.id for r in runs] == ["1"]
 
 
+def test_list_runs_recent_bare_workflow_filter_sees_full_raw_page_before_limit(monkeypatch):
+    """Round-2 finding 1: the raw page fetched from the API must not be
+    sized to the caller's `limit` when `workflow` can only be matched
+    client-side (a bare display name, no server-side equivalent for
+    `/actions/runs`) — otherwise a genuine match positioned beyond the
+    first `limit` raw results is silently missed, because the server
+    already truncated the page before `apply_run_filters` ever saw it.
+    Unlike most mocks in this file, this one actually honors `per_page`
+    (mirroring the real GitHub API) — that's what let this bug through
+    the existing tests unnoticed.
+    """
+    all_runs = [_run(1, name="CI"), _run(2, name="release"), _run(3, name="CI")]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        per_page = int(req.url.params.get("per_page", "30"))
+        return _json({"workflow_runs": all_runs[:per_page]})
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = GitHubProvider().list_runs_recent(
+        _project(), token="t", workflow="release", limit=1,
+    )
+    assert [r.id for r in runs] == ["2"]
+
+
 def test_list_runs_for_commit_limit_applied_after_filtering(monkeypatch):
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path

@@ -47,6 +47,7 @@ from lib_python_projects.providers.base import (
     RelationNotFound,
     Release,
     resolve_event_alias,
+    resolve_fetch_page_size,
     run_matches_ref,
     Review,
     review_decision_from_states,
@@ -5201,7 +5202,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 runs = apply_run_filters(
                     [_map_run(r) for r in raw_runs],
                     provider="github", workflow=_client_side_workflow_filter(workflow),
-                event=event,
+                    event=event,
                     since=since, limit=limit,
                 )
                 return runs, [sha]
@@ -5349,14 +5350,17 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         """
         _validate_limit(limit)
         with _client(token) as client:
-            params = _runs_params(status, limit, event=event, since=since)
+            params = _runs_params(
+                status, limit, event=event, since=since,
+                workflow=_client_side_workflow_filter(workflow),
+            )
             r = client.get(_runs_path(project, workflow), params=params)
             _check(r)
             raw_runs = (r.json() or {}).get("workflow_runs", [])
         runs = apply_run_filters(
             [_map_run(run) for run in raw_runs],
             provider="github", workflow=_client_side_workflow_filter(workflow),
-                event=event,
+            event=event,
             since=since, limit=limit,
         )
         return runs, []
@@ -5875,9 +5879,19 @@ def _runs_params(
     *,
     event: str | None = None,
     since: str | None = None,
+    workflow: str | None = None,
 ) -> dict[str, Any]:
+    """`workflow` here must already be the *client-side-effective* value
+    (i.e. `_client_side_workflow_filter(workflow)`, `None` when the
+    request already hit an exactly-scoped `/actions/workflows/{id}/runs`
+    endpoint) — see `resolve_fetch_page_size` for why a still-client-
+    side-only `workflow`/`event`/`since` widens `per_page` to the API
+    max instead of the caller's `limit` (ticket #200 round-2 finding 1).
+    """
     _validate_limit(limit)
-    per_page = min(max(1, limit), 100)
+    per_page = resolve_fetch_page_size(
+        limit, workflow=workflow, event=event, since=since, max_page=100,
+    )
     params: dict[str, Any] = {"per_page": per_page}
     if status and status != "all" and status in _RUN_STATUS_FILTERS:
         params["status"] = status
@@ -5949,7 +5963,10 @@ def _list_runs_for_branch(
     event: str | None = None,
     since: str | None = None,
 ) -> list[dict]:
-    params = _runs_params(status, limit, event=event, since=since)
+    params = _runs_params(
+        status, limit, event=event, since=since,
+        workflow=_client_side_workflow_filter(workflow),
+    )
     params["branch"] = branch
     r = client.get(_runs_path(project, workflow), params=params)
     if r.status_code in (301, 302):
@@ -5969,7 +5986,10 @@ def _list_runs_for_commit(
     event: str | None = None,
     since: str | None = None,
 ) -> list[dict]:
-    params = _runs_params(status, limit, event=event, since=since)
+    params = _runs_params(
+        status, limit, event=event, since=since,
+        workflow=_client_side_workflow_filter(workflow),
+    )
     params["head_sha"] = sha
     r = client.get(_runs_path(project, workflow), params=params)
     _check(r)

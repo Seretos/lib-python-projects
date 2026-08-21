@@ -2199,6 +2199,102 @@ def test_list_runs_recent_workflow_unresolved_name_falls_back_client_side(
     assert [r.id for r in runs] == ["1"]
 
 
+def test_list_runs_recent_bare_workflow_filter_sees_full_raw_page_before_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-2 finding 1: when `_resolve_definition_id` can't resolve
+    `workflow` to a build-definition id, filtering falls back to purely
+    client-side matching against `run.name` — so the raw `$top` page
+    fetched must not be sized to the caller's `limit`, or a genuine
+    match positioned beyond the first `limit` raw results is silently
+    missed, because the server already truncated the page before
+    `apply_run_filters` ever saw it. Unlike most mocks in this file,
+    this one actually honors `$top` (mirroring the real Azure DevOps
+    API) — that's what let this bug through the existing tests
+    unnoticed.
+    """
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/definitions"):
+            return _json({"value": []})  # unresolved -> client-side only
+        if req.url.path.endswith("/_apis/build/builds"):
+            top = int(req.url.params.get("$top", "30"))
+            all_builds = [
+                _build_payload(1, definition={"name": "CI"}),
+                _build_payload(2, definition={"name": "Release"}),
+                _build_payload(3, definition={"name": "CI"}),
+            ]
+            return _json({"value": all_builds[:top]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = AzureDevOpsProvider().list_runs_recent(
+        _project(), token="t", workflow="Release", limit=1,
+    )
+    assert [r.id for r in runs] == ["2"]
+
+
+def test_list_runs_recent_bare_workflow_filter_caps_raw_fetch_at_max_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-3 finding 1: `resolve_fetch_page_size` intentionally caps
+    the raw `$top` fetch at `max_page` (200) even when the caller's
+    `limit` exceeds it — an accepted, documented limitation (see its
+    docstring), not something this round attempts to lift. This is a
+    regression guard for that cap staying in place: `limit=500` combined
+    with an unresolvable (client-side-only) `workflow` name must still
+    only request/consider the first 200 raw, server-ordered builds —
+    never 500.
+    """
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/definitions"):
+            return _json({"value": []})  # unresolved -> client-side only
+        if req.url.path.endswith("/_apis/build/builds"):
+            captured["top"] = int(req.url.params.get("$top", "30"))
+            return _json({"value": [_build_payload(1, definition={"name": "CI"})]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    AzureDevOpsProvider().list_runs_recent(
+        _project(), token="t", workflow="NoSuchDefinition", limit=500,
+    )
+    assert captured["top"] == 200
+
+
+def test_list_runs_recent_resolved_workflow_name_still_reapplies_client_side(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-3 finding 2, considered and rejected: it's tempting to skip
+    the client-side `run.name` re-check once a name-shaped `workflow`
+    resolves to a `definitions=` id, on the theory that the server-side
+    filter already scoped the query exactly. But `apply_run_filters` is
+    documented as the final, *always*-authoritative pass specifically so
+    a provider-native filter the server ignored still produces a correct
+    result — this test is the concrete case: the mocked `/builds`
+    endpoint returns runs from every definition regardless of the
+    `definitions=` param sent (representing a server that didn't apply
+    the filter), so only the client-side re-check narrows the page down
+    to the requested workflow. Guards against reintroducing round-3
+    finding 2's proposed (and rejected) optimization.
+    """
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/definitions"):
+            return _json({"value": [{"id": 42, "name": "Release"}]})
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": [
+                _build_payload(1, definition={"name": "CI"}),
+                _build_payload(2, definition={"name": "Release"}),
+            ]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = AzureDevOpsProvider().list_runs_recent(
+        _project(), token="t", workflow="Release", limit=5,
+    )
+    assert [r.id for r in runs] == ["2"]
+
+
 def test_list_runs_for_branch_accepts_filter_kwargs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2410,6 +2506,39 @@ def test_wait_for_run_timeout_returns_none(monkeypatch: pytest.MonkeyPatch) -> N
 def test_wait_for_run_without_since_raises_type_error() -> None:
     with pytest.raises(TypeError):
         AzureDevOpsProvider().wait_for_run(_project(), token="t", ref="main")
+
+
+def test_wait_for_run_matches_tag_ref_via_refs_tags_prefix_stripping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-2 finding 3: Azure DevOps's `sourceBranch` keeps a tag's
+    `refs/tags/` prefix in place — `_map_build_run` only strips
+    `refs/heads/` (see its `branch = ... .removeprefix("refs/heads/")`),
+    so `run.branch` here is `"refs/tags/v1.2.3"` while `wait_for_run` is
+    called with the bare `"v1.2.3"` ref. The two sides genuinely differ
+    in shape, unlike the existing GitHub/GitLab indirect tag tests (which
+    compare the same bare string on both sides and so never actually
+    exercised `run_matches_ref`'s prefix-stripping). ADO is the provider
+    most likely to need this exercised end-to-end.
+    """
+    _no_sleep(monkeypatch)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": [
+                _build_payload(
+                    9, sourceBranch="refs/tags/v1.2.3",
+                    queueTime="2026-08-21T10:05:00Z",
+                ),
+            ]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    run = AzureDevOpsProvider().wait_for_run(
+        _project(), token="t", since="2026-08-21T10:00:00Z", ref="v1.2.3",
+    )
+    assert run is not None
+    assert run.id == "9"
 
 
 # ---------- ticket #200 -- get_ref -------------------------------------------
@@ -2624,3 +2753,50 @@ def test_list_releases_lightweight_tag_has_empty_body_and_hard_false_flags(
     assert rel.body == ""
     assert rel.draft is False
     assert rel.prerelease is False
+
+
+def test_list_releases_sorted_most_recent_first_before_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-2 finding 2: the docstring promises "most recent first",
+    but the implementation used to slice `tag_refs[:limit]` *before*
+    fetching/sorting by tag date — so when the API's raw ref order
+    doesn't happen to already be date-sorted (it is not guaranteed to
+    be), an older tag could be kept over a newer one. Here the API
+    lists the older tag first; with `limit=1`, only the genuinely most
+    recent release must survive.
+    """
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in path:
+            return _refs_response([
+                {
+                    "name": "refs/tags/v1.0.0",
+                    "objectId": "tagobjsha1",
+                    "peeledObjectId": "commitsha1",
+                },
+                {
+                    "name": "refs/tags/v2.0.0",
+                    "objectId": "tagobjsha2",
+                    "peeledObjectId": "commitsha2",
+                },
+            ])
+        if "/_apis/git/repositories/repo-guid/annotatedtags/tagobjsha1" in path:
+            return _json({
+                "objectId": "tagobjsha1", "name": "v1.0.0",
+                "message": "old", "taggedBy": {"date": "2026-01-01T00:00:00Z"},
+                "url": "https://dev.azure.com/annotatedtags/tagobjsha1",
+            })
+        if "/_apis/git/repositories/repo-guid/annotatedtags/tagobjsha2" in path:
+            return _json({
+                "objectId": "tagobjsha2", "name": "v2.0.0",
+                "message": "new", "taggedBy": {"date": "2026-06-01T00:00:00Z"},
+                "url": "https://dev.azure.com/annotatedtags/tagobjsha2",
+            })
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    releases = AzureDevOpsProvider().list_releases(_project(), token="t", limit=1)
+    assert [r.tag for r in releases] == ["v2.0.0"]

@@ -1048,6 +1048,68 @@ def apply_run_filters(
     return result
 
 
+def resolve_fetch_page_size(
+    limit: int,
+    *,
+    workflow: str | None = None,
+    event: str | None = None,
+    since: str | None = None,
+    max_page: int,
+) -> int:
+    """Return the raw server-side page/`$top` size a run-listing call
+    should request (ticket #200 round-2 finding 1).
+
+    `apply_run_filters` always runs client-side as the final,
+    authoritative pass over whatever raw page the provider actually
+    returned (see its docstring) — most notably for a bare workflow
+    *display* name, which several providers cannot filter on server-side
+    at all. If that raw page were sized to the caller's `limit`, a
+    genuine match sitting beyond the first `limit` raw results would be
+    silently discarded before the client-side filter ever got a chance
+    to look at it — the server already truncated the candidate set.
+
+    When any of `workflow`/`event`/`since` is passed (non-empty/non-
+    None), this returns `max_page` — the provider's own maximum page
+    size — so the client-side pass sees as large a raw page as the API
+    allows before `apply_run_filters`'s own `limit=` truncates the
+    *filtered* result at the end. With no filters requested there is
+    nothing for `apply_run_filters` to discard, so the page is sized to
+    `limit` exactly (clamped to `max_page`) to avoid unnecessary over-
+    fetching.
+
+    Callers that already know a given filter was pushed down as a
+    server-side-authoritative, exactly-scoped query (e.g. GitHub's
+    `_client_side_workflow_filter` returning `None` for a numeric
+    workflow id or `.yml`/`.yaml` filename, because the request already
+    hit the precisely-scoped `/actions/workflows/{id}/runs` endpoint)
+    should pass `None` for that filter here, not the raw value — passing
+    the raw value would over-fetch for no correctness benefit.
+
+    **`max_page` is an intentional, hard ceiling — it is never exceeded,
+    even when `limit` is larger (ticket #200 round-3 finding 1).** When a
+    client-side-only filter is active, this returns `max_page` outright
+    — not `min(limit, max_page)` — so a caller that passes e.g.
+    `limit=500` against Azure DevOps's `max_page=200` still only fetches
+    (and therefore only lets `apply_run_filters` consider) the first 200
+    raw, server-ordered results. A genuine match sitting beyond position
+    `max_page` in the provider's own ordering can be missed in that
+    combination — `limit > max_page` *and* a client-side-only filter
+    active. This mirrors Azure DevOps's `list_runs_for_commit`, which has
+    always hard-coded an unconditional `$top=200` for the same reason
+    (accepted as correct in ticket #200 round 1) and is deliberately
+    **not** lifted here: raising the cap or paginating past it would
+    require verifying each provider's real server-side page-size ceiling
+    against its live API, which cannot be done from a description alone.
+    Treat `max_page` as each provider's already-established pagination
+    ceiling (Azure DevOps uses 200 elsewhere too, e.g. comments
+    pagination) rather than a value to tune per call.
+    """
+    _validate_limit(limit)
+    if workflow or event or since:
+        return max_page
+    return min(max(1, limit), max_page)
+
+
 def run_matches_ref(run: PipelineRun, ref: str) -> bool:
     """Return whether `run.branch` matches `ref` (ticket #200).
 

@@ -184,6 +184,24 @@ run = provider.wait_for_run(
 display name still works — it just isn't pushed down as a server-side
 path/`definitions=` filter, only matched client-side against `run.name`);
 GitLab has no per-workflow concept and ignores it beyond signature parity.
+
+**`trigger_pipeline`'s `workflow` is stricter than `wait_for_run`'s.**
+`trigger_pipeline` must resolve `workflow` to a concrete dispatch/queue
+target *before* making any HTTP call, so on GitHub a bare display name
+(e.g. `"Release"`) raises `ValueError` up front rather than being
+forwarded to a dispatch request that would 404 — only a filename
+(`"release.yml"`) or numeric workflow id is accepted. On Azure DevOps a
+name or numeric id both work, but an unresolvable one raises
+`AzureDevOpsError(404, ...)` before any build is queued. `wait_for_run`,
+by contrast, never raises for an unresolvable `workflow` — it accepts any
+string and, whenever the value can't be pushed down as a server-side
+filter, silently falls back to `apply_run_filters`'s client-side match
+against `run.name` (matching zero runs, and eventually timing out, is a
+valid outcome there, not an error). Passing the same bare display name to
+both calls will make `trigger_pipeline` raise immediately while a
+standalone `wait_for_run(..., workflow="Release")` call would happily
+poll and match client-side — don't assume symmetry between the two.
+
 `since` is a **required** keyword-only argument on `wait_for_run` — an
 unbounded wait would happily return a pre-existing run instead of the one
 just triggered. Both `trigger_pipeline` and `wait_for_run` return the

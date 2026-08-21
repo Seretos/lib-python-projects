@@ -796,6 +796,43 @@ class TestApplyRunFilters:
         assert len(apply_run_filters(runs, provider="github", limit=None)) == 2
 
 
+class TestRunMatchesRef:
+    """run_matches_ref (ticket #200 round-2 finding 3) — the direct unit
+    test this helper previously had none of. The two existing indirect
+    exercises (GitHub's and GitLab's `wait_for_run` tag tests) compare a
+    bare tag string against itself on both sides, so they never actually
+    exercised the `refs/heads/`/`refs/tags/` prefix-stripping logic —
+    these cases do.
+    """
+
+    def test_bare_branch_matches_refs_heads_prefixed(self):
+        from lib_python_projects.providers.base import run_matches_ref
+
+        run = _make_run(branch="main")
+        assert run_matches_ref(run, "refs/heads/main") is True
+
+    def test_bare_tag_matches_refs_tags_prefixed(self):
+        from lib_python_projects.providers.base import run_matches_ref
+
+        run = _make_run(branch="v1.2.3")
+        assert run_matches_ref(run, "refs/tags/v1.2.3") is True
+
+    def test_refs_tags_prefixed_run_matches_bare_tag(self):
+        """Azure DevOps's `sourceBranch` keeps a tag's `refs/tags/`
+        prefix in place (only `refs/heads/` is stripped by
+        `_map_build_run`) — the reverse direction of the previous case."""
+        from lib_python_projects.providers.base import run_matches_ref
+
+        run = _make_run(branch="refs/tags/v1.2.3")
+        assert run_matches_ref(run, "v1.2.3") is True
+
+    def test_genuine_mismatch_returns_false(self):
+        from lib_python_projects.providers.base import run_matches_ref
+
+        run = _make_run(branch="main")
+        assert run_matches_ref(run, "refs/heads/develop") is False
+
+
 class TestNowUtc:
     def test_returns_z_suffixed_string(self):
         from lib_python_projects.providers.base import now_utc

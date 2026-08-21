@@ -68,6 +68,7 @@ from lib_python_projects.providers.base import (
     RelationNotFound,
     Release,
     resolve_event_alias,
+    resolve_fetch_page_size,
     run_matches_ref,
     Review,
     ReviewComment,
@@ -1691,8 +1692,9 @@ def _list_pipelines(
     *,
     event: str | None = None,
     since: str | None = None,
+    workflow: str | None = None,
 ) -> list[PipelineRun]:
-    """Shared body for list_runs_for_branch/tag/commit.
+    """Shared body for list_runs_for_branch/tag/commit/recent.
 
     GitLab's `/projects/:id/pipelines` endpoint accepts `ref`, `sha`,
     `status`, `source`, etc. Callers pass the addressing param via
@@ -1702,9 +1704,15 @@ def _list_pipelines(
     pushed down as a query param; `since` is pushed down as
     `updated_after`. Both are best-effort — the caller always re-applies
     `apply_run_filters` afterwards as the authoritative final pass.
+    `workflow` has no GitLab-side equivalent at all (pipelines aren't
+    named per-workflow) and is used only to size the raw page via
+    `resolve_fetch_page_size` (round-2 finding 1) — passing it here does
+    not add a query param.
     """
     _validate_limit(limit)
-    per_page = min(max(1, limit), 100)
+    per_page = resolve_fetch_page_size(
+        limit, workflow=workflow, event=event, since=since, max_page=100,
+    )
     params: dict[str, Any] = {
         "per_page": per_page,
         "order_by": "id",
@@ -3843,7 +3851,10 @@ class GitLabProvider(
         scope = _gitlab_pipeline_scope(status)
         if scope:
             params["scope"] = scope
-        runs = _list_pipelines(project, token, params, limit, event=event, since=since)
+        runs = _list_pipelines(
+            project, token, params, limit,
+            event=event, since=since, workflow=workflow,
+        )
         runs = apply_run_filters(
             runs, provider="gitlab", workflow=workflow, event=event,
             since=since, limit=limit,
@@ -3880,7 +3891,10 @@ class GitLabProvider(
         scope = _gitlab_pipeline_scope(status)
         if scope:
             params["scope"] = scope
-        runs = _list_pipelines(project, token, params, limit, event=event, since=since)
+        runs = _list_pipelines(
+            project, token, params, limit,
+            event=event, since=since, workflow=workflow,
+        )
         runs = apply_run_filters(
             runs, provider="gitlab", workflow=workflow, event=event,
             since=since, limit=limit,
@@ -3912,7 +3926,10 @@ class GitLabProvider(
         scope = _gitlab_pipeline_scope(status)
         if scope:
             params["scope"] = scope
-        runs = _list_pipelines(project, token, params, limit, event=event, since=since)
+        runs = _list_pipelines(
+            project, token, params, limit,
+            event=event, since=since, workflow=workflow,
+        )
         runs = apply_run_filters(
             runs, provider="gitlab", workflow=workflow, event=event,
             since=since, limit=limit,
@@ -3949,7 +3966,13 @@ class GitLabProvider(
         """
         _validate_limit(limit)
         path = _project_path(project)
-        per_page = min(max(1, limit), 100)
+        # `workflow`/`event`/`since` are all matched purely client-side
+        # here (the per-MR pipelines endpoint pushes nothing down), so
+        # the raw page must not be sized to `limit` when any is set
+        # (round-2 finding 1) — see `resolve_fetch_page_size`.
+        per_page = resolve_fetch_page_size(
+            limit, workflow=workflow, event=event, since=since, max_page=100,
+        )
         resolved_refs: list[str] = []
         with _client(project, token) as client:
             r = client.get(
@@ -4001,7 +4024,10 @@ class GitLabProvider(
         scope = _gitlab_pipeline_scope(status)
         if scope:
             params["scope"] = scope
-        runs = _list_pipelines(project, token, params, limit, event=event, since=since)
+        runs = _list_pipelines(
+            project, token, params, limit,
+            event=event, since=since, workflow=workflow,
+        )
         runs = apply_run_filters(
             runs, provider="gitlab", workflow=workflow, event=event,
             since=since, limit=limit,

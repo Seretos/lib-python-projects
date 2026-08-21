@@ -78,6 +78,7 @@ from lib_python_projects.providers.base import (
     RelationNotFound,
     Release,
     resolve_event_alias,
+    resolve_fetch_page_size,
     run_matches_ref,
     Review,
     review_decision_from_states,
@@ -5050,17 +5051,31 @@ class AzureDevOpsProvider(
             exists = _resolve_ado_branch(c, project, repo_id, branch)
         if not exists:
             return [], []
-        definition_id = (
-            self._resolve_definition_id(project, token, workflow) if workflow else None
+        definition_id, client_side_workflow = self._resolve_workflow_filters(
+            project, token, workflow,
         )
-        params = _api_version_params({"branchName": branch, "$top": max(1, limit)})
+        # Round-2 finding 1: the raw `$top` page must not be sized to
+        # `limit` when a filter can only be resolved client-side, or a
+        # genuine match beyond the first `limit` raw results is silently
+        # discarded before `apply_run_filters` ever sees it. Round-3
+        # finding 1: this still caps the raw fetch at `max_page` (200)
+        # even when `limit` exceeds 200 — see `resolve_fetch_page_size`'s
+        # docstring for why that cap is an intentional, accepted
+        # limitation (mirrors `list_runs_for_commit`'s existing
+        # unconditional `$top=200`), not something this fix attempts to
+        # lift.
+        fetch_size = resolve_fetch_page_size(
+            limit, workflow=client_side_workflow, event=event, since=since,
+            max_page=200,
+        )
+        params = _api_version_params({"branchName": branch, "$top": fetch_size})
         raw_runs = self._list_builds(
-            project, token, params, status, limit,
+            project, token, params, status, fetch_size,
             event=event, since=since, definition_id=definition_id,
         )
         runs = apply_run_filters(
             raw_runs, provider="azuredevops",
-            workflow=_client_side_workflow_filter(workflow), event=event,
+            workflow=client_side_workflow, event=event,
             since=since, limit=limit,
         )
         return runs, [ref]
@@ -5088,9 +5103,13 @@ class AzureDevOpsProvider(
         """
         _validate_limit(limit)
         # ADO doesn't filter by sourceVersion server-side on the public
-        # /builds list; fetch the last page and filter client-side.
-        definition_id = (
-            self._resolve_definition_id(project, token, workflow) if workflow else None
+        # /builds list; fetch the last page and filter client-side. This
+        # $top=200 is the unconditional precedent finding-1 (round 3)
+        # cites for `resolve_fetch_page_size`'s own `max_page` cap on the
+        # other listing methods — it was already accepted (round 1) as
+        # correct to never fetch more than 200 raw builds here.
+        definition_id, client_side_workflow = self._resolve_workflow_filters(
+            project, token, workflow,
         )
         params = _api_version_params({"$top": 200})
         raw_runs = self._list_builds(
@@ -5100,7 +5119,7 @@ class AzureDevOpsProvider(
         filtered_by_sha = [r for r in raw_runs if r.head_sha == sha]
         runs = apply_run_filters(
             filtered_by_sha, provider="azuredevops",
-            workflow=_client_side_workflow_filter(workflow), event=event,
+            workflow=client_side_workflow, event=event,
             since=since, limit=limit,
         )
         if runs:
@@ -5130,17 +5149,27 @@ class AzureDevOpsProvider(
         See `list_runs_for_branch` for `workflow`/`event`/`since` semantics.
         """
         branch = tag if tag.startswith("refs/") else f"refs/tags/{tag}"
-        definition_id = (
-            self._resolve_definition_id(project, token, workflow) if workflow else None
+        definition_id, client_side_workflow = self._resolve_workflow_filters(
+            project, token, workflow,
         )
-        params = _api_version_params({"branchName": branch, "$top": max(1, limit)})
+        # Round-2 finding 1: see `list_runs_for_branch` — the raw `$top`
+        # page must not be sized to `limit` when a filter can only be
+        # resolved client-side. Round-3 finding 1: still capped at
+        # `max_page` (200) even when `limit` exceeds it — see
+        # `resolve_fetch_page_size`'s docstring; this is an accepted,
+        # documented limitation, not something this fix lifts.
+        fetch_size = resolve_fetch_page_size(
+            limit, workflow=client_side_workflow, event=event, since=since,
+            max_page=200,
+        )
+        params = _api_version_params({"branchName": branch, "$top": fetch_size})
         raw_runs = self._list_builds(
-            project, token, params, status, limit,
+            project, token, params, status, fetch_size,
             event=event, since=since, definition_id=definition_id,
         )
         runs = apply_run_filters(
             raw_runs, provider="azuredevops",
-            workflow=_client_side_workflow_filter(workflow), event=event,
+            workflow=client_side_workflow, event=event,
             since=since, limit=limit,
         )
         if runs:
@@ -5240,17 +5269,27 @@ class AzureDevOpsProvider(
         `workflow`/`event`/`since` semantics.
         """
         _validate_limit(limit)
-        definition_id = (
-            self._resolve_definition_id(project, token, workflow) if workflow else None
+        definition_id, client_side_workflow = self._resolve_workflow_filters(
+            project, token, workflow,
         )
-        params = _api_version_params({"$top": max(1, limit)})
+        # Round-2 finding 1: see `list_runs_for_branch` — the raw `$top`
+        # page must not be sized to `limit` when a filter can only be
+        # resolved client-side. Round-3 finding 1: still capped at
+        # `max_page` (200) even when `limit` exceeds it — see
+        # `resolve_fetch_page_size`'s docstring; this is an accepted,
+        # documented limitation, not something this fix lifts.
+        fetch_size = resolve_fetch_page_size(
+            limit, workflow=client_side_workflow, event=event, since=since,
+            max_page=200,
+        )
+        params = _api_version_params({"$top": fetch_size})
         raw_runs = self._list_builds(
-            project, token, params, status, limit,
+            project, token, params, status, fetch_size,
             event=event, since=since, definition_id=definition_id,
         )
         runs = apply_run_filters(
             raw_runs, provider="azuredevops",
-            workflow=_client_side_workflow_filter(workflow), event=event,
+            workflow=client_side_workflow, event=event,
             since=since, limit=limit,
         )
         return runs, []
@@ -5284,6 +5323,45 @@ class AzureDevOpsProvider(
             if (d.get("name") or "").lower() == w.lower():
                 return d.get("id")
         return None
+
+    def _resolve_workflow_filters(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        workflow: str | None,
+    ) -> tuple[int | None, str | None]:
+        """Resolve `workflow` to `(definition_id, client_side_workflow)`.
+
+        `definition_id` is the server-side `definitions=` push-down (see
+        `_resolve_definition_id`) — non-`None` whenever `workflow` was
+        numeric or successfully matched a build definition by name.
+
+        `client_side_workflow` is the value `apply_run_filters` /
+        `resolve_fetch_page_size` re-check against `run.name` — see
+        `_client_side_workflow_filter`. Deliberately computed
+        independently of whether `definition_id` resolved (round-3
+        finding 2, considered and **not** applied — see that helper's
+        docstring): `apply_run_filters` is documented as *the* final,
+        always-authoritative pass "regardless of whether the provider
+        also pushed `workflow`/`event`/`since` down as server-side query
+        params," specifically so a provider-native filter the server
+        silently ignored still yields a correct result. Making
+        `client_side_workflow` skip that re-check whenever
+        `definition_id` resolved would trade away that safety net for a
+        page-size optimization, and two existing tests
+        (`test_list_runs_for_branch_accepts_filter_kwargs`,
+        `test_list_runs_for_commit_limit_applied_after_filtering`)
+        concretely demonstrate the risk: their mocked `/builds` endpoint
+        returns runs from *every* definition regardless of the
+        `definitions=` param sent, and only the client-side re-check
+        narrows the result to the requested workflow.
+        """
+        definition_id = (
+            self._resolve_definition_id(project, token, workflow)
+            if workflow else None
+        )
+        client_side_workflow = _client_side_workflow_filter(workflow)
+        return definition_id, client_side_workflow
 
     def _list_builds(
         self,
@@ -5540,6 +5618,15 @@ class AzureDevOpsProvider(
         tag (no annotated tag object) yields an empty `body` and empty
         `created_at`/`published_at`, with `sha` taken directly from the
         ref's `objectId` (already the commit sha for a lightweight tag).
+
+        The `refs?filter=tags/` API gives no ordering guarantee, so
+        every tag is resolved (fetching its annotated-tag date where
+        one exists) before sorting by `created_at` descending and only
+        then truncating to `limit` (round-2 finding 2) — truncating
+        first would risk keeping an older tag over a newer one whenever
+        the raw ref order isn't already date-sorted. A lightweight tag
+        has no date evidence (`created_at == ""`) and sorts after every
+        dated release as a result.
         """
         _validate_limit(limit)
         repo_id = self._resolve_repository_id(project, token)
@@ -5549,7 +5636,7 @@ class AzureDevOpsProvider(
             resp = c.get(path, params=_api_version_params({"filter": "tags/"}))
             _check(resp)
             tag_refs = (resp.json() or {}).get("value") or []
-            for entry in tag_refs[:limit]:
+            for entry in tag_refs:
                 full_name = entry.get("name") or ""  # "refs/tags/v1.0.0"
                 tag_name = full_name.removeprefix("refs/tags/")
                 object_id = entry.get("objectId") or ""
@@ -5589,7 +5676,11 @@ class AzureDevOpsProvider(
                     published_at="",
                     body="",
                 ))
-        return out
+        # Most recent first (round-2 finding 2): sort by created_at desc
+        # over every resolved tag, THEN truncate to limit — never the
+        # reverse. Lightweight tags (created_at == "") sort last.
+        out.sort(key=lambda r: r.created_at, reverse=True)
+        return out[:limit]
 
     def _fetch_build_failure_context(
         self,

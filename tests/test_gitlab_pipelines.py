@@ -674,6 +674,31 @@ def test_list_runs_recent_workflow_has_no_server_equivalent_matches_synthetic_na
     assert [r.id for r in runs] == ["1"]
 
 
+def test_list_runs_recent_workflow_filter_sees_full_raw_page_before_limit(monkeypatch):
+    """Round-2 finding 1: `workflow` has no server-side equivalent on
+    GitLab at all (see `test_list_runs_recent_workflow_has_no_server_
+    equivalent_matches_synthetic_name`), so the raw page fetched from
+    the API must not be sized to the caller's `limit` — otherwise a
+    genuine match positioned beyond the first `limit` raw results is
+    silently missed, because the server already truncated the page
+    before `apply_run_filters` ever saw it. Unlike most mocks in this
+    file, this one actually honors `per_page` (mirroring the real
+    GitLab API) — that's what let this bug through the existing tests
+    unnoticed.
+    """
+    all_pipelines = [_pipeline(1), _pipeline(2), _pipeline(3)]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        per_page = int(req.url.params.get("per_page", "30"))
+        return _json(all_pipelines[:per_page])
+
+    _install_mock(monkeypatch, handler)
+    runs, _ = GitLabProvider().list_runs_recent(
+        _project(), "t", workflow="pipeline-2", limit=1,
+    )
+    assert [r.id for r in runs] == ["2"]
+
+
 def test_list_runs_for_branch_accepts_filter_kwargs(monkeypatch):
     def handler(req: httpx.Request) -> httpx.Response:
         if "/repository/branches/" in str(req.url):
