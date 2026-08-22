@@ -5324,6 +5324,13 @@ class GitHubProvider(
         Translates the GitHub merge-not-allowed 405 into a `GitHubError`
         via `_check`. After the merge succeeds, re-fetches the PR so the
         returned dataclass advertises the merged state.
+
+        The returned PR also carries `reviews`, `reviewers`, and
+        `review_decision`, synthesized the same way `get_pr` does (ticket
+        #214: `GET /pulls/{n}/reviews`), at the cost of one extra round
+        trip. This enrichment is best-effort: a failure degrades to empty
+        `reviews`/`reviewers`/`review_decision` (logged as a warning)
+        rather than failing an already-successful merge.
         """
         if merge_method not in ("merge", "squash", "rebase"):
             raise GitHubError(400, f"invalid merge_method '{merge_method}'")
@@ -5370,7 +5377,27 @@ class GitHubProvider(
             # Re-fetch so the response carries the merged state/timestamp.
             r2 = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
             _check(r2)
-            return _map_pr(r2.json())
+            pr = _map_pr(r2.json())
+            # Populate reviews/reviewers/review_decision the same way
+            # get_pr does (ticket #214), so a caller doesn't need a
+            # follow-up get_pr to see review data on a just-merged PR.
+            # Best-effort: never mask an already-successful merge — a
+            # failure here just leaves reviews/reviewers/review_decision
+            # empty (get_pr's/`_map_pr`'s defaults).
+            try:
+                reviews = _fetch_pr_reviews(client, project, pr_id)
+                latest_by_author = _latest_reviews_by_author(reviews)
+                pr.reviews = reviews
+                pr.reviewers = [rv.author for rv in latest_by_author]
+                pr.review_decision = review_decision_from_states(
+                    [rv.state for rv in latest_by_author]
+                )
+            except Exception:
+                log.warning(
+                    "PR %s: failed to fetch review data after merge; "
+                    "returning merged PR with empty reviews", pr_id,
+                )
+            return pr
 
     # ---------- relations (write side) --------------------------------------
 
