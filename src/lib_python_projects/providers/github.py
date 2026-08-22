@@ -479,12 +479,17 @@ def _find_pending_review(
 ) -> dict | None:
     """Return the caller's PENDING (unsubmitted) review on this PR, if any.
 
-    Hits `GET /repos/{o}/{r}/pulls/{n}/reviews?per_page=100` and returns
-    the raw dict of the last `PENDING` entry — GitHub only ever returns
-    a pending review to its own author, so there is at most one per
-    caller. Returns the raw dict (not a mapped `Review`) so callers get
-    both the REST `id` and the GraphQL `node_id`. `None` when no
-    pending review exists.
+    Hits `GET /repos/{o}/{r}/pulls/{n}/reviews?per_page=100`, paginating
+    through every page (same `_has_next_link`/`page`-increment recipe as
+    `_fetch_comments_for_scan`) — GitHub paginates this endpoint, and a
+    PR with more than 100 reviews can have its PENDING review sit on
+    page 2+. A single-page take would then wrongly conclude there's no
+    pending review, causing callers to create a duplicate one. Returns
+    the raw dict (not a mapped `Review`) of the last `PENDING` entry
+    across all pages — GitHub only ever returns a pending review to its
+    own author, so there is at most one per caller. Returns the raw
+    dict (not a mapped `Review`) so callers get both the REST `id` and
+    the GraphQL `node_id`. `None` when no pending review exists.
 
     A 404 on this lookup (e.g. a bad `pr_id`) is treated the same as
     "no pending review" rather than raised here: this call is an
@@ -493,14 +498,30 @@ def _find_pending_review(
     surface its own honest 404 — callers' existing 404-mapping logic
     stays the single source of truth for that error message.
     """
-    r = client.get(
-        f"{_repo_path(project)}/pulls/{pr_id}/reviews",
-        params={"per_page": 100},
-    )
-    if r.status_code == 404:
-        return None
-    _check(r)
-    pending = [it for it in r.json() if it.get("state") == "PENDING"]
+    reviews: list[dict] = []
+    page = 1
+    while True:
+        r = client.get(
+            f"{_repo_path(project)}/pulls/{pr_id}/reviews",
+            params={"per_page": 100, "page": page},
+        )
+        if r.status_code == 404:
+            return None
+        _check(r)
+        reviews.extend(r.json())
+        if not _has_next_link(r.headers.get("Link")):
+            break
+        page += 1
+        if page > 100:
+            log.warning(
+                "pending-review lookup for %s/%s#%s hit the %d-page"
+                " pagination cap — result may be incomplete and a"
+                " genuine PENDING review beyond this cap would be"
+                " missed",
+                project.owner, project.repo, pr_id, page - 1,
+            )
+            break
+    pending = [it for it in reviews if it.get("state") == "PENDING"]
     return pending[-1] if pending else None
 
 
@@ -530,6 +551,89 @@ def _create_pending_review(
     )
     _check(r)
     return r.json()
+
+
+def _cleanup_orphaned_pending_review(
+    client: httpx.Client, project: ProjectConfig, pr_id: str, pending: dict,
+) -> None:
+    """Best-effort delete of a pending review this call just created —
+    but ONLY if it is still genuinely empty.
+
+    Ticket #205, fix-round 3, finding 2: `add_pr_review_comment`'s reply
+    branch creates a bare `PENDING` review via `_create_pending_review`
+    and then attaches the reply in a *separate* follow-up GraphQL call
+    (`_reply_in_pending_review`). If that follow-up fails for ANY reason
+    — network error, rate limit, auth error, unexpected response shape,
+    not just a bad `in_reply_to` (already handled by resolving/
+    validating the parent id before creation) — the newly created
+    review is left dangling on the PR with zero comments, which later
+    blocks/breaks `submit_pr_review`. Callers should invoke this only
+    when THEY created the pending review this call — never for one
+    `_find_pending_review` already found.
+
+    Ticket #205, fix-round 4, finding 2: catching ANY exception around
+    the GraphQL reply is too broad on its own — the mutation can
+    actually succeed server-side while the client still sees a failure
+    (a timeout or dropped connection after the request lands, or a
+    response-decoding error such as `r.json()` choking on a malformed
+    200 body). Deleting the review in that case would silently destroy
+    the comment that *did* get created, since GitHub's DELETE-pending-
+    review endpoint removes the review's comments along with it — worse
+    than the orphan this cleanup exists to fix. So before deleting, we
+    re-fetch the review's own comments via
+    `GET /pulls/{n}/reviews/{id}/comments` (the same endpoint
+    `_latest_pending_review_comment` uses) and only delete when it
+    comes back empty, i.e. the mutation never actually landed. If it
+    already has a comment attached, the review is left in place as the
+    caller's now-successfully-created review — the original exception
+    still propagates to the caller from `add_pr_review_comment`, but we
+    must not destroy real data to do so.
+
+    Uses `DELETE /repos/{o}/{r}/pulls/{n}/reviews/{id}`, the REST
+    endpoint for discarding a still-PENDING review. Both the
+    verification GET and the DELETE are best-effort: never raises. A
+    failure here must not mask the original error that triggered the
+    cleanup, so every step is logged and swallowed instead — including
+    a failed verification, which is treated as "skip the delete" rather
+    than "assume it's safe": leaving a possibly-orphaned review behind
+    is safer than risking deletion of a real comment we couldn't
+    confirm is absent.
+    """
+    review_id = pending.get("id")
+    try:
+        r = client.get(
+            f"{_repo_path(project)}/pulls/{pr_id}/reviews/{review_id}/comments",
+            params={"per_page": 100},
+        )
+        _check(r)
+        comments = r.json()
+    except Exception as exc:
+        log.warning(
+            "could not verify pending review %s on %s/%s#%s is still empty"
+            " before cleanup — leaving it in place rather than risk"
+            " deleting a real comment: %s",
+            review_id, project.owner, project.repo, pr_id, exc,
+        )
+        return
+    if comments:
+        log.warning(
+            "pending review %s on %s/%s#%s already has %d comment(s)"
+            " attached — the follow-up mutation must have landed"
+            " server-side despite the client-side error; leaving the"
+            " review in place instead of deleting it",
+            review_id, project.owner, project.repo, pr_id, len(comments),
+        )
+        return
+    try:
+        r = client.delete(
+            f"{_repo_path(project)}/pulls/{pr_id}/reviews/{review_id}"
+        )
+        _check(r)
+    except Exception as exc:
+        log.warning(
+            "could not clean up orphaned pending review %s on %s/%s#%s: %s",
+            review_id, project.owner, project.repo, pr_id, exc,
+        )
 
 
 def _review_comment_node_id(
@@ -4999,6 +5103,22 @@ class GitHubProvider(
         pending review already exists, a new-thread `commit_sha` that
         does not match the pending review's own commit raises
         `ValueError` rather than being silently ignored.
+
+        Ticket #205, fix-round 3, finding 2: in the reply branch, if
+        this call creates the pending review itself (none existed yet)
+        and the follow-up GraphQL reply then fails for ANY reason, the
+        just-created review is a cleanup candidate before the error is
+        re-raised — see `_cleanup_orphaned_pending_review`. A pending
+        review `_find_pending_review` found (i.e. one that already
+        existed before this call) is never touched by that cleanup.
+
+        Ticket #205, fix-round 4, finding 2: that cleanup only actually
+        deletes the review if it re-verifies it is still empty — the
+        GraphQL mutation can succeed server-side even though this call
+        sees the follow-up as failed (timeout, dropped connection,
+        malformed response), and deleting a review that already has a
+        real comment on it would silently destroy that comment. The
+        original exception is re-raised to the caller either way.
         """
         prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
         try:
@@ -5015,11 +5135,23 @@ class GitHubProvider(
                     parent_node_id = _review_comment_node_id(
                         client, project, in_reply_to,
                     )
+                    created_review = pending is None
                     if pending is None:
                         pending = _create_pending_review(client, project, pr_id)
-                    comment_id = _reply_in_pending_review(
-                        client, pending["node_id"], parent_node_id, prefixed,
-                    )
+                    try:
+                        comment_id = _reply_in_pending_review(
+                            client, pending["node_id"], parent_node_id, prefixed,
+                        )
+                    except Exception:
+                        # Fix-round 3, finding 2: ANY failure here (not
+                        # just a bad parent id, already ruled out above)
+                        # must not leave an orphaned empty pending review
+                        # behind — but only if THIS call created it.
+                        if created_review:
+                            _cleanup_orphaned_pending_review(
+                                client, project, pr_id, pending,
+                            )
+                        raise
                     return _fetch_review_comment(client, project, comment_id)
                 if pending is None:
                     created = _create_pending_review(
@@ -5088,6 +5220,13 @@ class GitHubProvider(
         a second review while one is still pending for the same
         author. When no pending review exists, falls back to the
         original create-and-submit path, `POST /pulls/{n}/reviews`.
+
+        Ticket #205, fix-round 3, finding 3: mirrors
+        `add_pr_review_comment`'s same-commit contract — once a pending
+        review is found, a `commit_sha` that does not match the pending
+        review's own commit raises `ValueError` rather than silently
+        submitting a review that doesn't correspond to what the caller
+        intended.
         """
         event_map = {
             "approve": "APPROVE",
@@ -5111,6 +5250,16 @@ class GitHubProvider(
             try:
                 pending = _find_pending_review(client, project, pr_id)
                 if pending is not None:
+                    pending_commit_sha = pending.get("commit_id")
+                    if commit_sha is not None and commit_sha != pending_commit_sha:
+                        raise ValueError(
+                            f"submit_pr_review: commit_sha={commit_sha!r} does"
+                            f" not match the pending review's commit"
+                            f" {pending_commit_sha!r} — GitHub does not support"
+                            f" mixing commits within one review; omit commit_sha"
+                            f" or pass the pending review's own commit once a"
+                            f" pending review already exists."
+                        )
                     url = f"{_repo_path(project)}/pulls/{pr_id}/reviews/{pending['id']}/events"
                 else:
                     url = f"{_repo_path(project)}/pulls/{pr_id}/reviews"

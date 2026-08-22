@@ -393,6 +393,94 @@ def test_submit_pr_review_creates_new_review_when_none_pending(
     assert review.state == "approve"
 
 
+# ---------- Ticket #205, fix-round 3, finding 3: commit_sha contract ---------
+
+
+def test_submit_pr_review_rejects_mismatched_commit_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrors `add_pr_review_comment`'s same-commit contract: once a
+    pending review is found, a `commit_sha` that does not match the
+    pending review's own commit must raise `ValueError` rather than
+    being silently accepted — otherwise a review could be submitted
+    against a different commit than the pending review's original one.
+    Must fail fast: no submit POST may be sent."""
+    pending = {
+        "id": 900,
+        "node_id": "REVIEW_NODE_900",
+        "state": "PENDING",
+        "user": {"login": "me"},
+        "body": "",
+        "html_url": "",
+        "submitted_at": None,
+        "commit_id": "abc123",
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="commit_sha"):
+        GitHubProvider().submit_pr_review(
+            _project(),
+            token="t",
+            pr_id="7",
+            state="comment",
+            body="lgtm",
+            commit_sha="different-sha",
+        )
+    assert not any(
+        r.method == "POST" and r.url.path.startswith("/repos/acme/backend/pulls/7/reviews")
+        for r in seen
+    )
+
+
+def test_submit_pr_review_accepts_matching_commit_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: passing the SAME commit_sha as the pending
+    review's own commit still submits normally (no false-positive
+    rejection)."""
+    pending = {
+        "id": 900,
+        "node_id": "REVIEW_NODE_900",
+        "state": "PENDING",
+        "user": {"login": "me"},
+        "body": "",
+        "html_url": "",
+        "submitted_at": None,
+        "commit_id": "abc123",
+    }
+    submitted = {
+        **pending,
+        "state": "COMMENTED",
+        "body": "lgtm",
+        "submitted_at": "2024-01-02T00:00:00Z",
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/7/reviews/900/events":
+            return _json(submitted)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    review = GitHubProvider().submit_pr_review(
+        _project(),
+        token="t",
+        pr_id="7",
+        state="comment",
+        body="lgtm",
+        commit_sha="abc123",
+    )
+    assert review.id == "900"
+
+
 # ---------- Ticket #205: end-to-end acceptance (R5) --------------------------
 
 

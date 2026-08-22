@@ -69,11 +69,11 @@ def _install_mock(
     return seen
 
 
-def _json(payload, status_code: int = 200) -> httpx.Response:
+def _json(payload, status_code: int = 200, headers: dict | None = None) -> httpx.Response:
     return httpx.Response(
         status_code=status_code,
         content=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
     )
 
 
@@ -405,3 +405,240 @@ def test_add_pr_review_comment_reused_review_accepts_matching_commit_sha(
         commit_sha="abc123",
     )
     assert result.id == "9005"
+
+
+# ---------- fix-round 3, finding 1: _find_pending_review paginates ----------
+
+
+def test_add_pr_review_comment_finds_pending_review_on_second_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PR with more than 100 reviews can have its PENDING review sit
+    on page 2+ of `GET /pulls/{n}/reviews`. `_find_pending_review` must
+    follow the `Link: rel="next"` header and keep paging rather than
+    stopping after page 1 — otherwise it wrongly concludes there is no
+    pending review and a second, duplicate one gets created."""
+    page1 = [{"id": i, "state": "APPROVED"} for i in range(100)]
+    pending = _pending_review()
+    fetched = _comment(9006, path="src/qux.py", line=5, side="RIGHT")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            page = dict(req.url.params).get("page", "1")
+            if page == "1":
+                return _json(
+                    page1,
+                    headers={
+                        "Link": (
+                            '<https://api.github.com/repos/acme/backend'
+                            '/pulls/7/reviews?page=2>; rel="next"'
+                        )
+                    },
+                )
+            if page == "2":
+                return _json([pending])
+            raise AssertionError(f"unexpected page: {page}")
+        if req.method == "POST" and path == "/graphql":
+            gql = _body(req)
+            assert "addPullRequestReviewThread" in gql["query"]
+            assert gql["variables"]["reviewId"] == "REVIEW_NODE_900"
+            return _json(
+                {
+                    "data": {
+                        "addPullRequestReviewThread": {
+                            "thread": {"comments": {"nodes": [{"databaseId": 9006}]}}
+                        }
+                    }
+                }
+            )
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/9006":
+            return _json(fetched)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="7",
+        body="fourth nit",
+        path="src/qux.py",
+        line=5,
+        side="RIGHT",
+        commit_sha="abc123",
+    )
+    assert result.id == "9006"
+    # Must reuse the existing pending review found on page 2, never
+    # create a duplicate one.
+    assert not any(
+        r.method == "POST" and r.url.path == "/repos/acme/backend/pulls/7/reviews"
+        for r in seen
+    )
+
+
+# ---------- fix-round 3, finding 2: cleanup an orphaned pending review ------
+
+
+def test_add_pr_review_comment_reply_cleans_up_review_when_graphql_fails_for_other_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If this call creates the pending review itself and the follow-up
+    GraphQL reply call then fails for a reason OTHER than a bad parent
+    id (here: a generic 500), and the review's own comments (re-fetched
+    to verify) are still empty — i.e. the mutation never actually
+    landed — the just-created pending review must be deleted before the
+    error is re-raised; otherwise it's left dangling, empty, on the
+    PR."""
+    from lib_python_projects.providers.github import GitHubError
+
+    created_review = _pending_review()
+    parent = _comment(8002, node_id="PARENT_NODE_8002")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8002":
+            return _json(parent)
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json(created_review)
+        if req.method == "POST" and path == "/graphql":
+            return _json({"message": "internal server error"}, status_code=500)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews/900/comments":
+            # Verification re-fetch: the review is still genuinely
+            # empty — the mutation never landed — so cleanup should
+            # proceed with the delete.
+            return _json([])
+        if req.method == "DELETE" and path == "/repos/acme/backend/pulls/7/reviews/900":
+            return _json({})
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError):
+        GitHubProvider().add_pr_review_comment(
+            _project(), token="t", pr_id="7", body="reply", in_reply_to="8002",
+        )
+    assert any(
+        r.method == "DELETE" and r.url.path == "/repos/acme/backend/pulls/7/reviews/900"
+        for r in seen
+    )
+
+
+def test_add_pr_review_comment_reply_does_not_delete_review_when_reply_actually_landed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fix-round 4, finding 2: if the GraphQL reply mutation actually
+    succeeded server-side (the review now has a comment attached when
+    re-fetched) but the client still saw the call as failed — e.g. a
+    timeout or a malformed response after the mutation landed — cleanup
+    must NOT delete the review. Deleting it would silently destroy the
+    comment that was actually posted, which is worse than the orphan
+    this cleanup exists to prevent. The original exception must still
+    propagate to the caller."""
+    from lib_python_projects.providers.github import GitHubError
+
+    created_review = _pending_review()
+    parent = _comment(8004, node_id="PARENT_NODE_8004")
+    landed_comment = _comment(9004, node_id="COMMENT_NODE_9004")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8004":
+            return _json(parent)
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json(created_review)
+        if req.method == "POST" and path == "/graphql":
+            return _json({"message": "internal server error"}, status_code=500)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews/900/comments":
+            # Verification re-fetch: the mutation actually landed —
+            # the review already has a real comment on it — so cleanup
+            # must leave it alone.
+            return _json([landed_comment])
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError):
+        GitHubProvider().add_pr_review_comment(
+            _project(), token="t", pr_id="7", body="reply", in_reply_to="8004",
+        )
+    assert not any(r.method == "DELETE" for r in seen)
+
+
+def test_add_pr_review_comment_reply_does_not_delete_preexisting_pending_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a pending review already existed BEFORE this call (found via
+    `_find_pending_review`, not created by it) and the follow-up GraphQL
+    reply fails, cleanup must NOT delete it — only a review this call
+    itself created is eligible for cleanup."""
+    from lib_python_projects.providers.github import GitHubError
+
+    pending = _pending_review()
+    parent = _comment(8003, node_id="PARENT_NODE_8003")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8003":
+            return _json(parent)
+        if req.method == "POST" and path == "/graphql":
+            return _json({"message": "internal server error"}, status_code=500)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError):
+        GitHubProvider().add_pr_review_comment(
+            _project(), token="t", pr_id="7", body="reply", in_reply_to="8003",
+        )
+    assert not any(r.method == "DELETE" for r in seen)
+
+
+# ---------- ticket #205 fix-round 5: warn when pagination cap is hit --------
+
+
+def test_find_pending_review_logs_warning_when_pagination_cap_hit(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`_find_pending_review`'s pagination loop bails out after 100 pages
+    as a safety cap against a pathological/misbehaving API response. If a
+    PR genuinely has more than 10,000 reviews and the caller's PENDING
+    review sits beyond that cap, this silently returns `None` even though
+    a pending review exists. Hitting the cap must log a warning so this
+    doesn't happen with zero signal."""
+    import logging
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        assert req.method == "GET"
+        assert path == "/repos/acme/backend/pulls/7/reviews"
+        page = dict(req.url.params).get("page", "1")
+        return _json(
+            [{"id": int(page), "state": "APPROVED"}],
+            headers={
+                "Link": (
+                    f'<https://api.github.com/repos/acme/backend/pulls/7'
+                    f'/reviews?page={int(page) + 1}>; rel="next"'
+                )
+            },
+        )
+
+    _install_mock(monkeypatch, handler)
+    client = github_mod._client("t")
+    try:
+        with caplog.at_level(logging.WARNING, logger="project-issues.github"):
+            result = github_mod._find_pending_review(client, _project(), "7")
+    finally:
+        client.close()
+
+    assert result is None
+    warning_texts = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning_texts, "Expected a warning about the pagination cap, got none"
+    combined = " ".join(warning_texts)
+    assert "acme/backend#7" in combined, (
+        f"Expected owner/repo#pr_id in warning: {combined!r}"
+    )
+    assert "100" in combined, f"Expected the page cap in warning: {combined!r}"
