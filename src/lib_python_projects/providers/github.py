@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import posixpath
 import re
 import time
 from typing import Any
@@ -25,6 +26,7 @@ from lib_python_projects.providers.base import (
     apply_run_filters,
     BoardColumnSpec,
     BulkTicketResult,
+    CIConfigurationProvider,
     Comment,
     DiscoveredProject,
     FailingJob,
@@ -61,6 +63,8 @@ from lib_python_projects.providers.base import (
     TokenProjectDiscoveryProvider,
     ViewerIdentity,
     ViewerIdentityProvider,
+    Workflow,
+    NO_CI_SENTINEL,
     _assert_not_self_relation,
     _extract_parent_id,
     _validate_label_lists,
@@ -2614,7 +2618,9 @@ def _trigger_sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
+class GitHubProvider(
+    TokenProjectDiscoveryProvider, ViewerIdentityProvider, CIConfigurationProvider
+):
     def probe_token_capabilities(
         self, project: ProjectConfig, token: str
     ) -> TokenCapabilities:
@@ -2942,6 +2948,24 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         `None` (never raises on read — "not applicable" semantics).
         Binding configured but the issue has no item on that project ->
         `custom_fields = {}`.
+
+        The board's `Title` field (and `custom_fields["title"]`/
+        `custom_fields["Title"]`, whichever casing the board's live field
+        name uses) is a **mirror** of the issue title that GitHub itself
+        maintains, not a value this wrapper writes or refreshes. GitHub
+        does not guarantee that mirror is re-synced on every issue edit,
+        so after an `update_ticket(title=...)`, a subsequent read here
+        may lag: `custom_fields["Title"]` can be stale (still the
+        pre-update title) even though `ticket.title` (mapped from the
+        REST issue payload by `_map_issue` above) is already correct.
+        `ticket.title` is the authoritative value for the issue's title;
+        `custom_fields["Title"]` must not be treated as such (ticket
+        #203). This wrapper deliberately does not force-refresh or write
+        back the mirrored field — the map `_populate_board_fields`
+        builds is returned verbatim. The same lag can apply to
+        other board-mirrored *native* issue fields (not to
+        single-select/text/iteration fields the wrapper itself writes,
+        which are not mirrors).
 
         `ticket.milestone` (ticket #151) is populated from the same bound
         board's *iteration* field (see `GithubProjectsV2Binding.iteration_field`)
@@ -3288,7 +3312,11 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         Projects-v2 `projectItems` GraphQL read `get_ticket` uses, so the
         return matches an immediate
         `get_ticket(..., include_custom_fields=True)` — at the cost of
-        one extra round trip, confined to this path. A `milestone`-only
+        one extra round trip, confined to this path. That parity
+        includes the board's `Title` field's possible staleness after a
+        `title` change (ticket #203) — see `get_ticket`'s
+        `custom_fields` documentation for the full explanation. A
+        `milestone`-only
         board write does not trigger any of this (neither the state poll
         nor the board read-back): the iteration field has no REST-visible
         effect on the issue, so the returned `custom_fields` and
@@ -5162,6 +5190,31 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 kind, "github", self._SUPPORTED_RELATION_KINDS,
             )
 
+    # ---------- CI workflow discovery (ticket #209, CIConfigurationProvider) -
+
+    def list_workflows(
+        self, project: ProjectConfig, token: str | None
+    ) -> list[Workflow]:
+        """List every Actions workflow defined on the repository.
+
+        See `_list_workflows` for exact field mapping and error
+        semantics (only 404 folds to `[]`; 401/403/5xx propagate).
+        """
+        with _client(token) as client:
+            return _list_workflows(client, project)
+
+    def is_ci_configured(
+        self, project: ProjectConfig, token: str | None
+    ) -> bool:
+        """Return whether the repository has at least one Actions workflow.
+
+        `bool(self.list_workflows(project, token))` in spirit — uses
+        `_has_workflows` directly to avoid building `Workflow` objects
+        just to discard them.
+        """
+        with _client(token) as client:
+            return _has_workflows(client, project)
+
     # ---------- pipelines / CI runs -----------------------------------------
 
     def list_runs_for_branch(
@@ -5207,7 +5260,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 )
                 return runs, [sha]
             if not _has_workflows(client, project):
-                return [], [sha, "no-ci"]
+                return [], [sha, NO_CI_SENTINEL]
             return [], [sha]
 
     def list_runs_for_commit(
@@ -5226,7 +5279,9 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
 
         Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape:
         - ``([], [])`` — commit not found
-        - ``(runs, [sha])`` — commit found (runs may be empty)
+        - ``([], [sha, "no-ci"])`` — commit found, no runs, no workflows
+        - ``([], [sha])`` — commit found, no runs, CI is configured
+        - ``(runs, [sha])`` — commit found, runs found
 
         See `list_runs_for_branch` for `workflow`/`event`/`since` semantics.
         """
@@ -5244,7 +5299,11 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 event=event,
                 since=since, limit=limit,
             )
-            return runs, [sha]
+            if runs:
+                return runs, [sha]
+            if not _has_workflows(client, project):
+                return [], [sha, NO_CI_SENTINEL]
+            return [], [sha]
 
     def list_runs_for_tag(
         self,
@@ -5279,7 +5338,11 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 event=event,
                 since=since, limit=limit,
             )
-            return runs, [sha]
+            if runs:
+                return runs, [sha]
+            if not _has_workflows(client, project):
+                return [], [sha, NO_CI_SENTINEL]
+            return [], [sha]
 
     def list_runs_for_ticket(
         self,
@@ -5329,9 +5392,13 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 event=event,
                 since=since, limit=limit,
             )
-            return runs, shas
+            if runs:
+                return runs, shas
+            if not _has_workflows(client, project):
+                return [], [*shas, NO_CI_SENTINEL]
+            return [], shas
 
-    def list_runs_recent(
+    def _list_runs_recent_unprobed(
         self,
         project: ProjectConfig,
         token: str | None,
@@ -5342,11 +5409,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         event: str | None = None,
         since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
-        """List the most recent Actions workflow runs, unfiltered by ref.
+        """Core of `list_runs_recent`, without the `is_ci_configured` probe.
 
-        Returns ``(runs, [])`` — the empty ``resolved_refs`` signals that
-        no ref filter was applied. See `list_runs_for_branch` for
-        `workflow`/`event`/`since` semantics.
+        `wait_for_run` polls this helper directly (ticket #209) — it
+        must never trigger the extra probe request on every empty poll
+        iteration. See `list_runs_recent` for the public, probing
+        wrapper that real callers should use.
         """
         _validate_limit(limit)
         with _client(token) as client:
@@ -5364,6 +5432,37 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
             since=since, limit=limit,
         )
         return runs, []
+
+    def list_runs_recent(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        status: str = "all",
+        limit: int = 10,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List the most recent Actions workflow runs, unfiltered by ref.
+
+        Returns ``(runs, [])`` when runs are found, or when none are
+        found but CI is configured. Returns ``([], [NO_CI_SENTINEL])``
+        when there are no matching runs AND the repository has no
+        Actions workflows at all (ticket #209) — see `NO_CI_SENTINEL`.
+        See `list_runs_for_branch` for `workflow`/`event`/`since`
+        semantics.
+        """
+        runs, resolved_refs = self._list_runs_recent_unprobed(
+            project, token, status=status, limit=limit,
+            workflow=workflow, event=event, since=since,
+        )
+        if runs:
+            return runs, resolved_refs
+        with _client(token) as client:
+            if not _has_workflows(client, project):
+                return [], [NO_CI_SENTINEL]
+        return [], resolved_refs
 
     def get_run(
         self,
@@ -5541,7 +5640,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         deadline = time.monotonic() + timeout
         attempt = 0
         while True:
-            runs, _ = self.list_runs_recent(
+            runs, _ = self._list_runs_recent_unprobed(
                 project, token, limit=50,
                 workflow=workflow, event=event, since=since,
             )
@@ -6022,23 +6121,59 @@ def _resolve_commit(
     return True
 
 
+def _list_workflows(
+    client: httpx.Client,
+    project: ProjectConfig,
+) -> list[Workflow]:
+    """Return every Actions workflow defined on the repository (ticket #209).
+
+    Only 404 (repository or endpoint not found) is treated as "no
+    workflows / not applicable" and returns ``[]``.  Auth failures
+    (401/403) and server errors (5xx) are propagated via ``_check`` so
+    real credential or infrastructure problems surface rather than being
+    silently misclassified as the ``"no-ci"`` sentinel. This is the
+    promoted body of the original private `_has_workflows` probe
+    (ticket #200) — `_has_workflows` is now `bool(_list_workflows(...))`.
+    """
+    r = client.get(f"{_repo_path(project)}/actions/workflows")
+    if r.status_code == 404:
+        return []
+    _check(r)
+    raw = (r.json() or {}).get("workflows") or []
+    return [_map_workflow(w) for w in raw]
+
+
+def _map_workflow(raw: dict) -> Workflow:
+    """Translate a GitHub `workflow` payload into a `Workflow`.
+
+    `dispatch_target` is the filename segment of `path`
+    (`.github/workflows/ci.yml` -> `ci.yml`) — the shape
+    `_workflow_path_segment`/the dispatch endpoint require — falling
+    back to the numeric `id` as a string when `path` is missing/empty
+    (`_workflow_path_segment` also accepts a bare numeric id).
+    """
+    path = raw.get("path") or ""
+    filename = posixpath.basename(path) if path else ""
+    dispatch_target = filename or str(raw.get("id", ""))
+    return Workflow(
+        id=str(raw.get("id", "")),
+        name=raw.get("name") or "",
+        path=path,
+        state=raw.get("state") or "",
+        url=raw.get("html_url") or None,
+        dispatch_target=dispatch_target,
+    )
+
+
 def _has_workflows(
     client: httpx.Client,
     project: ProjectConfig,
 ) -> bool:
     """Return ``True`` if the repository has at least one Actions workflow.
 
-    Only 404 (repository or endpoint not found) is treated as "no
-    workflows / not applicable" and returns ``False``.  Auth failures
-    (401/403) and server errors (5xx) are propagated via ``_check`` so
-    real credential or infrastructure problems surface rather than being
-    silently misclassified as the ``"no-ci"`` sentinel.
+    See `_list_workflows` for the underlying request and error semantics.
     """
-    r = client.get(f"{_repo_path(project)}/actions/workflows")
-    if r.status_code == 404:
-        return False
-    _check(r)
-    return ((r.json() or {}).get("total_count") or 0) > 0
+    return bool(_list_workflows(client, project))
 
 
 def _resolve_tag_sha(

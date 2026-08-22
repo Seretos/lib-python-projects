@@ -56,6 +56,7 @@ from lib_python_projects.providers.base import (
     apply_run_filters,
     BoardColumnSpec,
     BulkTicketResult,
+    CIConfigurationProvider,
     Comment,
     DiscoveredProject,
     FailingJob,
@@ -94,6 +95,8 @@ from lib_python_projects.providers.base import (
     ViewerIdentity,
     ViewerIdentityProvider,
     WRITABLE_RELATION_KINDS,
+    Workflow,
+    NO_CI_SENTINEL,
     normalize_timestamp,
     _assert_not_self_relation,
     _extract_parent_id,
@@ -1595,6 +1598,49 @@ def _map_build_run(raw: dict, project: ProjectConfig) -> PipelineRun:
     )
 
 
+def _map_workflow(raw: dict) -> Workflow:
+    """Translate an Azure DevOps build-definition payload into a `Workflow`.
+
+    `dispatch_target` is the numeric definition id as a string — unique
+    and avoids the name-resolution 404s `_resolve_definition_id` can hit
+    for a bare display name (ticket #209).
+    """
+    definition_id = str(raw.get("id", ""))
+    return Workflow(
+        id=definition_id,
+        name=raw.get("name") or "",
+        path=raw.get("path") or "",
+        state=raw.get("queueStatus") or "",
+        url=(raw.get("_links") or {}).get("web", {}).get("href") or None,
+        dispatch_target=definition_id,
+    )
+
+
+def _list_workflows(
+    client: httpx.Client,
+    project: ProjectConfig,
+    repo_id: str,
+) -> list[Workflow]:
+    """Return every build definition wired to this repository (ticket #209).
+
+    Only 404 is treated as "no definitions / not applicable" and
+    returns `[]`; auth failures (401/403) and server errors (5xx)
+    propagate via `_check`, matching `_has_workflows`'s original GitHub
+    error semantics.
+    """
+    path = f"{_project_scope(project)}/_apis/build/definitions"
+    r = client.get(
+        path,
+        params=_api_version_params({
+            "repositoryId": repo_id, "repositoryType": "TfsGit",
+        }),
+    )
+    if r.status_code == 404:
+        return []
+    _check(r)
+    return [_map_workflow(d) for d in (r.json() or {}).get("value") or []]
+
+
 def _normalize_az_issues(rec: dict) -> list[FailureAnnotation]:
     """Map an Azure Pipelines timeline record's `issues[]` into
     `FailureAnnotation`s (ticket #152).
@@ -1850,7 +1896,10 @@ def _trigger_sleep(seconds: float) -> None:
 
 
 class AzureDevOpsProvider(
-    TokenCapabilityProvider, TokenProjectDiscoveryProvider, ViewerIdentityProvider
+    TokenCapabilityProvider,
+    TokenProjectDiscoveryProvider,
+    ViewerIdentityProvider,
+    CIConfigurationProvider,
 ):
     """Azure DevOps provider.
 
@@ -5019,6 +5068,29 @@ class AzureDevOpsProvider(
 
         return {"removed": True}
 
+    # ---------- CI workflow discovery (ticket #209, CIConfigurationProvider) -
+
+    def list_workflows(
+        self, project: ProjectConfig, token: str | None
+    ) -> list[Workflow]:
+        """List every build definition wired to this repository.
+
+        See module-level `_list_workflows` for exact field mapping and
+        error semantics (only 404 folds to `[]`; 401/403/5xx propagate).
+        """
+        repo_id = self._resolve_repository_id(project, token)
+        with _client(project, token) as c:
+            return _list_workflows(c, project, repo_id)
+
+    def is_ci_configured(
+        self, project: ProjectConfig, token: str | None
+    ) -> bool:
+        """Return whether the repository has at least one build definition.
+
+        `bool(self.list_workflows(project, token))` in spirit.
+        """
+        return bool(self.list_workflows(project, token))
+
     # ---------- pipelines -------------------------------------------------
 
     def list_runs_for_branch(
@@ -5078,7 +5150,11 @@ class AzureDevOpsProvider(
             workflow=client_side_workflow, event=event,
             since=since, limit=limit,
         )
-        return runs, [ref]
+        if runs:
+            return runs, [ref]
+        if not self.is_ci_configured(project, token):
+            return [], [ref, NO_CI_SENTINEL]
+        return [], [ref]
 
     def list_runs_for_commit(
         self,
@@ -5096,7 +5172,10 @@ class AzureDevOpsProvider(
 
         Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape:
         - ``([], [])`` — commit not found in the repository
-        - ``([], [sha])`` — commit exists, no builds reference it
+        - ``([], [sha, "no-ci"])`` — commit exists, no builds reference it,
+          no CI configured
+        - ``([], [sha])`` — commit exists, no builds reference it, CI is
+          configured
         - ``(runs, [sha])`` — commit exists and has matching builds
 
         See `list_runs_for_branch` for `workflow`/`event`/`since` semantics.
@@ -5127,7 +5206,11 @@ class AzureDevOpsProvider(
         repo_id = self._resolve_repository_id(project, token)
         with _client(project, token) as c:
             exists = _resolve_ado_commit(c, project, repo_id, sha)
-        return [], ([sha] if exists else [])
+        if not exists:
+            return [], []
+        if not self.is_ci_configured(project, token):
+            return [], [sha, NO_CI_SENTINEL]
+        return [], [sha]
 
     def list_runs_for_tag(
         self,
@@ -5143,7 +5226,10 @@ class AzureDevOpsProvider(
     ) -> tuple[list[PipelineRun], list[str]]:
         """Returns `(runs, resolved_refs)`:
         - ``([], [])`` — tag not found in the repository
-        - ``([], [tag])`` — tag exists, no builds reference it
+        - ``([], [tag, "no-ci"])`` — tag exists, no builds reference it,
+          no CI configured
+        - ``([], [tag])`` — tag exists, no builds reference it, CI is
+          configured
         - ``(runs, [tag])`` — tag exists and has matching builds
 
         See `list_runs_for_branch` for `workflow`/`event`/`since` semantics.
@@ -5177,7 +5263,11 @@ class AzureDevOpsProvider(
         repo_id = self._resolve_repository_id(project, token)
         with _client(project, token) as c:
             exists = _resolve_ado_tag(c, project, repo_id, tag)
-        return [], ([tag] if exists else [])
+        if not exists:
+            return [], []
+        if not self.is_ci_configured(project, token):
+            return [], [tag, NO_CI_SENTINEL]
+        return [], [tag]
 
     def list_runs_for_ticket(
         self,
@@ -5249,9 +5339,13 @@ class AzureDevOpsProvider(
             raw_runs, provider="azuredevops", workflow=workflow, event=event,
             since=since, limit=limit,
         )
-        return runs, resolved_refs
+        if runs:
+            return runs, resolved_refs
+        if not self.is_ci_configured(project, token):
+            return [], [*resolved_refs, NO_CI_SENTINEL]
+        return [], resolved_refs
 
-    def list_runs_recent(
+    def _list_runs_recent_unprobed(
         self,
         project: ProjectConfig,
         token: str | None,
@@ -5262,11 +5356,12 @@ class AzureDevOpsProvider(
         event: str | None = None,
         since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
-        """List the most recent builds, unfiltered by ref.
+        """Core of `list_runs_recent`, without the `is_ci_configured` probe.
 
-        Returns ``(runs, [])`` — the empty ``resolved_refs`` signals that
-        no ref filter was applied. See `list_runs_for_branch` for
-        `workflow`/`event`/`since` semantics.
+        `wait_for_run` polls this helper directly (ticket #209) — it
+        must never trigger the extra probe request on every empty poll
+        iteration. See `list_runs_recent` for the public, probing
+        wrapper that real callers should use.
         """
         _validate_limit(limit)
         definition_id, client_side_workflow = self._resolve_workflow_filters(
@@ -5293,6 +5388,36 @@ class AzureDevOpsProvider(
             since=since, limit=limit,
         )
         return runs, []
+
+    def list_runs_recent(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        status: str = "all",
+        limit: int = 20,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List the most recent builds, unfiltered by ref.
+
+        Returns ``(runs, [])`` when runs are found, or when none are
+        found but CI is configured. Returns ``([], [NO_CI_SENTINEL])``
+        when there are no matching builds AND the repository has no
+        build definitions at all (ticket #209) — see `NO_CI_SENTINEL`.
+        See `list_runs_for_branch` for `workflow`/`event`/`since`
+        semantics.
+        """
+        runs, resolved_refs = self._list_runs_recent_unprobed(
+            project, token, status=status, limit=limit,
+            workflow=workflow, event=event, since=since,
+        )
+        if runs:
+            return runs, resolved_refs
+        if not self.is_ci_configured(project, token):
+            return [], [NO_CI_SENTINEL]
+        return [], resolved_refs
 
     def _resolve_definition_id(
         self,
@@ -5542,7 +5667,7 @@ class AzureDevOpsProvider(
         deadline = time.monotonic() + timeout
         attempt = 0
         while True:
-            runs, _ = self.list_runs_recent(
+            runs, _ = self._list_runs_recent_unprobed(
                 project, token, limit=50,
                 workflow=workflow, event=event, since=since,
             )

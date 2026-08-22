@@ -1296,6 +1296,100 @@ class ViewerIdentityProvider:
         raise NotImplementedError
 
 
+# ---------- CI workflow discovery (ticket #209) -----------------------------
+
+
+#: Uniform "no CI configured" signal appended as the LAST element of
+#: ``resolved_refs`` by every one of the five run-listing methods
+#: (``list_runs_for_branch``/``_commit``/``_tag``/``_ticket``/``_recent``)
+#: on all three providers, IFF the method is about to return an empty
+#: ``runs`` list AND ``is_ci_configured(project, token)`` is ``False``.
+#: Never appended when ``runs`` is non-empty — a non-empty result already
+#: proves CI is configured, so the extra probe request is skipped
+#: entirely. Only reached once a ref/PR/MR/work-item has actually been
+#: resolved but has no runs — the "not found" / "not linked to
+#: anything" case short-circuits to ``([], [])`` before this logic runs
+#: (mirrored the same way across all three providers), so the sentinel
+#: answers "is there CI at all for this resolved target," not "why was
+#: nothing resolved."
+NO_CI_SENTINEL = "no-ci"
+
+
+@dataclass
+class Workflow:
+    """A single discoverable CI workflow/pipeline definition.
+
+    Returned by ``CIConfigurationProvider.list_workflows``. Fields are
+    intentionally provider-agnostic:
+
+    - `id` — provider-native identifier (GitHub numeric workflow id as a
+      string, GitLab's synthetic `"ci-config"`, Azure DevOps numeric
+      build-definition id as a string).
+    - `name` — human-readable display name.
+    - `path` — provider-native config-file path when applicable
+      (GitHub `.github/workflows/ci.yml`, GitLab `.gitlab-ci.yml`);
+      `""` when the provider has no per-workflow file path (Azure
+      DevOps YAML-less/classic definitions).
+    - `state` — provider-native state string (`"active"`, `"disabled"`,
+      ...); `""` when the provider doesn't expose one.
+    - `url` — human-navigable URL to the workflow's definition, when the
+      provider supplies one; `None` otherwise.
+    - `dispatch_target` — guaranteed to work **verbatim** as the
+      `workflow` argument to that same provider's `trigger_pipeline`.
+      See each provider's `_list_workflows`/`_map_workflow` for exactly
+      what value is placed here (GitHub: the workflow filename, falling
+      back to the numeric id when no path is available; GitLab: the CI
+      config path, accepted by `trigger_pipeline` but never sent to the
+      API; Azure DevOps: the numeric definition id as a string).
+    """
+
+    id: str
+    name: str
+    path: str
+    state: str
+    url: str | None
+    dispatch_target: str
+
+
+class CIConfigurationProvider:
+    """Mixin/interface: providers that can enumerate CI workflows and
+    answer "is CI configured at all" implement these two methods.
+
+    Contract (see `NO_CI_SENTINEL` for how `is_ci_configured` feeds the
+    uniform ``resolved_refs`` sentinel):
+
+    - `list_workflows` returns `[]` when the project has no CI
+      configured — never raises for that case.
+    - `is_ci_configured` is `bool(list_workflows(...))` in spirit (each
+      provider satisfies this via a cheaper existence check where
+      possible, but the two must always agree on truthiness — pinned
+      per-provider by each provider's `test_is_ci_configured_true_and_false`
+      / `test_is_ci_configured_true_when_workflows_exist` +
+      `test_is_ci_configured_false_when_no_workflows` tests, which use
+      the same fixtures as the corresponding `list_workflows` tests).
+    - Error semantics mirror `_has_workflows`'s original GitHub
+      contract, generalized to all three providers: only a definitive
+      "not configured" signal (404, empty listing, missing/absent CI
+      config file) is folded into `False`/`[]`. Authentication failures
+      (401/403) and server errors (5xx) propagate as the provider's
+      native error type (`GitHubError`/`GitLabError`/
+      `AzureDevOpsError`) rather than being silently reported as "no
+      CI" — a caller must not conclude "this project has no CI" from a
+      response that actually means "the token can't see it" or "the
+      server is down". Known, deliberately-unchanged limitation: GitHub
+      returns 403 (not 404) when Actions is disabled organization-wide,
+      so that case still raises rather than reporting "no CI" — this
+      was already `_has_workflows`'s behaviour and is pinned by a test,
+      not "fixed" here.
+    """
+
+    def list_workflows(self, project, token: str | None) -> list[Workflow]:
+        raise NotImplementedError
+
+    def is_ci_configured(self, project, token: str | None) -> bool:
+        raise NotImplementedError
+
+
 # ---------- token project discovery (ticket #80) ----------
 
 
