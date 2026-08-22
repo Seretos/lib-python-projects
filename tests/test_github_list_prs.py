@@ -371,6 +371,27 @@ def test_pr_search_term_without_searchable_text_raises(monkeypatch: pytest.Monke
     assert seen == []
 
 
+def test_list_prs_does_not_mutate_caller_filters_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`list_prs` must normalize `filters.search` into a local value, not
+    assign back into `filters.search` — a caller reusing the same
+    `PRFilters` object across multiple calls must not see its `.search`
+    attribute silently rewritten as a side effect."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/pulls", (
+            f"whitespace-only search should not route to search; hit {req.url}"
+        )
+        return _json([_pr_payload(1)])
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    filters = PRFilters(search="   ")
+    provider.list_prs(_project(), token="t", filters=filters)
+    assert filters.search == "   ", (
+        "list_prs must not mutate the caller-supplied filters.search"
+    )
+
+
 # ---------- ticket #6 core regression: search path must back-fill full shape --
 
 
