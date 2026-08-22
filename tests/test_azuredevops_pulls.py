@@ -1315,6 +1315,280 @@ def test_create_pr_applies_custom_auto_labels(monkeypatch: pytest.MonkeyPatch) -
     assert "robot-made" in pr.labels
 
 
+# ---------- create_pr — ticket #212 branch-error disambiguation -------------
+
+
+def _create_pr_refs_response(entries: list[dict]) -> httpx.Response:
+    return _json({"count": len(entries), "value": entries})
+
+
+def _create_pr_error_handler(
+    *,
+    existing_branches: set[str],
+    refs_status: int = 200,
+    message: str = "TF401398: The branch refs/heads/main does not exist in the repository.",
+    status_code: int = 400,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Handler for a `create_pr` POST that fails, plus a `/refs` filter
+    endpoint that reports existence per `existing_branches` (branch names
+    without the `refs/heads/` prefix)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/pullrequests"):
+            return _json({"message": message}, status_code=status_code)
+        if req.method == "GET" and path.endswith("/refs"):
+            if refs_status != 200:
+                return httpx.Response(status_code=refs_status, content=b"{}")
+            filt = req.url.params.get("filter", "")
+            branch_ref = filt.removeprefix("heads/")
+            if branch_ref in existing_branches:
+                return _create_pr_refs_response(
+                    [{"name": f"refs/heads/{branch_ref}", "objectId": "sha1"}]
+                )
+            return _create_pr_refs_response([])
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    return handler
+
+
+def test_create_pr_missing_head_branch_error_names_head_not_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A create_pr 400 that ADO misattributes to the (valid) base branch
+    must be rewrapped to name the actual invalid HEAD branch (ticket #212).
+    """
+    handler = _create_pr_error_handler(
+        existing_branches={"main"},  # base exists, head does not
+        message="TF401398: The branch refs/heads/main does not exist in the repository.",
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/missing", base="main",
+        )
+    assert "feat/missing" in exc.value.message
+    assert "head branch" in exc.value.message
+    assert "original error:" in exc.value.message
+
+
+def test_create_pr_missing_base_branch_error_names_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrored case: HEAD exists, BASE does not — the rewrap must name base."""
+    handler = _create_pr_error_handler(
+        existing_branches={"feat/x"},  # head exists, base does not
+        message="TF401398: Unable to resolve target branch.",
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/x", base="staging",
+        )
+    assert "staging" in exc.value.message
+    assert "base branch" in exc.value.message
+    assert "original error:" in exc.value.message
+
+
+def test_create_pr_both_branches_missing_reraises_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Neither branch exists — the probe can't discriminate, so the original
+    ADO message must pass through untouched."""
+    original_message = "TF401398: Unable to create pull request: invalid refs."
+    handler = _create_pr_error_handler(
+        existing_branches=set(),
+        message=original_message,
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/gone", base="also-gone",
+        )
+    assert exc.value.message == original_message
+    assert exc.value.status == 400
+
+
+def test_create_pr_probe_failure_reraises_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `/refs` probe itself errors (e.g. 401/403/500) — the probe
+    failure must be swallowed and the original message re-raised
+    untouched, not surfaced as a secondary error."""
+    original_message = "TF401398: The branch refs/heads/main does not exist in the repository."
+    handler = _create_pr_error_handler(
+        existing_branches={"main"},
+        refs_status=500,
+        message=original_message,
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/missing", base="main",
+        )
+    assert exc.value.message == original_message
+
+
+def test_create_pr_asymmetric_probe_failure_reraises_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The HEAD probe errors (e.g. transient 500) while the BASE probe
+    succeeds and confirms the base branch genuinely exists. An
+    indeterminate HEAD result must NOT be treated as "confirmed missing"
+    just because the base probe resolved cleanly — that would produce a
+    confident-but-wrong "head branch does not exist" rewrap even though
+    the head probe merely failed to answer. The original ADO message must
+    pass through untouched (ticket #212 asymmetric-probe-failure case)."""
+    original_message = "TF401398: The branch refs/heads/main does not exist in the repository."
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/pullrequests"):
+            return _json({"message": original_message}, status_code=400)
+        if req.method == "GET" and path.endswith("/refs"):
+            filt = req.url.params.get("filter", "")
+            branch_ref = filt.removeprefix("heads/")
+            if branch_ref == "feat/missing":
+                # HEAD probe: transient error — indeterminate, not "absent".
+                return httpx.Response(status_code=500, content=b"{}")
+            if branch_ref == "main":
+                # BASE probe: confirmed present.
+                return _create_pr_refs_response(
+                    [{"name": "refs/heads/main", "objectId": "sha1"}]
+                )
+            raise AssertionError(f"unexpected branch filter {branch_ref!r}")
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/missing", base="main",
+        )
+    assert exc.value.message == original_message
+
+
+def test_create_pr_unrelated_400_is_not_rewrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both branches exist — the 400 is about something else entirely and
+    must not be rewrapped."""
+    original_message = (
+        "TF401027: A pull request with this source and target branch "
+        "already exists."
+    )
+    handler = _create_pr_error_handler(
+        existing_branches={"feat/x", "main"},
+        message=original_message,
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/x", base="main",
+        )
+    assert exc.value.message == original_message
+    assert exc.value.status == 400
+
+
+def test_create_pr_preserves_remapped_404_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_check` remaps a 400 "does not exist" message to 404 before the
+    rewrap runs — the rewrapped error must keep that remapped status."""
+    handler = _create_pr_error_handler(
+        existing_branches={"main"},
+        message="TF401398: The branch refs/heads/main does not exist in the repository.",
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/missing", base="main",
+        )
+    assert exc.value.status == 404
+
+
+def test_create_pr_accepts_refs_heads_prefixed_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-supplied `refs/heads/`-prefixed head is probed correctly
+    (the prefix is stripped for the `/refs` filter) and echoed back with
+    its original prefix intact in the rewrapped message."""
+    handler = _create_pr_error_handler(
+        existing_branches={"main"},
+        message="TF401398: The branch refs/heads/main does not exist in the repository.",
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="refs/heads/foo", base="main",
+        )
+    assert "refs/heads/foo" in exc.value.message
+    assert "head branch" in exc.value.message
+
+
+def test_create_pr_head_probe_ignores_prefix_matching_sibling_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADO's `/refs?filter=` is a starts-with match, not an exact match — a
+    probe for `release` must not be fooled by a same-prefix sibling like
+    `release-1.0` into reporting `release` as existing.
+
+    Without an exact name check on the probe response, this scenario would
+    incorrectly SUPPRESS an accurate rewrap: HEAD genuinely exists, BASE
+    genuinely does not (only its prefix-sibling does) — a discriminating
+    case that must still produce a "base branch does not exist" rewrap
+    (ticket #212 fix-cycle #2)."""
+    original_message = "TF401398: Unable to create pull request: invalid refs."
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/pullrequests"):
+            return _json({"message": original_message}, status_code=400)
+        if req.method == "GET" and path.endswith("/refs"):
+            filt = req.url.params.get("filter", "")
+            branch_ref = filt.removeprefix("heads/")
+            if branch_ref == "feat/x":
+                # HEAD probe: confirmed present (exact match).
+                return _create_pr_refs_response(
+                    [{"name": "refs/heads/feat/x", "objectId": "sha1"}]
+                )
+            if branch_ref == "release":
+                # BASE probe: ADO's starts-with filter returns only a
+                # prefix-matching sibling, never the exact branch — must
+                # not be read as "release exists".
+                return _create_pr_refs_response(
+                    [{"name": "refs/heads/release-1.0", "objectId": "sha2"}]
+                )
+            raise AssertionError(f"unexpected branch filter {branch_ref!r}")
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/x", base="release",
+        )
+    assert "release" in exc.value.message
+    assert "base branch" in exc.value.message
+    assert "original error:" in exc.value.message
+
+
 # ---------- update_pr -------------------------------------------------------
 
 

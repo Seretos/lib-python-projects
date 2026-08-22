@@ -1776,6 +1776,101 @@ def _resolve_ado_branch(
         return False
 
 
+def _probe_ado_branch_exists(
+    client: "httpx.Client",
+    project: "ProjectConfig",
+    repo_id: str,
+    branch: str,
+) -> bool | None:
+    """Tri-state existence probe for `_rewrap_create_pr_branch_error` only
+    (ticket #212).
+
+    Returns ``True``/``False`` for a *confirmed* result, or ``None`` when
+    the probe itself failed (non-success response or exception) — an
+    indeterminate outcome that must never be read as "confirmed absent".
+
+    This is a local sibling of `_resolve_ado_branch`, deliberately not a
+    change to that function: `_resolve_ado_branch` collapses probe failure
+    to `False` and `list_runs_for_branch` (and others) rely on that public
+    bool contract, so it is left untouched. `create_pr`'s rewrap needs the
+    extra "indeterminate" state so a transient 500/403/network error on
+    one side's probe can't be mistaken for a genuine absence and trigger a
+    confident-but-wrong "branch does not exist" rewrap.
+
+    ADO's `refs?filter=` is a starts-with match, not an exact match — a
+    filter of `heads/main` also matches a sibling ref like
+    `refs/heads/main-2`. A bare `count > 0` check would therefore report a
+    false "exists" whenever a same-prefix sibling is present, which is
+    exactly the kind of misattribution `_rewrap_create_pr_branch_error`
+    exists to avoid. So this probe (unlike `_resolve_ado_branch`, which is
+    used only for the lower-stakes "does this branch have runs" check)
+    requires an exact match on `name` against `refs/heads/<branch_ref>`.
+    """
+    branch_ref = branch.removeprefix("refs/heads/")
+    path = (
+        f"{_project_scope(project)}/_apis/git/repositories"
+        f"/{repo_id}/refs"
+    )
+    try:
+        resp = client.get(
+            path,
+            params=_api_version_params({"filter": f"heads/{branch_ref}"}),
+        )
+        if not resp.is_success:
+            return None
+        payload = resp.json() or {}
+        return any(
+            v.get("name") == f"refs/heads/{branch_ref}"
+            for v in payload.get("value", [])
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _rewrap_create_pr_branch_error(
+    client: "httpx.Client",
+    project: "ProjectConfig",
+    repo_id: str,
+    head: str,
+    base: str,
+    exc: "AzureDevOpsError",
+) -> "AzureDevOpsError":
+    """Disambiguate a `create_pr` 400/404 (ticket #212).
+
+    ADO's raw message for these failures sometimes blames the (valid)
+    BASE branch when the actual problem is a non-existent HEAD branch (or
+    vice versa). Probes both refs via `_probe_ado_branch_exists` (a
+    tri-state sibling of `_resolve_ado_branch`, scoped to this call site)
+    on the same open client and rewraps only when both probes are
+    confirmed AND discriminating — exactly one side confirmed missing,
+    the other confirmed present. Returns `exc` untouched (never raises)
+    in every other case: both confirmed missing, both confirmed present,
+    or EITHER probe being indeterminate (its own request failed) —
+    an indeterminate probe on one side must not be treated as "confirmed
+    missing" just because the other side resolved, since that would
+    misattribute a transient probe error as a real branch absence. See
+    `create_pr`'s docstring for the rationale. The returned error
+    preserves `exc.status` and only replaces the message.
+    """
+    head_exists = _probe_ado_branch_exists(client, project, repo_id, head)
+    base_exists = _probe_ado_branch_exists(client, project, repo_id, base)
+    if head_exists is None or base_exists is None:
+        return exc
+    if head_exists == base_exists:
+        return exc
+    if not head_exists:
+        return AzureDevOpsError(
+            exc.status,
+            f"create_pr: head branch {head!r} does not exist in "
+            f"{project.id} — push it first; original error: {exc.message}",
+        )
+    return AzureDevOpsError(
+        exc.status,
+        f"create_pr: base branch {base!r} does not exist in "
+        f"{project.id}; original error: {exc.message}",
+    )
+
+
 def _resolve_ado_commit(
     client: "httpx.Client",
     project: "ProjectConfig",
@@ -4011,6 +4106,25 @@ class AzureDevOpsProvider(
         the same key but a different `title`/`head`/`base` raises
         `IdempotencyConflict`. `None`/`""` (the default) disables
         idempotency entirely.
+
+        Ticket #212: when the create call itself fails with a 400/404, ADO's
+        raw error message sometimes blames the (valid) BASE branch when the
+        actual problem is a non-existent HEAD branch. On failure only (the
+        happy path makes no extra requests), we probe whether `head`/`base`
+        exist via `_probe_ado_branch_exists` (a tri-state sibling of
+        `_resolve_ado_branch` scoped to this call site) on the same open
+        client and rewrap the error to name whichever one is actually
+        missing. Several cases are deliberately left un-rewrapped, re-raising
+        ADO's original message untouched: both branches confirmed missing,
+        both branches confirmed present (the 400 is about something
+        unrelated to refs), and — critically — EITHER probe coming back
+        indeterminate (its own request errored, e.g. transient 500/403/
+        network). An indeterminate probe on one side must never be treated
+        as "confirmed missing" just because the other side resolved cleanly:
+        that would misattribute the probe's own failure as a real branch
+        absence. We never pattern-match on ADO's message text to decide
+        which branch is at fault — the existence probe is the only
+        discriminator.
         """
         if idempotency_key:
             replay = _idempotency.lookup(
@@ -4041,7 +4155,14 @@ class AzureDevOpsProvider(
         )
         with _client(project, token) as c:
             resp = c.post(path, params=_api_version_params(), json=payload)
-        _check(resp)
+            try:
+                _check(resp)
+            except AzureDevOpsError as exc:
+                if exc.status in (400, 404):
+                    raise _rewrap_create_pr_branch_error(
+                        c, project, repo_id, head, base, exc
+                    ) from None
+                raise
         pr = _map_pr(resp.json(), project)
         # Mirror github.py:create_pr — always merge the project's
         # configured "generated" label, dropping caller duplicates while
