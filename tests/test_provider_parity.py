@@ -88,7 +88,8 @@ def test_gitlab_list_runs_for_branch_accepts_status_kwarg(monkeypatch):
     def handler(req):
         if "/repository/branches/" in str(req.url):
             return _resp({"commit": {"id": "sha-main"}})
-        captured["scope"] = req.url.params.get("scope", "")
+        if "/pipelines" in str(req.url):
+            captured["scope"] = req.url.params.get("scope", "")
         return _resp([])
 
     _install_gitlab_mock(monkeypatch, handler)
@@ -2105,3 +2106,83 @@ def test_release_dataclass_importable_from_base():
         "tag", "name", "sha", "url", "draft", "prerelease",
         "created_at", "published_at", "body",
     }
+
+
+# ---------- ticket #209: CI workflow discovery / NO_CI_SENTINEL parity ------
+
+
+def test_all_providers_expose_ci_configuration_methods():
+    """All three providers must expose `list_workflows`/`is_ci_configured`
+    as callables with the shared `(project, token)` signature — the
+    `CIConfigurationProvider` marker contract from `providers/base.py`.
+    Also pins that `Workflow`/`NO_CI_SENTINEL` are importable from
+    `providers.base` and that the sentinel's literal value is `"no-ci"`
+    (existing callers/tests compare against that literal)."""
+    import dataclasses
+    import inspect
+
+    from lib_python_projects.providers.base import (
+        CIConfigurationProvider, NO_CI_SENTINEL, Workflow,
+    )
+
+    assert NO_CI_SENTINEL == "no-ci"
+    field_names = {f.name for f in dataclasses.fields(Workflow)}
+    assert field_names == {
+        "id", "name", "path", "state", "url", "dispatch_target",
+    }
+
+    for provider_cls in _provider_classes():
+        assert issubclass(provider_cls, CIConfigurationProvider), (
+            f"{provider_cls.__name__} must implement CIConfigurationProvider"
+        )
+        for method_name in ("list_workflows", "is_ci_configured"):
+            assert callable(getattr(provider_cls, method_name, None)), (
+                f"{provider_cls.__name__}.{method_name} must be callable"
+            )
+            sig = inspect.signature(getattr(provider_cls, method_name))
+            params = list(sig.parameters)
+            assert params[:3] == ["self", "project", "token"], (
+                f"{provider_cls.__name__}.{method_name} must be "
+                f"(self, project, token), got {params}"
+            )
+
+
+@pytest.mark.parametrize("provider_name,make_provider,make_project,install_mock", [
+    (
+        "github",
+        lambda: GitHubProvider(),
+        lambda: _github_project(),
+        _install_github_mock,
+    ),
+    (
+        "gitlab",
+        lambda: GitLabProvider(),
+        lambda: _gitlab_project(),
+        _install_gitlab_mock,
+    ),
+    (
+        "azuredevops",
+        lambda: AzureDevOpsProvider(),
+        lambda: _ado_project(),
+        _install_azuredevops_mock,
+    ),
+])
+def test_is_ci_configured_401_raises_not_false(
+    monkeypatch, provider_name, make_provider, make_project, install_mock,
+):
+    """A 401 while probing CI configuration must propagate as the
+    provider's native error, never be silently folded into `False` —
+    only a definitive "not configured" signal (404 / empty listing /
+    missing config file) may report `False` (ticket #209)."""
+    _cache_clear_all()
+
+    def handler(req):
+        return _resp({"message": "Bad credentials"}, status_code=401)
+
+    install_mock(monkeypatch, handler)
+    provider = make_provider()
+    project = make_project()
+    with pytest.raises(Exception) as exc:
+        provider.is_ci_configured(project, "t")
+    # Every provider's error type carries `.status`.
+    assert getattr(exc.value, "status", None) == 401

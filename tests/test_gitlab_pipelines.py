@@ -53,6 +53,26 @@ def _json(payload, status_code: int = 200) -> httpx.Response:
     )
 
 
+def _ci_configured_response(url: str) -> httpx.Response | None:
+    """Route the ticket #209 `is_ci_configured` probe requests (GET
+    project info, then GET the CI config file) so pre-existing tests
+    that predate the probe and don't route it themselves keep working.
+    Reports CI as configured — no "no-ci" sentinel lands in
+    `resolved_refs`, so existing assertions on `resolved_refs`/query
+    params stay valid. Returns `None` for any other URL so callers can
+    fall through to their own routing.
+    """
+    if url.endswith("/projects/acme%2Fbackend"):
+        return _json({
+            "builds_access_level": "enabled",
+            "ci_config_path": None,
+            "default_branch": "main",
+        })
+    if "/repository/files/" in url:
+        return _json({"file_name": ".gitlab-ci.yml"})
+    return None
+
+
 def _pipeline(pid: int, **overrides) -> dict:
     base = {
         "id": pid,
@@ -90,6 +110,9 @@ def test_list_runs_for_tag_uses_ref_param(
     """GitLab doesn't distinguish branch vs tag — both use `ref`."""
 
     def handler(req: httpx.Request) -> httpx.Response:
+        probe = _ci_configured_response(str(req.url))
+        if probe is not None:
+            return probe
         assert req.url.params.get("ref") == "v1.0.0"
         return _json([])
 
@@ -105,6 +128,9 @@ def test_list_runs_for_commit_sends_sha(
     def handler(req: httpx.Request) -> httpx.Response:
         if "/repository/commits/" in str(req.url):
             return _json({"id": "deadbeef"})
+        probe = _ci_configured_response(str(req.url))
+        if probe is not None:
+            return probe
         assert req.url.params.get("sha") == "deadbeef"
         return _json([])
 
@@ -116,6 +142,9 @@ def test_list_runs_limit_capped(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(req: httpx.Request) -> httpx.Response:
         if "/repository/branches/" in str(req.url):
             return _json({"commit": {"id": "sha-main"}})
+        probe = _ci_configured_response(str(req.url))
+        if probe is not None:
+            return probe
         assert req.url.params.get("per_page") == "100"
         return _json([])
 
@@ -158,7 +187,45 @@ def test_list_runs_for_ticket_no_related_mrs(
     def handler(req: httpx.Request) -> httpx.Response:
         if "/related_merge_requests" in str(req.url):
             return _json([])
+        probe = _ci_configured_response(str(req.url))
+        if probe is not None:
+            return probe
         return _json([], 404)
+
+    _install_mock(monkeypatch, handler)
+    runs, refs = GitLabProvider().list_runs_for_ticket(_project(), "t", "5")
+    assert runs == []
+    assert refs == []
+
+
+def test_list_runs_for_ticket_no_related_mrs_no_ci_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Driving test (ticket #209 fix): when the issue has no related
+    MRs at all, `list_runs_for_ticket` must short-circuit to `([], [])`
+    — mirroring GitHub's `if not shas: return [], []` and Azure
+    DevOps's `if not build_ids: return [], []` for the identical "not
+    linked to anything" scenario — *even when* CI is genuinely not
+    configured for the project. Without the early-return guard, this
+    case falls through into the sentinel logic and incorrectly
+    produces `([], [NO_CI_SENTINEL])` instead, diverging from the
+    other two providers. Using a handler that reports CI as NOT
+    configured (unlike `_ci_configured_response`, which always reports
+    CI as configured and would mask this divergent path) is what makes
+    this test able to catch the bug.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/related_merge_requests" in url:
+            return _json([])
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({
+                "builds_access_level": "disabled",
+                "ci_config_path": None,
+                "default_branch": "main",
+            })
+        raise AssertionError(f"unexpected request (should short-circuit): {url}")
 
     _install_mock(monkeypatch, handler)
     runs, refs = GitLabProvider().list_runs_for_ticket(_project(), "t", "5")
@@ -345,6 +412,9 @@ def test_list_runs_for_branch_found_no_runs(
             return _json({"commit": {"id": "abc123"}})
         if "/pipelines" in str(req.url):
             return _json([])
+        probe = _ci_configured_response(str(req.url))
+        if probe is not None:
+            return probe
         raise AssertionError(f"unexpected request: {req.url}")
 
     _install_mock(monkeypatch, handler)
@@ -457,7 +527,11 @@ def test_list_runs_recent_sends_no_ref_or_sha(
     captured: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
-        captured["params"] = dict(req.url.params)
+        if "/pipelines" in str(req.url):
+            captured["params"] = dict(req.url.params)
+        probe = _ci_configured_response(str(req.url))
+        if probe is not None:
+            return probe
         return _json([])
 
     _install_mock(monkeypatch, handler)
@@ -478,7 +552,11 @@ def test_list_runs_recent_status_all_omits_scope(
     captured: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
-        captured["params"] = dict(req.url.params)
+        if "/pipelines" in str(req.url):
+            captured["params"] = dict(req.url.params)
+        probe = _ci_configured_response(str(req.url))
+        if probe is not None:
+            return probe
         return _json([])
 
     _install_mock(monkeypatch, handler)
@@ -493,7 +571,11 @@ def test_list_runs_recent_status_in_progress_sends_scope_running(
     captured: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
-        captured["params"] = dict(req.url.params)
+        if "/pipelines" in str(req.url):
+            captured["params"] = dict(req.url.params)
+        probe = _ci_configured_response(str(req.url))
+        if probe is not None:
+            return probe
         return _json([])
 
     _install_mock(monkeypatch, handler)
@@ -884,6 +966,239 @@ def test_wait_for_run_timeout_returns_none(monkeypatch):
 def test_wait_for_run_without_since_raises_type_error():
     with pytest.raises(TypeError):
         GitLabProvider().wait_for_run(_project(), "t", ref="main")
+
+
+# ---------- ticket #209 -- CI workflow discovery -----------------------------
+
+
+def test_list_workflows_maps_ci_config_path(monkeypatch):
+    """`list_workflows` reports the project's CI config file as a
+    single synthetic `Workflow` entry when one is configured."""
+    from lib_python_projects.providers.base import Workflow
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({
+                "builds_access_level": "enabled",
+                "ci_config_path": "custom/ci.yml",
+                "default_branch": "main",
+            })
+        if "/repository/files/" in url:
+            assert "custom%2Fci.yml" in url
+            return _json({"file_name": "ci.yml"})
+        raise AssertionError(f"unexpected request: {url}")
+
+    _install_mock(monkeypatch, handler)
+    workflows = GitLabProvider().list_workflows(_project(), token="t")
+    assert workflows == [Workflow(
+        id="ci-config", name="custom/ci.yml", path="custom/ci.yml",
+        state="active", url=None, dispatch_target="custom/ci.yml",
+    )]
+
+
+def test_list_workflows_empty_ci_config_path_uses_default(monkeypatch):
+    """Driving test: an unset `ci_config_path` falls back to the
+    default `.gitlab-ci.yml` filename."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({
+                "builds_access_level": "enabled",
+                "ci_config_path": None,
+                "default_branch": "main",
+            })
+        if "/repository/files/" in url:
+            return _json({"file_name": ".gitlab-ci.yml"})
+        raise AssertionError(f"unexpected request: {url}")
+
+    _install_mock(monkeypatch, handler)
+    workflows = GitLabProvider().list_workflows(_project(), token="t")
+    assert len(workflows) == 1
+    assert workflows[0].path == ".gitlab-ci.yml"
+    assert workflows[0].dispatch_target == ".gitlab-ci.yml"
+
+
+def test_list_workflows_builds_disabled_skips_file_lookup(monkeypatch):
+    """Driving test: `builds_access_level == "disabled"` means CI is off
+    for the whole project — `[]` without ever hitting the config-file
+    lookup endpoint."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({
+                "builds_access_level": "disabled",
+                "ci_config_path": None,
+                "default_branch": "main",
+            })
+        raise AssertionError(f"unexpected request (file lookup?): {url}")
+
+    _install_mock(monkeypatch, handler)
+    assert GitLabProvider().list_workflows(_project(), token="t") == []
+
+
+def test_list_workflows_empty_on_missing_config_file(monkeypatch):
+    """Driving test: builds enabled but the config file is missing
+    (404) → `[]`, not an error."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({
+                "builds_access_level": "enabled",
+                "ci_config_path": None,
+                "default_branch": "main",
+            })
+        if "/repository/files/" in url:
+            return _json({"message": "404 File Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {url}")
+
+    _install_mock(monkeypatch, handler)
+    assert GitLabProvider().list_workflows(_project(), token="t") == []
+
+
+def test_is_ci_configured_true_and_false(monkeypatch):
+    def handler_configured(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"builds_access_level": "enabled", "ci_config_path": None, "default_branch": "main"})
+        return _json({"file_name": ".gitlab-ci.yml"})
+
+    _install_mock(monkeypatch, handler_configured)
+    assert GitLabProvider().is_ci_configured(_project(), token="t") is True
+
+    def handler_not_configured(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"builds_access_level": "disabled", "ci_config_path": None, "default_branch": "main"})
+        raise AssertionError(f"unexpected request: {url}")
+
+    _install_mock(monkeypatch, handler_not_configured)
+    assert GitLabProvider().is_ci_configured(_project(), token="t") is False
+
+
+def test_list_runs_for_branch_appends_no_ci_sentinel_when_not_configured(
+    monkeypatch,
+):
+    """Driving test (ticket #209): branch resolves, no pipelines, and
+    the project has no CI configured at all → the uniform
+    `NO_CI_SENTINEL` is appended as the last element of resolved_refs."""
+    from lib_python_projects.providers.base import NO_CI_SENTINEL
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/repository/branches/main" in url:
+            return _json({"commit": {"id": "abc123"}})
+        if "/pipelines" in url:
+            return _json([])
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"builds_access_level": "disabled", "ci_config_path": None, "default_branch": "main"})
+        raise AssertionError(f"unexpected request: {url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitLabProvider().list_runs_for_branch(
+        _project(), "t", "main",
+    )
+    assert runs == []
+    assert resolved_refs == ["abc123", NO_CI_SENTINEL]
+
+
+def test_list_runs_for_tag_appends_no_ci_sentinel_when_not_configured(
+    monkeypatch,
+):
+    """Driving test (ticket #209): GitLab's tag mode has no existing
+    ref-existence probe — it must still get the sentinel when there are
+    no pipelines and no CI configured."""
+    from lib_python_projects.providers.base import NO_CI_SENTINEL
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/pipelines" in url:
+            return _json([])
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"builds_access_level": "disabled", "ci_config_path": None, "default_branch": "main"})
+        raise AssertionError(f"unexpected request: {url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitLabProvider().list_runs_for_tag(
+        _project(), "t", "v1.0.0",
+    )
+    assert runs == []
+    assert resolved_refs == ["v1.0.0", NO_CI_SENTINEL]
+
+
+def test_list_runs_recent_appends_no_ci_sentinel_when_not_configured(
+    monkeypatch,
+):
+    """Driving test (ticket #209): no pipelines at all, and no CI
+    configured → `([], [NO_CI_SENTINEL])`."""
+    from lib_python_projects.providers.base import NO_CI_SENTINEL
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/pipelines" in url:
+            return _json([])
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"builds_access_level": "disabled", "ci_config_path": None, "default_branch": "main"})
+        raise AssertionError(f"unexpected request: {url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitLabProvider().list_runs_recent(_project(), token="t")
+    assert runs == []
+    assert resolved_refs == [NO_CI_SENTINEL]
+
+
+def test_wait_for_run_never_probes_ci_configuration(monkeypatch):
+    """Regression guard (ticket #209): `wait_for_run` must poll through
+    the unprobed helper — a strict handler that raises on the CI-probe
+    endpoints (project info / config file), combined with a timeout
+    that forces several empty polls, proves the probe is never hit."""
+    _no_sleep(monkeypatch)
+    poll_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if "/pipelines" in url:
+            poll_count["n"] += 1
+            return _json([])
+        raise AssertionError(f"unexpected request (probe?): {url}")
+
+    _install_mock(monkeypatch, handler)
+    run = GitLabProvider().wait_for_run(
+        _project(), "t", since="2026-08-21T10:00:00Z", timeout=0.05,
+    )
+    assert run is None
+    assert poll_count["n"] >= 1
+
+
+def test_dispatch_target_round_trips_into_trigger_pipeline(monkeypatch):
+    """GitLab's `dispatch_target` is the CI config path — `trigger_pipeline`
+    validates it's non-empty but never sends it to the API."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"builds_access_level": "enabled", "ci_config_path": None, "default_branch": "main"})
+        if "/repository/files/" in url:
+            return _json({"file_name": ".gitlab-ci.yml"})
+        if req.method == "POST" and url.endswith("/pipeline"):
+            assert "dispatch_target" not in (req.content or b"").decode("utf-8", "ignore")
+            return _json(_pipeline(42, source="web"))
+        if "/pipelines/42" in url:
+            return _json(_pipeline(42, source="web"))
+        raise AssertionError(f"unexpected request: {url}")
+
+    _install_mock(monkeypatch, handler)
+    workflows = GitLabProvider().list_workflows(_project(), token="t")
+    assert workflows[0].dispatch_target == ".gitlab-ci.yml"
+
+    run = GitLabProvider().trigger_pipeline(
+        _project(), "t", workflows[0].dispatch_target, ref="main",
+    )
+    assert run is not None
+    assert run.id == "42"
 
 
 # ---------- ticket #200 -- get_ref -------------------------------------------
