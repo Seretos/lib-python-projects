@@ -314,3 +314,306 @@ def test_get_pr_same_author_multiple_reviews_latest_state_wins(
     assert pr.reviewers == ["alice"]
     assert pr.review_decision == "APPROVED"
     assert len(pr.reviews) == 2  # pr.reviews keeps the full history
+
+
+# ---------- Ticket #205: submit_pr_review submits a pending review -----------
+
+
+def test_submit_pr_review_submits_existing_pending_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4: when the caller already has a PENDING review on the PR (left
+    by prior `add_pr_review_comment` calls), `submit_pr_review` submits
+    *that* review via `POST /pulls/{n}/reviews/{id}/events` instead of
+    creating a new one — GitHub rejects creating a second review while
+    one is still pending for the same author."""
+    pending = {
+        "id": 900,
+        "node_id": "REVIEW_NODE_900",
+        "state": "PENDING",
+        "user": {"login": "me"},
+        "body": "",
+        "html_url": "",
+        "submitted_at": None,
+        "commit_id": "abc123",
+    }
+    submitted = {
+        **pending,
+        "state": "COMMENTED",
+        "body": "lgtm",
+        "submitted_at": "2024-01-02T00:00:00Z",
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/7/reviews/900/events":
+            payload = json.loads(req.content or b"{}")
+            assert payload["event"] == "COMMENT"
+            assert payload["body"]
+            return _json(submitted)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    review = GitHubProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="comment", body="lgtm",
+    )
+    assert review.id == "900"
+    assert review.state == "comment"
+    assert not any(
+        r.method == "POST" and r.url.path == "/repos/acme/backend/pulls/7/reviews"
+        for r in seen
+    )
+
+
+def test_submit_pr_review_creates_new_review_when_none_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4: with no PENDING review on the PR, `submit_pr_review` falls
+    back to the original create-and-submit path,
+    `POST /pulls/{n}/reviews`."""
+    created = _review(901, "APPROVED")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([])
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/7/reviews":
+            payload = json.loads(req.content or b"{}")
+            assert payload["event"] == "APPROVE"
+            return _json(created)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    review = GitHubProvider().submit_pr_review(
+        _project(), token="t", pr_id="7", state="approve",
+    )
+    assert review.id == "901"
+    assert review.state == "approve"
+
+
+# ---------- Ticket #205, fix-round 3, finding 3: commit_sha contract ---------
+
+
+def test_submit_pr_review_rejects_mismatched_commit_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrors `add_pr_review_comment`'s same-commit contract: once a
+    pending review is found, a `commit_sha` that does not match the
+    pending review's own commit must raise `ValueError` rather than
+    being silently accepted — otherwise a review could be submitted
+    against a different commit than the pending review's original one.
+    Must fail fast: no submit POST may be sent."""
+    pending = {
+        "id": 900,
+        "node_id": "REVIEW_NODE_900",
+        "state": "PENDING",
+        "user": {"login": "me"},
+        "body": "",
+        "html_url": "",
+        "submitted_at": None,
+        "commit_id": "abc123",
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="commit_sha"):
+        GitHubProvider().submit_pr_review(
+            _project(),
+            token="t",
+            pr_id="7",
+            state="comment",
+            body="lgtm",
+            commit_sha="different-sha",
+        )
+    assert not any(
+        r.method == "POST" and r.url.path.startswith("/repos/acme/backend/pulls/7/reviews")
+        for r in seen
+    )
+
+
+def test_submit_pr_review_accepts_matching_commit_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: passing the SAME commit_sha as the pending
+    review's own commit still submits normally (no false-positive
+    rejection)."""
+    pending = {
+        "id": 900,
+        "node_id": "REVIEW_NODE_900",
+        "state": "PENDING",
+        "user": {"login": "me"},
+        "body": "",
+        "html_url": "",
+        "submitted_at": None,
+        "commit_id": "abc123",
+    }
+    submitted = {
+        **pending,
+        "state": "COMMENTED",
+        "body": "lgtm",
+        "submitted_at": "2024-01-02T00:00:00Z",
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/7/reviews/900/events":
+            return _json(submitted)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    review = GitHubProvider().submit_pr_review(
+        _project(),
+        token="t",
+        pr_id="7",
+        state="comment",
+        body="lgtm",
+        commit_sha="abc123",
+    )
+    assert review.id == "900"
+
+
+# ---------- Ticket #205: end-to-end acceptance (R5) --------------------------
+
+
+def test_pending_review_flow_end_to_end_yields_one_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5 acceptance: two `add_pr_review_comment` calls followed by one
+    `submit_pr_review` must result in exactly one entry in both
+    `list_pr_reviews()` and `get_pr().reviews` — not two orphaned
+    auto-submitted reviews (the ticket #205 defect), and not zero (the
+    comments must actually land somewhere, via the shared pending
+    review)."""
+    _EVENT_TO_STATE = {
+        "APPROVE": "APPROVED",
+        "REQUEST_CHANGES": "CHANGES_REQUESTED",
+        "COMMENT": "COMMENTED",
+    }
+    state: dict = {"review": None, "comments": [], "next_comment_id": 9000}
+
+    def _comment_dict(cid: int, body: str, path: str, line: int) -> dict:
+        return {
+            "id": cid,
+            "node_id": f"COMMENT_NODE_{cid}",
+            "user": {"login": "me"},
+            "body": body,
+            "path": path,
+            "line": line,
+            "side": "RIGHT",
+            "commit_id": "abc123",
+            "in_reply_to_id": None,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "html_url": f"https://github.com/acme/backend/pull/7#discussion_r{cid}",
+        }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        method = req.method
+
+        if method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([state["review"]] if state["review"] else [])
+
+        if method == "POST" and path == "/repos/acme/backend/pulls/7/reviews":
+            payload = json.loads(req.content or b"{}")
+            assert state["review"] is None, "only one review should ever be created"
+            state["review"] = {
+                "id": 900,
+                "node_id": "REVIEW_NODE_900",
+                "state": "PENDING",
+                "user": {"login": "me"},
+                "body": "",
+                "html_url": "https://github.com/acme/backend/pull/7#pullrequestreview-900",
+                "submitted_at": None,
+                "commit_id": "abc123",
+            }
+            for c in payload.get("comments", []):
+                cid = state["next_comment_id"]
+                state["next_comment_id"] += 1
+                state["comments"].append(_comment_dict(cid, c["body"], c["path"], c["line"]))
+            return _json(state["review"])
+
+        if method == "GET" and path == "/repos/acme/backend/pulls/7/reviews/900/comments":
+            return _json(state["comments"])
+
+        if method == "POST" and path == "/graphql":
+            gql = json.loads(req.content or b"{}")
+            if "addPullRequestReviewThread" in gql["query"]:
+                v = gql["variables"]
+                cid = state["next_comment_id"]
+                state["next_comment_id"] += 1
+                state["comments"].append(_comment_dict(cid, v["body"], v["path"], v["line"]))
+                return _json(
+                    {
+                        "data": {
+                            "addPullRequestReviewThread": {
+                                "thread": {"comments": {"nodes": [{"databaseId": cid}]}}
+                            }
+                        }
+                    }
+                )
+            raise AssertionError(f"unexpected graphql query: {gql['query']}")
+
+        if method == "GET" and path.startswith("/repos/acme/backend/pulls/comments/"):
+            wanted = int(path.rsplit("/", 1)[-1])
+            match = next(c for c in state["comments"] if c["id"] == wanted)
+            return _json(match)
+
+        if method == "POST" and path == "/repos/acme/backend/pulls/7/reviews/900/events":
+            payload = json.loads(req.content or b"{}")
+            state["review"]["state"] = _EVENT_TO_STATE[payload["event"]]
+            state["review"]["body"] = payload.get("body", "")
+            state["review"]["submitted_at"] = "2024-01-02T00:00:00Z"
+            return _json(state["review"])
+
+        if method == "GET" and path == "/repos/acme/backend/pulls/7":
+            return _json(_pr_payload())
+
+        if method == "GET" and path == "/repos/acme/backend/issues/7/comments":
+            return _json([])
+
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+
+    provider.add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="7",
+        body="first nit",
+        path="src/foo.py",
+        line=1,
+        side="RIGHT",
+        commit_sha="abc123",
+    )
+    provider.add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="7",
+        body="second nit",
+        path="src/foo.py",
+        line=2,
+        side="RIGHT",
+        commit_sha="abc123",
+    )
+    provider.submit_pr_review(
+        _project(), token="t", pr_id="7", state="comment", body="done",
+    )
+
+    reviews = provider.list_pr_reviews(_project(), token="t", pr_id="7")
+    assert len(reviews) == 1
+    assert reviews[0].state == "comment"
+
+    pr, _ = provider.get_pr(_project(), token="t", pr_id="7")
+    assert len(pr.reviews) == 1
+    assert pr.reviews[0].state == "comment"

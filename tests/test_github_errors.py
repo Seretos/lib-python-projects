@@ -155,6 +155,62 @@ def test_add_pr_review_comment_422_names_inputs(
     assert "7" in msg  # PR id
 
 
+def test_add_pr_review_comment_422_via_graphql_names_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #205: with a PENDING review already on the PR, a new-thread
+    comment is added via the GraphQL leg (`addPullRequestReviewThread`).
+    A 422-equivalent GraphQL `errors[]` response on that leg must produce
+    the exact same named message as the REST-transport 422 case above —
+    the error contract doesn't depend on which leg of the multi-call flow
+    failed."""
+    pending_review = {
+        "id": 900,
+        "node_id": "REVIEW_NODE_900",
+        "state": "PENDING",
+        "user": {"login": "me"},
+        "body": "",
+        "html_url": "",
+        "submitted_at": None,
+        "commit_id": "abc123",
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending_review])
+        if req.method == "POST" and req.url.path == "/graphql":
+            return _json(
+                {
+                    "data": {"addPullRequestReviewThread": None},
+                    "errors": [
+                        {
+                            "type": "UNPROCESSABLE",
+                            "message": "path is not part of the pull request diff",
+                        }
+                    ],
+                }
+            )
+        raise AssertionError(f"unexpected request: {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_pr_review_comment(
+            _project(),
+            token="t",
+            pr_id="7",
+            body="nit",
+            path="src/foo.py",
+            line=42,
+            commit_sha="abc123",
+        )
+    msg = exc.value.message
+    assert exc.value.status == 422
+    assert "path" in msg
+    assert "line" in msg
+    assert "commit_sha" in msg
+    assert "7" in msg  # PR id
+
+
 # ---------- Ticket #28: create_pr side-step 422 is non-fatal -----------------
 
 

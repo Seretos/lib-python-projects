@@ -638,6 +638,15 @@ class ReviewComment:
         note id (`in_reply_to_id` for replies, own `id` for the first
         note); on GitLab it is the actual discussion id from the
         `/discussions` endpoint.
+
+    GitHub-specific pending-review caveat (ticket #205): on GitHub,
+    `add_pr_review_comment` attaches new comments to an unsubmitted
+    `PENDING` review rather than auto-submitting one review per call.
+    A comment created this way is invisible on the PR — and absent
+    from `list_pr_review_comments()` — until `submit_pr_review` is
+    called to submit that pending review. GitLab and Azure DevOps have
+    no equivalent pending state: their comments are visible as soon as
+    they're created.
     """
 
     id: str
