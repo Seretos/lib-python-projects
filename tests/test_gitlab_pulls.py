@@ -1,6 +1,7 @@
 """Tests for the GitLab provider's merge-request (PR) surface.
 
 Covers list_prs, get_pr, create_pr, update_pr, add_pr_comment, merge_pr.
+Also covers create_pr's source-branch-missing error rewrap (ticket #208).
 """
 from __future__ import annotations
 
@@ -120,7 +121,9 @@ def test_list_prs_state_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
     GitLabProvider().list_prs(p, "t", PRFilters(status="open"))   # result ignored
     GitLabProvider().list_prs(p, "t", PRFilters(status="closed"))  # result ignored
     GitLabProvider().list_prs(p, "t", PRFilters(status="any"))     # result ignored
-    assert seen == ["opened", "closed", "all"]
+    # "closed" issues two requests (state=closed, state=merged) so
+    # merged MRs aren't silently omitted (ticket #204).
+    assert seen == ["opened", "closed", "merged", "all"]
 
 
 # ---------- has_more boundary regression (ticket #39) -------------------------
@@ -154,6 +157,260 @@ def test_list_prs_has_more_false_when_partial_page_returned(monkeypatch: pytest.
     prs, has_more = GitLabProvider().list_prs(_project(), "t", PRFilters(limit=limit))
     assert len(prs) == 2
     assert has_more is False, "has_more must be False when API returns fewer than per_page items"
+
+
+# ---------- list_prs(status="closed") includes merged MRs (ticket #204) ------
+
+
+def test_gitlab_list_prs_closed_includes_merged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`status="closed"` must also surface merged MRs, matching the
+    tool's own documented contract ("'closed' also returns merged
+    PRs")."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        state = req.url.params.get("state")
+        if state == "closed":
+            return _json(
+                [_mr_payload(1, state="closed", created_at="2024-01-02T00:00:00Z")]
+            )
+        if state == "merged":
+            return _json(
+                [_mr_payload(
+                    2, state="merged",
+                    merged_at="2024-01-03T00:00:00Z",
+                    created_at="2024-01-03T00:00:00Z",
+                )]
+            )
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = GitLabProvider().list_prs(_project(), "t", PRFilters(status="closed"))
+    assert {p.id for p in prs} == {"1", "2"}
+    assert {p.status for p in prs} == {"closed", "merged"}
+
+
+def test_gitlab_list_prs_closed_with_no_merged_mrs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the `merged` request comes back empty, the result is just
+    the closed-only set and has_more stays False."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        state = req.url.params.get("state")
+        if state == "closed":
+            return _json([_mr_payload(1, state="closed")])
+        if state == "merged":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    prs, has_more = GitLabProvider().list_prs(
+        _project(), "t", PRFilters(status="closed"),
+    )
+    assert [p.id for p in prs] == ["1"]
+    assert has_more is False
+
+
+def test_gitlab_list_prs_closed_applies_all_filters_to_every_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every filter (labels, assignee, head, base, search, limit) must
+    be sent identically on both the `closed` and `merged` requests —
+    only `state` should differ."""
+    captured: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured.append(dict(req.url.params))
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    GitLabProvider().list_prs(
+        _project(), "t",
+        PRFilters(
+            status="closed",
+            labels=["bug", "urgent"],
+            assignee="alice",
+            head="feat/x",
+            base="main",
+            search="foo",
+            limit=5,
+        ),
+    )
+    assert len(captured) == 2
+    states = {c["state"] for c in captured}
+    assert states == {"closed", "merged"}
+    for key in (
+        "labels", "assignee_username", "source_branch",
+        "target_branch", "search", "per_page", "order_by", "sort",
+    ):
+        values = {c[key] for c in captured}
+        assert len(values) == 1, f"{key} differed between requests: {captured}"
+
+
+def test_gitlab_list_prs_closed_respects_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`limit=2` truncates the merged union to 2, newest first by
+    created_at, even though 4 items came back across both requests."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        state = req.url.params.get("state")
+        if state == "closed":
+            return _json([
+                _mr_payload(1, state="closed", created_at="2024-01-01T00:00:00Z"),
+                _mr_payload(2, state="closed", created_at="2024-01-04T00:00:00Z"),
+            ])
+        if state == "merged":
+            return _json([
+                _mr_payload(3, state="merged", created_at="2024-01-02T00:00:00Z"),
+                _mr_payload(4, state="merged", created_at="2024-01-03T00:00:00Z"),
+            ])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = GitLabProvider().list_prs(
+        _project(), "t", PRFilters(status="closed", limit=2),
+    )
+    assert [p.id for p in prs] == ["2", "4"]
+
+
+@pytest.mark.parametrize(
+    "closed_count,merged_count,per_page,expected_has_more",
+    [
+        (1, 1, 30, False),
+        (2, 2, 3, True),
+        (30, 0, 30, True),
+    ],
+)
+def test_gitlab_list_prs_closed_has_more_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    closed_count: int,
+    merged_count: int,
+    per_page: int,
+    expected_has_more: bool,
+) -> None:
+    """has_more reflects either a full page on a single request or a
+    union that had to be truncated to per_page."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        state = req.url.params.get("state")
+        if state == "closed":
+            return _json([_mr_payload(i, state="closed") for i in range(closed_count)])
+        if state == "merged":
+            return _json([
+                _mr_payload(1000 + i, state="merged")
+                for i in range(merged_count)
+            ])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    _, has_more = GitLabProvider().list_prs(
+        _project(), "t", PRFilters(status="closed", limit=per_page),
+    )
+    assert has_more is expected_has_more
+
+
+def test_gitlab_list_prs_closed_sorted_by_created_at_desc_across_offsets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain string sort of created_at would misorder payloads
+    carrying different UTC offsets (normalize_timestamp doesn't
+    normalize offsets) — the merge must sort by true chronological
+    order."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        state = req.url.params.get("state")
+        if state == "closed":
+            # Lexicographically this looks *later* than the merged
+            # item below, but "+02:00" means it's actually earlier in
+            # UTC (2024-01-01T09:00:00Z vs merged's 10:00:00Z).
+            return _json(
+                [_mr_payload(1, state="closed", created_at="2024-01-01T11:00:00+02:00")]
+            )
+        if state == "merged":
+            return _json(
+                [_mr_payload(2, state="merged", created_at="2024-01-01T10:00:00Z")]
+            )
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = GitLabProvider().list_prs(_project(), "t", PRFilters(status="closed"))
+    assert [p.id for p in prs] == ["2", "1"]
+
+
+def test_gitlab_list_prs_closed_sorted_handles_naive_and_malformed_created_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_created_at_key` must always return a timezone-aware datetime.
+
+    A `created_at` value with no `Z`/offset suffix (e.g.
+    "2024-01-15T10:30:00") parses successfully via
+    `datetime.fromisoformat` but yields a *naive* datetime, while the
+    malformed-value fallback path yields an *aware* one. Sorting a list
+    containing both `Z`-suffixed, `+HH:MM`-offset, offset-less, and
+    malformed values together must not raise
+    `TypeError: can't compare offset-naive and offset-aware datetimes`,
+    and must still sort newest-first with malformed values sorting
+    last."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        state = req.url.params.get("state")
+        if state == "closed":
+            return _json([
+                # Offset-less: parses to a naive datetime unless fixed.
+                _mr_payload(1, state="closed", created_at="2024-01-01T12:00:00"),
+                # Malformed: falls back to datetime.min (aware), sorts last.
+                _mr_payload(3, state="closed", created_at="not-a-date"),
+            ])
+        if state == "merged":
+            return _json([
+                _mr_payload(2, state="merged", created_at="2024-01-01T13:00:00+00:00"),
+            ])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = GitLabProvider().list_prs(_project(), "t", PRFilters(status="closed"))
+    # 2 (13:00Z) > 1 (12:00, treated as UTC) > 3 (malformed, sorts last).
+    assert [p.id for p in prs] == ["2", "1", "3"]
+
+
+def test_gitlab_list_prs_closed_include_approvals_covers_merged_mrs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """include_approvals=True fetches /approvals for merged MRs too,
+    but never for MRs dropped by the per_page truncation."""
+    approvals_fetched: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/approvals"):
+            approvals_fetched.append(url.rsplit("/", 2)[1])
+            return _json({
+                "approved": False, "approvals_required": 0,
+                "approvals_left": 0, "approved_by": [],
+            })
+        state = req.url.params.get("state")
+        if state == "closed":
+            return _json(
+                [_mr_payload(1, state="closed", created_at="2024-01-01T00:00:00Z")]
+            )
+        if state == "merged":
+            return _json(
+                [_mr_payload(
+                    2, state="merged",
+                    created_at="2024-01-02T00:00:00Z",
+                )]
+            )
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = GitLabProvider().list_prs(
+        _project(), "t",
+        PRFilters(status="closed", include_approvals=True, limit=1),
+    )
+    # limit=1 truncates to the newest (id=2, merged) only.
+    assert [p.id for p in prs] == ["2"]
+    assert approvals_fetched == ["2"]
 
 
 # ---------- get_pr -----------------------------------------------------------
@@ -655,6 +912,157 @@ def test_create_pr_applies_custom_auto_label_and_body_prefix(
     assert "ai-generated" not in captured["body"]["labels"]
 
 
+# ---------- create_pr: ticket #208 source-branch rewrap ---------------------
+
+
+def test_create_pr_source_branch_missing_names_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitLab's raw 'source_branch does not exist' validation failure is
+    rewrapped into a named error with the branch, project, and a
+    'push it first' hint — mirroring GitHub's head-branch 422 rewrap."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "merge_requests" in str(req.url):
+            return _json(
+                {"message": {"source_branch": ["does not exist"]}},
+                status_code=400,
+            )
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().create_pr(
+            _project(), "t",
+            title="t", body="b", head="nonexistent", base="main",
+        )
+    assert exc.value.status == 400
+    assert "nonexistent" in exc.value.message
+    assert "acme" in exc.value.message
+    assert "push it first" in exc.value.message
+
+
+def test_create_pr_duplicate_mr_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitLab's duplicate-MR error uses the space-separated phrase 'source
+    branch' (no 'does not exist') — must not trip the narrow rewrap."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "merge_requests" in str(req.url):
+            return _json(
+                {
+                    "message": [
+                        "Another open merge request already exists for "
+                        "this source branch"
+                    ]
+                },
+                status_code=409,
+            )
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().create_pr(
+            _project(), "t",
+            title="t", body="b", head="feat/x", base="main",
+        )
+    assert "push it first" not in exc.value.message
+
+
+def test_create_pr_source_branch_blank_other_field_does_not_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both fields fail validation in the same response: `source_branch`
+    is merely blank, while `target_branch` is the one that "does not
+    exist". A whole-message substring check would wrongly find both
+    'source_branch' (from the first segment's key) and 'does not exist'
+    (from the second segment's value) and fire the rewrap — the fix must
+    isolate `source_branch`'s own segment and see only 'can't be blank'
+    there, so the rewrap must NOT fire."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "merge_requests" in str(req.url):
+            return _json(
+                {
+                    "message": {
+                        "source_branch": ["can't be blank"],
+                        "target_branch": ["does not exist"],
+                    }
+                },
+                status_code=400,
+            )
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().create_pr(
+            _project(), "t",
+            title="t", body="b", head="", base="main",
+        )
+    assert "push it first" not in exc.value.message
+
+
+def test_create_pr_unrelated_validation_error_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A validation error with no 'source_branch' token at all must not
+    trip the rewrap."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "merge_requests" in str(req.url):
+            return _json(
+                {"message": {"title": ["can't be blank"]}}, status_code=400,
+            )
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().create_pr(
+            _project(), "t",
+            title="", body="b", head="feat/x", base="main",
+        )
+    assert "push it first" not in exc.value.message
+
+
+def test_create_pr_source_branch_invalid_reason_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`source_branch` present but a different reason ('is invalid', not
+    'does not exist') — documents the deliberately narrow two-token match."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "merge_requests" in str(req.url):
+            return _json(
+                {"message": {"source_branch": ["is invalid"]}},
+                status_code=400,
+            )
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().create_pr(
+            _project(), "t",
+            title="t", body="b", head="feat/x", base="main",
+        )
+    assert "push it first" not in exc.value.message
+
+
 # ---------- update_pr -------------------------------------------------------
 
 
@@ -1086,12 +1494,15 @@ def test_merge_pr_405_reports_already_merged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GitLab returns 405 when trying to merge an already-merged MR.
-    The provider must surface a clear 'already merged' message."""
+    The provider probes the MR; when the probe shows state=merged, it
+    must surface a clear 'already merged' message."""
     from lib_python_projects.providers.gitlab import GitLabError
 
     def handler(req: httpx.Request) -> httpx.Response:
         if req.method == "PUT" and "/merge" in str(req.url):
             return _json({"message": "405 Method Not Allowed"}, status_code=405)
+        if req.method == "GET":
+            return _json(_mr_payload(7, state="merged"))
         return _json({}, status_code=404)
 
     _install_mock(monkeypatch, handler)
@@ -1100,6 +1511,238 @@ def test_merge_pr_405_reports_already_merged(
     assert exc.value.status == 405
     assert "already merged" in exc.value.message
     assert "acme#7" in exc.value.message
+
+
+def test_gitlab_merge_pr_405_conflict_reports_real_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 405 caused by a genuine merge conflict (not 'already merged')
+    must surface the real `detailed_merge_status`, not be flattened
+    into 'already merged' (ticket #204)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "405 Method Not Allowed"}, status_code=405)
+        if req.method == "GET":
+            return _json(
+                _mr_payload(7, state="opened", detailed_merge_status="conflict")
+            )
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "7", merge_method="merge")
+    assert exc.value.status == 405
+    assert "conflict" in exc.value.message
+    assert "acme#7" in exc.value.message
+    assert "already merged" not in exc.value.message
+    # A genuine conflict is the one reason "resolve conflicts" guidance
+    # is actually correct (ticket #204 review finding #2).
+    assert "resolve conflicts" in exc.value.message
+
+
+def test_gitlab_merge_pr_405_already_merged_via_merged_at_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe payload with state='opened' but a non-null merged_at is
+    still 'already merged' — mirrors the merged-detection rule
+    `_map_mr` already applies."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "405 Method Not Allowed"}, status_code=405)
+        if req.method == "GET":
+            return _json(
+                _mr_payload(7, state="opened", merged_at="2024-01-01T00:00:00Z")
+            )
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "7", merge_method="merge")
+    assert exc.value.status == 405
+    assert "already merged" in exc.value.message
+
+
+def test_gitlab_merge_pr_405_legacy_merge_status_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When `detailed_merge_status` is absent, fall back to the legacy
+    `merge_status` field for the reported reason — and the message must
+    label it as `merge_status`, not misattribute it to
+    `detailed_merge_status` (ticket #204 review finding #3)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "405 Method Not Allowed"}, status_code=405)
+        if req.method == "GET":
+            payload = _mr_payload(7, state="opened", merge_status="cannot_be_merged")
+            payload.pop("detailed_merge_status", None)
+            return _json(payload)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "7", merge_method="merge")
+    assert exc.value.status == 405
+    assert "cannot_be_merged" in exc.value.message
+    assert "merge_status='cannot_be_merged'" in exc.value.message
+    assert "detailed_merge_status=" not in exc.value.message
+
+
+def test_gitlab_merge_pr_405_unknown_when_status_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the probe payload carries neither status field, degrade to
+    an explicit 'unknown' reason rather than crashing or lying."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "405 Method Not Allowed"}, status_code=405)
+        if req.method == "GET":
+            payload = _mr_payload(7, state="opened")
+            payload.pop("detailed_merge_status", None)
+            payload.pop("merge_status", None)
+            return _json(payload)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "7", merge_method="merge")
+    assert exc.value.status == 405
+    assert "unknown" in exc.value.message
+
+
+def test_gitlab_merge_pr_405_probe_failure_does_not_mask_405(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flaky/403/404 probe must never mask the original 405 — the
+    caller still sees a 405 with an 'unknown' reason, not the probe's
+    own error code leaking out."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "405 Method Not Allowed"}, status_code=405)
+        if req.method == "GET":
+            return _json({"message": "Internal Server Error"}, status_code=500)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "7", merge_method="merge")
+    assert exc.value.status == 405
+    assert "unknown" in exc.value.message
+
+
+def test_gitlab_merge_pr_405_probe_non_gitlab_error_does_not_mask_405(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A probe failure that is NOT a `GitLabError` (a malformed/non-JSON
+    response body triggering a JSON-decode error, e.g. simulating a
+    transport-level hiccup) must still degrade to 'unknown' and must
+    never let the original 405 be replaced by an unrelated exception
+    (ticket #204 review finding #1 — the original `except GitLabError`
+    was too narrow to catch this)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "405 Method Not Allowed"}, status_code=405)
+        if req.method == "GET":
+            # 200 OK but a non-JSON body: `_check` sees success and
+            # returns normally, so the failure only surfaces when the
+            # caller parses `.json()` — this is NOT a `GitLabError`.
+            return httpx.Response(
+                status_code=200,
+                content=b"not valid json",
+                headers={"Content-Type": "application/json"},
+            )
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "7", merge_method="merge")
+    assert exc.value.status == 405
+    assert "unknown" in exc.value.message
+
+
+def test_gitlab_merge_pr_405_probe_non_dict_json_does_not_mask_405(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A probe response that is valid JSON but not a dict (a list, as
+    from a misbehaving proxy or gateway error page) must degrade to
+    'unknown' like any other probe failure, not crash with
+    `AttributeError` from calling `.get()` on a list (ticket #204
+    review finding — the `try/except Exception` around `.json()` only
+    catches parsing failures, not a successfully-parsed non-dict
+    result consumed afterward)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "405 Method Not Allowed"}, status_code=405)
+        if req.method == "GET":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "7", merge_method="merge")
+    assert exc.value.status == 405
+    assert "unknown" in exc.value.message
+
+
+def test_gitlab_merge_pr_405_non_conflict_reason_omits_resolve_conflicts_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 405 blocked by a non-conflict condition (e.g. CI still running)
+    must NOT tell the caller to 'resolve conflicts' — that guidance is
+    misleading for the majority of real 405 causes this ticket set out
+    to disambiguate (ticket #204 review finding #2)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "405 Method Not Allowed"}, status_code=405)
+        if req.method == "GET":
+            return _json(
+                _mr_payload(7, state="opened", detailed_merge_status="ci_must_pass")
+            )
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "7", merge_method="merge")
+    assert exc.value.status == 405
+    assert "ci_must_pass" in exc.value.message
+    assert "resolve conflicts" not in exc.value.message
+
+
+def test_gitlab_merge_pr_non_405_error_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-405 error from the merge PUT (e.g. 409/422) re-raises
+    unchanged, and no probe GET is issued at all."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    request_methods: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        request_methods.append(req.method)
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "Conflict"}, status_code=409)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "7", merge_method="merge")
+    assert exc.value.status == 409
+    assert request_methods == ["PUT"]
 
 
 def test_create_then_reply_round_trip_uses_surfaced_discussion_id(
