@@ -8,6 +8,10 @@ Covers:
 - create_pr reviewer 422 → PR still returned with warning (ticket #28)
 - create_pr reviewer 500 → GitHubError raised
 - create_pr primary 422 → GitHubError raised
+- add_pr_review_comment 404 → "PR '<project>#<id>' not found" for the
+  new-thread shape; the reply shape (in_reply_to set) is ambiguous between
+  a missing PR and a missing in_reply_to comment id, so its raw 404
+  propagates unrewrapped (ticket #208)
 """
 from __future__ import annotations
 
@@ -153,6 +157,97 @@ def test_add_pr_review_comment_422_names_inputs(
     assert "line" in msg
     assert "commit_sha" in msg
     assert "7" in msg  # PR id
+
+
+# ---------- Ticket #208: add_pr_review_comment 404 names PR ------------------
+
+
+def test_add_pr_review_comment_404_names_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_pr_review_comment on a missing PR (new-thread shape) wraps the
+    404 with the resource id, matching sibling add_pr_comment's rewrap."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_pr_review_comment(
+            _project(),
+            token="t",
+            pr_id="55",
+            body="nit",
+            path="src/foo.py",
+            line=42,
+            commit_sha="abc123",
+        )
+    assert exc.value.status == 404
+    assert "PR 'acme#55' not found" in exc.value.message
+
+
+def test_add_pr_review_comment_reply_404_propagates_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reply shape (in_reply_to) is ambiguous on 404: it could mean the
+    PR is missing OR that the in_reply_to comment id doesn't exist. Since
+    the provider can't disambiguate from status alone, it must NOT claim
+    the PR is missing — the raw 404 propagates unchanged instead of being
+    rewrapped (unlike the unambiguous new-thread shape above)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_pr_review_comment(
+            _project(),
+            token="t",
+            pr_id="55",
+            body="nit",
+            in_reply_to="123",
+        )
+    assert exc.value.status == 404
+    assert exc.value.message == "Not Found"
+    assert "PR 'acme#55' not found" not in exc.value.message
+
+
+def test_add_pr_review_comment_success_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Happy-path evidence that the 404 rewrap doesn't touch the
+    ReviewComment return shape on success."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(
+            {
+                "id": 9001,
+                "user": {"login": "alice"},
+                "body": "nit",
+                "path": "src/foo.py",
+                "line": 42,
+                "original_line": 42,
+                "side": "RIGHT",
+                "commit_id": "abc123",
+                "in_reply_to_id": None,
+            },
+            status_code=201,
+        )
+
+    _install_mock(monkeypatch, handler)
+    comment = GitHubProvider().add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="55",
+        body="nit",
+        path="src/foo.py",
+        line=42,
+        commit_sha="abc123",
+    )
+    assert comment.id == "9001"
+    assert comment.body == "nit"
+    assert comment.path == "src/foo.py"
+    assert comment.line == 42
 
 
 # ---------- Ticket #28: create_pr side-step 422 is non-fatal -----------------

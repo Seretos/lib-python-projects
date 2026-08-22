@@ -2997,7 +2997,18 @@ class GitLabProvider(
             if reviewer_ids:
                 payload["reviewer_ids"] = reviewer_ids
             r = client.post(f"/projects/{path}/merge_requests", json=payload)
-            _check(r)
+            try:
+                _check(r)
+            except GitLabError as exc:
+                lowered = exc.message.lower()
+                if "source_branch" in lowered and "does not exist" in lowered:
+                    raise GitLabError(
+                        exc.status,
+                        f"create_pr: source branch {head!r} does not exist in "
+                        f"{project.id} — push it first; original error: "
+                        f"{exc.message}",
+                    ) from exc
+                raise
             pr = _map_mr(r.json(), project)
             if idempotency_key:
                 _idempotency.record(

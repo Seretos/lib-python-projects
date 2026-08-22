@@ -1,6 +1,7 @@
 """Tests for the GitLab provider's merge-request (PR) surface.
 
 Covers list_prs, get_pr, create_pr, update_pr, add_pr_comment, merge_pr.
+Also covers create_pr's source-branch-missing error rewrap (ticket #208).
 """
 from __future__ import annotations
 
@@ -653,6 +654,121 @@ def test_create_pr_applies_custom_auto_label_and_body_prefix(
     assert captured["body"]["description"].startswith("#robot-made")
     assert "robot-made" in captured["body"]["labels"]
     assert "ai-generated" not in captured["body"]["labels"]
+
+
+# ---------- create_pr: ticket #208 source-branch rewrap ---------------------
+
+
+def test_create_pr_source_branch_missing_names_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitLab's raw 'source_branch does not exist' validation failure is
+    rewrapped into a named error with the branch, project, and a
+    'push it first' hint — mirroring GitHub's head-branch 422 rewrap."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "merge_requests" in str(req.url):
+            return _json(
+                {"message": {"source_branch": ["does not exist"]}},
+                status_code=400,
+            )
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().create_pr(
+            _project(), "t",
+            title="t", body="b", head="nonexistent", base="main",
+        )
+    assert exc.value.status == 400
+    assert "nonexistent" in exc.value.message
+    assert "acme" in exc.value.message
+    assert "push it first" in exc.value.message
+
+
+def test_create_pr_duplicate_mr_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitLab's duplicate-MR error uses the space-separated phrase 'source
+    branch' (no 'does not exist') — must not trip the narrow rewrap."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "merge_requests" in str(req.url):
+            return _json(
+                {
+                    "message": [
+                        "Another open merge request already exists for "
+                        "this source branch"
+                    ]
+                },
+                status_code=409,
+            )
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().create_pr(
+            _project(), "t",
+            title="t", body="b", head="feat/x", base="main",
+        )
+    assert "push it first" not in exc.value.message
+
+
+def test_create_pr_unrelated_validation_error_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A validation error with no 'source_branch' token at all must not
+    trip the rewrap."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "merge_requests" in str(req.url):
+            return _json(
+                {"message": {"title": ["can't be blank"]}}, status_code=400,
+            )
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().create_pr(
+            _project(), "t",
+            title="", body="b", head="feat/x", base="main",
+        )
+    assert "push it first" not in exc.value.message
+
+
+def test_create_pr_source_branch_invalid_reason_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`source_branch` present but a different reason ('is invalid', not
+    'does not exist') — documents the deliberately narrow two-token match."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and "merge_requests" in str(req.url):
+            return _json(
+                {"message": {"source_branch": ["is invalid"]}},
+                status_code=400,
+            )
+        if req.method == "GET" and req.url.path == "/api/v4/users":
+            return _json([])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().create_pr(
+            _project(), "t",
+            title="t", body="b", head="feat/x", base="main",
+        )
+    assert "push it first" not in exc.value.message
 
 
 # ---------- update_pr -------------------------------------------------------

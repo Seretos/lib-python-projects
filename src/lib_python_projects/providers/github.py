@@ -4660,6 +4660,17 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
             try:
                 _check(r)
             except GitHubError as exc:
+                if exc.status == 404 and in_reply_to is None:
+                    # New-thread shape: the only id in the request that
+                    # could 404 is the PR itself, so this is unambiguous.
+                    raise GitHubError(
+                        404, f"PR '{project.id}#{pr_id}' not found"
+                    ) from exc
+                # Reply shape: a 404 here is ambiguous between "PR not
+                # found" and "in_reply_to comment id doesn't exist" — we
+                # can't safely disambiguate from status alone, so let the
+                # raw 404 propagate rather than misreport it as a missing
+                # PR.
                 if exc.status == 422:
                     raise GitHubError(
                         422,
