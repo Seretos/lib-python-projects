@@ -1713,6 +1713,11 @@ def test_merge_pr_success_returns_merged_pr(
     def handler(req: httpx.Request) -> httpx.Response:
         if req.method == "PUT" and "/pulls/7/merge" in req.url.path:
             return _json({"sha": "deadbeef", "merged": True, "message": "Pull Request successfully merged"})
+        # Ticket #214: merge_pr now fetches reviews after the re-fetch.
+        # Must be checked BEFORE the generic "/pulls/7" branch below,
+        # since "/pulls/7/reviews" also contains "/pulls/7" as a substring.
+        if req.method == "GET" and req.url.path.endswith("/pulls/7/reviews"):
+            return _json([])
         if req.method == "GET" and "/pulls/7" in req.url.path:
             get_count["n"] += 1
             # First GET is the pre-flight (not yet merged); second is the re-fetch.

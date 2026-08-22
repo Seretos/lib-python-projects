@@ -3738,6 +3738,14 @@ class GitLabProvider(
         429-as-`RateLimitError`, a malformed JSON body), the original
         405 is still raised, with the reason degraded to `'unknown'`
         rather than masked by the probe's own error.
+
+        The returned PR also carries `reviews`, `review_decision`, and
+        `approvals_required`/`approvals_received`, synthesized the same
+        way `get_pr` does (ticket #214: `GET .../approvals`), at the cost
+        of one extra round trip. This enrichment is best-effort: a
+        failure degrades to `approvals=None` (empty `reviews`,
+        `review_decision=None`, logged as a warning) rather than failing
+        an already-successful merge.
         """
         if merge_method == "rebase":
             raise ValueError(
@@ -3852,7 +3860,24 @@ class GitLabProvider(
             # mutations (e.g. webhook-driven label edits) are reflected.
             r2 = client.get(f"/projects/{path}/merge_requests/{pr_id}")
             _check(r2)
-            return _map_mr(r2.json(), project)
+            raw_mr = r2.json()
+            # Populate approvals/reviews the same way get_pr does (ticket
+            # #214), so a caller doesn't need a follow-up get_pr to see
+            # review data on a just-merged MR. Best-effort: never mask an
+            # already-successful merge — a failure here just falls back
+            # to `approvals=None`, reproducing today's `_map_mr(raw_mr,
+            # project)` (no approvals) behaviour.
+            approvals: dict | None = None
+            try:
+                approvals = _fetch_mr_approvals(client, path, pr_id)
+            except Exception:
+                log.warning(
+                    "MR %s: failed to fetch approvals after merge; "
+                    "returning merged MR with empty reviews", pr_id,
+                )
+            pr = _map_mr(raw_mr, project, approvals=approvals)
+            pr.reviews = _reviews_from_approvals(approvals)
+            return pr
 
     # ---------- relations (write side) ---------------------------------------
 

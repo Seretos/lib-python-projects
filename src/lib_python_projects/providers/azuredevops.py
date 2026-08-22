@@ -3654,13 +3654,29 @@ class AzureDevOpsProvider(
         # (ticket #148), matching each reviewer against their review-body
         # thread so `body`/`submitted_at`/comment-state reviews read back
         # consistently with `list_pr_reviews` (ticket #178).
+        self._attach_reviews_from_votes(pr, raw, project, pr_id, token, repo_id)
+        comments = self._list_pr_top_level_comments(project, token, pr_id, repo_id)
+        return pr, comments
+
+    def _attach_reviews_from_votes(
+        self,
+        pr: PullRequest,
+        raw: dict,
+        project: ProjectConfig,
+        pr_id: str,
+        token: str | None,
+        repo_id: str,
+    ) -> None:
+        """Populate `pr.reviews`/`pr.review_decision` from vote data on `raw`.
+
+        Shared by `get_pr` and `merge_pr` (ticket #214) so both surfaces
+        report the same review snapshot for a given PR payload.
+        """
         reviews = self._reviews_from_votes(raw, project, pr_id, token, repo_id)
         pr.reviews = reviews
         pr.review_decision = review_decision_from_states(
             [rv.state for rv in _latest_reviews_by_author(reviews)]
         )
-        comments = self._list_pr_top_level_comments(project, token, pr_id, repo_id)
-        return pr, comments
 
     def _fetch_pr_labels(
         self,
@@ -4264,6 +4280,13 @@ class AzureDevOpsProvider(
         warning is emitted so callers are aware of the discrepancy.
 
         Note: completing a PR does not alter its reviewer set — ADO does not add the merging user to the PR's reviewers, so the returned PullRequest.requested_reviewers reflects only reviewers already assigned (empty if none); see test_merge_pr_does_not_populate_requested_reviewers.
+
+        The returned PR also carries `reviews`/`review_decision`,
+        synthesized from the settled PR's vote data the same way `get_pr`
+        does (ticket #214), at the cost of one extra threads round trip.
+        This enrichment is best-effort: a failure degrades to empty
+        `reviews`/`review_decision` (logged as a warning) rather than
+        failing an already-successful merge.
         """
         repo_id = self._resolve_repository_id(project, token)
         path = (
@@ -4343,6 +4366,20 @@ class AzureDevOpsProvider(
         # Labels live on a separate endpoint — keep merge_pr's return
         # consistent with get_pr / list_prs.
         pr.labels = self._fetch_pr_labels(project, token, repo_id, str(pr_id))
+        # Synthesize reviews from the vote data already present on
+        # `settled` (ticket #214), matching get_pr's population so a
+        # caller doesn't need a follow-up get_pr to see review data on
+        # a just-merged PR. Best-effort: never mask an already-successful
+        # merge — a failure here just leaves reviews/review_decision empty.
+        try:
+            self._attach_reviews_from_votes(
+                pr, settled, project, str(pr_id), token, repo_id
+            )
+        except Exception:
+            log.warning(
+                "PR %s: failed to fetch review data after merge; "
+                "returning merged PR with empty reviews", pr_id,
+            )
         return pr
 
     _MERGE_SETTLE_DELAYS_MS: tuple[int, ...] = (
