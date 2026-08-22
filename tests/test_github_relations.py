@@ -1900,6 +1900,125 @@ def test_add_relation_blocked_by_cycle_422(
     assert "#5" in exc.value.message
 
 
+def test_add_relation_child_circular_sub_issue_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation 'child' hitting a circular-dependency 422 on the
+    Sub-Issues endpoint must raise a clean GitHubError with 'relation
+    would create a cycle', not leak GitHub's raw provider message
+    (ticket #213)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Target issue resolution (for internal id).
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        # child branch also resolves the ticket's own internal id.
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, id=1001))
+        # Pre-flight GET for inverse-kind guard: empty list so the POST fires.
+        if "/sub_issues" in path and req.method == "GET":
+            return _json([])
+        # Sub-issues POST → circular-dependency 422.
+        if "/sub_issues" in path and req.method == "POST":
+            return _json(
+                {
+                    "message": "Validation Failed",
+                    "errors": [
+                        {"message": "Sub issue may not create a circular dependency"}
+                    ],
+                },
+                status_code=422,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="child", target="#5"
+        )
+    assert exc.value.status == 422
+    assert "relation would create a cycle" in exc.value.message
+    assert "child" in exc.value.message
+    assert "#5" in exc.value.message
+    assert "circular dependency" not in exc.value.message
+
+
+def test_add_relation_parent_circular_sub_issue_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation 'parent' hitting a circular-dependency 422 on the
+    Sub-Issues endpoint must raise a clean GitHubError with 'relation
+    would create a cycle', not leak GitHub's raw provider message
+    (ticket #213)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        # Target issue resolution (for internal id).
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        # Pre-flight GET for inverse-kind guard: empty list so the POST fires.
+        if "/sub_issues" in path and req.method == "GET":
+            return _json([])
+        # Sub-issues POST → circular-dependency 422.
+        if "/sub_issues" in path and req.method == "POST":
+            return _json(
+                {
+                    "message": "Validation Failed",
+                    "errors": [
+                        {"message": "Sub issue may not create a circular dependency"}
+                    ],
+                },
+                status_code=422,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="parent", target="#5"
+        )
+    assert exc.value.status == 422
+    assert "relation would create a cycle" in exc.value.message
+    assert "parent" in exc.value.message
+    assert "#5" in exc.value.message
+    assert "circular dependency" not in exc.value.message
+
+
+def test_add_relation_child_circular_sub_issue_422_top_level_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 'cycle'-keyword arm must also fire when the circular wording
+    only appears in the top-level `message` field (no `errors[]` array),
+    exercising the non-errors[] message path (ticket #213)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/5":
+            return _json(_issue_payload(5, id=5001))
+        if path == "/repos/acme/backend/issues/1":
+            return _json(_issue_payload(1, id=1001))
+        if "/sub_issues" in path and req.method == "GET":
+            return _json([])
+        if "/sub_issues" in path and req.method == "POST":
+            return _json(
+                {"message": "this sub-issue would create a cycle"},
+                status_code=422,
+            )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_relation(
+            _project(), token="t", ticket_id="1", kind="child", target="#5"
+        )
+    assert exc.value.status == 422
+    assert "relation would create a cycle" in exc.value.message
+    assert "child" in exc.value.message
+    assert "#5" in exc.value.message
+    assert "this sub-issue would create a cycle" not in exc.value.message
+
+
 # ---------- Defects from ticket #37 -----------------------------------------
 
 
