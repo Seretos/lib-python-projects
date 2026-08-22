@@ -5119,6 +5119,15 @@ class GitHubProvider(
         malformed response), and deleting a review that already has a
         real comment on it would silently destroy that comment. The
         original exception is re-raised to the caller either way.
+
+        Ticket #208: in the new-thread shape (`in_reply_to is None`), a
+        404 from `_create_pending_review` is unambiguous — the only id
+        in that request that could 404 is the PR itself — so it is
+        rewrapped into `GitHubError(404, "PR '{id}#{pr}' not found")`,
+        matching `add_pr_comment`'s existing behaviour. The reply shape
+        deliberately leaves a raw 404 alone: it's ambiguous between a
+        missing PR and a missing `in_reply_to` comment id, so we can't
+        safely disambiguate from status alone.
         """
         prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
         try:
@@ -5154,15 +5163,27 @@ class GitHubProvider(
                         raise
                     return _fetch_review_comment(client, project, comment_id)
                 if pending is None:
-                    created = _create_pending_review(
-                        client,
-                        project,
-                        pr_id,
-                        commit_sha=commit_sha,
-                        comments=[
-                            {"path": path, "line": line, "side": side, "body": prefixed},
-                        ],
-                    )
+                    # Ticket #208: this is the direct functional
+                    # descendant of the old single-POST implementation's
+                    # 404 target — in the new-thread shape there is no
+                    # other id in the request that could 404, so it can
+                    # only mean the PR itself doesn't exist.
+                    try:
+                        created = _create_pending_review(
+                            client,
+                            project,
+                            pr_id,
+                            commit_sha=commit_sha,
+                            comments=[
+                                {"path": path, "line": line, "side": side, "body": prefixed},
+                            ],
+                        )
+                    except GitHubError as exc:
+                        if exc.status == 404:
+                            raise GitHubError(
+                                404, f"PR '{project.id}#{pr_id}' not found"
+                            ) from exc
+                        raise
                     comment = _latest_pending_review_comment(
                         client, project, pr_id, str(created["id"]),
                     )

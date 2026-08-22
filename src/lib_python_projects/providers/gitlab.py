@@ -298,6 +298,32 @@ def _check(resp: httpx.Response) -> None:
     raise GitLabError(resp.status_code, msg)
 
 
+def _source_branch_missing(message: str) -> bool:
+    """Detect whether `message` reports a missing `source_branch`.
+
+    `_check` collapses GitLab's validation-style `{"message": {"field":
+    ["err"]}}` payloads into a single string of `"; "`-separated
+    `"key: value"` segments. A naive whole-message substring test for
+    `"source_branch"` and `"does not exist"` can false-positive when a
+    *different* field's error happens to contain "does not exist" while
+    `source_branch` itself failed for an unrelated reason (e.g. "can't be
+    blank"). So isolate the segment(s) whose key is exactly
+    `source_branch` (case-insensitive, after stripping whitespace) and
+    only look for "does not exist" within that segment's own value —
+    never elsewhere in the message, and never matching a key like
+    `source_branch_ids` that merely starts with the same prefix.
+    """
+    for segment in message.split("; "):
+        key, sep, value = segment.partition(":")
+        if not sep:
+            continue
+        if key.strip().lower() != "source_branch":
+            continue
+        if "does not exist" in value.lower():
+            return True
+    return False
+
+
 def _project_path(project: ProjectConfig) -> str:
     """URL-encoded project identifier for use as the `:id` path segment.
 
@@ -3114,7 +3140,17 @@ class GitLabProvider(
             if reviewer_ids:
                 payload["reviewer_ids"] = reviewer_ids
             r = client.post(f"/projects/{path}/merge_requests", json=payload)
-            _check(r)
+            try:
+                _check(r)
+            except GitLabError as exc:
+                if _source_branch_missing(exc.message):
+                    raise GitLabError(
+                        exc.status,
+                        f"create_pr: source branch {head!r} does not exist in "
+                        f"{project.id} — push it first; original error: "
+                        f"{exc.message}",
+                    ) from exc
+                raise
             pr = _map_mr(r.json(), project)
             if idempotency_key:
                 _idempotency.record(

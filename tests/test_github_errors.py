@@ -8,6 +8,10 @@ Covers:
 - create_pr reviewer 422 → PR still returned with warning (ticket #28)
 - create_pr reviewer 500 → GitHubError raised
 - create_pr primary 422 → GitHubError raised
+- add_pr_review_comment 404 → "PR '<project>#<id>' not found" for the
+  new-thread shape; the reply shape (in_reply_to set) is ambiguous between
+  a missing PR and a missing in_reply_to comment id, so its raw 404
+  propagates unrewrapped (ticket #208)
 """
 from __future__ import annotations
 
@@ -153,6 +157,144 @@ def test_add_pr_review_comment_422_names_inputs(
     assert "line" in msg
     assert "commit_sha" in msg
     assert "7" in msg  # PR id
+
+
+# ---------- Ticket #208: add_pr_review_comment 404 names PR ------------------
+#
+# Ticket #205 rewrote add_pr_review_comment's transport to route through
+# GitHub's pending-review flow (see test_github_pr_review_comments.py).
+# For a new-thread comment with no pending review yet, the call that can
+# 404 with "PR not found" semantics is now `_create_pending_review`'s
+# `POST /pulls/{n}/reviews` — the direct functional descendant of the old
+# single-POST implementation's 404 target. These tests mock that new call
+# shape (GET reviews -> [] to signal "no pending review", then the POST
+# that creates one) instead of the old direct `/pulls/{n}/comments` POST.
+
+
+def test_add_pr_review_comment_404_names_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_pr_review_comment on a missing PR (new-thread shape) wraps the
+    404 raised by `_create_pending_review` with the resource id, matching
+    sibling add_pr_comment's rewrap."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/55/reviews":
+            return _json([])
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/55/reviews":
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_pr_review_comment(
+            _project(),
+            token="t",
+            pr_id="55",
+            body="nit",
+            path="src/foo.py",
+            line=42,
+            commit_sha="abc123",
+        )
+    assert exc.value.status == 404
+    assert "PR 'acme#55' not found" in exc.value.message
+
+
+def test_add_pr_review_comment_reply_404_propagates_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reply shape (in_reply_to) is ambiguous on 404: it could mean the
+    PR is missing OR that the in_reply_to comment id doesn't exist. Since
+    the provider can't disambiguate from status alone, it must NOT claim
+    the PR is missing — the raw 404 propagates unchanged instead of being
+    rewrapped (unlike the unambiguous new-thread shape above).
+
+    Under #205's flow, the reply branch resolves `in_reply_to`'s node id
+    via `GET /pulls/comments/{id}` before touching any pending review —
+    that lookup is where this 404 originates."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/55/reviews":
+            return _json([])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/123":
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_pr_review_comment(
+            _project(),
+            token="t",
+            pr_id="55",
+            body="nit",
+            in_reply_to="123",
+        )
+    assert exc.value.status == 404
+    assert exc.value.message == "Not Found"
+    assert "PR 'acme#55' not found" not in exc.value.message
+
+
+def test_add_pr_review_comment_success_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Happy-path evidence that the 404 rewrap doesn't touch the
+    ReviewComment return shape on success, under #205's pending-review
+    creation flow."""
+    created_review = {
+        "id": 900,
+        "node_id": "REVIEW_NODE_900",
+        "state": "PENDING",
+        "user": {"login": "me"},
+        "body": "",
+        "html_url": "",
+        "submitted_at": None,
+        "commit_id": "abc123",
+    }
+    created_comment = {
+        "id": 9001,
+        "node_id": "COMMENT_NODE_9001",
+        "user": {"login": "alice"},
+        "body": "nit",
+        "path": "src/foo.py",
+        "line": 42,
+        "original_line": 42,
+        "side": "RIGHT",
+        "commit_id": "abc123",
+        "in_reply_to_id": None,
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z",
+        "html_url": "https://github.com/acme/backend/pull/55#discussion_r9001",
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/55/reviews":
+            return _json([])
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/55/reviews":
+            return _json(created_review)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/55/reviews/900/comments":
+            return _json([created_comment])
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    comment = GitHubProvider().add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="55",
+        body="nit",
+        path="src/foo.py",
+        line=42,
+        commit_sha="abc123",
+    )
+    assert comment.id == "9001"
+    assert comment.body == "nit"
+    assert comment.path == "src/foo.py"
+    assert comment.line == 42
+
+
+# ---------- Ticket #205: 422 via the GraphQL leg -----------------------------
 
 
 def test_add_pr_review_comment_422_via_graphql_names_inputs(
