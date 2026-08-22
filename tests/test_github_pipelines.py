@@ -176,6 +176,10 @@ def test_ticket_is_pr_with_no_runs(monkeypatch: pytest.MonkeyPatch) -> None:
             return _json(_pr_payload(42, head_sha))
         if path == "/repos/acme/backend/actions/runs":
             return _json({"workflow_runs": []})
+        if path == "/repos/acme/backend/actions/workflows":
+            # CI configured (ticket #209) — no runs matched, but the
+            # repository does have a workflow, so no "no-ci" sentinel.
+            return _json({"total_count": 1, "workflows": [{"id": 1, "path": ".github/workflows/ci.yml"}]})
         raise AssertionError(f"unexpected request: {req.url}")
 
     _install_mock(monkeypatch, handler)
@@ -474,6 +478,10 @@ def test_list_runs_for_commit_found_no_runs(
             return _json({"sha": sha})
         if path.endswith("/actions/runs"):
             return _json({"workflow_runs": []})
+        if path.endswith("/actions/workflows"):
+            # CI configured (ticket #209) — no runs matched, but the
+            # repository does have a workflow, so no "no-ci" sentinel.
+            return _json({"total_count": 1, "workflows": [{"id": 1, "path": ".github/workflows/ci.yml"}]})
         raise AssertionError(f"unexpected request: {req.url}")
 
     _install_mock(monkeypatch, handler)
@@ -534,8 +542,13 @@ def test_list_runs_recent_sends_no_branch_or_head_sha(
     captured: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
-        captured["params"] = dict(req.url.params)
-        return _json({"workflow_runs": []})
+        if req.url.path.endswith("/actions/runs"):
+            captured["params"] = dict(req.url.params)
+        # ticket #209: no runs matched, so `list_runs_recent` probes
+        # `/actions/workflows` — report CI as configured so no "no-ci"
+        # sentinel lands in `resolved_refs`, matching this test's
+        # existing `resolved_refs == []` assertion below.
+        return _json({"workflow_runs": [], "total_count": 1, "workflows": [{"id": 1}]})
 
     _install_mock(monkeypatch, handler)
     runs, resolved_refs = GitHubProvider().list_runs_recent(_project(), token="t")
@@ -553,8 +566,9 @@ def test_list_runs_recent_status_all_omits_status_param(
     captured: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
-        captured["params"] = dict(req.url.params)
-        return _json({"workflow_runs": []})
+        if req.url.path.endswith("/actions/runs"):
+            captured["params"] = dict(req.url.params)
+        return _json({"workflow_runs": [], "total_count": 1, "workflows": [{"id": 1}]})
 
     _install_mock(monkeypatch, handler)
     GitHubProvider().list_runs_recent(_project(), token="t", status="all")
@@ -568,8 +582,9 @@ def test_list_runs_recent_status_completed_sends_status_param(
     captured: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
-        captured["params"] = dict(req.url.params)
-        return _json({"workflow_runs": []})
+        if req.url.path.endswith("/actions/runs"):
+            captured["params"] = dict(req.url.params)
+        return _json({"workflow_runs": [], "total_count": 1, "workflows": [{"id": 1}]})
 
     _install_mock(monkeypatch, handler)
     GitHubProvider().list_runs_recent(_project(), token="t", status="completed")
@@ -1588,6 +1603,222 @@ def test_wait_for_run_timeout_returns_none(monkeypatch):
 def test_wait_for_run_without_since_raises_type_error():
     with pytest.raises(TypeError):
         GitHubProvider().wait_for_run(_project(), token="t", ref="main")
+
+
+# ---------- ticket #209 -- CI workflow discovery -----------------------------
+
+
+def test_list_workflows_maps_payload(monkeypatch):
+    """`list_workflows` maps the Actions `/actions/workflows` payload into
+    `Workflow` objects; `[]` on an empty listing and on 404."""
+    from lib_python_projects.providers.base import Workflow
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/actions/workflows"
+        return _json({
+            "total_count": 1,
+            "workflows": [{
+                "id": 161335,
+                "name": "CI",
+                "path": ".github/workflows/ci.yml",
+                "state": "active",
+                "html_url": "https://github.com/acme/backend/blob/main/.github/workflows/ci.yml",
+            }],
+        })
+
+    _install_mock(monkeypatch, handler)
+    workflows = GitHubProvider().list_workflows(_project(), token="t")
+    assert workflows == [Workflow(
+        id="161335", name="CI", path=".github/workflows/ci.yml",
+        state="active",
+        url="https://github.com/acme/backend/blob/main/.github/workflows/ci.yml",
+        dispatch_target="ci.yml",
+    )]
+
+
+def test_list_workflows_missing_path_falls_back_to_id(monkeypatch):
+    """A workflow entry with no `path` still yields a usable
+    `dispatch_target` — falls back to the numeric id as a string."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({
+            "total_count": 1,
+            "workflows": [{"id": 42, "name": "Legacy"}],
+        })
+
+    _install_mock(monkeypatch, handler)
+    workflows = GitHubProvider().list_workflows(_project(), token="t")
+    assert len(workflows) == 1
+    assert workflows[0].dispatch_target == "42"
+    assert workflows[0].url is None
+
+
+def test_list_workflows_empty_on_no_workflows(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"total_count": 0, "workflows": []})
+
+    _install_mock(monkeypatch, handler)
+    assert GitHubProvider().list_workflows(_project(), token="t") == []
+
+
+def test_list_workflows_empty_on_404(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    assert GitHubProvider().list_workflows(_project(), token="t") == []
+
+
+def test_is_ci_configured_true_when_workflows_exist(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"total_count": 1, "workflows": [{"id": 1}]})
+
+    _install_mock(monkeypatch, handler)
+    assert GitHubProvider().is_ci_configured(_project(), token="t") is True
+
+
+def test_is_ci_configured_false_when_no_workflows(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    assert GitHubProvider().is_ci_configured(_project(), token="t") is False
+
+
+def test_list_runs_for_branch_appends_no_ci_sentinel_when_not_configured(
+    monkeypatch,
+):
+    """Driving test (ticket #209): branch resolves, no runs, and the
+    repository has no Actions workflows at all → the uniform
+    `NO_CI_SENTINEL` is appended as the last element of resolved_refs."""
+    from lib_python_projects.providers.base import NO_CI_SENTINEL
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/branches/main":
+            return _json({"commit": {"sha": "sha1"}})
+        if path == "/repos/acme/backend/actions/runs":
+            return _json({"workflow_runs": []})
+        if path == "/repos/acme/backend/actions/workflows":
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitHubProvider().list_runs_for_branch(
+        _project(), token="t", branch="main",
+    )
+    assert runs == []
+    assert resolved_refs == ["sha1", NO_CI_SENTINEL]
+
+
+def test_list_runs_for_branch_no_sentinel_when_ci_configured(monkeypatch):
+    """Counterpart: branch resolves, no runs, but the repository DOES
+    have Actions workflows → no sentinel, matching the pre-ticket-#209
+    branch-mode shape exactly."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/branches/main":
+            return _json({"commit": {"sha": "sha1"}})
+        if path == "/repos/acme/backend/actions/runs":
+            return _json({"workflow_runs": []})
+        if path == "/repos/acme/backend/actions/workflows":
+            return _json({"total_count": 1, "workflows": [{"id": 1}]})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitHubProvider().list_runs_for_branch(
+        _project(), token="t", branch="main",
+    )
+    assert runs == []
+    assert resolved_refs == ["sha1"]
+
+
+def test_list_runs_recent_appends_no_ci_sentinel_when_not_configured(
+    monkeypatch,
+):
+    """Driving test (ticket #209): no runs at all, and no workflows
+    configured → `([], [NO_CI_SENTINEL])`."""
+    from lib_python_projects.providers.base import NO_CI_SENTINEL
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/actions/runs":
+            return _json({"workflow_runs": []})
+        if path == "/repos/acme/backend/actions/workflows":
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = GitHubProvider().list_runs_recent(_project(), token="t")
+    assert runs == []
+    assert resolved_refs == [NO_CI_SENTINEL]
+
+
+def test_wait_for_run_never_probes_ci_configuration(monkeypatch):
+    """Regression guard (ticket #209): `wait_for_run` must poll through
+    the unprobed helper — every empty poll iteration must NOT trigger
+    the `/actions/workflows` probe request. A strict handler that raises
+    on that path, combined with a timeout that forces several empty
+    polls, proves the probe is never hit."""
+    _no_sleep(monkeypatch, github_provider)
+    poll_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/actions/runs":
+            poll_count["n"] += 1
+            return _json({"workflow_runs": []})
+        raise AssertionError(f"unexpected request (probe?): {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    run = GitHubProvider().wait_for_run(
+        _project(), token="t", since="2026-08-21T10:00:00Z", timeout=0.05,
+    )
+    assert run is None
+    assert poll_count["n"] >= 1
+
+
+def test_dispatch_target_round_trips_into_trigger_pipeline(monkeypatch):
+    """The `dispatch_target` from `list_workflows` works verbatim as the
+    `workflow` argument to `trigger_pipeline` — hits the filename-scoped
+    dispatch endpoint, never the full `.github/workflows/...` path."""
+    _patch_now(monkeypatch, github_provider)
+    _no_sleep(monkeypatch, github_provider)
+    dispatch_paths = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/actions/workflows":
+            return _json({
+                "total_count": 1,
+                "workflows": [{
+                    "id": 9, "name": "CI", "path": ".github/workflows/ci.yml",
+                }],
+            })
+        if path.startswith("/repos/acme/backend/actions/workflows/") and path.endswith("/dispatches"):
+            dispatch_paths.append(path)
+            return httpx.Response(status_code=204)
+        if path == "/repos/acme/backend/branches/main":
+            return _json({"commit": {"sha": "branchsha1"}})
+        if path == "/repos/acme/backend/actions/workflows/ci.yml/runs":
+            return _json({"workflow_runs": [
+                _run(5, name="CI", event="workflow_dispatch",
+                     created_at="2026-08-21T10:00:01Z"),
+            ]})
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    workflows = GitHubProvider().list_workflows(_project(), token="t")
+    assert workflows[0].dispatch_target == "ci.yml"
+
+    run = GitHubProvider().trigger_pipeline(
+        _project(), token="t", workflow=workflows[0].dispatch_target, ref="main",
+    )
+    assert dispatch_paths == ["/repos/acme/backend/actions/workflows/ci.yml/dispatches"]
+    assert all(".github/workflows/" not in p for p in dispatch_paths)
+    assert run is not None
+    assert run.id == "5"
 
 
 # ---------- ticket #200 -- get_ref -------------------------------------------

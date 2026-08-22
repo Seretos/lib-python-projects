@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -47,6 +48,7 @@ from lib_python_projects.markers import (
 from lib_python_projects.providers.base import (
     apply_run_filters,
     BulkTicketResult,
+    CIConfigurationProvider,
     Comment,
     DiscoveredProject,
     FailingJob,
@@ -81,6 +83,8 @@ from lib_python_projects.providers.base import (
     TokenProjectDiscoveryProvider,
     ViewerIdentity,
     ViewerIdentityProvider,
+    Workflow,
+    NO_CI_SENTINEL,
     _assert_not_self_relation,
     _extract_parent_id,
     _validate_label_lists,
@@ -502,6 +506,34 @@ def _map_mergeable(raw: dict) -> bool | None:
     if raw_status.startswith("cannot_be_merged"):
         return False
     return None
+
+
+def _created_at_key(raw: dict) -> datetime:
+    """Sort key for merging raw MR payloads by true chronological
+    `created_at`, newest first (ticket #204).
+
+    `normalize_timestamp` only strips fractional seconds — it does not
+    normalize UTC offsets — so a plain string sort of `created_at`
+    across payloads that mix `Z` and `+HH:MM` offsets can misorder
+    them. This parses to an aware `datetime` instead. Missing/malformed
+    values sort last (oldest).
+
+    The returned datetime is always timezone-aware: an offset-less but
+    otherwise well-formed value (e.g. `"2024-01-15T10:30:00"`, no `Z`,
+    no `+HH:MM`) parses successfully as a *naive* datetime, which would
+    raise `TypeError` when compared against the aware datetimes this
+    function returns for the `Z`/`+HH:MM`/malformed cases. GitLab's API
+    is documented to return UTC timestamps, so a naive result is
+    assumed to be UTC and stamped accordingly.
+    """
+    raw_value = str(raw.get("created_at") or "")
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _map_mr(
@@ -1684,6 +1716,71 @@ def _resolve_gitlab_commit(
     return True
 
 
+def _fetch_gitlab_ci_config(
+    client: httpx.Client,
+    project_path: str,
+) -> tuple[str | None, str | None, bool]:
+    """Fetch `(ci_config_path, default_branch, builds_enabled)` (ticket #209).
+
+    `GET /projects/{id}` — `ci_config_path` empty/`None` means the
+    project uses the default `.gitlab-ci.yml`. `builds_access_level`
+    `"disabled"` means CI is turned off for the project entirely,
+    independent of whether a config file exists — callers should skip
+    the file lookup entirely in that case. Propagates via `_check` on
+    any non-2xx response (e.g. the project itself is invisible to the
+    token) — that is a different failure mode than "no CI configured".
+    """
+    r = client.get(f"/projects/{project_path}")
+    _check(r)
+    body = r.json() or {}
+    builds_enabled = (body.get("builds_access_level") or "enabled") != "disabled"
+    return (
+        body.get("ci_config_path") or None,
+        body.get("default_branch") or None,
+        builds_enabled,
+    )
+
+
+def _list_workflows(
+    client: httpx.Client,
+    project_path: str,
+) -> list[Workflow]:
+    """Return the CI config as an at-most-one-entry `Workflow` list (ticket #209).
+
+    GitLab has no per-workflow enumeration — a project runs a single
+    CI config file. CI is considered configured iff:
+      1. `builds_access_level` is not `"disabled"`, AND
+      2. the CI config file (`ci_config_path`, defaulting to
+         `.gitlab-ci.yml`) exists on the project's default branch.
+    Only a 404 on the config-file lookup (or `builds_access_level ==
+    "disabled"`, checked first to skip the file lookup) folds to `[]`;
+    other non-2xx responses propagate via `_check`, matching
+    `_has_workflows`'s original GitHub error semantics.
+    """
+    ci_config_path, default_branch, builds_enabled = _fetch_gitlab_ci_config(
+        client, project_path,
+    )
+    if not builds_enabled:
+        return []
+    config_path = ci_config_path or ".gitlab-ci.yml"
+    encoded = quote(config_path, safe="")
+    r = client.get(
+        f"/projects/{project_path}/repository/files/{encoded}",
+        params={"ref": default_branch or "HEAD"},
+    )
+    if r.status_code == 404:
+        return []
+    _check(r)
+    return [Workflow(
+        id="ci-config",
+        name=config_path,
+        path=config_path,
+        state="active",
+        url=None,
+        dispatch_target=config_path,
+    )]
+
+
 def _list_pipelines(
     project: ProjectConfig,
     token: str | None,
@@ -1814,7 +1911,10 @@ def _trigger_sleep(seconds: float) -> None:
 
 
 class GitLabProvider(
-    TokenCapabilityProvider, TokenProjectDiscoveryProvider, ViewerIdentityProvider
+    TokenCapabilityProvider,
+    TokenProjectDiscoveryProvider,
+    ViewerIdentityProvider,
+    CIConfigurationProvider,
 ):
     """GitLab REST v4 provider.
 
@@ -2800,10 +2900,13 @@ class GitLabProvider(
         """List merge requests for a project.
 
         Filter mapping (GitLab REST `/projects/:id/merge_requests`):
-          - `status`: `open`→`opened`, `closed`→`closed`, `any`→`all`.
-            Note: GitLab can't filter MRs by `merged` via `state`;
-            agents wanting only merged MRs filter post-fetch on
-            `status == "merged"`.
+          - `status`: `open`→`opened`, `any`→`all`. `closed`→ **two**
+            requests, `state=closed` and `state=merged`, unioned
+            client-side — GitLab has no single `state` value that means
+            "closed or merged", but the tool's own contract documents
+            `status="closed"` as also returning merged PRs. The union is
+            sorted by true `created_at` (desc, see `_created_at_key`)
+            and truncated to `per_page` before mapping.
           - `labels` → comma-joined `labels` param.
           - `assignee` → `assignee_username`.
           - `head` → `source_branch`. `base` → `target_branch`.
@@ -2816,19 +2919,21 @@ class GitLabProvider(
         on every returned `PullRequest`, and the historical zero-request
         behavior is preserved byte-for-byte. When
         `filters.include_approvals` is `True`, an `/approvals` request is
-        issued for each MR in the page (see `_fetch_mr_approvals`) and
-        the result populates real ints (`0` when there's no approval
-        gate), matching `get_pr` — except `None` for any individual MR
-        whose `/approvals` call returns 403/404.
+        issued for each MR that survives truncation (see
+        `_fetch_mr_approvals`) and the result populates real ints (`0`
+        when there's no approval gate), matching `get_pr` — except
+        `None` for any individual MR whose `/approvals` call returns
+        403/404.
 
-        Returns `(prs, has_more)`. `has_more` is True when the API returned
-        exactly `per_page` results, indicating more pages may exist.
+        Returns `(prs, has_more)`. `has_more` is True when a single
+        request returned exactly `per_page` results (more pages may
+        exist for that state), or when the `closed`+`merged` union had
+        to be truncated to `per_page`.
         """
         per_page = min(max(1, filters.limit), 100)
         state_map = {"open": "opened", "closed": "closed", "any": "all"}
         params: dict[str, Any] = {
             "per_page": per_page,
-            "state": state_map.get(filters.status, "opened"),
             "order_by": "created_at",
             "sort": "desc",
         }
@@ -2843,14 +2948,26 @@ class GitLabProvider(
         if filters.search:
             params["search"] = filters.search
         path = _project_path(project)
+        states = (
+            ["closed", "merged"]
+            if filters.status == "closed"
+            else [state_map.get(filters.status, "opened")]
+        )
         with _client(project, token) as client:
-            r = client.get(
-                f"/projects/{path}/merge_requests",
-                params=params,
+            pages: list[list[dict]] = []
+            for state in states:
+                r = client.get(
+                    f"/projects/{path}/merge_requests",
+                    params={**params, "state": state},
+                )
+                _check(r)
+                pages.append(r.json())
+            combined = [it for page in pages for it in page]
+            has_more = len(combined) > per_page or any(
+                len(page) >= per_page for page in pages
             )
-            _check(r)
-            items = r.json()
-            has_more = len(items) >= per_page
+            combined.sort(key=_created_at_key, reverse=True)
+            truncated = combined[:per_page]
             # Note: base.sha may be None for freshly-created MRs because
             # diff_refs is absent until GitLab runs a pipeline/diff computation.
             # See _map_mr docstring (the "diff_refs / base.sha" note) for details.
@@ -2860,10 +2977,10 @@ class GitLabProvider(
                         it, project,
                         approvals=_fetch_mr_approvals(client, path, it["iid"]),
                     )
-                    for it in items
+                    for it in truncated
                 ]
             else:
-                prs = [_map_mr(it, project) for it in items]
+                prs = [_map_mr(it, project) for it in truncated]
             return prs, has_more
 
     def get_pr(
@@ -3566,6 +3683,25 @@ class GitLabProvider(
         After the merge call, the MR is re-fetched so the response
         carries `merged_at`, `merge_commit_sha`, and the final
         `state="merged"`.
+
+        GitLab returns HTTP 405 from the merge endpoint both when the MR
+        is already merged AND when it genuinely cannot be merged (e.g. a
+        real conflict, pending CI, unresolved discussions, draft state,
+        missing approvals). On a 405 we probe the MR (`GET
+        .../merge_requests/:iid`) to tell the two apart: `state="merged"`
+        or a non-null `merged_at` → "already merged" (unchanged message);
+        otherwise the error reports the real `detailed_merge_status`/
+        `merge_status`, labeled with whichever field it actually came
+        from. The trailing guidance only says "resolve conflicts and
+        retry" when the reason is actually `"conflict"` — every other
+        reason gets a generic "see detailed_merge_status for the
+        blocking condition" suffix instead, so callers blocked by CI,
+        unresolved discussions, draft state, etc. aren't told to
+        resolve a conflict that doesn't exist. If the probe itself fails
+        for any reason at all (network hiccup, 403/404/500,
+        429-as-`RateLimitError`, a malformed JSON body), the original
+        405 is still raised, with the reason degraded to `'unknown'`
+        rather than masked by the probe's own error.
         """
         if merge_method == "rebase":
             raise ValueError(
@@ -3608,8 +3744,69 @@ class GitLabProvider(
                 _check(r)
             except GitLabError as exc:
                 if exc.status == 405:
+                    # GitLab returns 405 for both "already merged" and
+                    # "not mergeable" (conflict, pending CI, unresolved
+                    # discussions, draft, not approved, ...). Probe the
+                    # MR to find out which situation we're in, mirroring
+                    # GitHub's merge_pr 405 handling. Read the probe
+                    # payload as a raw dict (not via `_map_mr`) — a
+                    # degraded/partial payload must not raise while we
+                    # are only formulating an error message. No probe
+                    # failure of any kind — a GitLabError status
+                    # (403/404/500/429-as-RateLimitError), a
+                    # transport-level httpx exception, or a malformed
+                    # JSON body from `.json()` — may ever mask the
+                    # original 405, so this catches broadly rather than
+                    # just `GitLabError`. `.json()` can also succeed
+                    # with valid-but-non-dict JSON (a list, string,
+                    # number, ...) from a misbehaving proxy or gateway
+                    # error page — that must be treated the same as a
+                    # probe failure, not passed through to the
+                    # `.get(...)` calls below which assume a dict.
+                    try:
+                        probe = client.get(
+                            f"/projects/{path}/merge_requests/{pr_id}"
+                        )
+                        _check(probe)
+                        raw = probe.json()
+                        if not isinstance(raw, dict):
+                            raw = {}
+                    except Exception:
+                        raw = {}
+                    merged = (
+                        raw.get("state") == "merged"
+                        or bool(raw.get("merged_at"))
+                    )
+                    if merged:
+                        raise GitLabError(
+                            405, f"PR '{project.id}#{pr_id}' is already merged"
+                        ) from exc
+                    detailed_status = raw.get("detailed_merge_status")
+                    legacy_status = raw.get("merge_status")
+                    if detailed_status:
+                        reason = detailed_status
+                        status_field = "detailed_merge_status"
+                    elif legacy_status:
+                        reason = legacy_status
+                        status_field = "merge_status"
+                    else:
+                        reason = "unknown"
+                        status_field = "detailed_merge_status"
+                    # "resolve conflicts" is only accurate guidance when
+                    # the blocker actually is a conflict — for every
+                    # other reason (ci_must_pass, discussions_not_resolved,
+                    # draft_status, not_approved, checking, unknown, ...)
+                    # it would mislead the caller about what to do next.
+                    guidance = (
+                        "resolve conflicts and retry"
+                        if reason == "conflict"
+                        else "see detailed_merge_status for the blocking condition"
+                    )
                     raise GitLabError(
-                        405, f"PR '{project.id}#{pr_id}' is already merged"
+                        405,
+                        f"PR '{project.id}#{pr_id}' cannot be merged:"
+                        f" {status_field}='{reason}'"
+                        f" — {guidance}",
                     ) from exc
                 raise
             # Re-fetch so the response captures the post-merge state
@@ -3815,6 +4012,32 @@ class GitLabProvider(
                 kind, "gitlab", self._SUPPORTED_RELATION_KINDS,
             )
 
+    # ---------- CI workflow discovery (ticket #209, CIConfigurationProvider) -
+
+    def list_workflows(
+        self, project: ProjectConfig, token: str | None
+    ) -> list[Workflow]:
+        """Return the CI config as an at-most-one-entry `Workflow` list.
+
+        See module-level `_list_workflows` for exact semantics — GitLab
+        has no per-workflow enumeration, so this reports the single
+        `.gitlab-ci.yml`-shaped config (or `[]` when CI isn't configured).
+        """
+        path = _project_path(project)
+        with _client(project, token) as client:
+            return _list_workflows(client, path)
+
+    def is_ci_configured(
+        self, project: ProjectConfig, token: str | None
+    ) -> bool:
+        """Return whether the project has CI configured.
+
+        `bool(self.list_workflows(project, token))` in spirit.
+        """
+        path = _project_path(project)
+        with _client(project, token) as client:
+            return bool(_list_workflows(client, path))
+
     # ---------- pipelines / CI runs ------------------------------------------
 
     def list_runs_for_branch(
@@ -3859,7 +4082,11 @@ class GitLabProvider(
             runs, provider="gitlab", workflow=workflow, event=event,
             since=since, limit=limit,
         )
-        return runs, [sha]
+        if runs:
+            return runs, [sha]
+        if not self.is_ci_configured(project, token):
+            return [], [sha, NO_CI_SENTINEL]
+        return [], [sha]
 
     def list_runs_for_commit(
         self,
@@ -3899,7 +4126,11 @@ class GitLabProvider(
             runs, provider="gitlab", workflow=workflow, event=event,
             since=since, limit=limit,
         )
-        return runs, [sha]
+        if runs:
+            return runs, [sha]
+        if not self.is_ci_configured(project, token):
+            return [], [sha, NO_CI_SENTINEL]
+        return [], [sha]
 
     def list_runs_for_tag(
         self,
@@ -3934,7 +4165,11 @@ class GitLabProvider(
             runs, provider="gitlab", workflow=workflow, event=event,
             since=since, limit=limit,
         )
-        return runs, [tag]
+        if runs:
+            return runs, [tag]
+        if not self.is_ci_configured(project, token):
+            return [], [tag, NO_CI_SENTINEL]
+        return [], [tag]
 
     def list_runs_for_ticket(
         self,
@@ -3980,6 +4215,8 @@ class GitLabProvider(
             )
             _check(r)
             related = r.json()
+            if not related:
+                return [], []
             collected: list[dict] = []
             for mr in related:
                 mr_iid = mr.get("iid")
@@ -4001,9 +4238,13 @@ class GitLabProvider(
             provider="gitlab", workflow=workflow, event=event,
             since=since, limit=limit,
         )
-        return runs, resolved_refs
+        if runs:
+            return runs, resolved_refs
+        if not self.is_ci_configured(project, token):
+            return [], [*resolved_refs, NO_CI_SENTINEL]
+        return [], resolved_refs
 
-    def list_runs_recent(
+    def _list_runs_recent_unprobed(
         self,
         project: ProjectConfig,
         token: str | None,
@@ -4014,11 +4255,12 @@ class GitLabProvider(
         event: str | None = None,
         since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
-        """List the most recent pipelines, unfiltered by ref.
+        """Core of `list_runs_recent`, without the `is_ci_configured` probe.
 
-        Returns ``(runs, [])`` — the empty ``resolved_refs`` signals that
-        no ref filter was applied. See `list_runs_for_branch` for
-        `workflow`/`event`/`since` semantics.
+        `wait_for_run` polls this helper directly (ticket #209) — it
+        must never trigger the extra probe request on every empty poll
+        iteration. See `list_runs_recent` for the public, probing
+        wrapper that real callers should use.
         """
         params: dict[str, Any] = {}
         scope = _gitlab_pipeline_scope(status)
@@ -4033,6 +4275,35 @@ class GitLabProvider(
             since=since, limit=limit,
         )
         return runs, []
+
+    def list_runs_recent(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        status: str = "all",
+        limit: int = 20,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List the most recent pipelines, unfiltered by ref.
+
+        Returns ``(runs, [])`` when runs are found, or when none are
+        found but CI is configured. Returns ``([], [NO_CI_SENTINEL])``
+        when there are no matching pipelines AND the project has no CI
+        configured at all (ticket #209) — see `NO_CI_SENTINEL`. See
+        `list_runs_for_branch` for `workflow`/`event`/`since` semantics.
+        """
+        runs, resolved_refs = self._list_runs_recent_unprobed(
+            project, token, status=status, limit=limit,
+            workflow=workflow, event=event, since=since,
+        )
+        if runs:
+            return runs, resolved_refs
+        if not self.is_ci_configured(project, token):
+            return [], [NO_CI_SENTINEL]
+        return [], resolved_refs
 
     def get_run(
         self,
@@ -4173,7 +4444,7 @@ class GitLabProvider(
         deadline = time.monotonic() + timeout
         attempt = 0
         while True:
-            runs, _ = self.list_runs_recent(
+            runs, _ = self._list_runs_recent_unprobed(
                 project, token, limit=50,
                 workflow=workflow, event=event, since=since,
             )

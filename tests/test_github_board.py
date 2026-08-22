@@ -9,6 +9,7 @@ made through the same client are captured by one handler.
 """
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any, Callable
 
@@ -1041,6 +1042,87 @@ def test_get_ticket_without_include_custom_fields_stays_none(
     )
     assert ticket.custom_fields is None
     assert ticket.milestone is None
+
+
+def test_get_ticket_docstring_warns_board_title_field_can_be_stale() -> None:
+    """Ticket #203: the board's `Title` field is a GitHub-maintained mirror
+    of the issue title, not something this wrapper writes or refreshes.
+    Guard the `custom_fields` contract paragraph so a future edit can't
+    silently drop the staleness warning or claim the mirror is guaranteed
+    to be in sync with `ticket.title`."""
+    doc = GitHubProvider.get_ticket.__doc__
+    assert doc is not None
+    assert "Title" in doc
+    assert "mirror" in doc
+    assert "may lag" in doc or "can be stale" in doc
+    assert "`ticket.title` is the authoritative" in doc
+
+    # No opposite claim: no promise of tracking/resyncing.
+    assert "always matches" not in doc
+    assert "is resynced" not in doc
+    assert "does not guarantee that mirror is re-synced" in doc
+
+    # The note sits inside the `custom_fields` contract block: after the
+    # `include_custom_fields` sentence and before the `ticket.milestone`
+    # paragraph, not appended somewhere unrelated.
+    include_custom_fields_idx = doc.index("include_custom_fields")
+    title_idx = doc.index("mirror")
+    milestone_idx = doc.index("`ticket.milestone` (ticket #151)")
+    assert include_custom_fields_idx < title_idx < milestone_idx
+
+    # Lowercase `"title"` field-name spelling is acknowledged, since
+    # `_extract_project_field_values` keys the map by the board's live
+    # field name and that casing is user-controlled.
+    assert '"title"' in doc or "'title'" in doc
+
+    # Trailing generalisation is scoped to other board-mirrored *native*
+    # issue fields, not a broad claim that all board fields can lag.
+    assert "other board-mirrored" in doc or "other mirrored" in doc
+    assert "all board fields" not in doc
+
+
+def test_update_ticket_docstring_cross_references_stale_board_title() -> None:
+    """Ticket #203: the #185 read-back paragraph promises that
+    `update_ticket`'s return "matches an immediate
+    `get_ticket(..., include_custom_fields=True)`" — this must also flag
+    that parity includes the mirrored Title field's possible lag, and
+    point at `get_ticket` for the full explanation rather than duplicating
+    it. Guard both properties so a future edit can't silently drop the
+    cross-reference or accidentally re-explain the mirror mechanism here."""
+    # inspect.getdoc() dedents consistently across Python versions (raw
+    # `__doc__` preserves the source indentation on continuation lines on
+    # Python <=3.12, but is already dedented on Python 3.13+ — see ticket
+    # #211), so use it here rather than the raw attribute. However,
+    # inspect.getdoc() falls back to an inherited docstring via the MRO if
+    # update_ticket's own docstring is ever removed, which would let this
+    # test pass even though the regression it guards against (docstring
+    # content going missing) actually occurred. Guard against that by also
+    # checking the method's own __dict__ entry, which bypasses inheritance.
+    assert GitHubProvider.__dict__["update_ticket"].__doc__ is not None
+    doc = inspect.getdoc(GitHubProvider.update_ticket)
+    assert doc is not None
+
+    # Cross-reference is added, not substituted for the existing #185 sentence.
+    assert "get_ticket(..., include_custom_fields=True)" in doc
+    assert "Title" in doc
+    assert "get_ticket" in doc
+
+    # Pointer, not duplicate: the distinctive mirror-mechanism clause from
+    # get_ticket's docstring (which explains *why* the field can lag) is
+    # not repeated here — only referenced. Note "mirrors" legitimately
+    # appears elsewhere in this docstring (the unrelated `milestone=`
+    # paragraph), so check for the specific explanatory clause rather
+    # than the bare word.
+    assert "GitHub itself" not in doc and "GitHub-maintained mirror" not in doc, (
+        "get_ticket's mirror-mechanism explanation leaked into "
+        "update_ticket's docstring; this should be a pointer, not a copy"
+    )
+
+    # The pre-existing #178 REST-state staleness wording stays untouched
+    # and is not confused with the new Title note.
+    assert "MAY LAG" in doc
+    assert "best-effort" in doc
+    assert "Callers that\nneed guaranteed post-cascade REST state must issue a follow-up" in doc
 
 
 def test_create_ticket_custom_fields_writes_via_project_v2_mutations(

@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import posixpath
 import re
 import time
 from typing import Any
@@ -25,6 +26,7 @@ from lib_python_projects.providers.base import (
     apply_run_filters,
     BoardColumnSpec,
     BulkTicketResult,
+    CIConfigurationProvider,
     Comment,
     DiscoveredProject,
     FailingJob,
@@ -61,6 +63,8 @@ from lib_python_projects.providers.base import (
     TokenProjectDiscoveryProvider,
     ViewerIdentity,
     ViewerIdentityProvider,
+    Workflow,
+    NO_CI_SENTINEL,
     _assert_not_self_relation,
     _extract_parent_id,
     _validate_label_lists,
@@ -2698,6 +2702,83 @@ def _quote_label(name: str) -> str:
     return name
 
 
+def _quote_search_term(term: str) -> str:
+    """Neutralise GitHub Search qualifier syntax in a free-text `search`
+    term before it is spliced into a `q=` string (ticket #202).
+
+    A raw free-text term spliced in unescaped is read by GitHub Search as
+    qualifier syntax whenever a whitespace-delimited token contains `:`
+    (e.g. `"E2E:"` is parsed as an empty/unknown qualifier and silently
+    dropped) or starts with `-` (silent negation). Either failure mode
+    degrades the term into a no-op, and `list_tickets`/`list_prs` then
+    return the full, unfiltered result set instead of a filtered one.
+
+    This tokenizes the term quote-span-aware — a whole `"..."` phrase
+    (including any embedded spaces or colons) is treated as ONE
+    already-quoted token and left untouched, while everything outside
+    quotes still splits on whitespace — and wraps ONLY the offending
+    plain tokens in double quotes; an ordinary token is left untouched —
+    existing multi-word implicit-AND search semantics (e.g.
+    `"absurdly long title"`) are preserved bit-for-bit. Any `"` inside a
+    token being newly quoted is dropped — GitHub Search has no reliable
+    in-phrase escape.
+
+    A token that carries a stray/unbalanced `"` (one that doesn't pair up
+    into a whole `"..."` phrase — e.g. a lone leading quote, a quote
+    buried mid-token, or a dangling trailing quote) is quoted the same
+    way as a `:`- or `-`-led token, with the stray quote(s) dropped
+    before rewrapping. Left alone, an unbalanced `"` reaching `q=` makes
+    GitHub read everything after it as one open-ended literal string,
+    silently swallowing any qualifiers appended later in the query — the
+    same silent-degradation failure mode this function exists to close
+    for `:` and `-`.
+
+    `search` is strictly free text: this quoting is unconditional — there
+    is no qualifier allowlist and no opt-out. A deliberate
+    `search="label:bug"` now matches the literal text `label:bug` rather
+    than being interpreted as the `label:` qualifier.
+    """
+    tokens: list[str] = []
+    for tok in re.findall(r'"[^"]*"|\S+', term):
+        if len(tok) >= 2 and tok.startswith('"') and tok.endswith('"'):
+            tokens.append(tok)
+            continue
+        if ":" in tok or tok.startswith("-") or '"' in tok:
+            tokens.append(f'"{tok.replace(chr(34), "")}"')
+        else:
+            tokens.append(tok)
+    return " ".join(tokens)
+
+
+def _normalize_search_filter(term: str | None) -> str | None:
+    """Normalize a free-text `search` filter before it drives routing or
+    `q=` construction (ticket #202).
+
+    - `None` stays `None`.
+    - Whitespace-only collapses to `None` ("not set"), mirroring the
+      `not_labels=[]` normalization in `list_tickets` — this also avoids
+      needlessly forcing the expensive search route for a term with
+      nothing in it.
+    - A term with no alphanumeric character anywhere (e.g. `"::"`,
+      `"---"`) raises `ValueError` naming the term: `_quote_search_term`
+      would quote every token, but the result still carries no
+      searchable text, and letting it through would silently call the
+      Search API with a query that matches everything or nothing
+      unpredictably rather than erroring up front.
+    """
+    if term is None:
+        return None
+    stripped = term.strip()
+    if not stripped:
+        return None
+    if not any(ch.isalnum() for ch in stripped):
+        raise ValueError(
+            f"search term {term!r} has no searchable text (no "
+            f"alphanumeric characters) — GitHub Search cannot match it"
+        )
+    return term
+
+
 def _requires_search(filters: TicketFilters) -> bool:
     """Return True iff any filter forces us off the cheap `/issues` path
     and onto `/search/issues`.
@@ -2721,6 +2802,7 @@ def _list_via_search(
     client: httpx.Client,
     project: ProjectConfig,
     filters: TicketFilters,
+    normalized_search: str | None,
 ) -> list[dict]:
     """Hit `GET /search/issues` and return the raw `items` list.
 
@@ -2728,6 +2810,14 @@ def _list_via_search(
     the new Plan-7 filters (`not_labels`, `author`, date ranges). Sort is
     expressed as a `sort:<key>-<order>` qualifier appended to `q` (NOT a
     separate `sort=` param — that's the legacy endpoint's convention).
+
+    `normalized_search` is `filters.search` already run through
+    `_normalize_search_filter` by the caller (`list_tickets`) — this
+    function never mutates the caller-supplied `filters` object, so the
+    normalized value is threaded in explicitly. It is then run through
+    `_quote_search_term` (ticket #202) before being spliced into `q` so
+    qualifier-shaped tokens (a `:` anywhere, or a leading `-`) can't be
+    misread as Search syntax and silently degrade the term into a no-op.
     """
     per_page = min(max(1, filters.limit), 100)
     qual_parts: list[str] = [
@@ -2761,7 +2851,7 @@ def _list_via_search(
     if filters.updated_before:
         qual_parts.append(f"updated:<={filters.updated_before}")
     qual_parts.append(f"sort:{filters.sort_by}-{filters.sort_order}")
-    pieces = [filters.search] if filters.search else []
+    pieces = [_quote_search_term(normalized_search)] if normalized_search else []
     pieces.extend(qual_parts)
     q = " ".join(pieces)
     r = client.get("/search/issues", params={"q": q, "per_page": per_page})
@@ -2834,7 +2924,9 @@ def _trigger_sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
+class GitHubProvider(
+    TokenProjectDiscoveryProvider, ViewerIdentityProvider, CIConfigurationProvider
+):
     def probe_token_capabilities(
         self, project: ProjectConfig, token: str
     ) -> TokenCapabilities:
@@ -2933,7 +3025,17 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         REST endpoints below: it resolves the logical column against
         `project.board`, runs a single Projects-v2 GraphQL items query,
         and applies labels/not_labels/assignee/states/status client-side.
+
+        `filters.search` is normalized up front via
+        `_normalize_search_filter` (ticket #202): whitespace-only becomes
+        "not set", and a term with no searchable (alphanumeric) content
+        (e.g. `"::"`) raises `ValueError` rather than silently routing to
+        search and returning the full, unfiltered list. A term that does
+        carry searchable text is quoted per-token via
+        `_quote_search_term` before it reaches `q=` so qualifier-shaped
+        tokens can't be misread as Search syntax.
         """
+        normalized_search = _normalize_search_filter(filters.search)
         if filters and filters.area_path:
             raise ValueError(
                 "area_path is not supported on GitHub — it is an Azure DevOps "
@@ -2941,7 +3043,9 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
             )
         _validate_limit(filters.limit)
         if filters and filters.board_column:
-            return self._list_tickets_by_board_column(project, token, filters)
+            return self._list_tickets_by_board_column(
+                project, token, filters, normalized_search
+            )
         per_page = min(max(1, filters.limit), 100)
         # Normalize `not_labels=[]` (truthy-but-empty containers) to "not set".
         if not filters.not_labels:
@@ -2950,8 +3054,8 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         # unrecognised native value raises before any HTTP call.
         state_pairs = _github_states_pairs(filters.states) if filters.states else None
         with _client(token) as client:
-            if filters.search or _requires_search(filters):
-                items = _list_via_search(client, project, filters)
+            if normalized_search or _requires_search(filters):
+                items = _list_via_search(client, project, filters, normalized_search)
                 has_more = len(items) >= per_page
                 filtered = [it for it in items if "pull_request" not in it]
                 if state_pairs is not None:
@@ -3014,8 +3118,15 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         project: ProjectConfig,
         token: str | None,
         filters: TicketFilters,
+        normalized_search: str | None,
     ) -> tuple[list[Ticket], bool]:
         """Dedicated `filters.board_column` listing path (ticket #118).
+
+        `normalized_search` is `filters.search` already run through
+        `_normalize_search_filter` by the caller (`list_tickets`) — this
+        method never mutates the caller-supplied `filters` object, so the
+        normalized value is threaded in explicitly rather than re-derived
+        or read off `filters.search`.
 
         Resolves the logical column against `project.board`, then runs a
         single (paginated) Projects-v2 GraphQL items query — instead of
@@ -3027,7 +3138,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         `status`) are then applied client-side, and results are sorted
         and paginated per `sort_by`/`sort_order`/`limit`.
         """
-        if filters.search:
+        if normalized_search:
             raise ValueError(
                 "board_column cannot be combined with search — the "
                 "board-column path runs a dedicated GitHub Projects v2 "
@@ -3162,6 +3273,24 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         `None` (never raises on read — "not applicable" semantics).
         Binding configured but the issue has no item on that project ->
         `custom_fields = {}`.
+
+        The board's `Title` field (and `custom_fields["title"]`/
+        `custom_fields["Title"]`, whichever casing the board's live field
+        name uses) is a **mirror** of the issue title that GitHub itself
+        maintains, not a value this wrapper writes or refreshes. GitHub
+        does not guarantee that mirror is re-synced on every issue edit,
+        so after an `update_ticket(title=...)`, a subsequent read here
+        may lag: `custom_fields["Title"]` can be stale (still the
+        pre-update title) even though `ticket.title` (mapped from the
+        REST issue payload by `_map_issue` above) is already correct.
+        `ticket.title` is the authoritative value for the issue's title;
+        `custom_fields["Title"]` must not be treated as such (ticket
+        #203). This wrapper deliberately does not force-refresh or write
+        back the mirrored field — the map `_populate_board_fields`
+        builds is returned verbatim. The same lag can apply to
+        other board-mirrored *native* issue fields (not to
+        single-select/text/iteration fields the wrapper itself writes,
+        which are not mirrors).
 
         `ticket.milestone` (ticket #151) is populated from the same bound
         board's *iteration* field (see `GithubProjectsV2Binding.iteration_field`)
@@ -3508,7 +3637,11 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         Projects-v2 `projectItems` GraphQL read `get_ticket` uses, so the
         return matches an immediate
         `get_ticket(..., include_custom_fields=True)` — at the cost of
-        one extra round trip, confined to this path. A `milestone`-only
+        one extra round trip, confined to this path. That parity
+        includes the board's `Title` field's possible staleness after a
+        `title` change (ticket #203) — see `get_ticket`'s
+        `custom_fields` documentation for the full explanation. A
+        `milestone`-only
         board write does not trigger any of this (neither the state poll
         nor the board read-back): the iteration field has no REST-visible
         effect on the issue, so the returned `custom_fields` and
@@ -4316,10 +4449,22 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
 
         Returns `(prs, has_more)`. `has_more` is True when the API returned
         exactly `per_page` results, indicating more pages may exist.
+
+        `filters.search` is normalized up front via
+        `_normalize_search_filter` (ticket #202): whitespace-only becomes
+        "not set", and a term with no searchable (alphanumeric) content
+        (e.g. `"::"`) raises `ValueError` rather than silently routing to
+        search and returning the full, unfiltered list. A term that does
+        carry searchable text is quoted per-token via
+        `_quote_search_term` before it reaches `q=` so qualifier-shaped
+        tokens (a `:` anywhere, or a leading `-`) can't be misread as
+        Search syntax and silently degrade into a no-op — the same
+        protection `list_tickets`/`_list_via_search` apply.
         """
+        normalized_search = _normalize_search_filter(filters.search)
         per_page = min(max(1, filters.limit), 100)
         use_search = bool(
-            filters.labels or filters.assignee or filters.search
+            filters.labels or filters.assignee or normalized_search
         )
         with _client(token) as client:
             if use_search:
@@ -4337,7 +4482,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                     qual_parts.append(f"head:{filters.head}")
                 if filters.base:
                     qual_parts.append(f"base:{filters.base}")
-                pieces = [filters.search] if filters.search else []
+                pieces = [_quote_search_term(normalized_search)] if normalized_search else []
                 pieces.extend(qual_parts)
                 q = " ".join(pieces)
                 r = client.get("/search/issues", params={"q": q, "per_page": per_page})
@@ -5438,6 +5583,31 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 kind, "github", self._SUPPORTED_RELATION_KINDS,
             )
 
+    # ---------- CI workflow discovery (ticket #209, CIConfigurationProvider) -
+
+    def list_workflows(
+        self, project: ProjectConfig, token: str | None
+    ) -> list[Workflow]:
+        """List every Actions workflow defined on the repository.
+
+        See `_list_workflows` for exact field mapping and error
+        semantics (only 404 folds to `[]`; 401/403/5xx propagate).
+        """
+        with _client(token) as client:
+            return _list_workflows(client, project)
+
+    def is_ci_configured(
+        self, project: ProjectConfig, token: str | None
+    ) -> bool:
+        """Return whether the repository has at least one Actions workflow.
+
+        `bool(self.list_workflows(project, token))` in spirit — uses
+        `_has_workflows` directly to avoid building `Workflow` objects
+        just to discard them.
+        """
+        with _client(token) as client:
+            return _has_workflows(client, project)
+
     # ---------- pipelines / CI runs -----------------------------------------
 
     def list_runs_for_branch(
@@ -5483,7 +5653,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 )
                 return runs, [sha]
             if not _has_workflows(client, project):
-                return [], [sha, "no-ci"]
+                return [], [sha, NO_CI_SENTINEL]
             return [], [sha]
 
     def list_runs_for_commit(
@@ -5502,7 +5672,9 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
 
         Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape:
         - ``([], [])`` — commit not found
-        - ``(runs, [sha])`` — commit found (runs may be empty)
+        - ``([], [sha, "no-ci"])`` — commit found, no runs, no workflows
+        - ``([], [sha])`` — commit found, no runs, CI is configured
+        - ``(runs, [sha])`` — commit found, runs found
 
         See `list_runs_for_branch` for `workflow`/`event`/`since` semantics.
         """
@@ -5520,7 +5692,11 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 event=event,
                 since=since, limit=limit,
             )
-            return runs, [sha]
+            if runs:
+                return runs, [sha]
+            if not _has_workflows(client, project):
+                return [], [sha, NO_CI_SENTINEL]
+            return [], [sha]
 
     def list_runs_for_tag(
         self,
@@ -5555,7 +5731,11 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 event=event,
                 since=since, limit=limit,
             )
-            return runs, [sha]
+            if runs:
+                return runs, [sha]
+            if not _has_workflows(client, project):
+                return [], [sha, NO_CI_SENTINEL]
+            return [], [sha]
 
     def list_runs_for_ticket(
         self,
@@ -5605,9 +5785,13 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 event=event,
                 since=since, limit=limit,
             )
-            return runs, shas
+            if runs:
+                return runs, shas
+            if not _has_workflows(client, project):
+                return [], [*shas, NO_CI_SENTINEL]
+            return [], shas
 
-    def list_runs_recent(
+    def _list_runs_recent_unprobed(
         self,
         project: ProjectConfig,
         token: str | None,
@@ -5618,11 +5802,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         event: str | None = None,
         since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
-        """List the most recent Actions workflow runs, unfiltered by ref.
+        """Core of `list_runs_recent`, without the `is_ci_configured` probe.
 
-        Returns ``(runs, [])`` — the empty ``resolved_refs`` signals that
-        no ref filter was applied. See `list_runs_for_branch` for
-        `workflow`/`event`/`since` semantics.
+        `wait_for_run` polls this helper directly (ticket #209) — it
+        must never trigger the extra probe request on every empty poll
+        iteration. See `list_runs_recent` for the public, probing
+        wrapper that real callers should use.
         """
         _validate_limit(limit)
         with _client(token) as client:
@@ -5640,6 +5825,37 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
             since=since, limit=limit,
         )
         return runs, []
+
+    def list_runs_recent(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        status: str = "all",
+        limit: int = 10,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List the most recent Actions workflow runs, unfiltered by ref.
+
+        Returns ``(runs, [])`` when runs are found, or when none are
+        found but CI is configured. Returns ``([], [NO_CI_SENTINEL])``
+        when there are no matching runs AND the repository has no
+        Actions workflows at all (ticket #209) — see `NO_CI_SENTINEL`.
+        See `list_runs_for_branch` for `workflow`/`event`/`since`
+        semantics.
+        """
+        runs, resolved_refs = self._list_runs_recent_unprobed(
+            project, token, status=status, limit=limit,
+            workflow=workflow, event=event, since=since,
+        )
+        if runs:
+            return runs, resolved_refs
+        with _client(token) as client:
+            if not _has_workflows(client, project):
+                return [], [NO_CI_SENTINEL]
+        return [], resolved_refs
 
     def get_run(
         self,
@@ -5817,7 +6033,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         deadline = time.monotonic() + timeout
         attempt = 0
         while True:
-            runs, _ = self.list_runs_recent(
+            runs, _ = self._list_runs_recent_unprobed(
                 project, token, limit=50,
                 workflow=workflow, event=event, since=since,
             )
@@ -6298,23 +6514,59 @@ def _resolve_commit(
     return True
 
 
+def _list_workflows(
+    client: httpx.Client,
+    project: ProjectConfig,
+) -> list[Workflow]:
+    """Return every Actions workflow defined on the repository (ticket #209).
+
+    Only 404 (repository or endpoint not found) is treated as "no
+    workflows / not applicable" and returns ``[]``.  Auth failures
+    (401/403) and server errors (5xx) are propagated via ``_check`` so
+    real credential or infrastructure problems surface rather than being
+    silently misclassified as the ``"no-ci"`` sentinel. This is the
+    promoted body of the original private `_has_workflows` probe
+    (ticket #200) — `_has_workflows` is now `bool(_list_workflows(...))`.
+    """
+    r = client.get(f"{_repo_path(project)}/actions/workflows")
+    if r.status_code == 404:
+        return []
+    _check(r)
+    raw = (r.json() or {}).get("workflows") or []
+    return [_map_workflow(w) for w in raw]
+
+
+def _map_workflow(raw: dict) -> Workflow:
+    """Translate a GitHub `workflow` payload into a `Workflow`.
+
+    `dispatch_target` is the filename segment of `path`
+    (`.github/workflows/ci.yml` -> `ci.yml`) — the shape
+    `_workflow_path_segment`/the dispatch endpoint require — falling
+    back to the numeric `id` as a string when `path` is missing/empty
+    (`_workflow_path_segment` also accepts a bare numeric id).
+    """
+    path = raw.get("path") or ""
+    filename = posixpath.basename(path) if path else ""
+    dispatch_target = filename or str(raw.get("id", ""))
+    return Workflow(
+        id=str(raw.get("id", "")),
+        name=raw.get("name") or "",
+        path=path,
+        state=raw.get("state") or "",
+        url=raw.get("html_url") or None,
+        dispatch_target=dispatch_target,
+    )
+
+
 def _has_workflows(
     client: httpx.Client,
     project: ProjectConfig,
 ) -> bool:
     """Return ``True`` if the repository has at least one Actions workflow.
 
-    Only 404 (repository or endpoint not found) is treated as "no
-    workflows / not applicable" and returns ``False``.  Auth failures
-    (401/403) and server errors (5xx) are propagated via ``_check`` so
-    real credential or infrastructure problems surface rather than being
-    silently misclassified as the ``"no-ci"`` sentinel.
+    See `_list_workflows` for the underlying request and error semantics.
     """
-    r = client.get(f"{_repo_path(project)}/actions/workflows")
-    if r.status_code == 404:
-        return False
-    _check(r)
-    return ((r.json() or {}).get("total_count") or 0) > 0
+    return bool(_list_workflows(client, project))
 
 
 def _resolve_tag_sha(
