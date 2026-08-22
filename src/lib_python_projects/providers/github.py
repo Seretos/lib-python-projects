@@ -2943,6 +2943,24 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         Binding configured but the issue has no item on that project ->
         `custom_fields = {}`.
 
+        The board's `Title` field (and `custom_fields["title"]`/
+        `custom_fields["Title"]`, whichever casing the board's live field
+        name uses) is a **mirror** of the issue title that GitHub itself
+        maintains, not a value this wrapper writes or refreshes. GitHub
+        does not guarantee that mirror is re-synced on every issue edit,
+        so after an `update_ticket(title=...)`, a subsequent read here
+        may lag: `custom_fields["Title"]` can be stale (still the
+        pre-update title) even though `ticket.title` (mapped from the
+        REST issue payload by `_map_issue` above) is already correct.
+        `ticket.title` is the authoritative value for the issue's title;
+        `custom_fields["Title"]` must not be treated as such (ticket
+        #203). This wrapper deliberately does not force-refresh or write
+        back the mirrored field — the map `_populate_board_fields`
+        builds is returned verbatim. The same lag can apply to
+        other board-mirrored *native* issue fields (not to
+        single-select/text/iteration fields the wrapper itself writes,
+        which are not mirrors).
+
         `ticket.milestone` (ticket #151) is populated from the same bound
         board's *iteration* field (see `GithubProjectsV2Binding.iteration_field`)
         — GitHub has no native issue-milestone concept in this surface.
@@ -3288,7 +3306,11 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         Projects-v2 `projectItems` GraphQL read `get_ticket` uses, so the
         return matches an immediate
         `get_ticket(..., include_custom_fields=True)` — at the cost of
-        one extra round trip, confined to this path. A `milestone`-only
+        one extra round trip, confined to this path. That parity
+        includes the board's `Title` field's possible staleness after a
+        `title` change (ticket #203) — see `get_ticket`'s
+        `custom_fields` documentation for the full explanation. A
+        `milestone`-only
         board write does not trigger any of this (neither the state poll
         nor the board read-back): the iteration field has no REST-visible
         effect on the issue, so the returned `custom_fields` and
