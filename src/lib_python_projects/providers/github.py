@@ -461,6 +461,120 @@ def _latest_reviews_by_author(reviews: list[Review]) -> list[Review]:
     return list(latest.values())
 
 
+# ---------- Ticket #205: pending-review flow for inline comments -----------
+#
+# `POST /pulls/{n}/comments` implicitly auto-submits a `COMMENTED`
+# review per call. These helpers route inline comments through GitHub's
+# native pending-review flow instead: create/reuse one `PENDING` review
+# and attach every comment to it via GraphQL, so nothing lands in
+# `reviews[]` until `submit_pr_review` explicitly submits it.
+
+
+def _find_pending_review(
+    client: httpx.Client, project: ProjectConfig, pr_id: str,
+) -> dict | None:
+    """Return the caller's PENDING (unsubmitted) review on this PR, if any.
+
+    Hits `GET /repos/{o}/{r}/pulls/{n}/reviews?per_page=100` and returns
+    the raw dict of the last `PENDING` entry — GitHub only ever returns
+    a pending review to its own author, so there is at most one per
+    caller. Returns the raw dict (not a mapped `Review`) so callers get
+    both the REST `id` and the GraphQL `node_id`. `None` when no
+    pending review exists.
+
+    A 404 on this lookup (e.g. a bad `pr_id`) is treated the same as
+    "no pending review" rather than raised here: this call is an
+    optimistic pre-check, and the actual write that follows (create a
+    review, add a comment, …) hits the same-shaped endpoint and will
+    surface its own honest 404 — callers' existing 404-mapping logic
+    stays the single source of truth for that error message.
+    """
+    r = client.get(
+        f"{_repo_path(project)}/pulls/{pr_id}/reviews",
+        params={"per_page": 100},
+    )
+    if r.status_code == 404:
+        return None
+    _check(r)
+    pending = [it for it in r.json() if it.get("state") == "PENDING"]
+    return pending[-1] if pending else None
+
+
+def _create_pending_review(
+    client: httpx.Client,
+    project: ProjectConfig,
+    pr_id: str,
+    commit_sha: str | None = None,
+    comments: list[dict] | None = None,
+) -> dict:
+    """Create a new PENDING review via `POST /pulls/{n}/reviews`.
+
+    Omitting `event` from the payload is what makes GitHub create an
+    unsubmitted `PENDING` review instead of auto-submitting one — the
+    crux of the ticket #205 fix. `comments`, when given, seeds the
+    review with inline comments in the same call (GitHub's documented
+    `comments: [{path, line, side, body}]` shape).
+    """
+    payload: dict[str, Any] = {}
+    if commit_sha:
+        payload["commit_id"] = commit_sha
+    if comments:
+        payload["comments"] = comments
+    r = client.post(
+        f"{_repo_path(project)}/pulls/{pr_id}/reviews",
+        json=payload,
+    )
+    _check(r)
+    return r.json()
+
+
+def _review_comment_node_id(
+    client: httpx.Client, project: ProjectConfig, comment_id: str,
+) -> str:
+    """Resolve a REST review-comment id to its GraphQL `node_id`.
+
+    Needed to translate the caller's `in_reply_to` (a REST id) into the
+    id GraphQL's `addPullRequestReviewComment(inReplyTo:)` demands.
+    """
+    r = client.get(f"{_repo_path(project)}/pulls/comments/{comment_id}")
+    _check(r)
+    return r.json()["node_id"]
+
+
+def _fetch_review_comment(
+    client: httpx.Client, project: ProjectConfig, comment_id: str,
+) -> ReviewComment:
+    """Fetch a single review comment by id and map it to `ReviewComment`.
+
+    Used after the GraphQL create/reply mutations, whose responses only
+    select `databaseId` — this re-fetches the REST shape so every
+    `add_pr_review_comment` branch returns an identically-shaped result
+    via the one existing `_map_review_comment` mapper.
+    """
+    r = client.get(f"{_repo_path(project)}/pulls/comments/{comment_id}")
+    _check(r)
+    return _map_review_comment(r.json())
+
+
+def _latest_pending_review_comment(
+    client: httpx.Client, project: ProjectConfig, pr_id: str, review_id: str,
+) -> dict:
+    """Return the most recently added comment on a pending review.
+
+    `POST /pulls/{n}/reviews` (seeded creation) does not echo the
+    created comment in its response — only the review envelope — so the
+    new-thread/no-pending-review-yet branch of `add_pr_review_comment`
+    re-fetches via `GET /pulls/{n}/reviews/{review_id}/comments` and
+    takes the last item.
+    """
+    r = client.get(
+        f"{_repo_path(project)}/pulls/{pr_id}/reviews/{review_id}/comments",
+        params={"per_page": 100},
+    )
+    _check(r)
+    return r.json()[-1]
+
+
 def _map_pr(raw: dict) -> PullRequest:
     """Translate a GitHub pull-request payload into a `PullRequest`.
 
@@ -1243,6 +1357,112 @@ def _set_pr_draft_via_graphql(
     body = r.json()
     if body.get("errors"):
         raise GitHubError(400, f"GraphQL error toggling draft: {body['errors']}")
+
+
+# ---------- GraphQL: pending-review comment mutations (ticket #205) --------
+#
+# REST has no "add a comment to an existing pending review" endpoint —
+# once a pending review exists, further comments (new threads and
+# replies alike) must go through these two mutations instead.
+
+_ADD_REVIEW_THREAD_MUTATION = (
+    "mutation($reviewId:ID!,$path:String!,$line:Int!,$side:DiffSide!,$body:String!){"
+    "addPullRequestReviewThread(input:{pullRequestReviewId:$reviewId,path:$path,"
+    "line:$line,side:$side,body:$body}){"
+    "thread{comments(first:1){nodes{databaseId}}}}}"
+)
+_ADD_REVIEW_COMMENT_REPLY_MUTATION = (
+    "mutation($reviewId:ID!,$inReplyTo:ID!,$body:String!){"
+    "addPullRequestReviewComment(input:{pullRequestReviewId:$reviewId,"
+    "inReplyTo:$inReplyTo,body:$body}){comment{databaseId}}}"
+)
+
+
+def _graphql_review_error(body: dict) -> GitHubError:
+    """Translate a GraphQL `errors[]` payload from a review-comment
+    mutation into a `GitHubError`, mirroring `_set_pr_draft_via_graphql`.
+
+    Diff-position problems (an unresolvable path/line/side) come back
+    from GitHub either typed `UNPROCESSABLE` or with "position"/"line"/
+    "path" named in the message — those map to 422, matching the REST
+    422 contract `add_pr_review_comment` already promises. Anything
+    else is a generic 400.
+    """
+    errors = body.get("errors") or []
+    unprocessable = any(
+        isinstance(err, dict)
+        and (
+            err.get("type") == "UNPROCESSABLE"
+            or re.search(r"\b(position|line|path)\b", str(err.get("message", "")), re.IGNORECASE)
+        )
+        for err in errors
+    )
+    status = 422 if unprocessable else 400
+    return GitHubError(status, f"GraphQL error adding review comment: {errors}")
+
+
+def _add_thread_to_pending_review(
+    client: httpx.Client,
+    review_node_id: str,
+    path: str | None,
+    line: int | None,
+    side: str,
+    body: str,
+) -> str:
+    """Add a new inline-comment thread to an existing pending review.
+
+    GraphQL `addPullRequestReviewThread` — see the module note above on
+    why this can't be a REST call. Returns the new comment's REST id
+    (`databaseId`) as a string.
+    """
+    r = client.post(
+        "/graphql",
+        json={
+            "query": _ADD_REVIEW_THREAD_MUTATION,
+            "variables": {
+                "reviewId": review_node_id,
+                "path": path,
+                "line": line,
+                "side": side,
+                "body": body,
+            },
+        },
+    )
+    _check(r)
+    resp_body = r.json()
+    if resp_body.get("errors"):
+        raise _graphql_review_error(resp_body)
+    nodes = resp_body["data"]["addPullRequestReviewThread"]["thread"]["comments"]["nodes"]
+    return str(nodes[0]["databaseId"])
+
+
+def _reply_in_pending_review(
+    client: httpx.Client, review_node_id: str, parent_node_id: str, body: str,
+) -> str:
+    """Add a reply comment to an existing pending review.
+
+    GraphQL `addPullRequestReviewComment` with `inReplyTo` — REST's
+    reply shape (`POST .../comments` with `in_reply_to`) always
+    auto-submits its own review, so replies route through GraphQL too
+    once a pending review is in play. Returns the new comment's REST id
+    (`databaseId`) as a string.
+    """
+    r = client.post(
+        "/graphql",
+        json={
+            "query": _ADD_REVIEW_COMMENT_REPLY_MUTATION,
+            "variables": {
+                "reviewId": review_node_id,
+                "inReplyTo": parent_node_id,
+                "body": body,
+            },
+        },
+    )
+    _check(r)
+    resp_body = r.json()
+    if resp_body.get("errors"):
+        raise _graphql_review_error(resp_body)
+    return str(resp_body["data"]["addPullRequestReviewComment"]["comment"]["databaseId"])
 
 
 # ---------- GraphQL: GitHub Projects v2 board support (ticket #118) --------
@@ -4614,41 +4834,87 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
             `body`; positional fields must be `None`.
 
         Mode is validated at the tool layer; this method trusts its
-        inputs and routes them to the matching POST shape.
+        inputs and routes them to the matching call shape.
+
+        Ticket #205: plain `POST /pulls/{n}/comments` implicitly wraps
+        every inline comment in its own auto-submitted review, so each
+        call used to inject a bogus `COMMENTED`/`""` entry into
+        `list_pr_reviews()` / `get_pr().reviews`. Comments are now
+        routed through GitHub's pending-review flow instead: the first
+        comment (from this account) on a PR creates an unsubmitted
+        `PENDING` review and attaches to it; every later comment (new
+        thread or reply) reuses that same pending review via GraphQL.
+        The comment stays invisible on the PR — and absent from
+        `list_pr_review_comments()` — until `submit_pr_review` is
+        called, which submits the pending review and turns it into one
+        real `reviews[]` entry. The previous behaviour of one
+        auto-submitted review per comment is gone.
+
+        GitHub does not support mixing commits within one review: once a
+        pending review already exists, a new-thread `commit_sha` that
+        does not match the pending review's own commit raises
+        `ValueError` rather than being silently ignored.
         """
         prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
-        if in_reply_to is not None:
-            payload: dict[str, Any] = {
-                "body": prefixed,
-                "in_reply_to": int(in_reply_to),
-            }
-        else:
-            payload = {
-                "body": prefixed,
-                "path": path,
-                "line": line,
-                "side": side,
-                "commit_id": commit_sha,
-            }
-        with _client(token) as client:
-            r = client.post(
-                f"{_repo_path(project)}/pulls/{pr_id}/comments",
-                json=payload,
-            )
-            try:
-                _check(r)
-            except GitHubError as exc:
-                if exc.status == 422:
-                    raise GitHubError(
-                        422,
-                        f"add_pr_review_comment: could not resolve diff location"
-                        f" — check that path={path!r}, line={line!r},"
-                        f" commit_sha={commit_sha!r} refer to an existing"
-                        f" position in PR {pr_id};"
-                        f" original error: {exc.message}",
-                    ) from exc
-                raise
-            return _map_review_comment(r.json())
+        try:
+            with _client(token) as client:
+                pending = _find_pending_review(client, project, pr_id)
+                if in_reply_to is not None:
+                    # Resolve/validate the parent comment's node id BEFORE
+                    # creating a pending review (ticket #205 fix-round 2,
+                    # finding 1): if `in_reply_to` is bad (e.g. 404s) or the
+                    # subsequent GraphQL reply fails, we must not have
+                    # already created an empty PENDING review on the
+                    # server — that would leave it dangling with no way
+                    # for the caller to clean it up.
+                    parent_node_id = _review_comment_node_id(
+                        client, project, in_reply_to,
+                    )
+                    if pending is None:
+                        pending = _create_pending_review(client, project, pr_id)
+                    comment_id = _reply_in_pending_review(
+                        client, pending["node_id"], parent_node_id, prefixed,
+                    )
+                    return _fetch_review_comment(client, project, comment_id)
+                if pending is None:
+                    created = _create_pending_review(
+                        client,
+                        project,
+                        pr_id,
+                        commit_sha=commit_sha,
+                        comments=[
+                            {"path": path, "line": line, "side": side, "body": prefixed},
+                        ],
+                    )
+                    comment = _latest_pending_review_comment(
+                        client, project, pr_id, str(created["id"]),
+                    )
+                    return _map_review_comment(comment)
+                pending_commit_sha = pending.get("commit_id")
+                if commit_sha is not None and commit_sha != pending_commit_sha:
+                    raise ValueError(
+                        f"add_pr_review_comment: commit_sha={commit_sha!r} does"
+                        f" not match the pending review's commit"
+                        f" {pending_commit_sha!r} — GitHub does not support"
+                        f" mixing commits within one review; omit commit_sha"
+                        f" or pass the pending review's own commit once a"
+                        f" pending review already exists."
+                    )
+                comment_id = _add_thread_to_pending_review(
+                    client, pending["node_id"], path, line, side, prefixed,
+                )
+                return _fetch_review_comment(client, project, comment_id)
+        except GitHubError as exc:
+            if exc.status == 422:
+                raise GitHubError(
+                    422,
+                    f"add_pr_review_comment: could not resolve diff location"
+                    f" — check that path={path!r}, line={line!r},"
+                    f" commit_sha={commit_sha!r} refer to an existing"
+                    f" position in PR {pr_id};"
+                    f" original error: {exc.message}",
+                ) from exc
+            raise
 
     def submit_pr_review(
         self,
@@ -4659,7 +4925,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         body: str | None = None,
         commit_sha: str | None = None,
     ) -> Review:
-        """Submit a PR review via `POST /pulls/{n}/reviews`.
+        """Submit a PR review.
 
         `state` is one of `"approve"`, `"request_changes"`, `"comment"`
         (normalized values, lower-case). They map to GitHub's `event`
@@ -4669,6 +4935,14 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         `COMMENT`; we surface that as a `ValueError` to fail fast
         without round-tripping. The body is marker-prefixed via
         `ensure_comment_prefix` when present.
+
+        Ticket #205: if `add_pr_review_comment` calls left a `PENDING`
+        review on the PR (the normal case once any inline comment has
+        been posted), this submits *that* review via
+        `POST /pulls/{n}/reviews/{id}/events` — GitHub rejects creating
+        a second review while one is still pending for the same
+        author. When no pending review exists, falls back to the
+        original create-and-submit path, `POST /pulls/{n}/reviews`.
         """
         event_map = {
             "approve": "APPROVE",
@@ -4688,14 +4962,16 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         payload: dict[str, Any] = {"event": event}
         if body:
             payload["body"] = ensure_comment_prefix(body, markers=_marker_set(project))
-        if commit_sha:
-            payload["commit_id"] = commit_sha
         with _client(token) as client:
-            r = client.post(
-                f"{_repo_path(project)}/pulls/{pr_id}/reviews",
-                json=payload,
-            )
             try:
+                pending = _find_pending_review(client, project, pr_id)
+                if pending is not None:
+                    url = f"{_repo_path(project)}/pulls/{pr_id}/reviews/{pending['id']}/events"
+                else:
+                    url = f"{_repo_path(project)}/pulls/{pr_id}/reviews"
+                    if commit_sha:
+                        payload["commit_id"] = commit_sha
+                r = client.post(url, json=payload)
                 _check(r)
             except GitHubError as exc:
                 if exc.status == 404:
