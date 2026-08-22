@@ -4653,6 +4653,17 @@ class GitHubProvider(
         (distinct authors, keeping each author's most recently submitted
         review), and `pr.review_decision` (derived from the latest
         per-author review states; ticket #148).
+
+        Ticket #212: `pr.reviews` only ever contains *submitted* reviews.
+        An inline new-thread comment created via `add_pr_review_comment`
+        is attached to an unsubmitted PENDING review (ticket #205's
+        pending-review flow) and therefore does NOT appear here — GitHub's
+        API never lists another user's own pending review, and
+        `_fetch_pr_reviews`/`_map_review` additionally filter out any
+        `state == "PENDING"` review that does come back. Such comments
+        surface only via `list_pr_review_comments()` until
+        `submit_pr_review` submits the pending review, at which point
+        exactly one entry for it appears in `pr.reviews`.
         """
         with _client(token) as client:
             r = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
@@ -5063,6 +5074,12 @@ class GitHubProvider(
         page (the GitHub maximum) — matching `list_pr_review_comments`'s
         single-page take. `PENDING` reviews (still being drafted by the
         reviewer, not yet submitted) are skipped.
+
+        Ticket #212: this deliberately means a PR whose only reviewer
+        activity is unsubmitted inline comments from
+        `add_pr_review_comment` (ticket #205's pending-review flow)
+        returns an empty list here — see `get_pr`'s docstring for the
+        full rationale.
         """
         with _client(token) as client:
             return _fetch_pr_reviews(client, project, pr_id)
@@ -5098,11 +5115,15 @@ class GitHubProvider(
         comment (from this account) on a PR creates an unsubmitted
         `PENDING` review and attaches to it; every later comment (new
         thread or reply) reuses that same pending review via GraphQL.
-        The comment stays invisible on the PR — and absent from
-        `list_pr_review_comments()` — until `submit_pr_review` is
-        called, which submits the pending review and turns it into one
-        real `reviews[]` entry. The previous behaviour of one
-        auto-submitted review per comment is gone.
+        The comment is immediately visible to its own author via
+        `list_pr_review_comments()` (GitHub returns a user's own pending
+        comments from that endpoint — they're only hidden from *other*
+        users until submitted). What stays hidden until `submit_pr_review`
+        is called is the *review* itself: the `PENDING` review is excluded
+        from `list_pr_reviews()` / `get_pr().reviews` (see that method's
+        docstring) until submission turns it into one real `reviews[]`
+        entry. The previous behaviour of one auto-submitted review per
+        comment is gone.
 
         GitHub does not support mixing commits within one review: once a
         pending review already exists, a new-thread `commit_sha` that
@@ -5133,6 +5154,11 @@ class GitHubProvider(
         deliberately leaves a raw 404 alone: it's ambiguous between a
         missing PR and a missing `in_reply_to` comment id, so we can't
         safely disambiguate from status alone.
+
+        Ticket #212: to spell it out once more at the call site — a
+        new-thread comment (`in_reply_to is None`) creates or reuses a
+        PENDING review that is invisible to `get_pr().reviews` /
+        `list_pr_reviews()` until `submit_pr_review` submits it.
         """
         prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
         try:
