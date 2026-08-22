@@ -2482,6 +2482,83 @@ def _quote_label(name: str) -> str:
     return name
 
 
+def _quote_search_term(term: str) -> str:
+    """Neutralise GitHub Search qualifier syntax in a free-text `search`
+    term before it is spliced into a `q=` string (ticket #202).
+
+    A raw free-text term spliced in unescaped is read by GitHub Search as
+    qualifier syntax whenever a whitespace-delimited token contains `:`
+    (e.g. `"E2E:"` is parsed as an empty/unknown qualifier and silently
+    dropped) or starts with `-` (silent negation). Either failure mode
+    degrades the term into a no-op, and `list_tickets`/`list_prs` then
+    return the full, unfiltered result set instead of a filtered one.
+
+    This tokenizes the term quote-span-aware — a whole `"..."` phrase
+    (including any embedded spaces or colons) is treated as ONE
+    already-quoted token and left untouched, while everything outside
+    quotes still splits on whitespace — and wraps ONLY the offending
+    plain tokens in double quotes; an ordinary token is left untouched —
+    existing multi-word implicit-AND search semantics (e.g.
+    `"absurdly long title"`) are preserved bit-for-bit. Any `"` inside a
+    token being newly quoted is dropped — GitHub Search has no reliable
+    in-phrase escape.
+
+    A token that carries a stray/unbalanced `"` (one that doesn't pair up
+    into a whole `"..."` phrase — e.g. a lone leading quote, a quote
+    buried mid-token, or a dangling trailing quote) is quoted the same
+    way as a `:`- or `-`-led token, with the stray quote(s) dropped
+    before rewrapping. Left alone, an unbalanced `"` reaching `q=` makes
+    GitHub read everything after it as one open-ended literal string,
+    silently swallowing any qualifiers appended later in the query — the
+    same silent-degradation failure mode this function exists to close
+    for `:` and `-`.
+
+    `search` is strictly free text: this quoting is unconditional — there
+    is no qualifier allowlist and no opt-out. A deliberate
+    `search="label:bug"` now matches the literal text `label:bug` rather
+    than being interpreted as the `label:` qualifier.
+    """
+    tokens: list[str] = []
+    for tok in re.findall(r'"[^"]*"|\S+', term):
+        if len(tok) >= 2 and tok.startswith('"') and tok.endswith('"'):
+            tokens.append(tok)
+            continue
+        if ":" in tok or tok.startswith("-") or '"' in tok:
+            tokens.append(f'"{tok.replace(chr(34), "")}"')
+        else:
+            tokens.append(tok)
+    return " ".join(tokens)
+
+
+def _normalize_search_filter(term: str | None) -> str | None:
+    """Normalize a free-text `search` filter before it drives routing or
+    `q=` construction (ticket #202).
+
+    - `None` stays `None`.
+    - Whitespace-only collapses to `None` ("not set"), mirroring the
+      `not_labels=[]` normalization in `list_tickets` — this also avoids
+      needlessly forcing the expensive search route for a term with
+      nothing in it.
+    - A term with no alphanumeric character anywhere (e.g. `"::"`,
+      `"---"`) raises `ValueError` naming the term: `_quote_search_term`
+      would quote every token, but the result still carries no
+      searchable text, and letting it through would silently call the
+      Search API with a query that matches everything or nothing
+      unpredictably rather than erroring up front.
+    """
+    if term is None:
+        return None
+    stripped = term.strip()
+    if not stripped:
+        return None
+    if not any(ch.isalnum() for ch in stripped):
+        raise ValueError(
+            f"search term {term!r} has no searchable text (no "
+            f"alphanumeric characters) — GitHub Search cannot match it"
+        )
+    return term
+
+
 def _requires_search(filters: TicketFilters) -> bool:
     """Return True iff any filter forces us off the cheap `/issues` path
     and onto `/search/issues`.
@@ -2505,6 +2582,7 @@ def _list_via_search(
     client: httpx.Client,
     project: ProjectConfig,
     filters: TicketFilters,
+    normalized_search: str | None,
 ) -> list[dict]:
     """Hit `GET /search/issues` and return the raw `items` list.
 
@@ -2512,6 +2590,14 @@ def _list_via_search(
     the new Plan-7 filters (`not_labels`, `author`, date ranges). Sort is
     expressed as a `sort:<key>-<order>` qualifier appended to `q` (NOT a
     separate `sort=` param — that's the legacy endpoint's convention).
+
+    `normalized_search` is `filters.search` already run through
+    `_normalize_search_filter` by the caller (`list_tickets`) — this
+    function never mutates the caller-supplied `filters` object, so the
+    normalized value is threaded in explicitly. It is then run through
+    `_quote_search_term` (ticket #202) before being spliced into `q` so
+    qualifier-shaped tokens (a `:` anywhere, or a leading `-`) can't be
+    misread as Search syntax and silently degrade the term into a no-op.
     """
     per_page = min(max(1, filters.limit), 100)
     qual_parts: list[str] = [
@@ -2545,7 +2631,7 @@ def _list_via_search(
     if filters.updated_before:
         qual_parts.append(f"updated:<={filters.updated_before}")
     qual_parts.append(f"sort:{filters.sort_by}-{filters.sort_order}")
-    pieces = [filters.search] if filters.search else []
+    pieces = [_quote_search_term(normalized_search)] if normalized_search else []
     pieces.extend(qual_parts)
     q = " ".join(pieces)
     r = client.get("/search/issues", params={"q": q, "per_page": per_page})
@@ -2719,7 +2805,17 @@ class GitHubProvider(
         REST endpoints below: it resolves the logical column against
         `project.board`, runs a single Projects-v2 GraphQL items query,
         and applies labels/not_labels/assignee/states/status client-side.
+
+        `filters.search` is normalized up front via
+        `_normalize_search_filter` (ticket #202): whitespace-only becomes
+        "not set", and a term with no searchable (alphanumeric) content
+        (e.g. `"::"`) raises `ValueError` rather than silently routing to
+        search and returning the full, unfiltered list. A term that does
+        carry searchable text is quoted per-token via
+        `_quote_search_term` before it reaches `q=` so qualifier-shaped
+        tokens can't be misread as Search syntax.
         """
+        normalized_search = _normalize_search_filter(filters.search)
         if filters and filters.area_path:
             raise ValueError(
                 "area_path is not supported on GitHub — it is an Azure DevOps "
@@ -2727,7 +2823,9 @@ class GitHubProvider(
             )
         _validate_limit(filters.limit)
         if filters and filters.board_column:
-            return self._list_tickets_by_board_column(project, token, filters)
+            return self._list_tickets_by_board_column(
+                project, token, filters, normalized_search
+            )
         per_page = min(max(1, filters.limit), 100)
         # Normalize `not_labels=[]` (truthy-but-empty containers) to "not set".
         if not filters.not_labels:
@@ -2736,8 +2834,8 @@ class GitHubProvider(
         # unrecognised native value raises before any HTTP call.
         state_pairs = _github_states_pairs(filters.states) if filters.states else None
         with _client(token) as client:
-            if filters.search or _requires_search(filters):
-                items = _list_via_search(client, project, filters)
+            if normalized_search or _requires_search(filters):
+                items = _list_via_search(client, project, filters, normalized_search)
                 has_more = len(items) >= per_page
                 filtered = [it for it in items if "pull_request" not in it]
                 if state_pairs is not None:
@@ -2800,8 +2898,15 @@ class GitHubProvider(
         project: ProjectConfig,
         token: str | None,
         filters: TicketFilters,
+        normalized_search: str | None,
     ) -> tuple[list[Ticket], bool]:
         """Dedicated `filters.board_column` listing path (ticket #118).
+
+        `normalized_search` is `filters.search` already run through
+        `_normalize_search_filter` by the caller (`list_tickets`) — this
+        method never mutates the caller-supplied `filters` object, so the
+        normalized value is threaded in explicitly rather than re-derived
+        or read off `filters.search`.
 
         Resolves the logical column against `project.board`, then runs a
         single (paginated) Projects-v2 GraphQL items query — instead of
@@ -2813,7 +2918,7 @@ class GitHubProvider(
         `status`) are then applied client-side, and results are sorted
         and paginated per `sort_by`/`sort_order`/`limit`.
         """
-        if filters.search:
+        if normalized_search:
             raise ValueError(
                 "board_column cannot be combined with search — the "
                 "board-column path runs a dedicated GitHub Projects v2 "
@@ -4124,10 +4229,22 @@ class GitHubProvider(
 
         Returns `(prs, has_more)`. `has_more` is True when the API returned
         exactly `per_page` results, indicating more pages may exist.
+
+        `filters.search` is normalized up front via
+        `_normalize_search_filter` (ticket #202): whitespace-only becomes
+        "not set", and a term with no searchable (alphanumeric) content
+        (e.g. `"::"`) raises `ValueError` rather than silently routing to
+        search and returning the full, unfiltered list. A term that does
+        carry searchable text is quoted per-token via
+        `_quote_search_term` before it reaches `q=` so qualifier-shaped
+        tokens (a `:` anywhere, or a leading `-`) can't be misread as
+        Search syntax and silently degrade into a no-op — the same
+        protection `list_tickets`/`_list_via_search` apply.
         """
+        normalized_search = _normalize_search_filter(filters.search)
         per_page = min(max(1, filters.limit), 100)
         use_search = bool(
-            filters.labels or filters.assignee or filters.search
+            filters.labels or filters.assignee or normalized_search
         )
         with _client(token) as client:
             if use_search:
@@ -4145,7 +4262,7 @@ class GitHubProvider(
                     qual_parts.append(f"head:{filters.head}")
                 if filters.base:
                     qual_parts.append(f"base:{filters.base}")
-                pieces = [filters.search] if filters.search else []
+                pieces = [_quote_search_term(normalized_search)] if normalized_search else []
                 pieces.extend(qual_parts)
                 q = " ".join(pieces)
                 r = client.get("/search/issues", params={"q": q, "per_page": per_page})
