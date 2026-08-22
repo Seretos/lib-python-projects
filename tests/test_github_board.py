@@ -9,6 +9,7 @@ made through the same client are captured by one handler.
 """
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any, Callable
 
@@ -1088,7 +1089,17 @@ def test_update_ticket_docstring_cross_references_stale_board_title() -> None:
     point at `get_ticket` for the full explanation rather than duplicating
     it. Guard both properties so a future edit can't silently drop the
     cross-reference or accidentally re-explain the mirror mechanism here."""
-    doc = GitHubProvider.update_ticket.__doc__
+    # inspect.getdoc() dedents consistently across Python versions (raw
+    # `__doc__` preserves the source indentation on continuation lines on
+    # Python <=3.12, but is already dedented on Python 3.13+ — see ticket
+    # #211), so use it here rather than the raw attribute. However,
+    # inspect.getdoc() falls back to an inherited docstring via the MRO if
+    # update_ticket's own docstring is ever removed, which would let this
+    # test pass even though the regression it guards against (docstring
+    # content going missing) actually occurred. Guard against that by also
+    # checking the method's own __dict__ entry, which bypasses inheritance.
+    assert GitHubProvider.__dict__["update_ticket"].__doc__ is not None
+    doc = inspect.getdoc(GitHubProvider.update_ticket)
     assert doc is not None
 
     # Cross-reference is added, not substituted for the existing #185 sentence.
