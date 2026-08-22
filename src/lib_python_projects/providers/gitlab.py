@@ -47,6 +47,7 @@ from lib_python_projects.markers import (
 from lib_python_projects.providers.base import (
     apply_run_filters,
     BulkTicketResult,
+    CIConfigurationProvider,
     Comment,
     DiscoveredProject,
     FailingJob,
@@ -81,6 +82,8 @@ from lib_python_projects.providers.base import (
     TokenProjectDiscoveryProvider,
     ViewerIdentity,
     ViewerIdentityProvider,
+    Workflow,
+    NO_CI_SENTINEL,
     _assert_not_self_relation,
     _extract_parent_id,
     _validate_label_lists,
@@ -1684,6 +1687,71 @@ def _resolve_gitlab_commit(
     return True
 
 
+def _fetch_gitlab_ci_config(
+    client: httpx.Client,
+    project_path: str,
+) -> tuple[str | None, str | None, bool]:
+    """Fetch `(ci_config_path, default_branch, builds_enabled)` (ticket #209).
+
+    `GET /projects/{id}` — `ci_config_path` empty/`None` means the
+    project uses the default `.gitlab-ci.yml`. `builds_access_level`
+    `"disabled"` means CI is turned off for the project entirely,
+    independent of whether a config file exists — callers should skip
+    the file lookup entirely in that case. Propagates via `_check` on
+    any non-2xx response (e.g. the project itself is invisible to the
+    token) — that is a different failure mode than "no CI configured".
+    """
+    r = client.get(f"/projects/{project_path}")
+    _check(r)
+    body = r.json() or {}
+    builds_enabled = (body.get("builds_access_level") or "enabled") != "disabled"
+    return (
+        body.get("ci_config_path") or None,
+        body.get("default_branch") or None,
+        builds_enabled,
+    )
+
+
+def _list_workflows(
+    client: httpx.Client,
+    project_path: str,
+) -> list[Workflow]:
+    """Return the CI config as an at-most-one-entry `Workflow` list (ticket #209).
+
+    GitLab has no per-workflow enumeration — a project runs a single
+    CI config file. CI is considered configured iff:
+      1. `builds_access_level` is not `"disabled"`, AND
+      2. the CI config file (`ci_config_path`, defaulting to
+         `.gitlab-ci.yml`) exists on the project's default branch.
+    Only a 404 on the config-file lookup (or `builds_access_level ==
+    "disabled"`, checked first to skip the file lookup) folds to `[]`;
+    other non-2xx responses propagate via `_check`, matching
+    `_has_workflows`'s original GitHub error semantics.
+    """
+    ci_config_path, default_branch, builds_enabled = _fetch_gitlab_ci_config(
+        client, project_path,
+    )
+    if not builds_enabled:
+        return []
+    config_path = ci_config_path or ".gitlab-ci.yml"
+    encoded = quote(config_path, safe="")
+    r = client.get(
+        f"/projects/{project_path}/repository/files/{encoded}",
+        params={"ref": default_branch or "HEAD"},
+    )
+    if r.status_code == 404:
+        return []
+    _check(r)
+    return [Workflow(
+        id="ci-config",
+        name=config_path,
+        path=config_path,
+        state="active",
+        url=None,
+        dispatch_target=config_path,
+    )]
+
+
 def _list_pipelines(
     project: ProjectConfig,
     token: str | None,
@@ -1814,7 +1882,10 @@ def _trigger_sleep(seconds: float) -> None:
 
 
 class GitLabProvider(
-    TokenCapabilityProvider, TokenProjectDiscoveryProvider, ViewerIdentityProvider
+    TokenCapabilityProvider,
+    TokenProjectDiscoveryProvider,
+    ViewerIdentityProvider,
+    CIConfigurationProvider,
 ):
     """GitLab REST v4 provider.
 
@@ -3815,6 +3886,32 @@ class GitLabProvider(
                 kind, "gitlab", self._SUPPORTED_RELATION_KINDS,
             )
 
+    # ---------- CI workflow discovery (ticket #209, CIConfigurationProvider) -
+
+    def list_workflows(
+        self, project: ProjectConfig, token: str | None
+    ) -> list[Workflow]:
+        """Return the CI config as an at-most-one-entry `Workflow` list.
+
+        See module-level `_list_workflows` for exact semantics — GitLab
+        has no per-workflow enumeration, so this reports the single
+        `.gitlab-ci.yml`-shaped config (or `[]` when CI isn't configured).
+        """
+        path = _project_path(project)
+        with _client(project, token) as client:
+            return _list_workflows(client, path)
+
+    def is_ci_configured(
+        self, project: ProjectConfig, token: str | None
+    ) -> bool:
+        """Return whether the project has CI configured.
+
+        `bool(self.list_workflows(project, token))` in spirit.
+        """
+        path = _project_path(project)
+        with _client(project, token) as client:
+            return bool(_list_workflows(client, path))
+
     # ---------- pipelines / CI runs ------------------------------------------
 
     def list_runs_for_branch(
@@ -3859,7 +3956,11 @@ class GitLabProvider(
             runs, provider="gitlab", workflow=workflow, event=event,
             since=since, limit=limit,
         )
-        return runs, [sha]
+        if runs:
+            return runs, [sha]
+        if not self.is_ci_configured(project, token):
+            return [], [sha, NO_CI_SENTINEL]
+        return [], [sha]
 
     def list_runs_for_commit(
         self,
@@ -3899,7 +4000,11 @@ class GitLabProvider(
             runs, provider="gitlab", workflow=workflow, event=event,
             since=since, limit=limit,
         )
-        return runs, [sha]
+        if runs:
+            return runs, [sha]
+        if not self.is_ci_configured(project, token):
+            return [], [sha, NO_CI_SENTINEL]
+        return [], [sha]
 
     def list_runs_for_tag(
         self,
@@ -3934,7 +4039,11 @@ class GitLabProvider(
             runs, provider="gitlab", workflow=workflow, event=event,
             since=since, limit=limit,
         )
-        return runs, [tag]
+        if runs:
+            return runs, [tag]
+        if not self.is_ci_configured(project, token):
+            return [], [tag, NO_CI_SENTINEL]
+        return [], [tag]
 
     def list_runs_for_ticket(
         self,
@@ -3980,6 +4089,8 @@ class GitLabProvider(
             )
             _check(r)
             related = r.json()
+            if not related:
+                return [], []
             collected: list[dict] = []
             for mr in related:
                 mr_iid = mr.get("iid")
@@ -4001,9 +4112,13 @@ class GitLabProvider(
             provider="gitlab", workflow=workflow, event=event,
             since=since, limit=limit,
         )
-        return runs, resolved_refs
+        if runs:
+            return runs, resolved_refs
+        if not self.is_ci_configured(project, token):
+            return [], [*resolved_refs, NO_CI_SENTINEL]
+        return [], resolved_refs
 
-    def list_runs_recent(
+    def _list_runs_recent_unprobed(
         self,
         project: ProjectConfig,
         token: str | None,
@@ -4014,11 +4129,12 @@ class GitLabProvider(
         event: str | None = None,
         since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
-        """List the most recent pipelines, unfiltered by ref.
+        """Core of `list_runs_recent`, without the `is_ci_configured` probe.
 
-        Returns ``(runs, [])`` — the empty ``resolved_refs`` signals that
-        no ref filter was applied. See `list_runs_for_branch` for
-        `workflow`/`event`/`since` semantics.
+        `wait_for_run` polls this helper directly (ticket #209) — it
+        must never trigger the extra probe request on every empty poll
+        iteration. See `list_runs_recent` for the public, probing
+        wrapper that real callers should use.
         """
         params: dict[str, Any] = {}
         scope = _gitlab_pipeline_scope(status)
@@ -4033,6 +4149,35 @@ class GitLabProvider(
             since=since, limit=limit,
         )
         return runs, []
+
+    def list_runs_recent(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        status: str = "all",
+        limit: int = 20,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List the most recent pipelines, unfiltered by ref.
+
+        Returns ``(runs, [])`` when runs are found, or when none are
+        found but CI is configured. Returns ``([], [NO_CI_SENTINEL])``
+        when there are no matching pipelines AND the project has no CI
+        configured at all (ticket #209) — see `NO_CI_SENTINEL`. See
+        `list_runs_for_branch` for `workflow`/`event`/`since` semantics.
+        """
+        runs, resolved_refs = self._list_runs_recent_unprobed(
+            project, token, status=status, limit=limit,
+            workflow=workflow, event=event, since=since,
+        )
+        if runs:
+            return runs, resolved_refs
+        if not self.is_ci_configured(project, token):
+            return [], [NO_CI_SENTINEL]
+        return [], resolved_refs
 
     def get_run(
         self,
@@ -4173,7 +4318,7 @@ class GitLabProvider(
         deadline = time.monotonic() + timeout
         attempt = 0
         while True:
-            runs, _ = self.list_runs_recent(
+            runs, _ = self._list_runs_recent_unprobed(
                 project, token, limit=50,
                 workflow=workflow, event=event, since=since,
             )

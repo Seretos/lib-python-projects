@@ -1288,6 +1288,10 @@ def test_list_runs_for_tag_exists_but_no_builds(
     def handler(req: httpx.Request) -> httpx.Response:
         if req.url.path.endswith("/_apis/build/builds"):
             return _json({"value": []})
+        if req.url.path.endswith("/_apis/build/definitions"):
+            # ticket #209: is_ci_configured probe — report CI as
+            # configured so no "no-ci" sentinel lands in resolved_refs.
+            return _json({"value": [{"id": 1, "name": "CI"}]})
         if req.url.path.endswith("/_apis/git/repositories"):
             return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
         if "/_apis/git/repositories/repo-guid/refs" in req.url.path:
@@ -1755,6 +1759,10 @@ def test_list_runs_for_commit_exists_but_no_builds(
     def handler(req: httpx.Request) -> httpx.Response:
         if req.url.path.endswith("/_apis/build/builds"):
             return _json({"value": [_build_payload(10, sourceVersion="aaaa")]})
+        if req.url.path.endswith("/_apis/build/definitions"):
+            # ticket #209: is_ci_configured probe — report CI as
+            # configured so no "no-ci" sentinel lands in resolved_refs.
+            return _json({"value": [{"id": 1, "name": "CI"}]})
         if req.url.path.endswith("/_apis/git/repositories"):
             return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
         if req.url.path.endswith("/_apis/git/repositories/repo-guid/commits/cccc"):
@@ -1902,6 +1910,12 @@ def test_list_runs_recent_sends_no_branch_name(
         if req.url.path.endswith("/_apis/build/builds"):
             captured["params"] = dict(req.url.params)
             return _json({"value": []})
+        if req.url.path.endswith("/_apis/build/definitions"):
+            # ticket #209: is_ci_configured probe — report CI as
+            # configured so no "no-ci" sentinel lands in resolved_refs.
+            return _json({"value": [{"id": 1, "name": "CI"}]})
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
         raise AssertionError(f"unexpected {req.url.path}")
 
     _install_mock(monkeypatch, handler)
@@ -1924,6 +1938,12 @@ def test_list_runs_recent_status_in_progress_sends_status_filter(
         if req.url.path.endswith("/_apis/build/builds"):
             captured["params"] = dict(req.url.params)
             return _json({"value": []})
+        if req.url.path.endswith("/_apis/build/definitions"):
+            # ticket #209: is_ci_configured probe — report CI as
+            # configured so no "no-ci" sentinel lands in resolved_refs.
+            return _json({"value": [{"id": 1, "name": "CI"}]})
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
         raise AssertionError(f"unexpected {req.url.path}")
 
     _install_mock(monkeypatch, handler)
@@ -1944,6 +1964,12 @@ def test_list_runs_recent_status_all_omits_status_filter(
         if req.url.path.endswith("/_apis/build/builds"):
             captured["params"] = dict(req.url.params)
             return _json({"value": []})
+        if req.url.path.endswith("/_apis/build/definitions"):
+            # ticket #209: is_ci_configured probe — report CI as
+            # configured so no "no-ci" sentinel lands in resolved_refs.
+            return _json({"value": [{"id": 1, "name": "CI"}]})
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
         raise AssertionError(f"unexpected {req.url.path}")
 
     _install_mock(monkeypatch, handler)
@@ -2253,6 +2279,11 @@ def test_list_runs_recent_bare_workflow_filter_caps_raw_fetch_at_max_page(
         if req.url.path.endswith("/_apis/build/builds"):
             captured["top"] = int(req.url.params.get("$top", "30"))
             return _json({"value": [_build_payload(1, definition={"name": "CI"})]})
+        if req.url.path.endswith("/_apis/git/repositories"):
+            # ticket #209: the run matched nothing client-side, so
+            # `list_runs_recent` falls through to the `is_ci_configured`
+            # probe, which resolves the repository id first.
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
         raise AssertionError(f"unexpected {req.url.path}")
 
     _install_mock(monkeypatch, handler)
@@ -2506,6 +2537,174 @@ def test_wait_for_run_timeout_returns_none(monkeypatch: pytest.MonkeyPatch) -> N
 def test_wait_for_run_without_since_raises_type_error() -> None:
     with pytest.raises(TypeError):
         AzureDevOpsProvider().wait_for_run(_project(), token="t", ref="main")
+
+
+# ---------- ticket #209 -- CI workflow discovery -----------------------------
+
+
+def test_list_workflows_maps_build_definitions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`list_workflows` maps `/_apis/build/definitions` (scoped to this
+    repository) into `Workflow` objects."""
+    from lib_python_projects.providers.base import Workflow
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if req.url.path.endswith("/_apis/build/definitions"):
+            assert req.url.params.get("repositoryId") == "repo-guid"
+            assert req.url.params.get("repositoryType") == "TfsGit"
+            return _json({"value": [{
+                "id": 7, "name": "CI", "path": "\\",
+                "queueStatus": "enabled",
+                "_links": {"web": {"href": "https://dev.azure.com/x/_build?definitionId=7"}},
+            }]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    workflows = AzureDevOpsProvider().list_workflows(_project(), token="t")
+    assert workflows == [Workflow(
+        id="7", name="CI", path="\\", state="enabled",
+        url="https://dev.azure.com/x/_build?definitionId=7",
+        dispatch_target="7",
+    )]
+
+
+def test_list_workflows_empty_on_no_definitions(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if req.url.path.endswith("/_apis/build/definitions"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    assert AzureDevOpsProvider().list_workflows(_project(), token="t") == []
+
+
+def test_is_ci_configured_true_and_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler_configured(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        return _json({"value": [{"id": 7, "name": "CI"}]})
+
+    _install_mock(monkeypatch, handler_configured)
+    assert AzureDevOpsProvider().is_ci_configured(_project(), token="t") is True
+
+    def handler_not_configured(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        return _json({"value": []})
+
+    _install_mock(monkeypatch, handler_not_configured)
+    assert AzureDevOpsProvider().is_ci_configured(_project(), token="t") is False
+
+
+def test_list_runs_for_branch_appends_no_ci_sentinel_when_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Driving test (ticket #209): branch exists, no builds, and the
+    repository has no build definitions at all → the uniform
+    `NO_CI_SENTINEL` is appended as the last element of resolved_refs."""
+    from lib_python_projects.providers.base import NO_CI_SENTINEL
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if "/_apis/git/repositories/repo-guid/refs" in req.url.path:
+            return _json({"count": 1, "value": [{"name": "refs/heads/main"}]})
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": []})
+        if req.url.path.endswith("/_apis/build/definitions"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_for_branch(
+        _project(), token="t", ref="main",
+    )
+    assert runs == []
+    assert resolved_refs == ["main", NO_CI_SENTINEL]
+
+
+def test_list_runs_recent_appends_no_ci_sentinel_when_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Driving test (ticket #209): no builds at all, and no build
+    definitions configured → `([], [NO_CI_SENTINEL])`."""
+    from lib_python_projects.providers.base import NO_CI_SENTINEL
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/builds"):
+            return _json({"value": []})
+        if req.url.path.endswith("/_apis/build/definitions"):
+            return _json({"value": []})
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    runs, resolved_refs = AzureDevOpsProvider().list_runs_recent(_project(), token="t")
+    assert runs == []
+    assert resolved_refs == [NO_CI_SENTINEL]
+
+
+def test_wait_for_run_never_probes_ci_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard (ticket #209): `wait_for_run` must poll through
+    the unprobed helper — a strict handler that raises on the
+    `/_apis/build/definitions` probe path, combined with a timeout that
+    forces several empty polls, proves the probe is never hit. (The repo
+    id lookup for the branch-existence check is a separate concern and
+    is not exercised here since `ref` is omitted.)"""
+    _no_sleep(monkeypatch)
+    poll_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/build/builds"):
+            poll_count["n"] += 1
+            return _json({"value": []})
+        raise AssertionError(f"unexpected request (probe?): {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    run = AzureDevOpsProvider().wait_for_run(
+        _project(), token="t", since="2026-08-21T10:00:00Z", timeout=0.05,
+    )
+    assert run is None
+    assert poll_count["n"] >= 1
+
+
+def test_dispatch_target_round_trips_into_trigger_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The numeric definition id `dispatch_target` from `list_workflows`
+    works verbatim as the `workflow` argument to `trigger_pipeline` —
+    unique, so it avoids the name-resolution 404s a bare display name
+    could hit."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/_apis/git/repositories"):
+            return _json({"value": [{"id": "repo-guid", "name": "azure-tests"}]})
+        if path.endswith("/_apis/build/definitions"):
+            return _json({"value": [{"id": 7, "name": "CI"}]})
+        if req.method == "POST" and path.endswith("/_apis/build/builds"):
+            body = json.loads(req.content)
+            assert body["definition"]["id"] == 7
+            return _json(_build_payload(555, reason="manual"))
+        if path.endswith("/_apis/build/builds/555"):
+            return _json(_build_payload(555, reason="manual"))
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    workflows = AzureDevOpsProvider().list_workflows(_project(), token="t")
+    assert workflows[0].dispatch_target == "7"
+
+    run = AzureDevOpsProvider().trigger_pipeline(
+        _project(), token="t", workflow=workflows[0].dispatch_target, ref="main",
+    )
+    assert run is not None
+    assert run.id == "555"
 
 
 def test_wait_for_run_matches_tag_ref_via_refs_tags_prefix_stripping(
