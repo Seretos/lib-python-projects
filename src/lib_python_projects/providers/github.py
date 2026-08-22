@@ -2478,6 +2478,73 @@ def _quote_label(name: str) -> str:
     return name
 
 
+def _quote_search_term(term: str) -> str:
+    """Neutralise GitHub Search qualifier syntax in a free-text `search`
+    term before it is spliced into a `q=` string (ticket #202).
+
+    A raw free-text term spliced in unescaped is read by GitHub Search as
+    qualifier syntax whenever a whitespace-delimited token contains `:`
+    (e.g. `"E2E:"` is parsed as an empty/unknown qualifier and silently
+    dropped) or starts with `-` (silent negation). Either failure mode
+    degrades the term into a no-op, and `list_tickets`/`list_prs` then
+    return the full, unfiltered result set instead of a filtered one.
+
+    This tokenizes the term quote-span-aware — a whole `"..."` phrase
+    (including any embedded spaces or colons) is treated as ONE
+    already-quoted token and left untouched, while everything outside
+    quotes still splits on whitespace — and wraps ONLY the offending
+    plain tokens in double quotes; an ordinary token is left untouched —
+    existing multi-word implicit-AND search semantics (e.g.
+    `"absurdly long title"`) are preserved bit-for-bit. Any `"` inside a
+    token being newly quoted is dropped — GitHub Search has no reliable
+    in-phrase escape.
+
+    `search` is strictly free text: this quoting is unconditional — there
+    is no qualifier allowlist and no opt-out. A deliberate
+    `search="label:bug"` now matches the literal text `label:bug` rather
+    than being interpreted as the `label:` qualifier.
+    """
+    tokens: list[str] = []
+    for tok in re.findall(r'"[^"]*"|\S+', term):
+        if len(tok) >= 2 and tok.startswith('"') and tok.endswith('"'):
+            tokens.append(tok)
+            continue
+        if ":" in tok or tok.startswith("-"):
+            tokens.append(f'"{tok.replace(chr(34), "")}"')
+        else:
+            tokens.append(tok)
+    return " ".join(tokens)
+
+
+def _normalize_search_filter(term: str | None) -> str | None:
+    """Normalize a free-text `search` filter before it drives routing or
+    `q=` construction (ticket #202).
+
+    - `None` stays `None`.
+    - Whitespace-only collapses to `None` ("not set"), mirroring the
+      `not_labels=[]` normalization in `list_tickets` — this also avoids
+      needlessly forcing the expensive search route for a term with
+      nothing in it.
+    - A term with no alphanumeric character anywhere (e.g. `"::"`,
+      `"---"`) raises `ValueError` naming the term: `_quote_search_term`
+      would quote every token, but the result still carries no
+      searchable text, and letting it through would silently call the
+      Search API with a query that matches everything or nothing
+      unpredictably rather than erroring up front.
+    """
+    if term is None:
+        return None
+    stripped = term.strip()
+    if not stripped:
+        return None
+    if not any(ch.isalnum() for ch in stripped):
+        raise ValueError(
+            f"search term {term!r} has no searchable text (no "
+            f"alphanumeric characters) — GitHub Search cannot match it"
+        )
+    return term
+
+
 def _requires_search(filters: TicketFilters) -> bool:
     """Return True iff any filter forces us off the cheap `/issues` path
     and onto `/search/issues`.
@@ -2508,6 +2575,11 @@ def _list_via_search(
     the new Plan-7 filters (`not_labels`, `author`, date ranges). Sort is
     expressed as a `sort:<key>-<order>` qualifier appended to `q` (NOT a
     separate `sort=` param — that's the legacy endpoint's convention).
+
+    `filters.search` is run through `_quote_search_term` (ticket #202)
+    before being spliced into `q` so qualifier-shaped tokens (a `:`
+    anywhere, or a leading `-`) can't be misread as Search syntax and
+    silently degrade the term into a no-op.
     """
     per_page = min(max(1, filters.limit), 100)
     qual_parts: list[str] = [
@@ -2541,7 +2613,7 @@ def _list_via_search(
     if filters.updated_before:
         qual_parts.append(f"updated:<={filters.updated_before}")
     qual_parts.append(f"sort:{filters.sort_by}-{filters.sort_order}")
-    pieces = [filters.search] if filters.search else []
+    pieces = [_quote_search_term(filters.search)] if filters.search else []
     pieces.extend(qual_parts)
     q = " ".join(pieces)
     r = client.get("/search/issues", params={"q": q, "per_page": per_page})
@@ -2713,7 +2785,17 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         REST endpoints below: it resolves the logical column against
         `project.board`, runs a single Projects-v2 GraphQL items query,
         and applies labels/not_labels/assignee/states/status client-side.
+
+        `filters.search` is normalized up front via
+        `_normalize_search_filter` (ticket #202): whitespace-only becomes
+        "not set", and a term with no searchable (alphanumeric) content
+        (e.g. `"::"`) raises `ValueError` rather than silently routing to
+        search and returning the full, unfiltered list. A term that does
+        carry searchable text is quoted per-token via
+        `_quote_search_term` before it reaches `q=` so qualifier-shaped
+        tokens can't be misread as Search syntax.
         """
+        filters.search = _normalize_search_filter(filters.search)
         if filters and filters.area_path:
             raise ValueError(
                 "area_path is not supported on GitHub — it is an Azure DevOps "
@@ -4096,7 +4178,19 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
 
         Returns `(prs, has_more)`. `has_more` is True when the API returned
         exactly `per_page` results, indicating more pages may exist.
+
+        `filters.search` is normalized up front via
+        `_normalize_search_filter` (ticket #202): whitespace-only becomes
+        "not set", and a term with no searchable (alphanumeric) content
+        (e.g. `"::"`) raises `ValueError` rather than silently routing to
+        search and returning the full, unfiltered list. A term that does
+        carry searchable text is quoted per-token via
+        `_quote_search_term` before it reaches `q=` so qualifier-shaped
+        tokens (a `:` anywhere, or a leading `-`) can't be misread as
+        Search syntax and silently degrade into a no-op — the same
+        protection `list_tickets`/`_list_via_search` apply.
         """
+        filters.search = _normalize_search_filter(filters.search)
         per_page = min(max(1, filters.limit), 100)
         use_search = bool(
             filters.labels or filters.assignee or filters.search
@@ -4117,7 +4211,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                     qual_parts.append(f"head:{filters.head}")
                 if filters.base:
                     qual_parts.append(f"base:{filters.base}")
-                pieces = [filters.search] if filters.search else []
+                pieces = [_quote_search_term(filters.search)] if filters.search else []
                 pieces.extend(qual_parts)
                 q = " ".join(pieces)
                 r = client.get("/search/issues", params={"q": q, "per_page": per_page})

@@ -429,6 +429,20 @@ class TicketFilters:
     labels: list[str] = field(default_factory=list)
     assignee: str | None = None
     search: str | None = None
+    """Free-text search term. Strictly free text — it is never interpreted
+    as provider query syntax; use the dedicated filter fields (`labels`,
+    `author`, `assignee`, date ranges, …) for structured filtering.
+
+    On GitHub (ticket #202): whitespace-only normalizes to "not set", and
+    a term with no searchable (alphanumeric) content (e.g. `"::"`) raises
+    `ValueError` rather than silently matching everything. A term
+    containing GitHub Search qualifier syntax (a `:` anywhere in a
+    whitespace-delimited token, e.g. `"E2E:"`, or a leading `-`) is
+    quoted before being sent, so it is matched as literal text instead
+    of being parsed as a qualifier (and, for `-`, a negation) — a
+    deliberate `search="label:bug"` matches the literal text `label:bug`,
+    not issues with the `bug` label.
+    """
     limit: int = 30
     not_labels: list[str] = field(default_factory=list)
     author: str | None = None
@@ -774,6 +788,13 @@ class PRFilters:
     head: str | None = None           # branch name (`feat/x`) or `owner:branch`
     base: str | None = None
     search: str | None = None
+    """Free-text search term. Same contract as `TicketFilters.search`
+    (ticket #202): strictly free text, whitespace-only normalizes to
+    "not set" on GitHub, a term with no searchable content raises
+    `ValueError`, and qualifier-shaped tokens are quoted before being
+    sent so they match as literal text rather than being parsed as
+    Search syntax.
+    """
     limit: int = 30
     # Opt-in (ticket #167): when True, GitLabProvider.list_prs fetches
     # per-MR `/approvals` data so approvals_required/approvals_received
