@@ -266,6 +266,69 @@ shape, and **`draft`/`prerelease` are always `False` there — not
 representable on Azure DevOps.** GitLab has no prerelease flag either, so
 `prerelease` is always `False` on GitLab too.
 
+### Discovering workflows / is CI configured? (ticket #209)
+
+Before calling `trigger_pipeline`, an agent can ask "does this project have
+CI at all?" and "which workflows can I trigger?" via the
+`CIConfigurationProvider` mixin all three providers implement:
+
+```python
+from lib_python_projects.providers.base import Workflow, NO_CI_SENTINEL
+
+workflows = provider.list_workflows(project, token)
+# list[Workflow] — [] when the project has no CI configured at all.
+
+configured = provider.is_ci_configured(project, token)
+# bool(list_workflows(...)) in spirit — cheaper on some providers.
+
+if workflows:
+    run = provider.trigger_pipeline(
+        project, token, workflows[0].dispatch_target, ref="main",
+    )
+```
+
+`Workflow.dispatch_target` is guaranteed to work **verbatim** as the
+`workflow` argument to that same provider's `trigger_pipeline` — no
+provider-specific munging needed:
+
+| Provider | `dispatch_target` | Notes |
+|---|---|---|
+| GitHub | workflow filename (e.g. `"ci.yml"`) | falls back to the numeric workflow id (as a string) when no `path` is available |
+| GitLab | the CI config path (e.g. `".gitlab-ci.yml"`) | GitLab has no per-workflow concept; `trigger_pipeline` validates it's non-empty but never sends it to the API |
+| Azure DevOps | numeric build-definition id (as a string) | unique — avoids the name-resolution 404s a bare display name can hit |
+
+**Error semantics** mirror the original GitHub-only `_has_workflows` probe
+(ticket #200), generalized to all three providers: only a definitive
+"not configured" signal (404, empty listing, missing/absent CI config
+file) folds to `False`/`[]`. Authentication failures (401/403) and server
+errors (5xx) propagate as the provider's native error type
+(`GitHubError`/`GitLabError`/`AzureDevOpsError`) — a caller must not
+conclude "no CI" from a response that actually means "the token can't see
+it" or "the server is down". Known, deliberately-unchanged limitation:
+GitHub returns 403 (not 404) when Actions is disabled organization-wide,
+so that case still raises rather than reporting "no CI".
+
+**The uniform `"no-ci"` sentinel.** All five run-listing methods
+(`list_runs_for_branch`/`_commit`/`_tag`/`_ticket`/`_recent`), on all
+three providers, append `NO_CI_SENTINEL` (`"no-ci"`) as the **last**
+element of `resolved_refs` whenever they are about to return an empty
+`runs` list **and** `is_ci_configured(...)` is `False`:
+
+```python
+runs, resolved_refs = provider.list_runs_for_branch(project, token, "main")
+if not runs and resolved_refs and resolved_refs[-1] == NO_CI_SENTINEL:
+    print("this project has no CI configured at all")
+```
+
+The sentinel is never appended when `runs` is non-empty (a non-empty
+result already proves CI is configured — the extra probe request is
+skipped entirely), and it is appended regardless of *why* `runs` came
+back empty (ref not found, no linked PR/MR/work item, ref exists but has
+no runs, ...) — it answers "is there CI at all," not "why no runs."
+`wait_for_run` never triggers this probe on any poll iteration — it polls
+through an internal unprobed helper, so a repeated `trigger_pipeline`
+wait loop doesn't pay for a CI-configuration check on every empty poll.
+
 ## Usage
 
 ```python
@@ -308,3 +371,10 @@ result = load_projects(
   methods, `get_ref`/`list_releases` read APIs, and the
   `permissions.pipelines.trigger` opt-in — on all three providers. See
   "Pipeline triggering, run filtering, refs & releases" above.
+- Ticket #209: `list_workflows`/`is_ci_configured`
+  (`CIConfigurationProvider`) on all three providers, so an agent can
+  discover CI workflows and check whether a project has CI configured at
+  all before calling `trigger_pipeline`. The `"no-ci"` sentinel
+  (`NO_CI_SENTINEL`) is now appended uniformly across all five
+  run-listing methods on all three providers, not just GitHub
+  branch-mode. See "Discovering workflows / is CI configured?" above.
