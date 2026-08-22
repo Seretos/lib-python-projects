@@ -922,6 +922,11 @@ def _github_post_sub_issue(
     except GitHubError as exc:
         if exc.status == 422:
             msg_lower = exc.message.lower()
+            if "cycle" in msg_lower or "circular" in msg_lower:
+                raise GitHubError(
+                    422,
+                    f"relation would create a cycle — kind: {relation_kind_for_caller!r}, target: {caller_target_ref}",
+                ) from exc
             if "duplicate sub-issue" in msg_lower or "may not contain duplicate" in msg_lower:
                 raise RelationAlreadyExists(
                     kind=relation_kind_for_caller,
