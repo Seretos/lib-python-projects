@@ -337,6 +337,42 @@ def test_gitlab_list_prs_closed_sorted_by_created_at_desc_across_offsets(
     assert [p.id for p in prs] == ["2", "1"]
 
 
+def test_gitlab_list_prs_closed_sorted_handles_naive_and_malformed_created_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_created_at_key` must always return a timezone-aware datetime.
+
+    A `created_at` value with no `Z`/offset suffix (e.g.
+    "2024-01-15T10:30:00") parses successfully via
+    `datetime.fromisoformat` but yields a *naive* datetime, while the
+    malformed-value fallback path yields an *aware* one. Sorting a list
+    containing both `Z`-suffixed, `+HH:MM`-offset, offset-less, and
+    malformed values together must not raise
+    `TypeError: can't compare offset-naive and offset-aware datetimes`,
+    and must still sort newest-first with malformed values sorting
+    last."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        state = req.url.params.get("state")
+        if state == "closed":
+            return _json([
+                # Offset-less: parses to a naive datetime unless fixed.
+                _mr_payload(1, state="closed", created_at="2024-01-01T12:00:00"),
+                # Malformed: falls back to datetime.min (aware), sorts last.
+                _mr_payload(3, state="closed", created_at="not-a-date"),
+            ])
+        if state == "merged":
+            return _json([
+                _mr_payload(2, state="merged", created_at="2024-01-01T13:00:00+00:00"),
+            ])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = GitLabProvider().list_prs(_project(), "t", PRFilters(status="closed"))
+    # 2 (13:00Z) > 1 (12:00, treated as UTC) > 3 (malformed, sorts last).
+    assert [p.id for p in prs] == ["2", "1", "3"]
+
+
 def test_gitlab_list_prs_closed_include_approvals_covers_merged_mrs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1474,6 +1510,32 @@ def test_gitlab_merge_pr_405_probe_non_gitlab_error_does_not_mask_405(
                 content=b"not valid json",
                 headers={"Content-Type": "application/json"},
             )
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "7", merge_method="merge")
+    assert exc.value.status == 405
+    assert "unknown" in exc.value.message
+
+
+def test_gitlab_merge_pr_405_probe_non_dict_json_does_not_mask_405(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A probe response that is valid JSON but not a dict (a list, as
+    from a misbehaving proxy or gateway error page) must degrade to
+    'unknown' like any other probe failure, not crash with
+    `AttributeError` from calling `.get()` on a list (ticket #204
+    review finding — the `try/except Exception` around `.json()` only
+    catches parsing failures, not a successfully-parsed non-dict
+    result consumed afterward)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "405 Method Not Allowed"}, status_code=405)
+        if req.method == "GET":
+            return _json([])
         return _json({}, status_code=404)
 
     _install_mock(monkeypatch, handler)

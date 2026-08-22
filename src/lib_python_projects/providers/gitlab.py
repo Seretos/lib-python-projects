@@ -517,12 +517,23 @@ def _created_at_key(raw: dict) -> datetime:
     across payloads that mix `Z` and `+HH:MM` offsets can misorder
     them. This parses to an aware `datetime` instead. Missing/malformed
     values sort last (oldest).
+
+    The returned datetime is always timezone-aware: an offset-less but
+    otherwise well-formed value (e.g. `"2024-01-15T10:30:00"`, no `Z`,
+    no `+HH:MM`) parses successfully as a *naive* datetime, which would
+    raise `TypeError` when compared against the aware datetimes this
+    function returns for the `Z`/`+HH:MM`/malformed cases. GitLab's API
+    is documented to return UTC timestamps, so a naive result is
+    assumed to be UTC and stamped accordingly.
     """
     raw_value = str(raw.get("created_at") or "")
     try:
-        return datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
     except ValueError:
         return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _map_mr(
@@ -3746,13 +3757,20 @@ class GitLabProvider(
                     # transport-level httpx exception, or a malformed
                     # JSON body from `.json()` — may ever mask the
                     # original 405, so this catches broadly rather than
-                    # just `GitLabError`.
+                    # just `GitLabError`. `.json()` can also succeed
+                    # with valid-but-non-dict JSON (a list, string,
+                    # number, ...) from a misbehaving proxy or gateway
+                    # error page — that must be treated the same as a
+                    # probe failure, not passed through to the
+                    # `.get(...)` calls below which assume a dict.
                     try:
                         probe = client.get(
                             f"/projects/{path}/merge_requests/{pr_id}"
                         )
                         _check(probe)
                         raw = probe.json()
+                        if not isinstance(raw, dict):
+                            raw = {}
                     except Exception:
                         raw = {}
                     merged = (
