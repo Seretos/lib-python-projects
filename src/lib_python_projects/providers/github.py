@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import posixpath
 import re
 import time
 from typing import Any
@@ -25,6 +26,7 @@ from lib_python_projects.providers.base import (
     apply_run_filters,
     BoardColumnSpec,
     BulkTicketResult,
+    CIConfigurationProvider,
     Comment,
     DiscoveredProject,
     FailingJob,
@@ -61,6 +63,8 @@ from lib_python_projects.providers.base import (
     TokenProjectDiscoveryProvider,
     ViewerIdentity,
     ViewerIdentityProvider,
+    Workflow,
+    NO_CI_SENTINEL,
     _assert_not_self_relation,
     _extract_parent_id,
     _validate_label_lists,
@@ -459,6 +463,224 @@ def _latest_reviews_by_author(reviews: list[Review]) -> list[Review]:
         if existing is None or rv.submitted_at >= existing.submitted_at:
             latest[rv.author] = rv
     return list(latest.values())
+
+
+# ---------- Ticket #205: pending-review flow for inline comments -----------
+#
+# `POST /pulls/{n}/comments` implicitly auto-submits a `COMMENTED`
+# review per call. These helpers route inline comments through GitHub's
+# native pending-review flow instead: create/reuse one `PENDING` review
+# and attach every comment to it via GraphQL, so nothing lands in
+# `reviews[]` until `submit_pr_review` explicitly submits it.
+
+
+def _find_pending_review(
+    client: httpx.Client, project: ProjectConfig, pr_id: str,
+) -> dict | None:
+    """Return the caller's PENDING (unsubmitted) review on this PR, if any.
+
+    Hits `GET /repos/{o}/{r}/pulls/{n}/reviews?per_page=100`, paginating
+    through every page (same `_has_next_link`/`page`-increment recipe as
+    `_fetch_comments_for_scan`) — GitHub paginates this endpoint, and a
+    PR with more than 100 reviews can have its PENDING review sit on
+    page 2+. A single-page take would then wrongly conclude there's no
+    pending review, causing callers to create a duplicate one. Returns
+    the raw dict (not a mapped `Review`) of the last `PENDING` entry
+    across all pages — GitHub only ever returns a pending review to its
+    own author, so there is at most one per caller. Returns the raw
+    dict (not a mapped `Review`) so callers get both the REST `id` and
+    the GraphQL `node_id`. `None` when no pending review exists.
+
+    A 404 on this lookup (e.g. a bad `pr_id`) is treated the same as
+    "no pending review" rather than raised here: this call is an
+    optimistic pre-check, and the actual write that follows (create a
+    review, add a comment, …) hits the same-shaped endpoint and will
+    surface its own honest 404 — callers' existing 404-mapping logic
+    stays the single source of truth for that error message.
+    """
+    reviews: list[dict] = []
+    page = 1
+    while True:
+        r = client.get(
+            f"{_repo_path(project)}/pulls/{pr_id}/reviews",
+            params={"per_page": 100, "page": page},
+        )
+        if r.status_code == 404:
+            return None
+        _check(r)
+        reviews.extend(r.json())
+        if not _has_next_link(r.headers.get("Link")):
+            break
+        page += 1
+        if page > 100:
+            log.warning(
+                "pending-review lookup for %s/%s#%s hit the %d-page"
+                " pagination cap — result may be incomplete and a"
+                " genuine PENDING review beyond this cap would be"
+                " missed",
+                project.owner, project.repo, pr_id, page - 1,
+            )
+            break
+    pending = [it for it in reviews if it.get("state") == "PENDING"]
+    return pending[-1] if pending else None
+
+
+def _create_pending_review(
+    client: httpx.Client,
+    project: ProjectConfig,
+    pr_id: str,
+    commit_sha: str | None = None,
+    comments: list[dict] | None = None,
+) -> dict:
+    """Create a new PENDING review via `POST /pulls/{n}/reviews`.
+
+    Omitting `event` from the payload is what makes GitHub create an
+    unsubmitted `PENDING` review instead of auto-submitting one — the
+    crux of the ticket #205 fix. `comments`, when given, seeds the
+    review with inline comments in the same call (GitHub's documented
+    `comments: [{path, line, side, body}]` shape).
+    """
+    payload: dict[str, Any] = {}
+    if commit_sha:
+        payload["commit_id"] = commit_sha
+    if comments:
+        payload["comments"] = comments
+    r = client.post(
+        f"{_repo_path(project)}/pulls/{pr_id}/reviews",
+        json=payload,
+    )
+    _check(r)
+    return r.json()
+
+
+def _cleanup_orphaned_pending_review(
+    client: httpx.Client, project: ProjectConfig, pr_id: str, pending: dict,
+) -> None:
+    """Best-effort delete of a pending review this call just created —
+    but ONLY if it is still genuinely empty.
+
+    Ticket #205, fix-round 3, finding 2: `add_pr_review_comment`'s reply
+    branch creates a bare `PENDING` review via `_create_pending_review`
+    and then attaches the reply in a *separate* follow-up GraphQL call
+    (`_reply_in_pending_review`). If that follow-up fails for ANY reason
+    — network error, rate limit, auth error, unexpected response shape,
+    not just a bad `in_reply_to` (already handled by resolving/
+    validating the parent id before creation) — the newly created
+    review is left dangling on the PR with zero comments, which later
+    blocks/breaks `submit_pr_review`. Callers should invoke this only
+    when THEY created the pending review this call — never for one
+    `_find_pending_review` already found.
+
+    Ticket #205, fix-round 4, finding 2: catching ANY exception around
+    the GraphQL reply is too broad on its own — the mutation can
+    actually succeed server-side while the client still sees a failure
+    (a timeout or dropped connection after the request lands, or a
+    response-decoding error such as `r.json()` choking on a malformed
+    200 body). Deleting the review in that case would silently destroy
+    the comment that *did* get created, since GitHub's DELETE-pending-
+    review endpoint removes the review's comments along with it — worse
+    than the orphan this cleanup exists to fix. So before deleting, we
+    re-fetch the review's own comments via
+    `GET /pulls/{n}/reviews/{id}/comments` (the same endpoint
+    `_latest_pending_review_comment` uses) and only delete when it
+    comes back empty, i.e. the mutation never actually landed. If it
+    already has a comment attached, the review is left in place as the
+    caller's now-successfully-created review — the original exception
+    still propagates to the caller from `add_pr_review_comment`, but we
+    must not destroy real data to do so.
+
+    Uses `DELETE /repos/{o}/{r}/pulls/{n}/reviews/{id}`, the REST
+    endpoint for discarding a still-PENDING review. Both the
+    verification GET and the DELETE are best-effort: never raises. A
+    failure here must not mask the original error that triggered the
+    cleanup, so every step is logged and swallowed instead — including
+    a failed verification, which is treated as "skip the delete" rather
+    than "assume it's safe": leaving a possibly-orphaned review behind
+    is safer than risking deletion of a real comment we couldn't
+    confirm is absent.
+    """
+    review_id = pending.get("id")
+    try:
+        r = client.get(
+            f"{_repo_path(project)}/pulls/{pr_id}/reviews/{review_id}/comments",
+            params={"per_page": 100},
+        )
+        _check(r)
+        comments = r.json()
+    except Exception as exc:
+        log.warning(
+            "could not verify pending review %s on %s/%s#%s is still empty"
+            " before cleanup — leaving it in place rather than risk"
+            " deleting a real comment: %s",
+            review_id, project.owner, project.repo, pr_id, exc,
+        )
+        return
+    if comments:
+        log.warning(
+            "pending review %s on %s/%s#%s already has %d comment(s)"
+            " attached — the follow-up mutation must have landed"
+            " server-side despite the client-side error; leaving the"
+            " review in place instead of deleting it",
+            review_id, project.owner, project.repo, pr_id, len(comments),
+        )
+        return
+    try:
+        r = client.delete(
+            f"{_repo_path(project)}/pulls/{pr_id}/reviews/{review_id}"
+        )
+        _check(r)
+    except Exception as exc:
+        log.warning(
+            "could not clean up orphaned pending review %s on %s/%s#%s: %s",
+            review_id, project.owner, project.repo, pr_id, exc,
+        )
+
+
+def _review_comment_node_id(
+    client: httpx.Client, project: ProjectConfig, comment_id: str,
+) -> str:
+    """Resolve a REST review-comment id to its GraphQL `node_id`.
+
+    Needed to translate the caller's `in_reply_to` (a REST id) into the
+    id GraphQL's `addPullRequestReviewComment(inReplyTo:)` demands.
+    """
+    r = client.get(f"{_repo_path(project)}/pulls/comments/{comment_id}")
+    _check(r)
+    return r.json()["node_id"]
+
+
+def _fetch_review_comment(
+    client: httpx.Client, project: ProjectConfig, comment_id: str,
+) -> ReviewComment:
+    """Fetch a single review comment by id and map it to `ReviewComment`.
+
+    Used after the GraphQL create/reply mutations, whose responses only
+    select `databaseId` — this re-fetches the REST shape so every
+    `add_pr_review_comment` branch returns an identically-shaped result
+    via the one existing `_map_review_comment` mapper.
+    """
+    r = client.get(f"{_repo_path(project)}/pulls/comments/{comment_id}")
+    _check(r)
+    return _map_review_comment(r.json())
+
+
+def _latest_pending_review_comment(
+    client: httpx.Client, project: ProjectConfig, pr_id: str, review_id: str,
+) -> dict:
+    """Return the most recently added comment on a pending review.
+
+    `POST /pulls/{n}/reviews` (seeded creation) does not echo the
+    created comment in its response — only the review envelope — so the
+    new-thread/no-pending-review-yet branch of `add_pr_review_comment`
+    re-fetches via `GET /pulls/{n}/reviews/{review_id}/comments` and
+    takes the last item.
+    """
+    r = client.get(
+        f"{_repo_path(project)}/pulls/{pr_id}/reviews/{review_id}/comments",
+        params={"per_page": 100},
+    )
+    _check(r)
+    return r.json()[-1]
 
 
 def _map_pr(raw: dict) -> PullRequest:
@@ -1243,6 +1465,112 @@ def _set_pr_draft_via_graphql(
     body = r.json()
     if body.get("errors"):
         raise GitHubError(400, f"GraphQL error toggling draft: {body['errors']}")
+
+
+# ---------- GraphQL: pending-review comment mutations (ticket #205) --------
+#
+# REST has no "add a comment to an existing pending review" endpoint —
+# once a pending review exists, further comments (new threads and
+# replies alike) must go through these two mutations instead.
+
+_ADD_REVIEW_THREAD_MUTATION = (
+    "mutation($reviewId:ID!,$path:String!,$line:Int!,$side:DiffSide!,$body:String!){"
+    "addPullRequestReviewThread(input:{pullRequestReviewId:$reviewId,path:$path,"
+    "line:$line,side:$side,body:$body}){"
+    "thread{comments(first:1){nodes{databaseId}}}}}"
+)
+_ADD_REVIEW_COMMENT_REPLY_MUTATION = (
+    "mutation($reviewId:ID!,$inReplyTo:ID!,$body:String!){"
+    "addPullRequestReviewComment(input:{pullRequestReviewId:$reviewId,"
+    "inReplyTo:$inReplyTo,body:$body}){comment{databaseId}}}"
+)
+
+
+def _graphql_review_error(body: dict) -> GitHubError:
+    """Translate a GraphQL `errors[]` payload from a review-comment
+    mutation into a `GitHubError`, mirroring `_set_pr_draft_via_graphql`.
+
+    Diff-position problems (an unresolvable path/line/side) come back
+    from GitHub either typed `UNPROCESSABLE` or with "position"/"line"/
+    "path" named in the message — those map to 422, matching the REST
+    422 contract `add_pr_review_comment` already promises. Anything
+    else is a generic 400.
+    """
+    errors = body.get("errors") or []
+    unprocessable = any(
+        isinstance(err, dict)
+        and (
+            err.get("type") == "UNPROCESSABLE"
+            or re.search(r"\b(position|line|path)\b", str(err.get("message", "")), re.IGNORECASE)
+        )
+        for err in errors
+    )
+    status = 422 if unprocessable else 400
+    return GitHubError(status, f"GraphQL error adding review comment: {errors}")
+
+
+def _add_thread_to_pending_review(
+    client: httpx.Client,
+    review_node_id: str,
+    path: str | None,
+    line: int | None,
+    side: str,
+    body: str,
+) -> str:
+    """Add a new inline-comment thread to an existing pending review.
+
+    GraphQL `addPullRequestReviewThread` — see the module note above on
+    why this can't be a REST call. Returns the new comment's REST id
+    (`databaseId`) as a string.
+    """
+    r = client.post(
+        "/graphql",
+        json={
+            "query": _ADD_REVIEW_THREAD_MUTATION,
+            "variables": {
+                "reviewId": review_node_id,
+                "path": path,
+                "line": line,
+                "side": side,
+                "body": body,
+            },
+        },
+    )
+    _check(r)
+    resp_body = r.json()
+    if resp_body.get("errors"):
+        raise _graphql_review_error(resp_body)
+    nodes = resp_body["data"]["addPullRequestReviewThread"]["thread"]["comments"]["nodes"]
+    return str(nodes[0]["databaseId"])
+
+
+def _reply_in_pending_review(
+    client: httpx.Client, review_node_id: str, parent_node_id: str, body: str,
+) -> str:
+    """Add a reply comment to an existing pending review.
+
+    GraphQL `addPullRequestReviewComment` with `inReplyTo` — REST's
+    reply shape (`POST .../comments` with `in_reply_to`) always
+    auto-submits its own review, so replies route through GraphQL too
+    once a pending review is in play. Returns the new comment's REST id
+    (`databaseId`) as a string.
+    """
+    r = client.post(
+        "/graphql",
+        json={
+            "query": _ADD_REVIEW_COMMENT_REPLY_MUTATION,
+            "variables": {
+                "reviewId": review_node_id,
+                "inReplyTo": parent_node_id,
+                "body": body,
+            },
+        },
+    )
+    _check(r)
+    resp_body = r.json()
+    if resp_body.get("errors"):
+        raise _graphql_review_error(resp_body)
+    return str(resp_body["data"]["addPullRequestReviewComment"]["comment"]["databaseId"])
 
 
 # ---------- GraphQL: GitHub Projects v2 board support (ticket #118) --------
@@ -2478,6 +2806,83 @@ def _quote_label(name: str) -> str:
     return name
 
 
+def _quote_search_term(term: str) -> str:
+    """Neutralise GitHub Search qualifier syntax in a free-text `search`
+    term before it is spliced into a `q=` string (ticket #202).
+
+    A raw free-text term spliced in unescaped is read by GitHub Search as
+    qualifier syntax whenever a whitespace-delimited token contains `:`
+    (e.g. `"E2E:"` is parsed as an empty/unknown qualifier and silently
+    dropped) or starts with `-` (silent negation). Either failure mode
+    degrades the term into a no-op, and `list_tickets`/`list_prs` then
+    return the full, unfiltered result set instead of a filtered one.
+
+    This tokenizes the term quote-span-aware — a whole `"..."` phrase
+    (including any embedded spaces or colons) is treated as ONE
+    already-quoted token and left untouched, while everything outside
+    quotes still splits on whitespace — and wraps ONLY the offending
+    plain tokens in double quotes; an ordinary token is left untouched —
+    existing multi-word implicit-AND search semantics (e.g.
+    `"absurdly long title"`) are preserved bit-for-bit. Any `"` inside a
+    token being newly quoted is dropped — GitHub Search has no reliable
+    in-phrase escape.
+
+    A token that carries a stray/unbalanced `"` (one that doesn't pair up
+    into a whole `"..."` phrase — e.g. a lone leading quote, a quote
+    buried mid-token, or a dangling trailing quote) is quoted the same
+    way as a `:`- or `-`-led token, with the stray quote(s) dropped
+    before rewrapping. Left alone, an unbalanced `"` reaching `q=` makes
+    GitHub read everything after it as one open-ended literal string,
+    silently swallowing any qualifiers appended later in the query — the
+    same silent-degradation failure mode this function exists to close
+    for `:` and `-`.
+
+    `search` is strictly free text: this quoting is unconditional — there
+    is no qualifier allowlist and no opt-out. A deliberate
+    `search="label:bug"` now matches the literal text `label:bug` rather
+    than being interpreted as the `label:` qualifier.
+    """
+    tokens: list[str] = []
+    for tok in re.findall(r'"[^"]*"|\S+', term):
+        if len(tok) >= 2 and tok.startswith('"') and tok.endswith('"'):
+            tokens.append(tok)
+            continue
+        if ":" in tok or tok.startswith("-") or '"' in tok:
+            tokens.append(f'"{tok.replace(chr(34), "")}"')
+        else:
+            tokens.append(tok)
+    return " ".join(tokens)
+
+
+def _normalize_search_filter(term: str | None) -> str | None:
+    """Normalize a free-text `search` filter before it drives routing or
+    `q=` construction (ticket #202).
+
+    - `None` stays `None`.
+    - Whitespace-only collapses to `None` ("not set"), mirroring the
+      `not_labels=[]` normalization in `list_tickets` — this also avoids
+      needlessly forcing the expensive search route for a term with
+      nothing in it.
+    - A term with no alphanumeric character anywhere (e.g. `"::"`,
+      `"---"`) raises `ValueError` naming the term: `_quote_search_term`
+      would quote every token, but the result still carries no
+      searchable text, and letting it through would silently call the
+      Search API with a query that matches everything or nothing
+      unpredictably rather than erroring up front.
+    """
+    if term is None:
+        return None
+    stripped = term.strip()
+    if not stripped:
+        return None
+    if not any(ch.isalnum() for ch in stripped):
+        raise ValueError(
+            f"search term {term!r} has no searchable text (no "
+            f"alphanumeric characters) — GitHub Search cannot match it"
+        )
+    return term
+
+
 def _requires_search(filters: TicketFilters) -> bool:
     """Return True iff any filter forces us off the cheap `/issues` path
     and onto `/search/issues`.
@@ -2501,6 +2906,7 @@ def _list_via_search(
     client: httpx.Client,
     project: ProjectConfig,
     filters: TicketFilters,
+    normalized_search: str | None,
 ) -> list[dict]:
     """Hit `GET /search/issues` and return the raw `items` list.
 
@@ -2508,6 +2914,14 @@ def _list_via_search(
     the new Plan-7 filters (`not_labels`, `author`, date ranges). Sort is
     expressed as a `sort:<key>-<order>` qualifier appended to `q` (NOT a
     separate `sort=` param — that's the legacy endpoint's convention).
+
+    `normalized_search` is `filters.search` already run through
+    `_normalize_search_filter` by the caller (`list_tickets`) — this
+    function never mutates the caller-supplied `filters` object, so the
+    normalized value is threaded in explicitly. It is then run through
+    `_quote_search_term` (ticket #202) before being spliced into `q` so
+    qualifier-shaped tokens (a `:` anywhere, or a leading `-`) can't be
+    misread as Search syntax and silently degrade the term into a no-op.
     """
     per_page = min(max(1, filters.limit), 100)
     qual_parts: list[str] = [
@@ -2541,7 +2955,7 @@ def _list_via_search(
     if filters.updated_before:
         qual_parts.append(f"updated:<={filters.updated_before}")
     qual_parts.append(f"sort:{filters.sort_by}-{filters.sort_order}")
-    pieces = [filters.search] if filters.search else []
+    pieces = [_quote_search_term(normalized_search)] if normalized_search else []
     pieces.extend(qual_parts)
     q = " ".join(pieces)
     r = client.get("/search/issues", params={"q": q, "per_page": per_page})
@@ -2614,7 +3028,9 @@ def _trigger_sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
+class GitHubProvider(
+    TokenProjectDiscoveryProvider, ViewerIdentityProvider, CIConfigurationProvider
+):
     def probe_token_capabilities(
         self, project: ProjectConfig, token: str
     ) -> TokenCapabilities:
@@ -2713,7 +3129,17 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         REST endpoints below: it resolves the logical column against
         `project.board`, runs a single Projects-v2 GraphQL items query,
         and applies labels/not_labels/assignee/states/status client-side.
+
+        `filters.search` is normalized up front via
+        `_normalize_search_filter` (ticket #202): whitespace-only becomes
+        "not set", and a term with no searchable (alphanumeric) content
+        (e.g. `"::"`) raises `ValueError` rather than silently routing to
+        search and returning the full, unfiltered list. A term that does
+        carry searchable text is quoted per-token via
+        `_quote_search_term` before it reaches `q=` so qualifier-shaped
+        tokens can't be misread as Search syntax.
         """
+        normalized_search = _normalize_search_filter(filters.search)
         if filters and filters.area_path:
             raise ValueError(
                 "area_path is not supported on GitHub — it is an Azure DevOps "
@@ -2721,7 +3147,9 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
             )
         _validate_limit(filters.limit)
         if filters and filters.board_column:
-            return self._list_tickets_by_board_column(project, token, filters)
+            return self._list_tickets_by_board_column(
+                project, token, filters, normalized_search
+            )
         per_page = min(max(1, filters.limit), 100)
         # Normalize `not_labels=[]` (truthy-but-empty containers) to "not set".
         if not filters.not_labels:
@@ -2730,8 +3158,8 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         # unrecognised native value raises before any HTTP call.
         state_pairs = _github_states_pairs(filters.states) if filters.states else None
         with _client(token) as client:
-            if filters.search or _requires_search(filters):
-                items = _list_via_search(client, project, filters)
+            if normalized_search or _requires_search(filters):
+                items = _list_via_search(client, project, filters, normalized_search)
                 has_more = len(items) >= per_page
                 filtered = [it for it in items if "pull_request" not in it]
                 if state_pairs is not None:
@@ -2794,8 +3222,15 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         project: ProjectConfig,
         token: str | None,
         filters: TicketFilters,
+        normalized_search: str | None,
     ) -> tuple[list[Ticket], bool]:
         """Dedicated `filters.board_column` listing path (ticket #118).
+
+        `normalized_search` is `filters.search` already run through
+        `_normalize_search_filter` by the caller (`list_tickets`) — this
+        method never mutates the caller-supplied `filters` object, so the
+        normalized value is threaded in explicitly rather than re-derived
+        or read off `filters.search`.
 
         Resolves the logical column against `project.board`, then runs a
         single (paginated) Projects-v2 GraphQL items query — instead of
@@ -2807,7 +3242,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         `status`) are then applied client-side, and results are sorted
         and paginated per `sort_by`/`sort_order`/`limit`.
         """
-        if filters.search:
+        if normalized_search:
             raise ValueError(
                 "board_column cannot be combined with search — the "
                 "board-column path runs a dedicated GitHub Projects v2 "
@@ -4118,10 +4553,22 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
 
         Returns `(prs, has_more)`. `has_more` is True when the API returned
         exactly `per_page` results, indicating more pages may exist.
+
+        `filters.search` is normalized up front via
+        `_normalize_search_filter` (ticket #202): whitespace-only becomes
+        "not set", and a term with no searchable (alphanumeric) content
+        (e.g. `"::"`) raises `ValueError` rather than silently routing to
+        search and returning the full, unfiltered list. A term that does
+        carry searchable text is quoted per-token via
+        `_quote_search_term` before it reaches `q=` so qualifier-shaped
+        tokens (a `:` anywhere, or a leading `-`) can't be misread as
+        Search syntax and silently degrade into a no-op — the same
+        protection `list_tickets`/`_list_via_search` apply.
         """
+        normalized_search = _normalize_search_filter(filters.search)
         per_page = min(max(1, filters.limit), 100)
         use_search = bool(
-            filters.labels or filters.assignee or filters.search
+            filters.labels or filters.assignee or normalized_search
         )
         with _client(token) as client:
             if use_search:
@@ -4139,7 +4586,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                     qual_parts.append(f"head:{filters.head}")
                 if filters.base:
                     qual_parts.append(f"base:{filters.base}")
-                pieces = [filters.search] if filters.search else []
+                pieces = [_quote_search_term(normalized_search)] if normalized_search else []
                 pieces.extend(qual_parts)
                 q = " ".join(pieces)
                 r = client.get("/search/issues", params={"q": q, "per_page": per_page})
@@ -4636,52 +5083,136 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
             `body`; positional fields must be `None`.
 
         Mode is validated at the tool layer; this method trusts its
-        inputs and routes them to the matching POST shape.
+        inputs and routes them to the matching call shape.
+
+        Ticket #205: plain `POST /pulls/{n}/comments` implicitly wraps
+        every inline comment in its own auto-submitted review, so each
+        call used to inject a bogus `COMMENTED`/`""` entry into
+        `list_pr_reviews()` / `get_pr().reviews`. Comments are now
+        routed through GitHub's pending-review flow instead: the first
+        comment (from this account) on a PR creates an unsubmitted
+        `PENDING` review and attaches to it; every later comment (new
+        thread or reply) reuses that same pending review via GraphQL.
+        The comment stays invisible on the PR — and absent from
+        `list_pr_review_comments()` — until `submit_pr_review` is
+        called, which submits the pending review and turns it into one
+        real `reviews[]` entry. The previous behaviour of one
+        auto-submitted review per comment is gone.
+
+        GitHub does not support mixing commits within one review: once a
+        pending review already exists, a new-thread `commit_sha` that
+        does not match the pending review's own commit raises
+        `ValueError` rather than being silently ignored.
+
+        Ticket #205, fix-round 3, finding 2: in the reply branch, if
+        this call creates the pending review itself (none existed yet)
+        and the follow-up GraphQL reply then fails for ANY reason, the
+        just-created review is a cleanup candidate before the error is
+        re-raised — see `_cleanup_orphaned_pending_review`. A pending
+        review `_find_pending_review` found (i.e. one that already
+        existed before this call) is never touched by that cleanup.
+
+        Ticket #205, fix-round 4, finding 2: that cleanup only actually
+        deletes the review if it re-verifies it is still empty — the
+        GraphQL mutation can succeed server-side even though this call
+        sees the follow-up as failed (timeout, dropped connection,
+        malformed response), and deleting a review that already has a
+        real comment on it would silently destroy that comment. The
+        original exception is re-raised to the caller either way.
+
+        Ticket #208: in the new-thread shape (`in_reply_to is None`), a
+        404 from `_create_pending_review` is unambiguous — the only id
+        in that request that could 404 is the PR itself — so it is
+        rewrapped into `GitHubError(404, "PR '{id}#{pr}' not found")`,
+        matching `add_pr_comment`'s existing behaviour. The reply shape
+        deliberately leaves a raw 404 alone: it's ambiguous between a
+        missing PR and a missing `in_reply_to` comment id, so we can't
+        safely disambiguate from status alone.
         """
         prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
-        if in_reply_to is not None:
-            payload: dict[str, Any] = {
-                "body": prefixed,
-                "in_reply_to": int(in_reply_to),
-            }
-        else:
-            payload = {
-                "body": prefixed,
-                "path": path,
-                "line": line,
-                "side": side,
-                "commit_id": commit_sha,
-            }
-        with _client(token) as client:
-            r = client.post(
-                f"{_repo_path(project)}/pulls/{pr_id}/comments",
-                json=payload,
-            )
-            try:
-                _check(r)
-            except GitHubError as exc:
-                if exc.status == 404 and in_reply_to is None:
-                    # New-thread shape: the only id in the request that
-                    # could 404 is the PR itself, so this is unambiguous.
-                    raise GitHubError(
-                        404, f"PR '{project.id}#{pr_id}' not found"
-                    ) from exc
-                # Reply shape: a 404 here is ambiguous between "PR not
-                # found" and "in_reply_to comment id doesn't exist" — we
-                # can't safely disambiguate from status alone, so let the
-                # raw 404 propagate rather than misreport it as a missing
-                # PR.
-                if exc.status == 422:
-                    raise GitHubError(
-                        422,
-                        f"add_pr_review_comment: could not resolve diff location"
-                        f" — check that path={path!r}, line={line!r},"
-                        f" commit_sha={commit_sha!r} refer to an existing"
-                        f" position in PR {pr_id};"
-                        f" original error: {exc.message}",
-                    ) from exc
-                raise
-            return _map_review_comment(r.json())
+        try:
+            with _client(token) as client:
+                pending = _find_pending_review(client, project, pr_id)
+                if in_reply_to is not None:
+                    # Resolve/validate the parent comment's node id BEFORE
+                    # creating a pending review (ticket #205 fix-round 2,
+                    # finding 1): if `in_reply_to` is bad (e.g. 404s) or the
+                    # subsequent GraphQL reply fails, we must not have
+                    # already created an empty PENDING review on the
+                    # server — that would leave it dangling with no way
+                    # for the caller to clean it up.
+                    parent_node_id = _review_comment_node_id(
+                        client, project, in_reply_to,
+                    )
+                    created_review = pending is None
+                    if pending is None:
+                        pending = _create_pending_review(client, project, pr_id)
+                    try:
+                        comment_id = _reply_in_pending_review(
+                            client, pending["node_id"], parent_node_id, prefixed,
+                        )
+                    except Exception:
+                        # Fix-round 3, finding 2: ANY failure here (not
+                        # just a bad parent id, already ruled out above)
+                        # must not leave an orphaned empty pending review
+                        # behind — but only if THIS call created it.
+                        if created_review:
+                            _cleanup_orphaned_pending_review(
+                                client, project, pr_id, pending,
+                            )
+                        raise
+                    return _fetch_review_comment(client, project, comment_id)
+                if pending is None:
+                    # Ticket #208: this is the direct functional
+                    # descendant of the old single-POST implementation's
+                    # 404 target — in the new-thread shape there is no
+                    # other id in the request that could 404, so it can
+                    # only mean the PR itself doesn't exist.
+                    try:
+                        created = _create_pending_review(
+                            client,
+                            project,
+                            pr_id,
+                            commit_sha=commit_sha,
+                            comments=[
+                                {"path": path, "line": line, "side": side, "body": prefixed},
+                            ],
+                        )
+                    except GitHubError as exc:
+                        if exc.status == 404:
+                            raise GitHubError(
+                                404, f"PR '{project.id}#{pr_id}' not found"
+                            ) from exc
+                        raise
+                    comment = _latest_pending_review_comment(
+                        client, project, pr_id, str(created["id"]),
+                    )
+                    return _map_review_comment(comment)
+                pending_commit_sha = pending.get("commit_id")
+                if commit_sha is not None and commit_sha != pending_commit_sha:
+                    raise ValueError(
+                        f"add_pr_review_comment: commit_sha={commit_sha!r} does"
+                        f" not match the pending review's commit"
+                        f" {pending_commit_sha!r} — GitHub does not support"
+                        f" mixing commits within one review; omit commit_sha"
+                        f" or pass the pending review's own commit once a"
+                        f" pending review already exists."
+                    )
+                comment_id = _add_thread_to_pending_review(
+                    client, pending["node_id"], path, line, side, prefixed,
+                )
+                return _fetch_review_comment(client, project, comment_id)
+        except GitHubError as exc:
+            if exc.status == 422:
+                raise GitHubError(
+                    422,
+                    f"add_pr_review_comment: could not resolve diff location"
+                    f" — check that path={path!r}, line={line!r},"
+                    f" commit_sha={commit_sha!r} refer to an existing"
+                    f" position in PR {pr_id};"
+                    f" original error: {exc.message}",
+                ) from exc
+            raise
 
     def submit_pr_review(
         self,
@@ -4692,7 +5223,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         body: str | None = None,
         commit_sha: str | None = None,
     ) -> Review:
-        """Submit a PR review via `POST /pulls/{n}/reviews`.
+        """Submit a PR review.
 
         `state` is one of `"approve"`, `"request_changes"`, `"comment"`
         (normalized values, lower-case). They map to GitHub's `event`
@@ -4702,6 +5233,21 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         `COMMENT`; we surface that as a `ValueError` to fail fast
         without round-tripping. The body is marker-prefixed via
         `ensure_comment_prefix` when present.
+
+        Ticket #205: if `add_pr_review_comment` calls left a `PENDING`
+        review on the PR (the normal case once any inline comment has
+        been posted), this submits *that* review via
+        `POST /pulls/{n}/reviews/{id}/events` — GitHub rejects creating
+        a second review while one is still pending for the same
+        author. When no pending review exists, falls back to the
+        original create-and-submit path, `POST /pulls/{n}/reviews`.
+
+        Ticket #205, fix-round 3, finding 3: mirrors
+        `add_pr_review_comment`'s same-commit contract — once a pending
+        review is found, a `commit_sha` that does not match the pending
+        review's own commit raises `ValueError` rather than silently
+        submitting a review that doesn't correspond to what the caller
+        intended.
         """
         event_map = {
             "approve": "APPROVE",
@@ -4721,14 +5267,26 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         payload: dict[str, Any] = {"event": event}
         if body:
             payload["body"] = ensure_comment_prefix(body, markers=_marker_set(project))
-        if commit_sha:
-            payload["commit_id"] = commit_sha
         with _client(token) as client:
-            r = client.post(
-                f"{_repo_path(project)}/pulls/{pr_id}/reviews",
-                json=payload,
-            )
             try:
+                pending = _find_pending_review(client, project, pr_id)
+                if pending is not None:
+                    pending_commit_sha = pending.get("commit_id")
+                    if commit_sha is not None and commit_sha != pending_commit_sha:
+                        raise ValueError(
+                            f"submit_pr_review: commit_sha={commit_sha!r} does"
+                            f" not match the pending review's commit"
+                            f" {pending_commit_sha!r} — GitHub does not support"
+                            f" mixing commits within one review; omit commit_sha"
+                            f" or pass the pending review's own commit once a"
+                            f" pending review already exists."
+                        )
+                    url = f"{_repo_path(project)}/pulls/{pr_id}/reviews/{pending['id']}/events"
+                else:
+                    url = f"{_repo_path(project)}/pulls/{pr_id}/reviews"
+                    if commit_sha:
+                        payload["commit_id"] = commit_sha
+                r = client.post(url, json=payload)
                 _check(r)
             except GitHubError as exc:
                 if exc.status == 404:
@@ -5195,6 +5753,31 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 kind, "github", self._SUPPORTED_RELATION_KINDS,
             )
 
+    # ---------- CI workflow discovery (ticket #209, CIConfigurationProvider) -
+
+    def list_workflows(
+        self, project: ProjectConfig, token: str | None
+    ) -> list[Workflow]:
+        """List every Actions workflow defined on the repository.
+
+        See `_list_workflows` for exact field mapping and error
+        semantics (only 404 folds to `[]`; 401/403/5xx propagate).
+        """
+        with _client(token) as client:
+            return _list_workflows(client, project)
+
+    def is_ci_configured(
+        self, project: ProjectConfig, token: str | None
+    ) -> bool:
+        """Return whether the repository has at least one Actions workflow.
+
+        `bool(self.list_workflows(project, token))` in spirit — uses
+        `_has_workflows` directly to avoid building `Workflow` objects
+        just to discard them.
+        """
+        with _client(token) as client:
+            return _has_workflows(client, project)
+
     # ---------- pipelines / CI runs -----------------------------------------
 
     def list_runs_for_branch(
@@ -5240,7 +5823,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 )
                 return runs, [sha]
             if not _has_workflows(client, project):
-                return [], [sha, "no-ci"]
+                return [], [sha, NO_CI_SENTINEL]
             return [], [sha]
 
     def list_runs_for_commit(
@@ -5259,7 +5842,9 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
 
         Returns ``(runs, resolved_refs)`` to mirror the tag/ticket shape:
         - ``([], [])`` — commit not found
-        - ``(runs, [sha])`` — commit found (runs may be empty)
+        - ``([], [sha, "no-ci"])`` — commit found, no runs, no workflows
+        - ``([], [sha])`` — commit found, no runs, CI is configured
+        - ``(runs, [sha])`` — commit found, runs found
 
         See `list_runs_for_branch` for `workflow`/`event`/`since` semantics.
         """
@@ -5277,7 +5862,11 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 event=event,
                 since=since, limit=limit,
             )
-            return runs, [sha]
+            if runs:
+                return runs, [sha]
+            if not _has_workflows(client, project):
+                return [], [sha, NO_CI_SENTINEL]
+            return [], [sha]
 
     def list_runs_for_tag(
         self,
@@ -5312,7 +5901,11 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 event=event,
                 since=since, limit=limit,
             )
-            return runs, [sha]
+            if runs:
+                return runs, [sha]
+            if not _has_workflows(client, project):
+                return [], [sha, NO_CI_SENTINEL]
+            return [], [sha]
 
     def list_runs_for_ticket(
         self,
@@ -5362,9 +5955,13 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
                 event=event,
                 since=since, limit=limit,
             )
-            return runs, shas
+            if runs:
+                return runs, shas
+            if not _has_workflows(client, project):
+                return [], [*shas, NO_CI_SENTINEL]
+            return [], shas
 
-    def list_runs_recent(
+    def _list_runs_recent_unprobed(
         self,
         project: ProjectConfig,
         token: str | None,
@@ -5375,11 +5972,12 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         event: str | None = None,
         since: str | None = None,
     ) -> tuple[list[PipelineRun], list[str]]:
-        """List the most recent Actions workflow runs, unfiltered by ref.
+        """Core of `list_runs_recent`, without the `is_ci_configured` probe.
 
-        Returns ``(runs, [])`` — the empty ``resolved_refs`` signals that
-        no ref filter was applied. See `list_runs_for_branch` for
-        `workflow`/`event`/`since` semantics.
+        `wait_for_run` polls this helper directly (ticket #209) — it
+        must never trigger the extra probe request on every empty poll
+        iteration. See `list_runs_recent` for the public, probing
+        wrapper that real callers should use.
         """
         _validate_limit(limit)
         with _client(token) as client:
@@ -5397,6 +5995,37 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
             since=since, limit=limit,
         )
         return runs, []
+
+    def list_runs_recent(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        *,
+        status: str = "all",
+        limit: int = 10,
+        workflow: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
+    ) -> tuple[list[PipelineRun], list[str]]:
+        """List the most recent Actions workflow runs, unfiltered by ref.
+
+        Returns ``(runs, [])`` when runs are found, or when none are
+        found but CI is configured. Returns ``([], [NO_CI_SENTINEL])``
+        when there are no matching runs AND the repository has no
+        Actions workflows at all (ticket #209) — see `NO_CI_SENTINEL`.
+        See `list_runs_for_branch` for `workflow`/`event`/`since`
+        semantics.
+        """
+        runs, resolved_refs = self._list_runs_recent_unprobed(
+            project, token, status=status, limit=limit,
+            workflow=workflow, event=event, since=since,
+        )
+        if runs:
+            return runs, resolved_refs
+        with _client(token) as client:
+            if not _has_workflows(client, project):
+                return [], [NO_CI_SENTINEL]
+        return [], resolved_refs
 
     def get_run(
         self,
@@ -5574,7 +6203,7 @@ class GitHubProvider(TokenProjectDiscoveryProvider, ViewerIdentityProvider):
         deadline = time.monotonic() + timeout
         attempt = 0
         while True:
-            runs, _ = self.list_runs_recent(
+            runs, _ = self._list_runs_recent_unprobed(
                 project, token, limit=50,
                 workflow=workflow, event=event, since=since,
             )
@@ -6055,23 +6684,59 @@ def _resolve_commit(
     return True
 
 
+def _list_workflows(
+    client: httpx.Client,
+    project: ProjectConfig,
+) -> list[Workflow]:
+    """Return every Actions workflow defined on the repository (ticket #209).
+
+    Only 404 (repository or endpoint not found) is treated as "no
+    workflows / not applicable" and returns ``[]``.  Auth failures
+    (401/403) and server errors (5xx) are propagated via ``_check`` so
+    real credential or infrastructure problems surface rather than being
+    silently misclassified as the ``"no-ci"`` sentinel. This is the
+    promoted body of the original private `_has_workflows` probe
+    (ticket #200) — `_has_workflows` is now `bool(_list_workflows(...))`.
+    """
+    r = client.get(f"{_repo_path(project)}/actions/workflows")
+    if r.status_code == 404:
+        return []
+    _check(r)
+    raw = (r.json() or {}).get("workflows") or []
+    return [_map_workflow(w) for w in raw]
+
+
+def _map_workflow(raw: dict) -> Workflow:
+    """Translate a GitHub `workflow` payload into a `Workflow`.
+
+    `dispatch_target` is the filename segment of `path`
+    (`.github/workflows/ci.yml` -> `ci.yml`) — the shape
+    `_workflow_path_segment`/the dispatch endpoint require — falling
+    back to the numeric `id` as a string when `path` is missing/empty
+    (`_workflow_path_segment` also accepts a bare numeric id).
+    """
+    path = raw.get("path") or ""
+    filename = posixpath.basename(path) if path else ""
+    dispatch_target = filename or str(raw.get("id", ""))
+    return Workflow(
+        id=str(raw.get("id", "")),
+        name=raw.get("name") or "",
+        path=path,
+        state=raw.get("state") or "",
+        url=raw.get("html_url") or None,
+        dispatch_target=dispatch_target,
+    )
+
+
 def _has_workflows(
     client: httpx.Client,
     project: ProjectConfig,
 ) -> bool:
     """Return ``True`` if the repository has at least one Actions workflow.
 
-    Only 404 (repository or endpoint not found) is treated as "no
-    workflows / not applicable" and returns ``False``.  Auth failures
-    (401/403) and server errors (5xx) are propagated via ``_check`` so
-    real credential or infrastructure problems surface rather than being
-    silently misclassified as the ``"no-ci"`` sentinel.
+    See `_list_workflows` for the underlying request and error semantics.
     """
-    r = client.get(f"{_repo_path(project)}/actions/workflows")
-    if r.status_code == 404:
-        return False
-    _check(r)
-    return ((r.json() or {}).get("total_count") or 0) > 0
+    return bool(_list_workflows(client, project))
 
 
 def _resolve_tag_sha(

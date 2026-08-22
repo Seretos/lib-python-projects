@@ -243,6 +243,155 @@ def test_search_text_filter_routes_to_search(monkeypatch: pytest.MonkeyPatch) ->
     assert [pr.id for pr in prs] == ["30"]
 
 
+# ---------- ticket #202: search-term quoting on the PR path -------------------
+
+
+def test_pr_search_term_with_colon_is_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`PRFilters(search="E2E:")` must not leak `E2E:` as bare qualifier
+    syntax into `q` — same defect and fix as the ticket path."""
+    stub = _search_pr_stub(50)
+    full = _pr_payload(50)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/search/issues":
+            q = req.url.params["q"]
+            assert '"E2E:"' in q
+            tokens = q.split(" ")
+            assert "E2E:" not in tokens
+            assert "is:pr" in q
+            assert "repo:acme/backend" in q
+            return _json({"items": [stub], "total_count": 1})
+        if req.url.path == "/repos/acme/backend/pulls/50":
+            return _json(full)
+        raise AssertionError(f"Unexpected request path: {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    prs, _ = provider.list_prs(_project(), token="t", filters=PRFilters(search="E2E:"))
+    assert [pr.id for pr in prs] == ["50"]
+
+
+def test_pr_already_quoted_multiword_phrase_is_not_split_or_mangled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-supplied multi-word `"..."` phrase — including one
+    containing a colon — must be recognized as a single already-quoted
+    unit and passed through verbatim on the PR path too, not split on
+    internal whitespace into a dangling unmatched quote plus a mangled
+    re-quoted colon token."""
+    stub = _search_pr_stub(53)
+    full = _pr_payload(53)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/search/issues":
+            q = req.url.params["q"]
+            assert '"foo bar:baz"' in q
+            assert '"foo "bar:baz"' not in q
+            return _json({"items": [stub], "total_count": 1})
+        if req.url.path == "/repos/acme/backend/pulls/53":
+            return _json(full)
+        raise AssertionError(f"Unexpected request path: {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    prs, _ = provider.list_prs(_project(), token="t", filters=PRFilters(search='"foo bar:baz"'))
+    assert [pr.id for pr in prs] == ["53"]
+
+
+def test_pr_plain_search_term_is_not_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ordinary PR search text keeps its unquoted implicit-AND form."""
+    stub = _search_pr_stub(51)
+    full = _pr_payload(51)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/search/issues":
+            q = req.url.params["q"]
+            assert "fix memory leak" in q
+            assert '"' not in q
+            return _json({"items": [stub], "total_count": 1})
+        if req.url.path == "/repos/acme/backend/pulls/51":
+            return _json(full)
+        raise AssertionError(f"Unexpected request path: {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    prs, _ = provider.list_prs(_project(), token="t", filters=PRFilters(search="fix memory leak"))
+    assert [pr.id for pr in prs] == ["51"]
+
+
+def test_pr_search_term_combined_with_other_qualifiers_keeps_them_intact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A colon-bearing search term combined with `labels`/`assignee`/
+    `head`/`base` must quote only the search term and leave the other
+    qualifiers untouched."""
+    stub = _search_pr_stub(52)
+    full = _pr_payload(52)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/search/issues":
+            q = req.url.params["q"]
+            assert '"E2E:"' in q
+            assert "label:bug" in q
+            assert "assignee:bob" in q
+            assert "head:feat/x" in q
+            assert "base:main" in q
+            return _json({"items": [stub], "total_count": 1})
+        if req.url.path == "/repos/acme/backend/pulls/52":
+            return _json(full)
+        raise AssertionError(f"Unexpected request path: {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    prs, _ = provider.list_prs(
+        _project(),
+        token="t",
+        filters=PRFilters(
+            search="E2E:",
+            labels=["bug"],
+            assignee="bob",
+            head="feat/x",
+            base="main",
+        ),
+    )
+    assert [pr.id for pr in prs] == ["52"]
+
+
+def test_pr_search_term_without_searchable_text_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`PRFilters(search="::")` must raise `ValueError` before any HTTP
+    call, matching the ticket-path guard."""
+    seen = _install_mock(monkeypatch, lambda req: _json({"items": []}))
+    provider = GitHubProvider()
+    with pytest.raises(ValueError, match="::"):
+        provider.list_prs(
+            _project(),
+            token="t",
+            filters=PRFilters(search="::"),
+        )
+    assert seen == []
+
+
+def test_list_prs_does_not_mutate_caller_filters_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`list_prs` must normalize `filters.search` into a local value, not
+    assign back into `filters.search` — a caller reusing the same
+    `PRFilters` object across multiple calls must not see its `.search`
+    attribute silently rewritten as a side effect."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/pulls", (
+            f"whitespace-only search should not route to search; hit {req.url}"
+        )
+        return _json([_pr_payload(1)])
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    filters = PRFilters(search="   ")
+    provider.list_prs(_project(), token="t", filters=filters)
+    assert filters.search == "   ", (
+        "list_prs must not mutate the caller-supplied filters.search"
+    )
+
+
 # ---------- ticket #6 core regression: search path must back-fill full shape --
 
 

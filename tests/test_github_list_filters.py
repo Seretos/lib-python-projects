@@ -275,6 +275,287 @@ def test_search_text_still_routes_to_search(monkeypatch: pytest.MonkeyPatch) -> 
     )
 
 
+def test_search_term_with_colon_is_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A colon-bearing free-text search term (ticket #202) must not leak
+    as qualifier syntax into `q` — GitHub reads a bare `E2E:` token as an
+    empty/unknown qualifier and silently drops it, degrading the filter
+    into a no-op that returns the full, unfiltered list.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/search/issues"
+        q = req.url.params["q"]
+        assert '"E2E:"' in q
+        # The offending token must not also appear bare/unquoted.
+        tokens = q.split(" ")
+        assert "E2E:" not in tokens
+        # Existing qualifiers stay untouched.
+        assert "is:issue" in q
+        assert "repo:acme/backend" in q
+        assert "sort:created-desc" in q
+        return _json({"items": []})
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    provider.list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(search="E2E:"),
+    )
+
+
+def test_plain_search_term_is_not_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ordinary multi-word terms must keep today's implicit-AND semantics
+    bit-for-bit — no quotes introduced where none are needed.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/search/issues"
+        q = req.url.params["q"]
+        assert "absurdly long title" in q
+        assert '"' not in q
+        return _json({"items": []})
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    provider.list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(search="absurdly long title"),
+    )
+
+
+def test_mixed_search_term_quotes_only_offending_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A search term mixing a qualifier-shaped token with plain words
+    quotes only the offending token, leaving the rest untouched.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/search/issues"
+        q = req.url.params["q"]
+        assert '"E2E:"' in q
+        assert "absurdly long title" in q
+        return _json({"items": []})
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    provider.list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(search="E2E: absurdly long title"),
+    )
+
+
+def test_already_quoted_search_token_is_not_double_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A token the caller already wrapped in `"..."` is left as-is."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/search/issues"
+        q = req.url.params["q"]
+        assert '"E2E:"' in q
+        assert '""E2E:""' not in q
+        return _json({"items": []})
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    provider.list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(search='"E2E:"'),
+    )
+
+
+def test_already_quoted_multiword_phrase_is_not_split_or_mangled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-supplied multi-word `"..."` phrase — including one
+    containing a colon — must be recognized as a single already-quoted
+    unit and passed through verbatim, not split on internal whitespace
+    into separate tokens (which would produce a dangling unmatched quote
+    on one half and a mangled re-quoted colon token on the other)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/search/issues"
+        q = req.url.params["q"]
+        assert '"foo bar:baz"' in q
+        assert '"foo "bar:baz"' not in q
+        return _json({"items": []})
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    provider.list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(search='"foo bar:baz"'),
+    )
+
+
+def test_leading_dash_search_token_is_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A leading `-` is silent negation syntax on Search — must be quoted
+    just like a colon-bearing token."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/search/issues"
+        q = req.url.params["q"]
+        assert '"-urgent"' in q
+        tokens = q.split(" ")
+        assert "-urgent" not in tokens
+        return _json({"items": []})
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    provider.list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(search="-urgent"),
+    )
+
+
+def test_embedded_quote_in_search_token_is_sanitised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A `"` embedded in a token being quoted is dropped before the token
+    is wrapped — Search has no reliable in-phrase escape. The token's
+    other characters (including a legitimate `:` — the reason it's being
+    quoted in the first place) are preserved inside the wrapping quotes.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/search/issues"
+        q = req.url.params["q"]
+        assert '"ticket202:fix"' in q
+        return _json({"items": []})
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    provider.list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(search='ticket"202:fix'),
+    )
+
+
+def test_quote_search_term_sanitises_stray_unbalanced_quotes() -> None:
+    """A stray/unbalanced `"` in a plain token (ticket #202 follow-up) must
+    not survive into the returned token unbalanced — an unbalanced `"`
+    reaching `q=` makes GitHub treat everything after it as one
+    open-ended literal string, silently swallowing any qualifier
+    appended later in the query (the same failure mode as an
+    un-neutralised `:`/`-` token).
+    """
+    for term in ('"foo bar', 'foo"bar', 'foo bar"'):
+        result = github_provider._quote_search_term(term)
+        assert result.count('"') % 2 == 0, (
+            f"_quote_search_term({term!r}) returned an unbalanced-quote "
+            f"result: {result!r}"
+        )
+        # A qualifier appended after the (now-safe) term must still read
+        # as a literal, un-swallowed qualifier.
+        full = result + " repo:owner/name"
+        assert "repo:owner/name" in full.split(" "), (
+            f"repo: qualifier was swallowed for term {term!r}: {full!r}"
+        )
+
+
+def test_search_term_with_leading_stray_quote_is_sanitised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A search term with a stray/unbalanced leading `"` (ticket #202
+    follow-up) must not leak into `q` unbalanced — otherwise GitHub reads
+    everything after the dangling quote (including the `repo:` qualifier
+    appended by `_list_via_search`) as one literal quoted string, silently
+    dropping the repo scoping.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/search/issues"
+        q = req.url.params["q"]
+        assert q.count('"') % 2 == 0, f"unbalanced quote leaked into q: {q!r}"
+        assert "repo:acme/backend" in q.split(" ")
+        return _json({"items": []})
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    provider.list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(search='"foo bar'),
+    )
+
+
+def test_search_term_matching_qualifier_syntax_is_quoted_as_literal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`search="label:bug"` is documented free text, not the `label:`
+    qualifier: it must be quoted (matched literally), not passed through
+    as an actual qualifier."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/search/issues"
+        q = req.url.params["q"]
+        assert '"label:bug"' in q
+        tokens = q.split(" ")
+        assert "label:bug" not in tokens
+        return _json({"items": []})
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    provider.list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(search="label:bug"),
+    )
+
+
+def test_search_term_without_searchable_text_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A search term with no alphanumeric content (e.g. `"::"`) can never
+    match anything meaningful — must raise `ValueError` before any HTTP
+    call rather than silently routing to search."""
+    seen = _install_mock(monkeypatch, lambda req: _json({"items": []}))
+    provider = GitHubProvider()
+    with pytest.raises(ValueError, match="::"):
+        provider.list_tickets(
+            _project(),
+            token="t",
+            filters=TicketFilters(search="::"),
+        )
+    assert seen == []
+
+
+def test_whitespace_only_search_term_normalizes_to_not_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A whitespace-only `search` must NOT raise and must NOT force the
+    expensive search route — it normalizes to "not set"."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/issues", (
+            f"whitespace-only search should not route to search; hit {req.url}"
+        )
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    provider.list_tickets(
+        _project(),
+        token="t",
+        filters=TicketFilters(search="   "),
+    )
+
+
+def test_list_tickets_does_not_mutate_caller_filters_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`list_tickets` must normalize `filters.search` into a local value,
+    not assign back into `filters.search` — a caller reusing the same
+    `TicketFilters` object across multiple calls must not see its
+    `.search` attribute silently rewritten as a side effect."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/issues", (
+            f"whitespace-only search should not route to search; hit {req.url}"
+        )
+        return _json([])
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    filters = TicketFilters(search="   ")
+    provider.list_tickets(_project(), token="t", filters=filters)
+    assert filters.search == "   ", (
+        "list_tickets must not mutate the caller-supplied filters.search"
+    )
+
+
 def test_empty_not_labels_does_not_route_to_search(monkeypatch: pytest.MonkeyPatch) -> None:
     """`not_labels=[]` must be treated as "not set" — stay on `/issues`."""
 
