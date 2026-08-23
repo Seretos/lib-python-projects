@@ -617,3 +617,119 @@ def test_pending_review_flow_end_to_end_yields_one_review(
     pr, _ = provider.get_pr(_project(), token="t", pr_id="7")
     assert len(pr.reviews) == 1
     assert pr.reviews[0].state == "comment"
+
+
+# ---------- Ticket #212 -------------------------------------------------------
+
+
+def test_add_pr_review_comment_pending_review_does_not_leak_into_get_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard (ticket #212): the E2E sweep believed a new-thread
+    `add_pr_review_comment` call created a phantom empty-body 'comment'
+    review entry in `get_pr().reviews`. Investigation found this was
+    already fixed by the #205 wave (new-thread comments route through an
+    unsubmitted PENDING review; `_map_review`/`_fetch_pr_reviews` already
+    filter `PENDING` out of `reviews[]`). This test locks that already-
+    correct behaviour in as a regression guard — it must PASS unmodified
+    against current `_map_review`/`_fetch_pr_reviews`/
+    `add_pr_review_comment`, and stops BEFORE `submit_pr_review` (unlike
+    `test_pending_review_flow_end_to_end_yields_one_review`, which only
+    asserts the post-submission state)."""
+    state: dict = {"review": None, "comments": []}
+
+    def _comment_dict(cid: int, body: str, path: str, line: int) -> dict:
+        return {
+            "id": cid,
+            "node_id": f"COMMENT_NODE_{cid}",
+            "user": {"login": "me"},
+            "body": body,
+            "path": path,
+            "line": line,
+            "side": "RIGHT",
+            "commit_id": "abc123",
+            "in_reply_to_id": None,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "html_url": f"https://github.com/acme/backend/pull/7#discussion_r{cid}",
+        }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        method = req.method
+
+        if method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([state["review"]] if state["review"] else [])
+
+        if method == "POST" and path == "/repos/acme/backend/pulls/7/reviews":
+            payload = json.loads(req.content or b"{}")
+            assert state["review"] is None, "only one review should ever be created"
+            state["review"] = {
+                "id": 900,
+                "node_id": "REVIEW_NODE_900",
+                "state": "PENDING",
+                "user": {"login": "me"},
+                "body": "",
+                "html_url": "https://github.com/acme/backend/pull/7#pullrequestreview-900",
+                "submitted_at": None,
+                "commit_id": "abc123",
+            }
+            for c in payload.get("comments", []):
+                state["comments"].append(
+                    _comment_dict(9001, c["body"], c["path"], c["line"])
+                )
+            return _json(state["review"])
+
+        if method == "GET" and path == "/repos/acme/backend/pulls/7/reviews/900/comments":
+            return _json(state["comments"])
+
+        if method == "GET" and path == "/repos/acme/backend/pulls/7/comments":
+            # Real GitHub behaviour: a pending review's inline comments are
+            # visible to the review's own author via this endpoint right
+            # away — only *other* users can't see them until submission.
+            # Our mock always answers "as" the comment's own author, so it
+            # must return them here too (ticket #212 finding #2).
+            return _json(state["comments"])
+
+        if method == "GET" and path == "/repos/acme/backend/pulls/7":
+            return _json(_pr_payload())
+
+        if method == "GET" and path == "/repos/acme/backend/issues/7/comments":
+            return _json([])
+
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+
+    created_comment = provider.add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="7",
+        body="pending nit",
+        path="src/foo.py",
+        line=1,
+        side="RIGHT",
+        commit_sha="abc123",
+    )
+    # The comment itself is created and returned (with the project's
+    # AI-generated marker prefix applied) — it's just not visible in the
+    # review-level surfaces below until submitted.
+    assert "pending nit" in created_comment.body
+
+    reviews = provider.list_pr_reviews(_project(), token="t", pr_id="7")
+    assert reviews == [], "an unsubmitted PENDING review must not leak into list_pr_reviews()"
+
+    pr, _ = provider.get_pr(_project(), token="t", pr_id="7")
+    assert pr.reviews == [], "an unsubmitted PENDING review must not leak into get_pr().reviews"
+
+    # The comment itself is NOT invisible everywhere: it is readable back
+    # via list_pr_review_comments() (the review_comments path) even though
+    # the review that carries it is still excluded from reviews[] above —
+    # that's the real GitHub behaviour this regression guard locks in.
+    review_comments = provider.list_pr_review_comments(_project(), token="t", pr_id="7")
+    assert any("pending nit" in rc.body for rc in review_comments), (
+        "the pending review's inline comment must be visible via "
+        "list_pr_review_comments() even though its review is absent "
+        "from reviews[]"
+    )

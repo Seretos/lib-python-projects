@@ -641,12 +641,15 @@ class ReviewComment:
 
     GitHub-specific pending-review caveat (ticket #205): on GitHub,
     `add_pr_review_comment` attaches new comments to an unsubmitted
-    `PENDING` review rather than auto-submitting one review per call.
-    A comment created this way is invisible on the PR — and absent
-    from `list_pr_review_comments()` — until `submit_pr_review` is
-    called to submit that pending review. GitLab and Azure DevOps have
-    no equivalent pending state: their comments are visible as soon as
-    they're created.
+    `PENDING` review rather than auto-submitting one review per call. A
+    comment created this way is visible to its own author right away via
+    `list_pr_review_comments()` — GitHub only hides another user's
+    pending comments, not the author's own — but the *review* stays
+    excluded from `list_pr_reviews()` / `get_pr().reviews` until
+    `submit_pr_review` is called to submit that pending review. GitLab
+    and Azure DevOps have no equivalent pending state: their comments
+    are visible as soon as they're created, and there is no separate
+    review-submission step gating visibility.
     """
 
     id: str

@@ -90,6 +90,21 @@ def _pr_payload(number: int = 7, merged: bool = False) -> dict:
     }
 
 
+def _review(review_id: int, state: str, **overrides) -> dict:
+    """Mirrors tests/test_github_reviews.py's `_review` fixture shape."""
+    base: dict = {
+        "id": review_id,
+        "user": {"login": "reviewer1"},
+        "body": "looks good",
+        "state": state,
+        "html_url": f"https://github.com/acme/backend/pull/7#pullrequestreview-{review_id}",
+        "submitted_at": "2024-01-01T00:00:00Z",
+        "commit_id": "abc123",
+    }
+    base.update(overrides)
+    return base
+
+
 # ---------- regression: pre-flight guards against silent double-merge ----------
 
 
@@ -134,6 +149,8 @@ def test_merge_pr_success_normal(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
+        if req.method == "GET" and path.endswith("/pulls/7/reviews"):
+            return _json([])
         if req.method == "GET" and path.endswith("/pulls/7"):
             get_count["n"] += 1
             # First GET is the pre-flight (not merged), second is the re-fetch
@@ -208,3 +225,181 @@ def test_merge_pr_405_already_merged_via_405_path(
 
     assert exc.value.status == 405
     assert "already merged" in exc.value.message
+
+
+# ---------- ticket #214: reviews/reviewers/review_decision on merge -----------
+
+
+def test_merge_pr_populates_reviews_reviewers_and_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """merge_pr must populate reviews/reviewers/review_decision from the
+    same GET /pulls/{n}/reviews endpoint get_pr uses, instead of leaving
+    them empty until a follow-up get_pr call."""
+    get_count: dict[str, int] = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pulls/7/reviews"):
+            return _json([_review(1, "APPROVED")])
+        if req.method == "GET" and path.endswith("/pulls/7"):
+            get_count["n"] += 1
+            merged = get_count["n"] > 1
+            return _json(_pr_payload(7, merged=merged))
+        if req.method == "PUT" and path.endswith("/pulls/7/merge"):
+            return _json(
+                {"sha": "abc123", "merged": True, "message": "Pull Request successfully merged"},
+                status_code=200,
+            )
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    pr = GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+
+    assert pr.merged is True
+    assert pr.reviews[0].state == "approve"
+    assert pr.reviewers == ["reviewer1"]
+    assert pr.review_decision == "APPROVED"
+
+
+def test_merge_pr_no_reviews_leaves_fields_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No submitted reviews -> reviews/reviewers/review_decision all stay
+    empty, matching get_pr's no-reviews behaviour."""
+    get_count: dict[str, int] = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pulls/7/reviews"):
+            return _json([])
+        if req.method == "GET" and path.endswith("/pulls/7"):
+            get_count["n"] += 1
+            merged = get_count["n"] > 1
+            return _json(_pr_payload(7, merged=merged))
+        if req.method == "PUT" and path.endswith("/pulls/7/merge"):
+            return _json(
+                {"sha": "abc123", "merged": True, "message": "Pull Request successfully merged"},
+                status_code=200,
+            )
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    pr = GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+
+    assert pr.merged is True
+    assert pr.reviews == []
+    assert pr.reviewers == []
+    assert pr.review_decision is None
+
+
+def test_merge_pr_pending_review_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PENDING (unsubmitted draft) review must not surface in the
+    merged PR's reviews/reviewers, mirroring get_pr's behaviour."""
+    get_count: dict[str, int] = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pulls/7/reviews"):
+            return _json([_review(1, "PENDING")])
+        if req.method == "GET" and path.endswith("/pulls/7"):
+            get_count["n"] += 1
+            merged = get_count["n"] > 1
+            return _json(_pr_payload(7, merged=merged))
+        if req.method == "PUT" and path.endswith("/pulls/7/merge"):
+            return _json(
+                {"sha": "abc123", "merged": True, "message": "Pull Request successfully merged"},
+                status_code=200,
+            )
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    pr = GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+
+    assert pr.merged is True
+    assert pr.reviews == []
+    assert pr.reviewers == []
+    assert pr.review_decision is None
+
+
+def test_merge_pr_same_author_latest_review_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same author submits CHANGES_REQUESTED then later APPROVED -> one
+    entry in reviewers, decision APPROVED (the newer review wins)."""
+    get_count: dict[str, int] = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pulls/7/reviews"):
+            return _json([
+                _review(
+                    1, "CHANGES_REQUESTED",
+                    user={"login": "reviewer1"},
+                    submitted_at="2024-01-01T00:00:00Z",
+                ),
+                _review(
+                    2, "APPROVED",
+                    user={"login": "reviewer1"},
+                    submitted_at="2024-01-02T00:00:00Z",
+                ),
+            ])
+        if req.method == "GET" and path.endswith("/pulls/7"):
+            get_count["n"] += 1
+            merged = get_count["n"] > 1
+            return _json(_pr_payload(7, merged=merged))
+        if req.method == "PUT" and path.endswith("/pulls/7/merge"):
+            return _json(
+                {"sha": "abc123", "merged": True, "message": "Pull Request successfully merged"},
+                status_code=200,
+            )
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    pr = GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+
+    assert pr.merged is True
+    assert pr.reviewers == ["reviewer1"]
+    assert pr.review_decision == "APPROVED"
+
+
+def test_merge_pr_reviews_fetch_failure_does_not_mask_successful_merge(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The review-enrichment fetch is best-effort. If GET /reviews 500s,
+    merge_pr must still return the merged PR (empty review fields) rather
+    than raising and masking an already-successful merge."""
+    import logging
+
+    get_count: dict[str, int] = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pulls/7/reviews"):
+            return _json({"message": "Internal Server Error"}, status_code=500)
+        if req.method == "GET" and path.endswith("/pulls/7"):
+            get_count["n"] += 1
+            merged = get_count["n"] > 1
+            return _json(_pr_payload(7, merged=merged))
+        if req.method == "PUT" and path.endswith("/pulls/7/merge"):
+            return _json(
+                {"sha": "abc123", "merged": True, "message": "Pull Request successfully merged"},
+                status_code=200,
+            )
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING, logger="project-issues.github"):
+        pr = GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+
+    assert pr.merged is True
+    assert pr.reviews == []
+    assert pr.reviewers == []
+    assert pr.review_decision is None
+    assert any(
+        "7" in record.message and "review" in record.message.lower()
+        for record in caplog.records
+    )

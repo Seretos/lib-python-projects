@@ -922,6 +922,11 @@ def _github_post_sub_issue(
     except GitHubError as exc:
         if exc.status == 422:
             msg_lower = exc.message.lower()
+            if "cycle" in msg_lower or "circular" in msg_lower:
+                raise GitHubError(
+                    422,
+                    f"relation would create a cycle — kind: {relation_kind_for_caller!r}, target: {caller_target_ref}",
+                ) from exc
             if "duplicate sub-issue" in msg_lower or "may not contain duplicate" in msg_lower:
                 raise RelationAlreadyExists(
                     kind=relation_kind_for_caller,
@@ -4648,6 +4653,17 @@ class GitHubProvider(
         (distinct authors, keeping each author's most recently submitted
         review), and `pr.review_decision` (derived from the latest
         per-author review states; ticket #148).
+
+        Ticket #212: `pr.reviews` only ever contains *submitted* reviews.
+        An inline new-thread comment created via `add_pr_review_comment`
+        is attached to an unsubmitted PENDING review (ticket #205's
+        pending-review flow) and therefore does NOT appear here — GitHub's
+        API never lists another user's own pending review, and
+        `_fetch_pr_reviews`/`_map_review` additionally filter out any
+        `state == "PENDING"` review that does come back. Such comments
+        surface only via `list_pr_review_comments()` until
+        `submit_pr_review` submits the pending review, at which point
+        exactly one entry for it appears in `pr.reviews`.
         """
         with _client(token) as client:
             r = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
@@ -5058,6 +5074,12 @@ class GitHubProvider(
         page (the GitHub maximum) — matching `list_pr_review_comments`'s
         single-page take. `PENDING` reviews (still being drafted by the
         reviewer, not yet submitted) are skipped.
+
+        Ticket #212: this deliberately means a PR whose only reviewer
+        activity is unsubmitted inline comments from
+        `add_pr_review_comment` (ticket #205's pending-review flow)
+        returns an empty list here — see `get_pr`'s docstring for the
+        full rationale.
         """
         with _client(token) as client:
             return _fetch_pr_reviews(client, project, pr_id)
@@ -5093,11 +5115,15 @@ class GitHubProvider(
         comment (from this account) on a PR creates an unsubmitted
         `PENDING` review and attaches to it; every later comment (new
         thread or reply) reuses that same pending review via GraphQL.
-        The comment stays invisible on the PR — and absent from
-        `list_pr_review_comments()` — until `submit_pr_review` is
-        called, which submits the pending review and turns it into one
-        real `reviews[]` entry. The previous behaviour of one
-        auto-submitted review per comment is gone.
+        The comment is immediately visible to its own author via
+        `list_pr_review_comments()` (GitHub returns a user's own pending
+        comments from that endpoint — they're only hidden from *other*
+        users until submitted). What stays hidden until `submit_pr_review`
+        is called is the *review* itself: the `PENDING` review is excluded
+        from `list_pr_reviews()` / `get_pr().reviews` (see that method's
+        docstring) until submission turns it into one real `reviews[]`
+        entry. The previous behaviour of one auto-submitted review per
+        comment is gone.
 
         GitHub does not support mixing commits within one review: once a
         pending review already exists, a new-thread `commit_sha` that
@@ -5128,6 +5154,11 @@ class GitHubProvider(
         deliberately leaves a raw 404 alone: it's ambiguous between a
         missing PR and a missing `in_reply_to` comment id, so we can't
         safely disambiguate from status alone.
+
+        Ticket #212: to spell it out once more at the call site — a
+        new-thread comment (`in_reply_to is None`) creates or reuses a
+        PENDING review that is invisible to `get_pr().reviews` /
+        `list_pr_reviews()` until `submit_pr_review` submits it.
         """
         prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
         try:
@@ -5324,6 +5355,13 @@ class GitHubProvider(
         Translates the GitHub merge-not-allowed 405 into a `GitHubError`
         via `_check`. After the merge succeeds, re-fetches the PR so the
         returned dataclass advertises the merged state.
+
+        The returned PR also carries `reviews`, `reviewers`, and
+        `review_decision`, synthesized the same way `get_pr` does (ticket
+        #214: `GET /pulls/{n}/reviews`), at the cost of one extra round
+        trip. This enrichment is best-effort: a failure degrades to empty
+        `reviews`/`reviewers`/`review_decision` (logged as a warning)
+        rather than failing an already-successful merge.
         """
         if merge_method not in ("merge", "squash", "rebase"):
             raise GitHubError(400, f"invalid merge_method '{merge_method}'")
@@ -5370,7 +5408,27 @@ class GitHubProvider(
             # Re-fetch so the response carries the merged state/timestamp.
             r2 = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
             _check(r2)
-            return _map_pr(r2.json())
+            pr = _map_pr(r2.json())
+            # Populate reviews/reviewers/review_decision the same way
+            # get_pr does (ticket #214), so a caller doesn't need a
+            # follow-up get_pr to see review data on a just-merged PR.
+            # Best-effort: never mask an already-successful merge — a
+            # failure here just leaves reviews/reviewers/review_decision
+            # empty (get_pr's/`_map_pr`'s defaults).
+            try:
+                reviews = _fetch_pr_reviews(client, project, pr_id)
+                latest_by_author = _latest_reviews_by_author(reviews)
+                pr.reviews = reviews
+                pr.reviewers = [rv.author for rv in latest_by_author]
+                pr.review_decision = review_decision_from_states(
+                    [rv.state for rv in latest_by_author]
+                )
+            except Exception:
+                log.warning(
+                    "PR %s: failed to fetch review data after merge; "
+                    "returning merged PR with empty reviews", pr_id,
+                )
+            return pr
 
     # ---------- relations (write side) --------------------------------------
 

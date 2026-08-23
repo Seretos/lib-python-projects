@@ -143,6 +143,22 @@ def _labels_handler(
     return None
 
 
+def _threads_handler(
+    req: httpx.Request, threads: list[dict] | None = None
+) -> httpx.Response | None:
+    """Shared shard for the PR-threads endpoint that `_reviews_from_votes`
+    (via `_review_body_thread_matcher`) now fetches on `merge_pr` too
+    (ticket #214). Returns an empty thread list by default so tests that
+    don't care about review-body matching don't need to bother."""
+    if (
+        req.method == "GET"
+        and "/_apis/git/repositories/" in req.url.path
+        and req.url.path.endswith("/threads")
+    ):
+        return _json({"value": threads or []})
+    return None
+
+
 # ---------- list_prs ---------------------------------------------------------
 
 
@@ -1299,6 +1315,280 @@ def test_create_pr_applies_custom_auto_labels(monkeypatch: pytest.MonkeyPatch) -
     assert "robot-made" in pr.labels
 
 
+# ---------- create_pr — ticket #212 branch-error disambiguation -------------
+
+
+def _create_pr_refs_response(entries: list[dict]) -> httpx.Response:
+    return _json({"count": len(entries), "value": entries})
+
+
+def _create_pr_error_handler(
+    *,
+    existing_branches: set[str],
+    refs_status: int = 200,
+    message: str = "TF401398: The branch refs/heads/main does not exist in the repository.",
+    status_code: int = 400,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Handler for a `create_pr` POST that fails, plus a `/refs` filter
+    endpoint that reports existence per `existing_branches` (branch names
+    without the `refs/heads/` prefix)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/pullrequests"):
+            return _json({"message": message}, status_code=status_code)
+        if req.method == "GET" and path.endswith("/refs"):
+            if refs_status != 200:
+                return httpx.Response(status_code=refs_status, content=b"{}")
+            filt = req.url.params.get("filter", "")
+            branch_ref = filt.removeprefix("heads/")
+            if branch_ref in existing_branches:
+                return _create_pr_refs_response(
+                    [{"name": f"refs/heads/{branch_ref}", "objectId": "sha1"}]
+                )
+            return _create_pr_refs_response([])
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    return handler
+
+
+def test_create_pr_missing_head_branch_error_names_head_not_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A create_pr 400 that ADO misattributes to the (valid) base branch
+    must be rewrapped to name the actual invalid HEAD branch (ticket #212).
+    """
+    handler = _create_pr_error_handler(
+        existing_branches={"main"},  # base exists, head does not
+        message="TF401398: The branch refs/heads/main does not exist in the repository.",
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/missing", base="main",
+        )
+    assert "feat/missing" in exc.value.message
+    assert "head branch" in exc.value.message
+    assert "original error:" in exc.value.message
+
+
+def test_create_pr_missing_base_branch_error_names_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrored case: HEAD exists, BASE does not — the rewrap must name base."""
+    handler = _create_pr_error_handler(
+        existing_branches={"feat/x"},  # head exists, base does not
+        message="TF401398: Unable to resolve target branch.",
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/x", base="staging",
+        )
+    assert "staging" in exc.value.message
+    assert "base branch" in exc.value.message
+    assert "original error:" in exc.value.message
+
+
+def test_create_pr_both_branches_missing_reraises_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Neither branch exists — the probe can't discriminate, so the original
+    ADO message must pass through untouched."""
+    original_message = "TF401398: Unable to create pull request: invalid refs."
+    handler = _create_pr_error_handler(
+        existing_branches=set(),
+        message=original_message,
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/gone", base="also-gone",
+        )
+    assert exc.value.message == original_message
+    assert exc.value.status == 400
+
+
+def test_create_pr_probe_failure_reraises_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `/refs` probe itself errors (e.g. 401/403/500) — the probe
+    failure must be swallowed and the original message re-raised
+    untouched, not surfaced as a secondary error."""
+    original_message = "TF401398: The branch refs/heads/main does not exist in the repository."
+    handler = _create_pr_error_handler(
+        existing_branches={"main"},
+        refs_status=500,
+        message=original_message,
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/missing", base="main",
+        )
+    assert exc.value.message == original_message
+
+
+def test_create_pr_asymmetric_probe_failure_reraises_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The HEAD probe errors (e.g. transient 500) while the BASE probe
+    succeeds and confirms the base branch genuinely exists. An
+    indeterminate HEAD result must NOT be treated as "confirmed missing"
+    just because the base probe resolved cleanly — that would produce a
+    confident-but-wrong "head branch does not exist" rewrap even though
+    the head probe merely failed to answer. The original ADO message must
+    pass through untouched (ticket #212 asymmetric-probe-failure case)."""
+    original_message = "TF401398: The branch refs/heads/main does not exist in the repository."
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/pullrequests"):
+            return _json({"message": original_message}, status_code=400)
+        if req.method == "GET" and path.endswith("/refs"):
+            filt = req.url.params.get("filter", "")
+            branch_ref = filt.removeprefix("heads/")
+            if branch_ref == "feat/missing":
+                # HEAD probe: transient error — indeterminate, not "absent".
+                return httpx.Response(status_code=500, content=b"{}")
+            if branch_ref == "main":
+                # BASE probe: confirmed present.
+                return _create_pr_refs_response(
+                    [{"name": "refs/heads/main", "objectId": "sha1"}]
+                )
+            raise AssertionError(f"unexpected branch filter {branch_ref!r}")
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/missing", base="main",
+        )
+    assert exc.value.message == original_message
+
+
+def test_create_pr_unrelated_400_is_not_rewrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both branches exist — the 400 is about something else entirely and
+    must not be rewrapped."""
+    original_message = (
+        "TF401027: A pull request with this source and target branch "
+        "already exists."
+    )
+    handler = _create_pr_error_handler(
+        existing_branches={"feat/x", "main"},
+        message=original_message,
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/x", base="main",
+        )
+    assert exc.value.message == original_message
+    assert exc.value.status == 400
+
+
+def test_create_pr_preserves_remapped_404_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_check` remaps a 400 "does not exist" message to 404 before the
+    rewrap runs — the rewrapped error must keep that remapped status."""
+    handler = _create_pr_error_handler(
+        existing_branches={"main"},
+        message="TF401398: The branch refs/heads/main does not exist in the repository.",
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/missing", base="main",
+        )
+    assert exc.value.status == 404
+
+
+def test_create_pr_accepts_refs_heads_prefixed_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-supplied `refs/heads/`-prefixed head is probed correctly
+    (the prefix is stripped for the `/refs` filter) and echoed back with
+    its original prefix intact in the rewrapped message."""
+    handler = _create_pr_error_handler(
+        existing_branches={"main"},
+        message="TF401398: The branch refs/heads/main does not exist in the repository.",
+    )
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="refs/heads/foo", base="main",
+        )
+    assert "refs/heads/foo" in exc.value.message
+    assert "head branch" in exc.value.message
+
+
+def test_create_pr_head_probe_ignores_prefix_matching_sibling_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADO's `/refs?filter=` is a starts-with match, not an exact match — a
+    probe for `release` must not be fooled by a same-prefix sibling like
+    `release-1.0` into reporting `release` as existing.
+
+    Without an exact name check on the probe response, this scenario would
+    incorrectly SUPPRESS an accurate rewrap: HEAD genuinely exists, BASE
+    genuinely does not (only its prefix-sibling does) — a discriminating
+    case that must still produce a "base branch does not exist" rewrap
+    (ticket #212 fix-cycle #2)."""
+    original_message = "TF401398: Unable to create pull request: invalid refs."
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/pullrequests"):
+            return _json({"message": original_message}, status_code=400)
+        if req.method == "GET" and path.endswith("/refs"):
+            filt = req.url.params.get("filter", "")
+            branch_ref = filt.removeprefix("heads/")
+            if branch_ref == "feat/x":
+                # HEAD probe: confirmed present (exact match).
+                return _create_pr_refs_response(
+                    [{"name": "refs/heads/feat/x", "objectId": "sha1"}]
+                )
+            if branch_ref == "release":
+                # BASE probe: ADO's starts-with filter returns only a
+                # prefix-matching sibling, never the exact branch — must
+                # not be read as "release exists".
+                return _create_pr_refs_response(
+                    [{"name": "refs/heads/release-1.0", "objectId": "sha2"}]
+                )
+            raise AssertionError(f"unexpected branch filter {branch_ref!r}")
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().create_pr(
+            _project(), token="t", title="hello", body="Body",
+            head="feat/x", base="release",
+        )
+    assert "release" in exc.value.message
+    assert "base branch" in exc.value.message
+    assert "original error:" in exc.value.message
+
+
 # ---------- update_pr -------------------------------------------------------
 
 
@@ -1391,6 +1681,9 @@ def test_merge_pr_method_mapping(
         labels = _labels_handler(req)
         if labels is not None:
             return labels
+        threads = _threads_handler(req)
+        if threads is not None:
+            return threads
         path = req.url.path
         if req.method == "GET" and path.endswith("/pullrequests/7"):
             # First GET (before PATCH) returns the open PR; subsequent
@@ -1415,6 +1708,234 @@ def test_merge_pr_method_mapping(
     )
     assert captured["body"]["status"] == "completed"
     assert captured["body"]["completionOptions"]["mergeStrategy"] == theirs
+
+
+def test_merge_pr_populates_reviews_and_review_decision(
+    monkeypatch: pytest.MonkeyPatch, fast_merge_settle: None
+) -> None:
+    """Ticket #214: `merge_pr` must populate `pr.reviews`/`review_decision`
+    from the settled PR's vote data, the same way `get_pr` does, instead
+    of returning an empty snapshot that only a follow-up `get_pr` would
+    fill in."""
+    state: dict = {"poll": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        threads = _threads_handler(req)
+        if threads is not None:
+            return threads
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            state["poll"] += 1
+            if state["poll"] <= 1:
+                return _json(_pr_payload(7, status="active", mergeStatus="notSet"))
+            return _json(
+                _pr_payload(
+                    7,
+                    status="completed",
+                    mergeStatus="succeeded",
+                    reviewers=[
+                        {
+                            "id": "reviewer-approve",
+                            "displayName": "Alice Builder",
+                            "uniqueName": "alice@example.com",
+                            "vote": 10,
+                        },
+                    ],
+                )
+            )
+        if req.method == "PATCH" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(7, status="active", mergeStatus="queued"))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr = AzureDevOpsProvider().merge_pr(
+        _project(), token="t", pr_id="7", merge_method="merge"
+    )
+    assert pr.merged is True
+    assert [rv.author for rv in pr.reviews] == ["alice@example.com"]
+    assert pr.review_decision == "APPROVED"
+
+
+def test_merge_pr_review_snapshot_matches_get_pr(
+    monkeypatch: pytest.MonkeyPatch, fast_merge_settle: None
+) -> None:
+    """Driving `merge_pr` and `get_pr` off the same settled payload must
+    produce the same (author, state) review snapshot and review_decision
+    — ticket #214's cross-provider-parity goal for ADO specifically."""
+    state: dict = {"poll": 0}
+    merged_payload = _pr_payload(
+        7,
+        status="completed",
+        mergeStatus="succeeded",
+        reviewers=[
+            {
+                "id": "reviewer-approve",
+                "displayName": "Alice Builder",
+                "uniqueName": "alice@example.com",
+                "vote": 10,
+            },
+            {
+                "id": "reviewer-reject",
+                "displayName": "Bob Reviewer",
+                "uniqueName": "bob@example.com",
+                "vote": -10,
+            },
+        ],
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        threads = _threads_handler(req)
+        if threads is not None:
+            return threads
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            state["poll"] += 1
+            if state["poll"] <= 1:
+                return _json(_pr_payload(7, status="active", mergeStatus="notSet"))
+            return _json(merged_payload)
+        if req.method == "PATCH" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(7, status="active", mergeStatus="queued"))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    merged_pr = AzureDevOpsProvider().merge_pr(
+        _project(), token="t", pr_id="7", merge_method="merge"
+    )
+
+    # get_pr off the exact same settled payload (no settle-loop involved).
+    def get_handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        threads = _threads_handler(req)
+        if threads is not None:
+            return threads
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(merged_payload)
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, get_handler)
+    fetched_pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+
+    merged_tuples = {(rv.author, rv.state) for rv in merged_pr.reviews}
+    fetched_tuples = {(rv.author, rv.state) for rv in fetched_pr.reviews}
+    assert merged_tuples == fetched_tuples
+    assert merged_pr.review_decision == fetched_pr.review_decision == "CHANGES_REQUESTED"
+
+
+def test_merge_pr_no_votes_leaves_reviews_empty(
+    monkeypatch: pytest.MonkeyPatch, fast_merge_settle: None
+) -> None:
+    """No votes on the settled PR -> reviews == [] / review_decision is
+    None, mirroring get_pr's no-votes behaviour."""
+    state: dict = {"poll": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        threads = _threads_handler(req)
+        if threads is not None:
+            return threads
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            state["poll"] += 1
+            if state["poll"] <= 1:
+                return _json(_pr_payload(7, status="active", mergeStatus="notSet"))
+            return _json(
+                _pr_payload(
+                    7, status="completed", mergeStatus="succeeded", reviewers=[]
+                )
+            )
+        if req.method == "PATCH" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(7, status="active", mergeStatus="queued"))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr = AzureDevOpsProvider().merge_pr(
+        _project(), token="t", pr_id="7", merge_method="merge"
+    )
+    assert pr.merged is True
+    assert pr.reviews == []
+    assert pr.review_decision is None
+
+
+def test_merge_pr_review_fetch_failure_does_not_mask_successful_merge(
+    monkeypatch: pytest.MonkeyPatch,
+    fast_merge_settle: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Ticket #214: the review-enrichment fetch is best-effort. If the
+    threads endpoint 500s, merge_pr must still return the merged PR
+    (reviews/review_decision degrade to empty) rather than raising and
+    masking an already-successful merge."""
+    import logging
+
+    state: dict = {"poll": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if (
+            req.method == "GET"
+            and "/_apis/git/repositories/" in path
+            and path.endswith("/threads")
+        ):
+            return httpx.Response(status_code=500, content=b"boom")
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            state["poll"] += 1
+            if state["poll"] <= 1:
+                return _json(_pr_payload(7, status="active", mergeStatus="notSet"))
+            return _json(
+                _pr_payload(
+                    7,
+                    status="completed",
+                    mergeStatus="succeeded",
+                    reviewers=[{"displayName": "Alice", "vote": 10}],
+                )
+            )
+        if req.method == "PATCH" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(7, status="active", mergeStatus="queued"))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING, logger="project-issues.azuredevops"):
+        pr = AzureDevOpsProvider().merge_pr(
+            _project(), token="t", pr_id="7", merge_method="merge"
+        )
+
+    assert pr.merged is True
+    assert pr.status == "merged"
+    assert pr.reviews == []
+    assert pr.review_decision is None
+    assert any(
+        "7" in record.message and "review" in record.message.lower()
+        for record in caplog.records
+    )
 
 
 @pytest.fixture
@@ -1447,6 +1968,9 @@ def test_merge_pr_squash_policy_override_emits_warning(
         labels = _labels_handler(req)
         if labels is not None:
             return labels
+        threads = _threads_handler(req)
+        if threads is not None:
+            return threads
         path = req.url.path
         if req.method == "GET" and path.endswith("/pullrequests/7"):
             if "patched" in captured:
@@ -2770,6 +3294,9 @@ def test_merge_pr_waits_for_both_status_and_merge_to_settle(
         labels = _labels_handler(req)
         if labels is not None:
             return labels
+        threads = _threads_handler(req)
+        if threads is not None:
+            return threads
         path = req.url.path
         if req.method == "GET" and path.endswith("/pullrequests/7"):
             state["poll"] += 1
@@ -2873,6 +3400,9 @@ def test_merge_pr_does_not_populate_requested_reviewers(
         labels = _labels_handler(req)
         if labels is not None:
             return labels
+        threads = _threads_handler(req)
+        if threads is not None:
+            return threads
         path = req.url.path
         if req.method == "GET" and path.endswith("/pullrequests/7"):
             state["poll"] += 1
@@ -2912,6 +3442,9 @@ def test_merge_pr_preserves_preassigned_requested_reviewer(
         labels = _labels_handler(req)
         if labels is not None:
             return labels
+        threads = _threads_handler(req)
+        if threads is not None:
+            return threads
         path = req.url.path
         if req.method == "GET" and path.endswith("/pullrequests/7"):
             state["poll"] += 1

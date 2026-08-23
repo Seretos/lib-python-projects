@@ -1208,6 +1208,11 @@ def test_merge_pr_merge_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
         if req.method == "PUT" and url.endswith("/merge"):
             captured["body"] = json.loads(req.content.decode())
             return _json(_mr_payload(5, state="merged"))
+        # Ticket #214: merge_pr now fetches approvals after the re-fetch;
+        # explicit branch for clarity (would also pass via the GET
+        # catch-all below, since a bare MR payload has no "approved_by").
+        if req.method == "GET" and url.endswith("/approvals"):
+            return _json({"approved": False, "approved_by": []})
         if req.method == "GET":
             return _json(_mr_payload(5, state="merged"))
         return _json({}, status_code=404)
@@ -1226,6 +1231,9 @@ def test_merge_pr_squash_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
         if req.method == "PUT" and url.endswith("/merge"):
             captured["body"] = json.loads(req.content.decode())
             return _json(_mr_payload(5, state="merged"))
+        # Ticket #214: merge_pr now fetches approvals after the re-fetch.
+        if req.method == "GET" and url.endswith("/approvals"):
+            return _json({"approved": False, "approved_by": []})
         if req.method == "GET":
             return _json(_mr_payload(5, state="merged"))
         return _json({}, status_code=404)
@@ -1257,7 +1265,9 @@ def test_merge_pr_refetches_after_merge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Mirror GitHub provider's pattern: after merge, do a fresh GET to
-    pick up post-merge state mutations (merge_commit_sha, etc.)."""
+    pick up post-merge state mutations (merge_commit_sha, etc.). Also
+    covers ticket #214: a third call fetches approvals so the returned
+    PR carries review data without a follow-up get_pr."""
     seen_methods: list[str] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -1265,17 +1275,21 @@ def test_merge_pr_refetches_after_merge(
         seen_methods.append(f"{req.method} {url.split('?')[0].split('/api/v4')[-1]}")
         if req.method == "PUT":
             return _json(_mr_payload(5, state="merged"))
+        if req.method == "GET" and url.endswith("/approvals"):
+            return _json({"approved": False, "approved_by": []})
         if req.method == "GET":
             return _json(_mr_payload(5, state="merged"))
         return _json({}, 404)
 
     _install_mock(monkeypatch, handler)
     GitLabProvider().merge_pr(_project(), "t", "5", merge_method="merge")
-    # Sequence: PUT /merge then GET /merge_requests/5
+    # Sequence: PUT /merge, GET /merge_requests/5, GET .../approvals.
     assert seen_methods[0].startswith("PUT")
     assert seen_methods[0].endswith("/merge")
     assert seen_methods[1].startswith("GET")
     assert seen_methods[1].endswith("/merge_requests/5")
+    assert seen_methods[2].startswith("GET")
+    assert seen_methods[2].endswith("/merge_requests/5/approvals")
 
 
 def test_merge_pr_commit_message_routed_per_strategy(
@@ -1284,11 +1298,15 @@ def test_merge_pr_commit_message_routed_per_strategy(
     captured: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
         if req.method == "PUT":
             captured.setdefault("bodies", []).append(
                 json.loads(req.content.decode())
             )
             return _json(_mr_payload(5, state="merged"))
+        # Ticket #214: merge_pr now fetches approvals after the re-fetch.
+        if req.method == "GET" and url.endswith("/approvals"):
+            return _json({"approved": False, "approved_by": []})
         return _json(_mr_payload(5, state="merged"))
 
     _install_mock(monkeypatch, handler)
@@ -1313,9 +1331,13 @@ def test_gitlab_merge_pr_default_merge_method(
     captured: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
         if req.method == "PUT":
             captured["body"] = json.loads(req.content.decode())
             return _json(_mr_payload(5, state="merged"))
+        # Ticket #214: merge_pr now fetches approvals after the re-fetch.
+        if req.method == "GET" and url.endswith("/approvals"):
+            return _json({"approved": False, "approved_by": []})
         return _json(_mr_payload(5, state="merged"))
 
     _install_mock(monkeypatch, handler)
@@ -1346,6 +1368,130 @@ def test_gitlab_merge_pr_squash_with_commit_title(
     )
     assert captured["body"]["squash"] is True
     assert captured["body"]["squash_commit_message"] == "T\n\nB"
+
+
+# ---------- ticket #214: reviews/approvals on merge -------------------------
+
+
+def test_merge_pr_populates_reviews_from_approvals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """merge_pr must populate pr.reviews/review_decision/approvals_*
+    from the same /approvals endpoint get_pr uses, instead of leaving
+    them empty until a follow-up get_pr call. Mirrors
+    test_gitlab_get_pr_populates_reviews_from_approvals."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "PUT" and url.endswith("/merge"):
+            return _json(_mr_payload(5, state="merged"))
+        if req.method == "GET" and url.endswith("/approvals"):
+            return _json({
+                "approved": True,
+                "approvals_required": 1,
+                "approvals_left": 0,
+                "approved_by": [{"user": {"id": 1, "username": "alice"}}],
+            })
+        if req.method == "GET" and url.endswith("/merge_requests/5"):
+            return _json(_mr_payload(5, state="merged"))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr = GitLabProvider().merge_pr(_project(), "t", "5", merge_method="merge")
+
+    assert pr.status == "merged"
+    assert [rv.author for rv in pr.reviews] == ["alice"]
+    assert pr.review_decision == "APPROVED"
+    assert pr.approvals_received == 1
+
+
+def test_merge_pr_degraded_approvals_leaves_reviews_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When /approvals 403s, merge_pr degrades gracefully: pr.reviews
+    stays [], review_decision is None, and the merged MR data (id,
+    title, status) is still intact."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "PUT" and url.endswith("/merge"):
+            return _json(_mr_payload(5, state="merged"))
+        if req.method == "GET" and url.endswith("/approvals"):
+            return _json({}, status_code=403)
+        if req.method == "GET" and url.endswith("/merge_requests/5"):
+            return _json(_mr_payload(5, state="merged"))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr = GitLabProvider().merge_pr(_project(), "t", "5", merge_method="merge")
+
+    assert pr.reviews == []
+    assert pr.review_decision is None
+    assert pr.id == "5"
+    assert pr.title == "MR 5"
+    assert pr.status == "merged"
+
+
+def test_merge_pr_approvals_error_does_not_mask_successful_merge(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The approvals-enrichment fetch is best-effort. If /approvals 500s
+    (re-raised by _fetch_mr_approvals via _check), merge_pr must still
+    return the merged MR (empty review fields) rather than raising and
+    masking an already-successful merge."""
+    import logging
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "PUT" and url.endswith("/merge"):
+            return _json(_mr_payload(5, state="merged"))
+        if req.method == "GET" and url.endswith("/approvals"):
+            return _json({"message": "Internal Server Error"}, status_code=500)
+        if req.method == "GET" and url.endswith("/merge_requests/5"):
+            return _json(_mr_payload(5, state="merged"))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING, logger="project-issues.gitlab"):
+        pr = GitLabProvider().merge_pr(_project(), "t", "5", merge_method="merge")
+
+    assert pr.status == "merged"
+    assert pr.reviews == []
+    assert pr.review_decision is None
+    assert any(
+        "5" in record.message and "approvals" in record.message.lower()
+        for record in caplog.records
+    )
+
+
+def test_merge_pr_squash_also_populates_reviews(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The review-enrichment applies on the squash path too, not just
+    the plain merge path."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "PUT" and url.endswith("/merge"):
+            return _json(_mr_payload(5, state="merged"))
+        if req.method == "GET" and url.endswith("/approvals"):
+            return _json({
+                "approved": True,
+                "approvals_required": 1,
+                "approvals_left": 0,
+                "approved_by": [{"user": {"id": 1, "username": "alice"}}],
+            })
+        if req.method == "GET" and url.endswith("/merge_requests/5"):
+            return _json(_mr_payload(5, state="merged"))
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr = GitLabProvider().merge_pr(_project(), "t", "5", merge_method="squash")
+
+    assert pr.status == "merged"
+    assert [rv.author for rv in pr.reviews] == ["alice"]
+    assert pr.review_decision == "APPROVED"
 
 
 # ---------- inline review comments (ticket #43 D) --------------------------
