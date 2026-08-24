@@ -504,6 +504,20 @@ def _validate_label_lists(
         )
 
 
+def _not_found_message(kind: str, *ids: str) -> str:
+    """Compose the canonical 404 message shared across all three providers.
+
+    `_not_found_message("PR", "acme#55")` -> `"PR 'acme#55' not found"`;
+    `_not_found_message("ticket", "acme#5", "acme#9")` ->
+    `"ticket 'acme#5' or 'acme#9' not found"` (the GitLab issue-link
+    two-id form). Not exported from `providers/__init__.py` — imported
+    privately by the provider modules, same precedent as
+    `_assert_not_self_relation` / `_validate_label_lists` / `_validate_limit`.
+    """
+    quoted = " or ".join(f"'{i}'" for i in ids)
+    return f"{kind} {quoted} not found"
+
+
 PRStatus = Literal["open", "closed", "merged"]
 PRListStatus = Literal["open", "closed", "any"]
 

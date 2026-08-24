@@ -962,3 +962,43 @@ class TestReleaseDataclass:
         )
         assert rel.tag == "v1.0.0"
         assert rel.body == "Release notes"
+
+
+# ---------- epic #224 (217/219/220): _not_found_message helper --------------
+
+
+class TestNotFoundMessage:
+    """`_not_found_message` (epic #224 / ticket #219) is the shared,
+    internal (not exported from `providers/__init__.py`) helper that
+    composes the canonical 404 wording used across all three provider
+    modules: `<kind> '<id>' not found` for a single id, and
+    `<kind> '<id1>' or '<id2>' not found` for the GitLab issue-link
+    two-id case. These are pure-function tests — they fail first only
+    because the symbol does not exist yet on `providers/base.py`
+    (`ImportError`), not because of a wrong composed string."""
+
+    def test_single_id_reproduces_pr_shape(self) -> None:
+        from lib_python_projects.providers.base import _not_found_message
+
+        assert _not_found_message("PR", "acme#55") == "PR 'acme#55' not found"
+
+    def test_two_ids_reproduces_gitlab_link_shape(self) -> None:
+        from lib_python_projects.providers.base import _not_found_message
+
+        assert (
+            _not_found_message("ticket", "acme#5", "acme#9")
+            == "ticket 'acme#5' or 'acme#9' not found"
+        )
+
+    def test_single_id_review_comment_shape(self) -> None:
+        from lib_python_projects.providers.base import _not_found_message
+
+        assert (
+            _not_found_message("review comment", "123")
+            == "review comment '123' not found"
+        )
+
+    def test_single_id_ticket_shape(self) -> None:
+        from lib_python_projects.providers.base import _not_found_message
+
+        assert _not_found_message("ticket", "acme#999") == "ticket 'acme#999' not found"

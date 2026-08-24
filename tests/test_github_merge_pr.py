@@ -105,6 +105,35 @@ def _review(review_id: int, state: str, **overrides) -> dict:
     return base
 
 
+# ---------- R7 (epic #224 / ticket #219): pre-flight 404 names the PR ---------
+
+
+def test_merge_pr_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """merge_pr's pre-flight GET (the same GET the already-merged check
+    below reads) 404ing on a missing PR must wrap the raw 404 into the
+    canonical `PR '<project>#<id>' not found` shape — today it leaks the
+    raw provider text straight through, and no PUT is (or should be)
+    issued once the pre-flight itself has failed."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pulls/55"):
+            return _json({"message": "Not Found"}, status_code=404)
+        if req.method == "PUT" and "/merge" in path:
+            raise AssertionError("PUT /merge should not be called on pre-flight 404")
+        return _json({})
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().merge_pr(_project(), token="t", pr_id="55")
+
+    assert exc.value.status == 404
+    assert "PR 'acme#55' not found" in exc.value.message
+    assert not any(r.method == "PUT" for r in seen)
+
+
 # ---------- regression: pre-flight guards against silent double-merge ----------
 
 

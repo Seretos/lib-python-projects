@@ -181,6 +181,50 @@ def test_list_runs_for_ticket_walks_related_mrs(
     assert refs == ["!10", "!11"]
 
 
+def test_list_runs_for_ticket_404_names_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9 (epic #224 / ticket #219/#220.3): a genuine 404 on the
+    `related_merge_requests` fetch (the issue itself doesn't exist)
+    keeps raising — the shape is unchanged — but the message must be
+    normalized to the canonical `ticket '<project>#<id>' not found`
+    shape instead of leaking GitLab's raw body text."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if str(req.url).endswith("/issues/5/related_merge_requests"):
+            return _json({"message": "404 Issue Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().list_runs_for_ticket(_project(), "t", "5")
+    assert exc.value.status == 404
+    assert "ticket 'acme#5' not found" in exc.value.message
+
+
+def test_list_runs_for_ticket_project_404_not_relabelled_as_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `related_merge_requests` GET 404s identically for a bad
+    project path and a genuinely missing issue id. A `404 Project Not
+    Found` body must surface as itself, never relabelled
+    `ticket '...' not found` (epic #224 review finding)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if str(req.url).endswith("/issues/5/related_merge_requests"):
+            return _json({"message": "404 Project Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().list_runs_for_ticket(_project(), "t", "5")
+    assert exc.value.status == 404
+    assert "ticket" not in exc.value.message
+    assert "Project Not Found" in exc.value.message
+
+
 def test_list_runs_for_ticket_no_related_mrs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

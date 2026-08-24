@@ -67,6 +67,7 @@ from lib_python_projects.providers.base import (
     NO_CI_SENTINEL,
     _assert_not_self_relation,
     _extract_parent_id,
+    _not_found_message,
     _validate_label_lists,
     _validate_limit,
     _validate_since,
@@ -1514,6 +1515,24 @@ def _graphql_review_error(body: dict) -> GitHubError:
     return GitHubError(status, f"GraphQL error adding review comment: {errors}")
 
 
+def _graphql_review_missing_payload(field: str, body: dict) -> GitHubError:
+    """Ticket #220.2: GitHub's review-comment mutations can come back
+    with `<field>: null` (or an empty `nodes` list) and **no** `errors[]`
+    at all — the diagnosed null-thread/null-comment case. Without this
+    guard, navigating the payload raises a raw `TypeError` that escapes
+    the structured-error contract. 422 is deliberate, not novel wording:
+    `add_pr_review_comment`'s outer handler already converts any 422 into
+    the actionable "could not resolve diff location" message, so this
+    factory's own message is terse/diagnostic only — it is never shown
+    to the end user on that path.
+    """
+    return GitHubError(
+        422,
+        f"GraphQL error adding review comment: {field} returned no payload: "
+        f"{body.get('data')!r}",
+    )
+
+
 def _add_thread_to_pending_review(
     client: httpx.Client,
     review_node_id: str,
@@ -1545,7 +1564,15 @@ def _add_thread_to_pending_review(
     resp_body = r.json()
     if resp_body.get("errors"):
         raise _graphql_review_error(resp_body)
-    nodes = resp_body["data"]["addPullRequestReviewThread"]["thread"]["comments"]["nodes"]
+    # Ticket #220.2: GitHub can return `thread: null` with no `errors[]` at
+    # all — the diagnosed null-payload case, guarded here rather than left
+    # to crash with a raw TypeError. `{"data": null}` (top-level GraphQL
+    # failure) and an empty `nodes` list (the thread WAS created) are
+    # different failure modes and deliberately NOT caught by this guard.
+    thread = (resp_body["data"]["addPullRequestReviewThread"] or {}).get("thread")
+    if thread is None:
+        raise _graphql_review_missing_payload("thread", resp_body)
+    nodes = thread["comments"]["nodes"]
     return str(nodes[0]["databaseId"])
 
 
@@ -1575,7 +1602,12 @@ def _reply_in_pending_review(
     resp_body = r.json()
     if resp_body.get("errors"):
         raise _graphql_review_error(resp_body)
-    return str(resp_body["data"]["addPullRequestReviewComment"]["comment"]["databaseId"])
+    # Ticket #220.2: mirror the same null-payload guard onto the reply
+    # mutation — GitHub can return `comment: null` with no `errors[]`.
+    comment = (resp_body["data"]["addPullRequestReviewComment"] or {}).get("comment")
+    if comment is None:
+        raise _graphql_review_missing_payload("comment", resp_body)
+    return str(comment["databaseId"])
 
 
 # ---------- GraphQL: GitHub Projects v2 board support (ticket #118) --------
@@ -4667,7 +4699,14 @@ class GitHubProvider(
         """
         with _client(token) as client:
             r = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
-            _check(r)
+            try:
+                _check(r)
+            except GitHubError as exc:
+                if exc.status == 404:
+                    raise GitHubError(
+                        404, _not_found_message("PR", f"{project.id}#{pr_id}")
+                    ) from exc
+                raise
             pr = _map_pr(r.json())
             c = client.get(
                 f"{_repo_path(project)}/issues/{pr_id}/comments",
@@ -5172,12 +5211,28 @@ class GitHubProvider(
                     # already created an empty PENDING review on the
                     # server — that would leave it dangling with no way
                     # for the caller to clean it up.
-                    parent_node_id = _review_comment_node_id(
-                        client, project, in_reply_to,
-                    )
+                    try:
+                        parent_node_id = _review_comment_node_id(
+                            client, project, in_reply_to,
+                        )
+                    except GitHubError as exc:
+                        if exc.status == 404:
+                            raise GitHubError(
+                                404,
+                                _not_found_message("review comment", in_reply_to),
+                            ) from exc
+                        raise
                     created_review = pending is None
                     if pending is None:
-                        pending = _create_pending_review(client, project, pr_id)
+                        try:
+                            pending = _create_pending_review(client, project, pr_id)
+                        except GitHubError as exc:
+                            if exc.status == 404:
+                                raise GitHubError(
+                                    404,
+                                    _not_found_message("PR", f"{project.id}#{pr_id}"),
+                                ) from exc
+                            raise
                     try:
                         comment_id = _reply_in_pending_review(
                             client, pending["node_id"], parent_node_id, prefixed,
@@ -5375,7 +5430,14 @@ class GitHubProvider(
             # callers get a clear "already merged" error rather than a silent
             # HTTP 200 that looks like a fresh merge.
             preflight = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
-            _check(preflight)
+            try:
+                _check(preflight)
+            except GitHubError as exc:
+                if exc.status == 404:
+                    raise GitHubError(
+                        404, _not_found_message("PR", f"{project.id}#{pr_id}")
+                    ) from exc
+                raise
             if preflight.json().get("merged") is True:
                 raise GitHubError(
                     405, f"PR '{project.id}#{pr_id}' is already merged"
@@ -5492,7 +5554,7 @@ class GitHubProvider(
                 if exc.status == 404:
                     raise GitHubError(
                         404,
-                        f"target issue #{target_number} not found in {project.owner}/{project.repo}",
+                        _not_found_message("ticket", f"{project.id}#{target_number}"),
                     ) from exc
                 raise
             if kind == "parent":
@@ -6865,9 +6927,18 @@ def _resolved_refs_for_ticket(
     # Fetch the ticket once to read its body (for the `branch:foo` hint).
     # A genuine 404 here means the ticket itself doesn't exist, which is
     # distinct from "ticket exists but has nothing linked" — raise instead
-    # of silently returning `[]` so callers can tell the two apart.
+    # of silently returning `[]` so callers can tell the two apart. The
+    # message is normalized to the canonical `ticket '<project>#<id>' not
+    # found` shape (ticket #219/#220.3) rather than the raw provider text.
     issue_r = client.get(f"{_repo_path(project)}/issues/{ticket_id}")
-    _check(issue_r)
+    try:
+        _check(issue_r)
+    except GitHubError as exc:
+        if exc.status == 404:
+            raise GitHubError(
+                404, _not_found_message("ticket", f"{project.id}#{ticket_id}")
+            ) from exc
+        raise
 
     # Early bail: if the ticket is itself a PR, use its own head.sha directly.
     # The `/issues/{id}` endpoint includes a `pull_request` key for PRs.

@@ -87,6 +87,7 @@ from lib_python_projects.providers.base import (
     NO_CI_SENTINEL,
     _assert_not_self_relation,
     _extract_parent_id,
+    _not_found_message,
     _validate_label_lists,
     _validate_limit,
     _validate_since,
@@ -338,6 +339,32 @@ def _project_path(project: ProjectConfig) -> str:
         )
     # `safe=""` so slashes get encoded — GitLab requires that.
     return quote(project.path, safe="")
+
+
+def _is_project_not_found_message(message: str) -> bool:
+    """Detect GitLab's project-level 404 body among the resource-level ones.
+
+    A single GET/PUT built from `_project_path(project)` — a pure local
+    string formatter with no live existence check — 404s identically
+    whether the *project path itself* fails to resolve or the resource id
+    inside a valid project doesn't exist. GitLab distinguishes the two
+    only in the message body: a bad project path yields
+    `{"message": "404 Project Not Found"}` (case collapsed here to
+    `"Project Not Found"` by `_check`'s status-prefix strip), while a
+    missing MR/issue/etc. inside a project that DOES exist yields
+    `{"message": "404 Not found"}` or a resource-named variant like
+    `"404 Issue Not Found"` / `"404 Merge Request Not Found"` — never
+    the word "project".
+
+    Requiring both "project" and "not found" (case-insensitively) keeps
+    this from matching those resource-named 404s, so a caller can let a
+    genuine project-404 pass through unrelabelled while still rewrapping
+    every other 404 shape into the canonical `<kind> '<id>' not found`
+    message (ticket #224 review finding: GitLab project-404 vs
+    ticket/PR-404 disambiguation).
+    """
+    lowered = message.lower()
+    return "project" in lowered and "not found" in lowered
 
 
 _CANONICAL_URL_REPLACEMENTS: tuple[tuple[str, str], ...] = (
@@ -924,6 +951,15 @@ def _gitlab_post_issue_link(
                 ticket_id=source_iid,
                 target=f"#{target_issue_iid}",
             ) from exc
+        if exc.status == 404 and not _is_project_not_found_message(exc.message):
+            raise GitLabError(
+                404,
+                _not_found_message(
+                    "ticket",
+                    f"{project.id}#{source_iid}",
+                    f"{project.id}#{target_issue_iid}",
+                ),
+            ) from exc
         raise
     raw = r.json()
     # The POST /issues/:iid/links response wraps the target issue inside
@@ -1016,7 +1052,14 @@ def _gitlab_mark_duplicate_of(
     path = _project_path(project)
     markers = _marker_set(project)
     src_r = client.get(f"/projects/{path}/issues/{source_iid}")
-    _check(src_r)
+    try:
+        _check(src_r)
+    except GitLabError as exc:
+        if exc.status == 404 and not _is_project_not_found_message(exc.message):
+            raise GitLabError(
+                404, _not_found_message("ticket", f"{project.id}#{source_iid}")
+            ) from exc
+        raise
     src = src_r.json()
     current_body = src.get("description") or ""
     current_labels = set(src.get("labels") or [])
@@ -1358,18 +1401,45 @@ _WORK_ITEM_HIERARCHY_QUERY = (
 
 def _gitlab_fetch_work_item(
     client: httpx.Client, project: ProjectConfig, iid: str,
+    *, require_project: bool = False,
 ) -> dict | None:
     """Resolve an issue iid to its Work Item node — global `id`, own
     fields, and (via `hierarchyWidget`) its current `parent`, when set.
 
-    Returns `None` when the project/iid can't be resolved to a work item
-    (e.g. it doesn't exist).
+    By default, returns `None` when the project/iid can't be resolved to
+    a work item (e.g. the project doesn't exist, or it exists but `iid`
+    doesn't) — collapsing both into a single not-found signal, which is
+    what the existing callers (`_gitlab_remove_hierarchy_relation`, and
+    `_fetch_relations`'s best-effort parent sidecall) want: neither needs
+    to tell "project missing" apart from "iid missing".
+
+    Pass `require_project=True` when the caller *does* need to tell them
+    apart (ticket #224 review finding: a project-config problem must not
+    be relabelled as a ticket-404). GitLab's GraphQL response already
+    carries the distinction with no extra request — the query returns
+    HTTP 200 either way:
+
+    - `data["project"]` is `None` -> the project itself didn't resolve.
+    - `data["project"]` is non-`None` but `workItems.nodes` is empty ->
+      the project exists and `iid` is the one that's missing.
+
+    With `require_project=True`, the first case raises
+    `GitLabError(404, "project '<id>' not found")` instead of returning
+    `None`, so the message can never be mistaken for the canonical
+    `ticket '...' not found` shape, and it satisfies the same
+    `_is_project_not_found_message` gate the REST call sites use. The
+    second case still returns `None`, unchanged.
     """
     data = _gitlab_graphql(
         client, project, _WORK_ITEM_HIERARCHY_QUERY,
         {"fullPath": project.path, "iid": str(iid)},
     )
-    nodes = (((data.get("project") or {}).get("workItems") or {}).get("nodes")) or []
+    project_data = data.get("project")
+    if project_data is None:
+        if require_project:
+            raise GitLabError(404, f"project '{project.id}' not found")
+        return None
+    nodes = (project_data.get("workItems") or {}).get("nodes") or []
     return nodes[0] if nodes else None
 
 
@@ -1396,9 +1466,9 @@ def _normalise_gl_work_item_state(state: str | None) -> str:
 
 
 _WORK_ITEM_UPDATE_HIERARCHY_MUTATION = (
-    "mutation($id: WorkItemID!, $parentId: WorkItemID, $removeParent: Boolean) {"
+    "mutation($id: WorkItemID!, $parentId: WorkItemID) {"
     "workItemUpdate(input: {id: $id, hierarchyWidget: {"
-    "parentId: $parentId, removeParent: $removeParent"
+    "parentId: $parentId"
     "}}) {"
     "workItem {"
     "id iid "
@@ -1428,7 +1498,6 @@ def _gitlab_set_work_item_parent(
     variables: dict[str, Any] = {
         "id": work_item_id,
         "parentId": parent_id,
-        "removeParent": parent_id is None,
     }
     data = _gitlab_graphql(
         client, project, _WORK_ITEM_UPDATE_HIERARCHY_MUTATION, variables,
@@ -1469,12 +1538,20 @@ def _gitlab_add_hierarchy_relation(
     else:
         subject_iid, new_parent_iid = target_iid, ticket_id
 
-    subject_wi = _gitlab_fetch_work_item(client, project, subject_iid)
+    subject_wi = _gitlab_fetch_work_item(
+        client, project, subject_iid, require_project=True,
+    )
     if subject_wi is None:
-        raise RelationNotFound(kind=kind, ticket_id=ticket_id, target=f"#{target_iid}")
-    parent_wi = _gitlab_fetch_work_item(client, project, new_parent_iid)
+        raise GitLabError(
+            404, _not_found_message("ticket", f"{project.id}#{subject_iid}")
+        )
+    parent_wi = _gitlab_fetch_work_item(
+        client, project, new_parent_iid, require_project=True,
+    )
     if parent_wi is None:
-        raise RelationNotFound(kind=kind, ticket_id=ticket_id, target=f"#{target_iid}")
+        raise GitLabError(
+            404, _not_found_message("ticket", f"{project.id}#{new_parent_iid}")
+        )
 
     existing_parent = _gitlab_work_item_parent(subject_wi)
     if existing_parent and str(existing_parent.get("iid")) == str(new_parent_iid):
@@ -3049,7 +3126,14 @@ class GitLabProvider(
         path = _project_path(project)
         with _client(project, token) as client:
             r = client.get(f"/projects/{path}/merge_requests/{pr_id}")
-            _check(r)
+            try:
+                _check(r)
+            except GitLabError as exc:
+                if exc.status == 404 and not _is_project_not_found_message(exc.message):
+                    raise GitLabError(
+                        404, _not_found_message("PR", f"{project.id}#{pr_id}")
+                    ) from exc
+                raise
             raw_mr = r.json()
             approvals = _fetch_mr_approvals(client, path, pr_id)
             pr = _map_mr(raw_mr, project, approvals=approvals)
@@ -3204,7 +3288,14 @@ class GitLabProvider(
         markers = _marker_set(project)
         with _client(project, token) as client:
             r0 = client.get(f"/projects/{path}/merge_requests/{pr_id}")
-            _check(r0)
+            try:
+                _check(r0)
+            except GitLabError as exc:
+                if exc.status == 404 and not _is_project_not_found_message(exc.message):
+                    raise GitLabError(
+                        404, _not_found_message("PR", f"{project.id}#{pr_id}")
+                    ) from exc
+                raise
             current = r0.json()
             current_labels = set(current.get("labels") or [])
 
@@ -3787,6 +3878,10 @@ class GitLabProvider(
             try:
                 _check(r)
             except GitLabError as exc:
+                if exc.status == 404 and not _is_project_not_found_message(exc.message):
+                    raise GitLabError(
+                        404, _not_found_message("PR", f"{project.id}#{pr_id}")
+                    ) from exc
                 if exc.status == 405:
                     # GitLab returns 405 for both "already merged" and
                     # "not mergeable" (conflict, pending CI, unresolved
@@ -4274,7 +4369,14 @@ class GitLabProvider(
             r = client.get(
                 f"/projects/{path}/issues/{ticket_id}/related_merge_requests",
             )
-            _check(r)
+            try:
+                _check(r)
+            except GitLabError as exc:
+                if exc.status == 404 and not _is_project_not_found_message(exc.message):
+                    raise GitLabError(
+                        404, _not_found_message("ticket", f"{project.id}#{ticket_id}")
+                    ) from exc
+                raise
             related = r.json()
             if not related:
                 return [], []

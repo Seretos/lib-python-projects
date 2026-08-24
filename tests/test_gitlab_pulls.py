@@ -470,6 +470,51 @@ def test_get_pr_returns_pr_and_filtered_comments(
     assert comments[0].body == "comment"
 
 
+def test_get_pr_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R6 (epic #224 / ticket #219): get_pr on a missing MR must wrap the
+    raw 404 into the canonical `PR '<project>#<id>' not found` shape —
+    today the raw GitLab body message leaks straight through."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/77"):
+            return _json({"message": "404 Not found"}, status_code=404)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().get_pr(_project(), "t", "77")
+    assert exc.value.status == 404
+    assert "PR 'acme#77' not found" in exc.value.message
+
+
+def test_get_pr_project_404_not_relabelled_as_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """get_pr builds its URL from `_project_path(project)` — a pure
+    local string formatter with no live existence check — and issues a
+    single GET. GitLab returns the same HTTP 404 whether the *project
+    path* fails to resolve or the MR id inside a valid project doesn't
+    exist; the two are distinguishable only by message content. A
+    genuine `404 Project Not Found` must surface as itself, never
+    relabelled `PR '...' not found` (epic #224 review finding)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("merge_requests/77"):
+            return _json({"message": "404 Project Not Found"}, status_code=404)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().get_pr(_project(), "t", "77")
+    assert exc.value.status == 404
+    assert "PR" not in exc.value.message
+    assert "Project Not Found" in exc.value.message
+
+
 # ---------- get_pr approval state (ticket #52 F9) ---------------------------
 
 
@@ -1089,6 +1134,48 @@ def test_create_pr_source_branch_invalid_reason_propagates_unchanged(
 
 
 # ---------- update_pr -------------------------------------------------------
+
+
+def test_update_pr_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R8 (epic #224 / ticket #219): update_pr on a missing MR must wrap
+    the raw 404 into the canonical `PR '<project>#<id>' not found`
+    shape — GitHub's `update_pr` already normalizes this (reference
+    behaviour, `test_update_pr_404_names_pr` in test_github_errors.py);
+    GitLab has none of it yet."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET":
+            return _json({"message": "404 Not found"}, status_code=404)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().update_pr(_project(), "t", "77", title="x")
+    assert exc.value.status == 404
+    assert "PR 'acme#77' not found" in exc.value.message
+
+
+def test_update_pr_project_404_not_relabelled_as_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_pr's initial GET (used to read current labels/state before
+    the PUT) 404s identically for a bad project path and a missing MR
+    id. A genuine `404 Project Not Found` must surface as itself, never
+    relabelled `PR '...' not found` (epic #224 review finding)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET":
+            return _json({"message": "404 Project Not Found"}, status_code=404)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().update_pr(_project(), "t", "77", title="x")
+    assert exc.value.status == 404
+    assert "PR" not in exc.value.message
+    assert "Project Not Found" in exc.value.message
 
 
 def test_update_pr_status_close(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1894,11 +1981,62 @@ def test_gitlab_merge_pr_405_non_conflict_reason_omits_resolve_conflicts_guidanc
     assert "resolve conflicts" not in exc.value.message
 
 
+def test_merge_pr_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R7 (epic #224 / ticket #219): a 404 from the merge PUT itself —
+    the genuinely-missing-MR case — must wrap into the canonical
+    `PR '<project>#<id>' not found` shape, added as a new branch on the
+    existing `except GitLabError` before the 405 branch. Kept narrow to
+    this one status code: the sibling
+    `test_gitlab_merge_pr_non_405_error_passthrough` test right below
+    is the negative counterpart proving a non-404/405 failure on an
+    MR that DOES exist (409/422) is never relabelled `PR ... not
+    found` — only a genuine 404 is."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "404 Not found"}, status_code=404)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "77", merge_method="merge")
+    assert exc.value.status == 404
+    assert "PR 'acme#77' not found" in exc.value.message
+
+
+def test_merge_pr_project_404_not_relabelled_as_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The merge PUT itself 404s identically for a bad project path and
+    a genuinely missing MR id. A `404 Project Not Found` body must
+    surface as itself, never relabelled `PR '...' not found` — the
+    narrow 404 branch added alongside merge_pr's 405 handling must not
+    conflate the two (epic #224 review finding)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT" and "/merge" in str(req.url):
+            return _json({"message": "404 Project Not Found"}, status_code=404)
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().merge_pr(_project(), "t", "77", merge_method="merge")
+    assert exc.value.status == 404
+    assert "PR" not in exc.value.message
+    assert "Project Not Found" in exc.value.message
+
+
 def test_gitlab_merge_pr_non_405_error_passthrough(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A non-405 error from the merge PUT (e.g. 409/422) re-raises
-    unchanged, and no probe GET is issued at all."""
+    unchanged, and no probe GET is issued at all. Negative counterpart
+    to `test_merge_pr_404_names_pr` above (epic #224 / ticket #219):
+    proves the new 404 branch doesn't swallow other statuses — an
+    existing-MR failure (409 conflict) must NOT be relabelled
+    `PR ... not found`."""
     from lib_python_projects.providers.gitlab import GitLabError
 
     request_methods: list[str] = []

@@ -256,6 +256,26 @@ def test_ticket_not_found_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     assert exc.value.status == 404
 
 
+def test_list_runs_for_ticket_404_names_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R9 (epic #224 / ticket #219/#220.3): the message on the genuine
+    404 above must be normalized to the canonical `ticket
+    '<project>#<id>' not found` shape — the raise-vs-return shape stays
+    unchanged (this is message-only normalization), only the wording."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/42":
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    provider = GitHubProvider()
+    with pytest.raises(GitHubError) as exc:
+        provider.list_runs_for_ticket(_project(), token="t", ticket_id="42")
+    assert exc.value.status == 404
+    assert "ticket 'acme#42' not found" in exc.value.message
+
+
 def test_ticket_is_pr_but_pr_fetch_fails_returns_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

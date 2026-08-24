@@ -738,6 +738,166 @@ def test_add_relation_self_relation_gitlab(
         GitLabProvider().add_relation(_project(), "t", "5", "relates_to", "#5")
 
 
+# ---------- R5: issue-link 404 names both ids (epic #224 / ticket #219) -----
+
+
+def test_add_relation_relates_to_404_names_both_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation 'relates_to' whose issue-links POST 404s (source or
+    target issue doesn't exist — GitLab's error doesn't disambiguate)
+    must raise GitLabError(404, "ticket 'acme#5' or 'acme#9' not found")
+    naming both ids, with no extra HTTP request beyond what the handler
+    already sees today."""
+    seen_requests: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"id": 42})
+        if "/issues/5/links" in url and req.method == "POST":
+            return _json({"message": "404 Not found"}, status_code=404)
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    seen_requests = _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "relates_to", "#9")
+    assert exc.value.status == 404
+    assert "ticket 'acme#5' or 'acme#9' not found" in exc.value.message
+    # No extra HTTP request beyond project-id resolution + the link POST.
+    assert len(seen_requests) == 2
+
+
+def test_add_relation_duplicate_of_404_names_both_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation 'duplicate_of' whose issue-links POST 404s (via
+    `_gitlab_mark_duplicate_of` -> `_gitlab_post_issue_link`) must also
+    get the two-id message — the source issue GET succeeds first, so
+    this is unambiguous only at the link-POST layer."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"id": 42})
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({
+                "iid": 5, "description": "original body", "labels": [],
+                "state": "opened", "title": "Source",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/5",
+            })
+        if req.method == "POST" and "/issues/5/links" in url:
+            return _json({"message": "404 Not found"}, status_code=404)
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "duplicate_of", "#9")
+    assert exc.value.status == 404
+    assert "ticket 'acme#5' or 'acme#9' not found" in exc.value.message
+
+
+def test_add_relation_duplicate_of_source_missing_names_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """add_relation 'duplicate_of' whose *source* GET (the earlier,
+    unambiguous read in `_gitlab_mark_duplicate_of`) 404s must name only
+    the source — a single-id message, since the link POST is never
+    reached to know anything about the target."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({"message": "404 Issue Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "duplicate_of", "#9")
+    assert exc.value.status == 404
+    assert exc.value.message == "ticket 'acme#5' not found"
+
+
+def test_add_relation_duplicate_of_source_project_404_not_relabelled_as_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_gitlab_mark_duplicate_of`'s source GET (built from
+    `_project_path(project)`, no live existence check) 404s identically
+    for a bad project path and a genuinely missing source issue. A
+    `404 Project Not Found` body must surface as itself, never
+    relabelled `ticket '...' not found` (epic #224 review finding) —
+    the sibling case right above this one, source-missing, is the
+    positive counterpart proving a genuine issue-404 still gets
+    relabelled."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _json({"message": "404 Project Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "duplicate_of", "#9")
+    assert exc.value.status == 404
+    assert "ticket" not in exc.value.message
+    assert "Project Not Found" in exc.value.message
+
+
+def test_add_relation_relates_to_project_404_not_relabelled_as_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine project-404 from `_resolve_gitlab_project_numeric_id`
+    (the target project path doesn't resolve at all) must NOT be
+    relabelled as a ticket-404 — it precedes and is unrelated to the
+    issue-links POST that the two-id message is about."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"message": "404 Project Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "relates_to", "#9")
+    assert exc.value.status == 404
+    assert "ticket" not in exc.value.message
+    assert "Project Not Found" in exc.value.message
+
+
+def test_add_relation_relates_to_link_post_project_404_not_relabelled_as_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Epic #224 review round 2, blocking finding 1: `_gitlab_post_issue_link`'s
+    two-id 404 rewrap had no project-404 guard. For `relates_to`, the
+    issue-links POST (`/projects/{source_project_path}/issues/{source_iid}
+    /links`) is the request whose *own* 404 is being rewrapped here — the
+    preceding GET only resolves the *target* project id via
+    `_resolve_gitlab_project_numeric_id` (same path as source in this
+    same-project-only call, but a distinct request). If that POST itself
+    404s with a project-level body (`404 Project Not Found`), it must
+    surface as itself, never relabelled as the two-id ticket message —
+    the sibling positive case right above
+    (`test_add_relation_relates_to_project_404_not_relabelled_as_ticket`)
+    covers the earlier GET's project-404; this one covers the POST's own."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _json({"id": 42})
+        if req.method == "POST" and "/issues/5/links" in url:
+            return _json({"message": "404 Project Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "relates_to", "#9")
+    assert exc.value.status == 404
+    assert "ticket" not in exc.value.message
+    assert "Project Not Found" in exc.value.message
+
+
 # ---------- R1: remove_relation duplicate_of strips body line ----------------
 
 
@@ -1433,7 +1593,37 @@ def test_add_relation_parent_via_work_items_graphql_returns_relation(
     assert relation.resolved is True
     assert captured_mutation["id"] == "gid://gitlab/WorkItem/5"
     assert captured_mutation["parentId"] == "gid://gitlab/WorkItem/7"
-    assert captured_mutation["removeParent"] is False
+    # Ticket #217: `removeParent` was an invalid GraphQL argument on this
+    # mutation — the fixed variables dict must not carry it at all, on
+    # either the add or the remove path.
+    assert "removeParent" not in captured_mutation
+
+
+def test_hierarchy_mutation_declares_no_remove_parent() -> None:
+    """R1: `_WORK_ITEM_UPDATE_HIERARCHY_MUTATION` (ticket #217) must not
+    declare or reference `$removeParent` anywhere — neither in the
+    mutation's variable declaration nor in the `hierarchyWidget` input —
+    since GitLab's `workItemUpdate` mutation has no such argument.
+    Asserted against the full mutation string (not a substring check) so
+    a mutation still carrying a leftover `$removeParent` declaration
+    cannot slip through."""
+    assert "removeParent" not in gitlab_mod._WORK_ITEM_UPDATE_HIERARCHY_MUTATION
+    assert (
+        gitlab_mod._WORK_ITEM_UPDATE_HIERARCHY_MUTATION
+        == (
+            "mutation($id: WorkItemID!, $parentId: WorkItemID) {"
+            "workItemUpdate(input: {id: $id, hierarchyWidget: {"
+            "parentId: $parentId"
+            "}}) {"
+            "workItem {"
+            "id iid "
+            "widgets { ... on WorkItemWidgetHierarchy { parent { id iid title webUrl state } } }"
+            "} "
+            "errors"
+            "}"
+            "}"
+        )
+    )
 
 
 def test_add_relation_child_via_work_items_graphql_returns_relation(
@@ -1511,8 +1701,12 @@ def test_add_relation_parent_already_exists_raises(
 def test_add_relation_parent_target_not_found_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Target iid doesn't resolve to a work item -> RelationNotFound, not
-    a crash."""
+    """R3: target iid doesn't resolve to a work item -> a provider 404
+    (`GitLabError`), not `RelationNotFound` — ticket #219's message
+    normalization requires a real HTTP-shaped error here, since
+    `RelationNotFound`'s message is phrased for *removal* ("no relation
+    ... found to remove"), which reads wrong for a target that was never
+    reachable to add a relation to in the first place."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         url = str(req.url)
@@ -1529,13 +1723,141 @@ def test_add_relation_parent_target_not_found_raises(
         raise AssertionError(f"unexpected {req.method} {req.url}")
 
     _install_mock(monkeypatch, handler)
-    with pytest.raises(RelationNotFound):
+    with pytest.raises(GitLabError) as exc:
         GitLabProvider().add_relation(_project(), "t", "5", "parent", "#999")
+    assert exc.value.status == 404
+    assert "ticket 'acme#999' not found" in exc.value.message
+
+
+def test_add_relation_parent_subject_not_found_names_subject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 additional coverage: when the *subject* (ticket_id, iid 5) is
+    the one that fails to resolve — not the target (iid 7, which does
+    resolve) — the 404 message must name the subject's iid (acme#5), not
+    the target's."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            iid = int(variables["iid"])
+            if iid == 5:
+                return _graphql_response({"project": {"workItems": {"nodes": []}}})
+            if iid == 7:
+                return _graphql_response({
+                    "project": {"workItems": {"nodes": [_work_item(7, title="Epic 7")]}}
+                })
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "parent", "#7")
+    assert exc.value.status == 404
+    assert "ticket 'acme#5' not found" in exc.value.message
+    assert "acme#7" not in exc.value.message
+
+
+def test_add_relation_child_target_not_found_names_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 additional coverage, swapped direction: for `kind='child'`, the
+    *target* iid (7) is the one whose work item is mutated (the
+    "subject" in `_gitlab_add_hierarchy_relation`'s internal sense), so
+    a missing target must name acme#7 — the subject/target labels are
+    swapped relative to the 'parent' branch."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            iid = int(variables["iid"])
+            if iid == 7:
+                return _graphql_response({"project": {"workItems": {"nodes": []}}})
+            if iid == 5:
+                return _graphql_response({
+                    "project": {"workItems": {"nodes": [_work_item(5, title="Issue 5")]}}
+                })
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "child", "#7")
+    assert exc.value.status == 404
+    assert "ticket 'acme#7' not found" in exc.value.message
+
+
+def test_add_relation_parent_project_not_found_is_not_ticket_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 defect-class closure: when the *project itself* doesn't resolve
+    (GitLab's Work Items GraphQL returns HTTP 200 with `project: null` —
+    there is no 404 status/message to gate on the way the REST sites
+    do), `_gitlab_add_hierarchy_relation` must not relabel that as
+    `ticket '...' not found`. The response already distinguishes the two
+    cases with no extra request: `project: null` means the project
+    didn't resolve, vs. a non-null project with empty `workItems.nodes`
+    meaning the iid is missing inside a project that does exist. Only
+    the iid fetch for the *subject* (iid 5) is expected here — a
+    project-resolution failure must short-circuit before ever looking up
+    the new-parent iid (7)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            iid = int(variables["iid"])
+            if iid == 5:
+                return _graphql_response({"project": None})
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "parent", "#7")
+    assert exc.value.status == 404
+    assert "ticket" not in exc.value.message
+    assert "not found" in exc.value.message.lower()
+    assert "project" in exc.value.message.lower()
+
+
+def test_remove_relation_parent_project_not_found_still_raises_relation_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Additional coverage — the project-null disambiguation added to
+    `_gitlab_fetch_work_item` for `_gitlab_add_hierarchy_relation` must
+    be opt-in: `_gitlab_remove_hierarchy_relation`'s `RelationNotFound`
+    behaviour (pinned by `tests/test_provider_parity.py`'s
+    `RelationNotFound` invariants) is deliberately untouched by this
+    package, so an unresolved project on the remove path must still
+    collapse to the same `RelationNotFound` it raised before this fix,
+    not a `GitLabError`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            iid = int(variables["iid"])
+            if iid == 5:
+                return _graphql_response({"project": None})
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(RelationNotFound):
+        GitLabProvider().remove_relation(_project(), "t", "5", "parent", "#7")
 
 
 def test_remove_relation_parent_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    """remove_relation(kind='parent') clears the stored parent edge via
-    `removeParent: true` when it matches `target`."""
+    """R2: remove_relation(kind='parent') clears the stored parent edge
+    via an explicit `parentId: null` mutation variable when it matches
+    `target` — ticket #217 replaced the invalid `removeParent: true`
+    argument with this. An *omitted* nullable GraphQL variable means
+    "leave unchanged"; an explicit `null` value is what actually clears
+    it, so `parentId` must be present in the captured variables with
+    value `None`, and `removeParent` must not appear at all."""
     captured_mutation: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -1563,9 +1885,9 @@ def test_remove_relation_parent_success(monkeypatch: pytest.MonkeyPatch) -> None
     _install_mock(monkeypatch, handler)
     result = GitLabProvider().remove_relation(_project(), "t", "5", "parent", "#7")
     assert result == {"removed": True}
-    assert captured_mutation["id"] == "gid://gitlab/WorkItem/5"
-    assert captured_mutation["parentId"] is None
-    assert captured_mutation["removeParent"] is True
+    assert captured_mutation == {"id": "gid://gitlab/WorkItem/5", "parentId": None}
+    assert "parentId" in captured_mutation
+    assert "removeParent" not in captured_mutation
 
 
 def test_remove_relation_parent_mismatch_raises_not_found(
