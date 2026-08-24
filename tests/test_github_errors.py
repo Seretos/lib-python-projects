@@ -201,18 +201,24 @@ def test_add_pr_review_comment_404_names_pr(
     assert "PR 'acme#55' not found" in exc.value.message
 
 
-def test_add_pr_review_comment_reply_404_propagates_raw(
+def test_add_pr_review_comment_reply_404_names_review_comment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The reply shape (in_reply_to) is ambiguous on 404: it could mean the
-    PR is missing OR that the in_reply_to comment id doesn't exist. Since
-    the provider can't disambiguate from status alone, it must NOT claim
-    the PR is missing — the raw 404 propagates unchanged instead of being
-    rewrapped (unlike the unambiguous new-thread shape above).
+    """R10 (epic #224 / ticket #219.2): a 404 from resolving the reply
+    branch's `in_reply_to` node id (`GET /pulls/comments/{id}`) is now
+    unambiguous PER CALL SITE — this specific lookup only ever fails
+    because that review-comment id doesn't exist, so it is rewrapped
+    into `review comment '123' not found` rather than left as a raw,
+    un-actionable 404. (The previous rationale — that a 404 here was
+    "ambiguous between a missing PR and a missing in_reply_to id" — is
+    superseded by #219.2's per-call-site rewrap: the node-id lookup and
+    the pending-review-create call are two separate requests, each
+    rewrapped with the specific resource id relevant to it, at line
+    5175 vs 5180.)
 
-    Under #205's flow, the reply branch resolves `in_reply_to`'s node id
-    via `GET /pulls/comments/{id}` before touching any pending review —
-    that lookup is where this 404 originates."""
+    Ticket #205 fix-round 2's invariant still holds: the node-id lookup
+    happens BEFORE any pending review is created, so no
+    `POST /pulls/55/reviews` should ever be issued for this failure."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
@@ -222,7 +228,7 @@ def test_add_pr_review_comment_reply_404_propagates_raw(
             return _json({"message": "Not Found"}, status_code=404)
         raise AssertionError(f"unexpected request: {req.method} {path}")
 
-    _install_mock(monkeypatch, handler)
+    seen = _install_mock(monkeypatch, handler)
     with pytest.raises(GitHubError) as exc:
         GitHubProvider().add_pr_review_comment(
             _project(),
@@ -232,8 +238,53 @@ def test_add_pr_review_comment_reply_404_propagates_raw(
             in_reply_to="123",
         )
     assert exc.value.status == 404
-    assert exc.value.message == "Not Found"
-    assert "PR 'acme#55' not found" not in exc.value.message
+    assert exc.value.message == "review comment '123' not found"
+    assert not any(
+        r.method == "POST" and r.url.path == "/repos/acme/backend/pulls/55/reviews"
+        for r in seen
+    )
+
+
+def test_add_pr_review_comment_reply_create_review_404_names_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R11 (epic #224 / ticket #219.2): when the reply branch's node-id
+    lookup succeeds but no pending review exists yet, and the
+    subsequent `POST /pulls/55/reviews` (`_create_pending_review`) then
+    404s, the only id in THAT request that could 404 is the PR itself —
+    unambiguous, so it is rewrapped into `PR 'acme#55' not found`.
+
+    Because the review was never actually created, no orphan-cleanup
+    `DELETE` may be attempted."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/55/reviews":
+            return _json([])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/123":
+            return _json({
+                "id": 123, "node_id": "PARENT_NODE_123", "user": {"login": "me"},
+                "body": "parent", "path": "src/foo.py", "line": 10, "side": "RIGHT",
+                "commit_id": "abc123", "in_reply_to_id": None,
+                "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z",
+                "html_url": "https://github.com/acme/backend/pull/55#discussion_r123",
+            })
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/55/reviews":
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().add_pr_review_comment(
+            _project(),
+            token="t",
+            pr_id="55",
+            body="reply text",
+            in_reply_to="123",
+        )
+    assert exc.value.status == 404
+    assert exc.value.message == "PR 'acme#55' not found"
+    assert not any(r.method == "DELETE" for r in seen)
 
 
 def test_add_pr_review_comment_success_unchanged(
@@ -659,6 +710,22 @@ def test_update_pr_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "PR 'acme#99999' not found" in exc.value.message
 
 
+def test_get_pr_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R6 (epic #224 / ticket #219): get_pr on a missing PR must wrap the
+    raw 404 into the canonical `PR '<project>#<id>' not found` shape,
+    mirroring update_pr's existing behaviour above — get_pr had none of
+    this normalization yet."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().get_pr(_project(), token="t", pr_id="55")
+    assert exc.value.status == 404
+    assert "PR 'acme#55' not found" in exc.value.message
+
+
 def test_create_pr_head_branch_missing_422_names_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -785,7 +852,11 @@ def _minimal_issue_payload(number: int, internal_id: int = 1001) -> dict:
 def test_add_relation_bogus_target_names_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """add_relation with a missing target issue produces 'target #NN not found'."""
+    """R4 (epic #224 / ticket #219): add_relation with a missing target
+    issue must produce the canonical `ticket '<project>#<id>' not
+    found` shape — the old bespoke `target issue #NN not found in
+    owner/repo` wording is retired in favour of the shape shared by
+    every other 404 on this surface."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         # Target fetch (issue/99) → 404
@@ -799,7 +870,7 @@ def test_add_relation_bogus_target_names_target(
             _project(), token="t", ticket_id="1", kind="child", target="#99",
         )
     assert exc.value.status == 404
-    assert "target issue #99 not found in acme/backend" in exc.value.message
+    assert "ticket 'acme#99' not found" in exc.value.message
 
 
 def test_add_relation_bogus_ticket_id_names_ticket(

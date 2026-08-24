@@ -220,6 +220,176 @@ def test_add_pr_review_comment_second_new_thread_reuses_pending_review(
     )
 
 
+# ---------- epic #224 (220.2): null GraphQL payload -> structured 422 -------
+#
+# GitHub can return `thread: null` / `comment: null` from these mutations
+# with NO top-level `errors[]` key — the existing `resp_body.get("errors")`
+# guard never fires, so the un-guarded payload navigation
+# (`resp_body["data"][...]["thread"]["comments"]["nodes"]`) raises a raw
+# `TypeError: 'NoneType' object is not subscriptable` that escapes
+# `add_pr_review_comment`'s own `except GitHubError` handler entirely.
+# These tests cover only the two diagnosed null shapes — NOT `{"data":
+# null}` (a standard GraphQL top-level failure) or an empty `nodes` list
+# (the thread WAS created), which are different failure modes this fix
+# must not misclassify as "could not resolve diff location".
+
+
+def test_add_thread_to_pending_review_null_thread_raises_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R12: a second new-thread comment (pending review already exists,
+    routed through `_add_thread_to_pending_review`'s GraphQL call) whose
+    response is `{"data": {"addPullRequestReviewThread": {"thread":
+    null}}}` with no `errors` key must raise a structured `GitHubError`
+    (422) instead of crashing with `TypeError` — `add_pr_review_comment`'s
+    outer handler then converts that 422 into the actionable "could not
+    resolve diff location" message (no new user-facing wording is
+    invented here)."""
+    pending = _pending_review()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "POST" and path == "/graphql":
+            return _json(
+                {"data": {"addPullRequestReviewThread": {"thread": None}}}
+            )
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(github_mod.GitHubError) as exc:
+        GitHubProvider().add_pr_review_comment(
+            _project(),
+            token="t",
+            pr_id="7",
+            body="second nit",
+            path="src/bar.py",
+            line=20,
+            side="RIGHT",
+            commit_sha="abc123",
+        )
+    assert exc.value.status == 422
+    assert "could not resolve diff location" in exc.value.message
+    assert "path='src/bar.py'" in exc.value.message
+    assert "line=20" in exc.value.message
+    assert "commit_sha='abc123'" in exc.value.message
+
+
+def test_add_thread_to_pending_review_errors_key_still_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Additional coverage (must already pass — pre-existing behaviour):
+    the pre-existing `errors[]`-populated path via `_graphql_review_error`
+    is untouched by the null-payload guard and must stay 422."""
+    pending = _pending_review()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "POST" and path == "/graphql":
+            return _json(
+                {"errors": [{"type": "UNPROCESSABLE", "message": "bad position"}]}
+            )
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(github_mod.GitHubError) as exc:
+        GitHubProvider().add_pr_review_comment(
+            _project(),
+            token="t",
+            pr_id="7",
+            body="second nit",
+            path="src/bar.py",
+            line=20,
+            side="RIGHT",
+            commit_sha="abc123",
+        )
+    assert exc.value.status == 422
+
+
+def test_add_thread_to_pending_review_top_level_data_null_not_mislabeled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boundary test (epic #224 critique-gate note 4): `{"data": null}`
+    with no top-level `errors` key is the standard GraphQL
+    top-level-failure shape — a genuinely different failure mode from
+    the diagnosed `thread: null` case. The null-payload guard must not
+    be widened to swallow it: it must NOT come out as the friendly
+    "could not resolve diff location" 422 (that would misrepresent a
+    top-level GraphQL failure as a diff-location problem). This repo's
+    fix deliberately leaves this shape unguarded — it surfaces as the
+    raw `TypeError` from navigating `None["addPullRequestReviewThread"]`,
+    the same way it did before the #220.2 fix, because widening the
+    guard to cover it is explicitly out of scope."""
+    pending = _pending_review()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "POST" and path == "/graphql":
+            return _json({"data": None})
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(TypeError):
+        GitHubProvider().add_pr_review_comment(
+            _project(),
+            token="t",
+            pr_id="7",
+            body="second nit",
+            path="src/bar.py",
+            line=20,
+            side="RIGHT",
+            commit_sha="abc123",
+        )
+
+
+def test_add_thread_to_pending_review_empty_nodes_not_mislabeled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boundary test (epic #224 critique-gate note 4): an empty
+    `comments.nodes` list means the thread WAS created (GitHub just
+    didn't echo a comment node back) — a different failure mode from a
+    null `thread`. The null-payload guard only fires on `thread is
+    None`, so it does not intercept this case at all: it must NOT come
+    out as "could not resolve diff location" either. It surfaces as the
+    raw `IndexError` from `nodes[0]` on an empty list, which is the
+    correct (if unfriendly) behaviour for this out-of-scope shape."""
+    pending = _pending_review()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "POST" and path == "/graphql":
+            return _json(
+                {
+                    "data": {
+                        "addPullRequestReviewThread": {
+                            "thread": {"comments": {"nodes": []}}
+                        }
+                    }
+                }
+            )
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(IndexError):
+        GitHubProvider().add_pr_review_comment(
+            _project(),
+            token="t",
+            pr_id="7",
+            body="second nit",
+            path="src/bar.py",
+            line=20,
+            side="RIGHT",
+            commit_sha="abc123",
+        )
+
+
 # ---------- R3: reply mode ---------------------------------------------------
 
 
@@ -258,6 +428,101 @@ def test_add_pr_review_comment_reply_with_pending_review_uses_graphql(
     )
     assert result.id == "9003"
     assert result.in_reply_to == "8001"
+
+
+def test_reply_in_pending_review_null_comment_raises_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R12 (epic #224 / ticket #220.2): a reply (pending review already
+    exists, routed through `_reply_in_pending_review`'s GraphQL call)
+    whose response is `{"data": {"addPullRequestReviewComment":
+    {"comment": null}}}` with no `errors` key must raise a structured
+    `GitHubError` (422) instead of crashing with `TypeError` — same
+    null-payload guard as the new-thread mutation, mirrored onto the
+    reply mutation.
+
+    Decision for the developer-phase note on "what the reply-mode
+    message says" (plan carries this forward as an under-specified
+    observable): `add_pr_review_comment`'s outer `except GitHubError`
+    handler (github.py ~5238-5245) is a single generic wrap shared by
+    both the new-thread and reply branches — ticket #220.2 explicitly
+    keeps it that way ("no new user-facing wording is invented"; step 8
+    of the plan). It is not mode-aware, so on a reply (`in_reply_to` set,
+    `path`/`line`/`commit_sha` all `None` because the caller never
+    supplied them) it renders those three as `None` verbatim rather than
+    omitting them. That is a known, accepted quirk of reusing the
+    existing wrap as-is instead of special-casing reply mode — pinned
+    here explicitly rather than left as a vague "same 422", per this
+    round's critique note asking for the exact reply-mode observable."""
+    pending = _pending_review()
+    parent = _comment(8001, node_id="PARENT_NODE_8001")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8001":
+            return _json(parent)
+        if req.method == "POST" and path == "/graphql":
+            return _json(
+                {"data": {"addPullRequestReviewComment": {"comment": None}}}
+            )
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(github_mod.GitHubError) as exc:
+        GitHubProvider().add_pr_review_comment(
+            _project(), token="t", pr_id="7", body="reply text", in_reply_to="8001",
+        )
+    assert exc.value.status == 422
+    assert "could not resolve diff location" in exc.value.message
+    # Pin the reply-mode quirk explicitly: path/line/commit_sha are all
+    # `None` in reply mode, and the shared outer wrap names them as such.
+    assert "path=None" in exc.value.message
+    assert "line=None" in exc.value.message
+    assert "commit_sha=None" in exc.value.message
+
+
+def test_reply_in_pending_review_null_comment_created_review_cleaned_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Additional coverage: when THIS call created the pending review
+    (none existed yet) and the reply mutation then comes back with a
+    null `comment` (the R12 failure), the existing fix-round-3 cleanup
+    contract must still fire — the just-created, still-empty pending
+    review is deleted rather than left orphaned, exactly as it already
+    does for any other exception from this call."""
+    created_review = _pending_review()
+    parent = _comment(8001, node_id="PARENT_NODE_8001")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([])
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json(created_review)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8001":
+            return _json(parent)
+        if req.method == "POST" and path == "/graphql":
+            return _json(
+                {"data": {"addPullRequestReviewComment": {"comment": None}}}
+            )
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews/900/comments":
+            return _json([])
+        if req.method == "DELETE" and path == "/repos/acme/backend/pulls/7/reviews/900":
+            return httpx.Response(status_code=204)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    with pytest.raises(github_mod.GitHubError) as exc:
+        GitHubProvider().add_pr_review_comment(
+            _project(), token="t", pr_id="7", body="reply text", in_reply_to="8001",
+        )
+    assert exc.value.status == 422
+    assert any(
+        r.method == "DELETE" and r.url.path == "/repos/acme/backend/pulls/7/reviews/900"
+        for r in seen
+    )
 
 
 def test_add_pr_review_comment_reply_with_no_pending_review_creates_one(

@@ -3621,6 +3621,106 @@ def test_get_pr_labels_endpoint_403_does_not_kill_call(
     assert pr.labels == []
 
 
+# ---------- epic #224 (219): 404 message normalization ----------------------
+
+
+def test_get_pr_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R6: get_pr on a missing PR must wrap the raw 404 (ADO's
+    `TF401180`-style leak) into the canonical `PR '<project>#<id>' not
+    found` shape."""
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/77"):
+            return _json(
+                {"message": "TF401180: The pull request 77 does not exist."},
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="77")
+    assert exc.value.status == 404
+    assert "PR 'azure-tests#77' not found" in exc.value.message
+
+
+def test_update_pr_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R8: update_pr on a missing PR must wrap the raw 404 into the
+    canonical `PR '<project>#<id>' not found` shape — the read GET that
+    fetches current state before the PATCH is the wrap boundary."""
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/77"):
+            return _json(
+                {"message": "TF401180: The pull request 77 does not exist."},
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().update_pr(_project(), token="t", pr_id="77", title="x")
+    assert exc.value.status == 404
+    assert "PR 'azure-tests#77' not found" in exc.value.message
+
+
+def test_merge_pr_404_names_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R7: merge_pr's pre-completion GET 404ing on a missing PR (the
+    `TF401180` leak) must wrap into the canonical
+    `PR '<project>#<id>' not found` shape."""
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/77"):
+            return _json(
+                {"message": "TF401180: The pull request 77 does not exist."},
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().merge_pr(_project(), token="t", pr_id="77")
+    assert exc.value.status == 404
+    assert "PR 'azure-tests#77' not found" in exc.value.message
+
+
+def test_get_pr_repository_404_not_relabelled_as_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine repository-404 from `_resolve_repository_id` (the
+    configured repo name doesn't resolve at all) must NOT be relabelled
+    as a PR-404 — it precedes and is unrelated to the PR fetch that
+    `PR '<project>#<id>' not found` is about."""
+    from lib_python_projects.providers.azuredevops import AzureDevOpsError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/git/repositories"):
+            return _json({"value": []})  # no repo matches project.repository
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="77")
+    assert exc.value.status == 404
+    assert "PR " not in exc.value.message
+    assert "repository" in exc.value.message
+
+
 def test_submit_pr_review_author_never_falls_through_to_guid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

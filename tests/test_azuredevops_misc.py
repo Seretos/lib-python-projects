@@ -1416,6 +1416,67 @@ def test_list_runs_for_ticket_limit_applied_after_filtering(
     assert resolved_refs == ["build/10", "build/11", "build/12"]
 
 
+def test_list_runs_for_ticket_404_names_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9 (epic #224 / ticket #219/#220.3): a genuine 404 on the work
+    item fetch (the ticket itself doesn't exist) keeps raising — shape
+    unchanged — but the message must be normalized to the canonical
+    `ticket '<project>#<id>' not found` shape rather than leaking the
+    raw provider text."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/5" in path:
+            return _json(
+                {"message": "TF401232: Work item 5 does not exist."},
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().list_runs_for_ticket(
+            _project(), token="t", ticket_id="5", limit=10
+        )
+    assert exc.value.status == 404
+    assert "ticket 'azure-tests#5' not found" in exc.value.message
+
+
+def test_list_runs_for_ticket_project_404_not_relabelled_as_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Epic #224 review round 2, blocking finding 2: `list_runs_for_ticket`'s
+    work-item GET is built from `_project_scope(project)` with no preceding
+    existence check — unlike `get_pr`/`update_pr`/`merge_pr`, which resolve
+    the repository id first and so structurally cannot conflate a repo-404
+    with a PR-404. A genuine project-level 404 (ADO's real wording:
+    `"TF200016: The following project does not exist"` — see
+    `tests/test_azuredevops_tickets.py`'s
+    `test_list_tickets_area_path_non_area_404_still_raises`) must surface
+    as itself, never relabelled `ticket '...' not found` — the sibling
+    case right above this one (a genuine work-item 404) is the positive
+    counterpart proving a real ticket-404 still gets relabelled."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if "/_apis/wit/workitems/5" in path:
+            return _json(
+                {"message": "TF200016: The following project does not exist"},
+                status_code=404,
+            )
+        raise AssertionError(f"unexpected {path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().list_runs_for_ticket(
+            _project(), token="t", ticket_id="5", limit=10
+        )
+    assert exc.value.status == 404
+    assert "ticket" not in exc.value.message
+    assert "TF200016" in exc.value.message
+
+
 def test_check_400_with_workitem_typekey_becomes_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

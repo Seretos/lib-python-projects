@@ -100,6 +100,7 @@ from lib_python_projects.providers.base import (
     normalize_timestamp,
     _assert_not_self_relation,
     _extract_parent_id,
+    _not_found_message,
     _validate_label_lists,
     _validate_limit,
     _validate_since,
@@ -476,6 +477,42 @@ def _project_scope(project: ProjectConfig) -> str:
             f"path {project.path!r}",
         )
     return f"/{quote(org, safe='')}/{quote(proj, safe='')}"
+
+
+def _is_ado_project_not_found_message(message: str) -> bool:
+    """Detect Azure DevOps' project/organization-level 404 among the
+    work-item/resource-level ones.
+
+    `list_runs_for_ticket`'s work-item GET is built from
+    `_project_scope(project)` (`/{org}/{project}`) with no preceding
+    existence check — unlike `get_pr`/`update_pr`/`merge_pr`, which call
+    `_resolve_repository_id` first and so structurally cannot conflate a
+    repo-404 with a PR-404. Any 404 here would otherwise be unconditionally
+    rewrapped into `ticket '...' not found`, including a genuine
+    project-level 404.
+
+    ADO's real wording for a bad org/project path — confirmed by this
+    repo's own pre-existing
+    `test_list_tickets_area_path_non_area_404_still_raises` /
+    `test_list_tickets_no_area_path_404_still_raises` fixtures in
+    `tests/test_azuredevops_tickets.py` — is
+    `"TF200016: The following project does not exist"`, while a missing
+    work item 404s with `"TF401232: Work item <id> does not exist."`,
+    never mentioning the TF200016 code or the word "project". Anchoring
+    on the TF200016 code (with a wording-only fallback of "project" +
+    "does not exist", in case a future ADO version rephrases without the
+    code) keeps this from matching resource-named 404s.
+
+    This repo has no fixture evidence for an *organization*-level 404's
+    exact wording (a bad org segment may not even reach this code —
+    it can 404/DNS-fail at the HTTP layer before a JSON body exists), so
+    that case is not specifically covered by this predicate; only the
+    project-level TF200016 shape is verified.
+    """
+    lowered = message.lower()
+    return "tf200016" in lowered or (
+        "project" in lowered and "does not exist" in lowered
+    )
 
 
 def _org_scope(project: ProjectConfig) -> str:
@@ -3760,7 +3797,14 @@ class AzureDevOpsProvider(
         )
         with _client(project, token) as c:
             resp = c.get(path, params=_api_version_params())
-        _check(resp)
+        try:
+            _check(resp)
+        except AzureDevOpsError as exc:
+            if exc.status == 404:
+                raise AzureDevOpsError(
+                    404, _not_found_message("PR", f"{project.id}#{pr_id}")
+                ) from exc
+            raise
         raw = resp.json()
         pr = _map_pr(raw, project)
         # ADO's single-PR GET doesn't include labels by default; the
@@ -4315,7 +4359,14 @@ class AzureDevOpsProvider(
         # label branches keeps it to one round-trip.
         with _client(project, token) as c:
             cur_resp = c.get(path, params=_api_version_params())
-        _check(cur_resp)
+        try:
+            _check(cur_resp)
+        except AzureDevOpsError as exc:
+            if exc.status == 404:
+                raise AzureDevOpsError(
+                    404, _not_found_message("PR", f"{project.id}#{pr_id}")
+                ) from exc
+            raise
         cur = cur_resp.json() or {}
         cur_labels = {
             (lbl.get("name") or "")
@@ -4440,7 +4491,14 @@ class AzureDevOpsProvider(
         # Need lastMergeSourceCommit for the completion handshake.
         with _client(project, token) as c:
             resp = c.get(path, params=_api_version_params())
-        _check(resp)
+        try:
+            _check(resp)
+        except AzureDevOpsError as exc:
+            if exc.status == 404:
+                raise AzureDevOpsError(
+                    404, _not_found_message("PR", f"{project.id}#{pr_id}")
+                ) from exc
+            raise
         cur = resp.json() or {}
         if cur.get("status") == "completed" and cur.get("mergeStatus") == "succeeded":
             raise AzureDevOpsError(
@@ -5489,7 +5547,16 @@ class AzureDevOpsProvider(
         )
         with _client(project, token) as c:
             resp = c.get(path, params=_api_version_params({"$expand": "Relations"}))
-        _check(resp)
+        try:
+            _check(resp)
+        except AzureDevOpsError as exc:
+            if exc.status == 404 and not _is_ado_project_not_found_message(
+                exc.message
+            ):
+                raise AzureDevOpsError(
+                    404, _not_found_message("ticket", f"{project.id}#{ticket_id}")
+                ) from exc
+            raise
         build_ids: list[int] = []
         for rel in (resp.json() or {}).get("relations") or []:
             if rel.get("rel") != "ArtifactLink":
