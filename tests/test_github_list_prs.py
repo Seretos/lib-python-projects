@@ -179,6 +179,31 @@ def test_default_filters_route_to_pulls_endpoint(monkeypatch: pytest.MonkeyPatch
     assert seen[0].url.path == "/repos/acme/backend/pulls"
 
 
+def test_plain_pulls_path_leaves_mergeable_fields_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Documentation-backing coverage for ticket #221 — this already
+    passes today; it is not a RED driver. The real `/pulls` list payload
+    doesn't carry `mergeable`/`mergeable_state` at all (unlike the
+    GraphQL batch path, which hard-codes them to `None` regardless of
+    payload — a different mechanism); `_map_pr`'s `raw.get(...)` falls
+    through to `None` for both. Pins this so the corrected docstring's
+    claim about the plain REST-path mechanism can't be silently
+    invalidated."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/acme/backend/pulls"
+        payload = _pr_payload(1)
+        payload.pop("mergeable", None)
+        payload.pop("mergeable_state", None)
+        return _json([payload])
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = GitHubProvider().list_prs(_project(), token="t", filters=PRFilters())
+    assert prs[0].mergeable is None
+    assert prs[0].mergeable_state is None
+
+
 def test_labels_filter_routes_to_search(monkeypatch: pytest.MonkeyPatch) -> None:
     """`PRFilters(labels=[...])` must route to `/search/issues` with `label:` qualifier."""
     stub = _search_pr_stub(10)

@@ -513,7 +513,9 @@ class PullRequest:
     """A pull-request snapshot mirroring `Ticket` but with PR-specific fields.
 
     `id` is the PR number as a string (mirrors `Ticket.id` style).
-    `mergeable` is `None` when GitHub has not yet computed mergeability.
+    `mergeable` is `None` when the provider has not (yet) computed
+    mergeability — see the mergeability note below for the exact
+    per-provider, per-path contract.
 
     Provider-specific fields are nullable on the other provider:
 
@@ -552,11 +554,38 @@ class PullRequest:
             when the approvals endpoint is inaccessible (restricted
             token scope or a self-hosted edition without the API).
 
-    Mergeability note (Issue 6):
-      `list_prs` never populates `mergeable` or `mergeable_state` — the
-      list endpoint does not compute mergeability for cost reasons. Both
-      fields are always `None` in `list_prs` results. Call `get_pr` for
-      the single-PR path, which does populate them.
+    Mergeability note (Issue 6, corrected by ticket #221):
+      `mergeable`/`mergeable_state` in `list_prs` results are NOT
+      uniformly `None` — the contract is per-provider and per-path:
+        * GitHub, plain `/pulls` path (no `labels`/`assignee`/`search`
+          filter): both fields are always `None` because
+          the list payload carries neither key — `_map_pr`'s
+          `raw.get(...)` simply has nothing to read.
+        * GitHub, GraphQL batch path (`github_batch._map_graphql_pr`):
+          both fields are always `None` too, but for a different
+          reason — they are hard-coded to `None` in that mapper
+          regardless of what the payload actually contains.
+        * GitHub, search-filtered path (`labels`, `assignee` or
+          `search` set): `list_prs` routes via `/search/issues` and
+          back-fills every hit with a full `GET /pulls/{n}`, so BOTH
+          fields come back populated exactly as `get_pr` would
+          populate them.
+        * GitLab: `mergeable` is real and tri-state — `True`/`False`/
+          `None` — derived by `_map_mergeable` from
+          `detailed_merge_status` (or the legacy `merge_status`),
+          which GitLab does return on the list endpoint. `None` here
+          means "not computed yet" (`checking`/`unchecked`/absent/
+          unrecognised), not "never populated". `mergeable_state` is
+          GitHub-only and stays `None`.
+        * Azure DevOps: `mergeable` is derived from `mergeStatus` —
+          `True` only for `succeeded`; `False` for `conflicts`,
+          `rejectedByPolicy` and `failure`; `None` while unset,
+          `queued` or `notSet` (and for any unrecognised value).
+          `mergeable_state` stays `None`.
+      `get_pr` remains the authoritative single-PR source on every
+      provider: it always fetches the full payload, so a `None` from
+      `get_pr` really means the provider has not computed
+      mergeability yet.
 
     Reviews note (ticket #148):
       `reviews`: the submitted `Review` objects for this PR/MR. Populated

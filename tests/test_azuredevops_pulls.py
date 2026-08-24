@@ -232,6 +232,72 @@ def test_list_prs_filters_by_label_client_side(
     assert [p.id for p in prs] == ["1"]
 
 
+# ---------- ticket #221: mergeStatus -> mergeable tri-state ------------------
+
+_ABSENT = object()
+
+
+@pytest.mark.parametrize(
+    "merge_status, expected",
+    [
+        ("succeeded", True),
+        ("conflicts", False),
+        ("rejectedByPolicy", False),
+        ("failure", False),
+        ("queued", None),
+        ("notSet", None),
+        (_ABSENT, None),
+        ("someFutureValue", None),
+    ],
+)
+def test_map_pr_mergeable_tri_state_per_merge_status(merge_status, expected) -> None:
+    """Regression #221: `_map_pr` mapped `mergeStatus="conflicts"` to
+    `mergeable=True` — the exact inverse of its meaning, because
+    `"conflicts"` was lumped into the same `in ("succeeded", "conflicts")`
+    tuple as the real success case. Pure-function test, no HTTP mock
+    needed: `_map_pr` only reads `raw`/`project`.
+
+    Expected RED: the `conflicts` case currently returns `True`, and the
+    `someFutureValue` (unrecognised) case currently returns `False`
+    instead of falling through to `None`.
+    """
+    kwargs = {} if merge_status is _ABSENT else {"mergeStatus": merge_status}
+    pr = azure_mod._map_pr(_pr_payload(7, **kwargs), _project())
+    assert pr.mergeable is expected
+
+
+def test_list_prs_mergeable_reflects_merge_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression #221: `list_prs` rows must surface the corrected
+    tri-state `mergeable` mapping — a conflicting ADO PR must not be
+    reported as mergeable. `mergeable_state` is a GitHub-only field and
+    must stay `None` on every row.
+
+    Expected RED: currently `[True, True, None]` (conflicts wrongly
+    maps to True).
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if "/pullrequests" in req.url.path:
+            return _json({
+                "value": [
+                    _pr_payload(1, mergeStatus="conflicts"),
+                    _pr_payload(2, mergeStatus="succeeded"),
+                    _pr_payload(3, mergeStatus="queued"),
+                ]
+            })
+        raise AssertionError(f"unexpected {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = AzureDevOpsProvider().list_prs(_project(), token="t", filters=PRFilters())
+    assert [p.mergeable for p in prs] == [False, True, None]
+    assert all(p.mergeable_state is None for p in prs)
+
+
 def test_repo_id_cache_hits_after_first_resolve(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3497,6 +3563,38 @@ def test_get_pr_fetches_labels_separately(
     _install_mock(monkeypatch, handler)
     pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
     assert pr.labels == ["ai-generated", "shipit"]
+
+
+def test_get_pr_mergeable_false_for_conflicting_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression #221: `_map_pr` is shared by `list_prs`, `get_pr`, the
+    search stub, and `merge_pr`, so the `mergeStatus` mapping fix reaches
+    every call site. This test pins the intended, approved consequence
+    that `get_pr` on a conflicting ADO PR also flips `mergeable`
+    `True -> False` (`merge_pr` is unaffected — it already raises 409 on
+    `conflicts` before `_map_pr` runs).
+
+    Expected RED: currently `mergeable is True` for this payload.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        labels = _labels_handler(req)
+        if labels is not None:
+            return labels
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pullrequests/7"):
+            return _json(_pr_payload(7, mergeStatus="conflicts"))
+        if path.endswith("/threads"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    pr, _ = AzureDevOpsProvider().get_pr(_project(), token="t", pr_id="7")
+    assert pr.mergeable is False
 
 
 def test_get_pr_labels_endpoint_403_does_not_kill_call(
