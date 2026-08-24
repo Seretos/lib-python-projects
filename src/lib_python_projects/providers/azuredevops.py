@@ -1476,6 +1476,31 @@ def _parse_thread_id_from_alias(value: str | None) -> str | None:
     return head or None
 
 
+# ADO `mergeStatus` values meaning the merge definitively cannot
+# proceed. Shared with `_wait_for_merge_status`, whose terminal
+# failure set must stay identical.
+_MERGE_FAILURE_STATUSES = frozenset({"conflicts", "rejectedByPolicy", "failure"})
+
+
+def _map_merge_status(merge_status: str | None) -> bool | None:
+    """Translate ADO's `mergeStatus` into the tri-state `mergeable`.
+
+      - `succeeded`                                  -> True
+      - `conflicts`/`rejectedByPolicy`/`failure`     -> False
+      - `notSet`/`queued`/missing/unrecognised       -> None (not computed)
+
+    Ticket #221: `conflicts` previously mapped to `True` — the exact
+    inverse of its meaning — because it was lumped in with `succeeded`
+    by a single `in (...)` test. Unrecognised values now fall through
+    to `None` rather than `False`, matching `gitlab._map_mergeable`.
+    """
+    if merge_status == "succeeded":
+        return True
+    if merge_status in _MERGE_FAILURE_STATUSES:
+        return False
+    return None
+
+
 def _map_pr(raw: dict, project: ProjectConfig) -> PullRequest:
     """Translate `/_apis/git/repositories/{repo}/pullrequests/{id}` into PR."""
     status_raw = raw.get("status")
@@ -1551,9 +1576,7 @@ def _map_pr(raw: dict, project: ProjectConfig) -> PullRequest:
         head=head,
         base=base_ref_dict,
         merged=merged,
-        mergeable=None
-        if raw.get("mergeStatus") in (None, "queued", "notSet")
-        else raw.get("mergeStatus") in ("succeeded", "conflicts"),
+        mergeable=_map_merge_status(raw.get("mergeStatus")),
         url=_build_pr_url(project, pr_id) if pr_id else "",
         created_at=normalize_timestamp(raw.get("creationDate") or ""),
         updated_at=normalize_timestamp(
@@ -4531,7 +4554,7 @@ class AzureDevOpsProvider(
         `merged=false` even though the merge is done. Cumulative cap
         is ~10s to absorb slow-environment lag.
         """
-        merge_failure = {"conflicts", "rejectedByPolicy", "failure"}
+        merge_failure = _MERGE_FAILURE_STATUSES
         last: dict = {}
         for delay_ms in self._MERGE_SETTLE_DELAYS_MS:
             time.sleep(delay_ms / 1000.0)

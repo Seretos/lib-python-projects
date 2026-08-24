@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import dataclasses
+import inspect
 
 import pytest
 
@@ -616,6 +617,70 @@ class TestPullRequestReviewsField:
         )
         pr = _make_pr(reviews=[rv])
         assert pr.reviews == [rv]
+
+
+# ---------- ticket #221 ----------
+
+
+def test_pullrequest_docstring_documents_per_path_mergeability() -> None:
+    """Ticket #221: the `Mergeability note (Issue 6)` block in
+    `PullRequest`'s docstring falsely claimed `list_prs` never populates
+    `mergeable`/`mergeable_state` and that both are always `None`. Real
+    behaviour is per-provider, per-path: GitHub's plain `/pulls` list
+    payload simply omits the keys (`_map_pr`'s `raw.get(...)` falls
+    through), while `github_batch._map_graphql_pr` hard-codes `None`
+    regardless of payload — two different mechanisms previously
+    conflated under one rationale; GitLab returns a real tri-state
+    `mergeable` from `detailed_merge_status`; GitHub's search-filtered
+    path back-fills full payloads via `/search/issues` + `GET
+    /pulls/{n}`; and Azure DevOps derives `mergeable` from `mergeStatus`
+    (`succeeded`/`rejectedByPolicy`/etc). This guard follows the repo's
+    established `inspect.getdoc` pattern (`tests/test_github_board.py`),
+    including the `__dict__` own-entry check that bypasses
+    `inspect.getdoc`'s MRO fallback to `object.__doc__` — without it,
+    this test would still pass even if the docstring were deleted
+    entirely (ticket #211 caveat).
+
+    Expected RED: the current docstring still says "never populates" and
+    lacks the per-path wording (`tri-state`, `back-fill`, etc).
+    """
+    from lib_python_projects.providers.base import PullRequest
+
+    assert PullRequest.__dict__["__doc__"] is not None
+    doc = inspect.getdoc(PullRequest)
+    assert doc is not None
+
+    # False claims must be gone. Note: the corrected text legitimately
+    # still contains the phrase "always `None`" (for the GitHub
+    # plain-path/batch bullet), so these guards target the specific
+    # false claims rather than that substring.
+    assert "never populates" not in doc
+    assert "does not compute mergeability for cost reasons" not in doc
+    assert "Both fields are always `None` in `list_prs` results" not in doc
+
+    # Positive guards: GitLab's tri-state contract.
+    assert "tri-state" in doc
+    assert "detailed_merge_status" in doc
+
+    # GitHub search-filtered back-fill path (deliberate, test-locked,
+    # unchanged).
+    assert "back-fill" in doc
+    assert "/search/issues" in doc
+
+    # The two distinct GitHub "always None" mechanisms, worded so a
+    # docstring that conflates them under one rationale cannot satisfy
+    # both guards: the plain REST path's payload simply lacks the keys...
+    assert "the list payload carries neither key" in doc
+    # ...while github_batch hard-codes None regardless of payload.
+    assert "github_batch._map_graphql_pr" in doc
+    assert "hard-coded" in doc
+
+    # Azure DevOps mergeStatus mapping.
+    assert "rejectedByPolicy" in doc
+    assert "succeeded" in doc
+
+    # get_pr remains authoritative.
+    assert "`get_pr` remains the authoritative" in doc
 
 
 # ---------- ticket #200 - event aliases / run filters / Ref / Release -------

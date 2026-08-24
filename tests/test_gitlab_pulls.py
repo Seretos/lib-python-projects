@@ -126,6 +126,31 @@ def test_list_prs_state_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
     assert seen == ["opened", "closed", "merged", "all"]
 
 
+def test_list_prs_populates_tri_state_mergeable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Documentation-backing coverage for ticket #221 — this already
+    passes today; it is not a RED driver. It pins GitLab's existing,
+    unchanged tri-state `mergeable` mapping on `list_prs` rows (real,
+    non-null `mergeable` derived by `_map_mergeable` from
+    `detailed_merge_status`, plus the legacy `merge_status` fallback)
+    so the corrected `PullRequest` docstring's GitLab claim can't be
+    silently invalidated by a future provider change. `mergeable_state`
+    is GitHub-only and must stay `None`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json([
+            _mr_payload(1),  # default detailed_merge_status="mergeable"
+            _mr_payload(2, detailed_merge_status="cannot_be_merged"),
+            _mr_payload(3, detailed_merge_status="checking"),
+            _mr_payload(4, detailed_merge_status=None, merge_status="can_be_merged"),
+        ])
+
+    _install_mock(monkeypatch, handler)
+    prs, _ = GitLabProvider().list_prs(_project(), "t", PRFilters())
+    assert [p.mergeable for p in prs[:3]] == [True, False, None]
+    assert prs[3].mergeable is True  # legacy merge_status fallback
+    assert all(p.mergeable_state is None for p in prs)
+
+
 # ---------- has_more boundary regression (ticket #39) -------------------------
 
 
