@@ -308,6 +308,17 @@ class ProjectConfig(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def token_available(self) -> bool:
+        """Whether `token_env` is set on this config AND that environment
+        variable is currently non-empty in the process environment.
+
+        This is **not evidence the token authenticates or is authorized**
+        against the live provider — it only reflects local environment
+        state, not a round-trip to GitHub/GitLab/Azure DevOps. A token can
+        be present and still be expired, revoked, or scoped to the wrong
+        surface (e.g. missing "Work Items" access on Azure DevOps). For an
+        actual read on what the token can do, see
+        `TokenCapabilityProvider.probe_token_capabilities`.
+        """
         return bool(self.token_env and os.environ.get(self.token_env))
 
     permissions: Permissions = Field(default_factory=Permissions)

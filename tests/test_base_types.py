@@ -1046,3 +1046,99 @@ def test_relation_docstring_contrasts_ticket_id_formats() -> None:
     # unrelated prose, so require both sides of the contrast.
     assert "read" in doc.lower()
     assert "write" in doc.lower()
+
+
+# ---------- ticket #231 (Finding 2): partial-flags contract -----------------
+
+
+class TestTokenCapabilitiesPartialFlagsContract:
+    """The `TokenCapabilities`/`TokenCapabilityProvider` docstrings
+    currently mandate all-False flags whenever `reason` is set. That
+    contract is too strict for Azure DevOps's new partial result
+    (`work_items_unavailable`, step 1-3 of the plan): `issues_create`/
+    `issues_modify` go False while the `pulls_*` flags — verified only by
+    the org-scoped `connectionData` call — legitimately stay True. This
+    guard pins the relaxed wording so a future edit can't silently
+    reintroduce the "all flags False" mandate.
+
+    `TokenCapabilities` is a `@dataclass` that already carries a
+    hand-written docstring today, so `inspect.getdoc` reflects it
+    directly; per the plan we rely on content assertions (key phrases)
+    rather than an own-`__dict__`-entry existence check, since a
+    dataclass with no docstring synthesizes a signature-shaped one
+    instead of returning `None` — an own-entry check would only matter if
+    the docstring were removed outright, which isn't in scope here.
+
+    Expected RED: the docstrings still say "all boolean flags should be
+    False" / "all flags False" and do not yet mention
+    "work_items_unavailable" or "partial, surface-specific failure".
+    """
+
+    def test_token_capabilities_docstring_allows_partial_flags(self) -> None:
+        from lib_python_projects.providers.base import TokenCapabilities
+
+        doc = inspect.getdoc(TokenCapabilities)
+        assert doc is not None
+
+        assert "work_items_unavailable" in doc, (
+            "TokenCapabilities docstring must document the new "
+            f"work_items_unavailable reason: {doc!r}"
+        )
+        assert "partial, surface-specific failure" in doc, (
+            "TokenCapabilities docstring must use the pinned phrase "
+            f"'partial, surface-specific failure': {doc!r}"
+        )
+        assert "all boolean flags should be False" not in doc, (
+            "TokenCapabilities docstring still asserts the old "
+            f"all-False-on-any-reason mandate: {doc!r}"
+        )
+
+    def test_token_capability_provider_docstring_allows_partial_flags(
+        self,
+    ) -> None:
+        from lib_python_projects.providers.base import TokenCapabilityProvider
+
+        doc = inspect.getdoc(TokenCapabilityProvider)
+        assert doc is not None
+
+        assert "all flags False" not in doc, (
+            "TokenCapabilityProvider docstring still mandates all-False "
+            f"flags on any failure: {doc!r}"
+        )
+        assert "partial, surface-specific failure" in doc, (
+            "TokenCapabilityProvider docstring must use the pinned "
+            f"phrase 'partial, surface-specific failure': {doc!r}"
+        )
+
+    def test_partial_flags_construct_and_roundtrip(self) -> None:
+        """Structural pinning guard, not expected to be RED — plain
+        dataclass construction already supports this shape today."""
+        from lib_python_projects.providers.base import TokenCapabilities
+
+        caps = TokenCapabilities(
+            issues_create=False,
+            issues_modify=False,
+            pulls_create=True,
+            pulls_modify=True,
+            pulls_merge=True,
+            reason="work_items_unavailable",
+        )
+        assert caps.issues_create is False
+        assert caps.issues_modify is False
+        assert caps.pulls_create is True
+        assert caps.pulls_modify is True
+        assert caps.pulls_merge is True
+        assert caps.reason == "work_items_unavailable"
+
+    def test_no_pipeline_or_board_flag_on_token_capabilities(self) -> None:
+        """Structural pinning guard for the probe docstring's claim (step
+        6c) that there is 'no dedicated pipeline flag' — should already
+        pass; if it ever fails, the probe docstring's claim goes stale
+        too."""
+        import dataclasses
+
+        from lib_python_projects.providers.base import TokenCapabilities
+
+        names = {f.name for f in dataclasses.fields(TokenCapabilities)}
+        assert not any("pipeline" in n for n in names)
+        assert not any("board" in n for n in names)

@@ -12,6 +12,7 @@ Covers the surface not already in `_scaffold` / `_tickets` / `_pulls`:
 """
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Callable
 
@@ -1081,6 +1082,18 @@ class TestNormalizeAzIssues:
 
 
 # ---------- token probe -----------------------------------------------------
+#
+# Ticket #231 (Finding 2): the probe used to grant all five capability
+# flags on the strength of the org-scoped `connectionData` call alone,
+# even though real work-item writes (`create_ticket` etc.) go through a
+# *project*-scoped path that can 401 independently (e.g. a PAT scoped to
+# "Code" but not "Work Items"). The probe now issues a second,
+# project-scoped `GET .../_apis/wit/workitemtypes` call (same shape as
+# `_list_work_item_types`, but a raw GET — not routed through `_check()`,
+# since the probe's contract is "return, never raise") after
+# `connectionData` succeeds, and reports partial flags
+# (`issues_create=False`, `issues_modify=False`, `pulls_*=True`,
+# `reason="work_items_unavailable"`) when that second call fails.
 
 
 def test_token_probe_success_returns_all_flags(
@@ -1089,13 +1102,196 @@ def test_token_probe_success_returns_all_flags(
     def handler(req: httpx.Request) -> httpx.Response:
         if req.url.path.endswith("/_apis/connectionData"):
             return _json({"authenticatedUser": {"id": "u1"}})
-        raise AssertionError
+        if req.url.path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
 
     _install_mock(monkeypatch, handler)
     caps = AzureDevOpsProvider().probe_token_capabilities(_project(), "PAT")
     assert caps.reason is None
     assert caps.issues_create is True
     assert caps.pulls_merge is True
+
+
+def test_token_probe_issues_project_scoped_work_item_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behavioural requirement 1: the probe must actually exercise the
+    work-item surface, not just the org-scoped connectionData call.
+
+    Expected RED: today `probe_token_capabilities` never issues a second
+    request, so no captured request path ends with
+    `/_apis/wit/workitemtypes` and this assertion fails.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/connectionData"):
+            return _json({"authenticatedUser": {"id": "u1"}})
+        if req.url.path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    caps = AzureDevOpsProvider().probe_token_capabilities(_project(), "PAT")
+
+    work_item_calls = [
+        r for r in seen if r.url.path.endswith("/_apis/wit/workitemtypes")
+    ]
+    assert len(work_item_calls) == 1, (
+        f"expected exactly one work-item probe call, saw paths: "
+        f"{[r.url.path for r in seen]}"
+    )
+    assert work_item_calls[0].url.path.endswith(
+        "/seredos/azure-tests/_apis/wit/workitemtypes"
+    ), work_item_calls[0].url.path
+    assert caps.reason is None
+    assert caps.issues_create is True
+    assert caps.issues_modify is True
+    assert caps.pulls_create is True
+    assert caps.pulls_modify is True
+    assert caps.pulls_merge is True
+
+
+def test_token_probe_work_item_call_is_not_memoized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behavioural requirement 1 (plan step 2): the work-item probe call
+    is deliberately NOT cached — a TTL cache would let a revoked
+    work-item permission read "clean" for up to an hour, which is the
+    exact failure this ticket exists to fix. Calling the probe twice on
+    the same provider instance must issue the work-item GET twice.
+
+    Expected RED: today there is no second call at all, so the work-item
+    path never appears in the captured requests (0 times, not 2).
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/connectionData"):
+            return _json({"authenticatedUser": {"id": "u1"}})
+        if req.url.path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"value": [{"name": "Issue"}]})
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    provider = AzureDevOpsProvider()
+    project = _project()
+    provider.probe_token_capabilities(project, "PAT")
+    provider.probe_token_capabilities(project, "PAT")
+
+    work_item_calls = [
+        r for r in seen if r.url.path.endswith("/_apis/wit/workitemtypes")
+    ]
+    assert len(work_item_calls) == 2, (
+        f"expected the work-item probe call issued fresh on every "
+        f"invocation (no memoization), got {len(work_item_calls)} calls"
+    )
+
+
+@pytest.mark.parametrize(
+    "work_item_response",
+    [
+        pytest.param(lambda: _json({"message": "unauthorized"}, 401), id="401"),
+        pytest.param(lambda: _json({"message": "forbidden"}, 403), id="403"),
+        pytest.param(lambda: _json({"message": "not found"}, 404), id="404"),
+        pytest.param(lambda: _json({"message": "boom"}, 500), id="500"),
+        pytest.param(
+            lambda: httpx.Response(
+                status_code=200,
+                content=b"<html>sign in</html>",
+                headers={"Content-Type": "text/html"},
+            ),
+            id="200-non-json",
+        ),
+    ],
+)
+def test_token_probe_work_item_failure_yields_partial_flags(
+    monkeypatch: pytest.MonkeyPatch, work_item_response
+) -> None:
+    """Behavioural requirement 2: a failing work-item probe (non-2xx, or a
+    2xx with an unparseable body — ADO answers some unauthenticated
+    requests with an HTML sign-in page under a 2xx status) must yield
+    partial flags, not a false all-clear and not an all-False collapse.
+    This is the primary regression test for the reported defect.
+
+    Expected RED: today the probe never issues the work-item call at
+    all, so it always returns all-True/`reason=None` regardless of what
+    this handler would have served for `workitemtypes`.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/connectionData"):
+            return _json({"authenticatedUser": {"id": "u1"}})
+        if req.url.path.endswith("/_apis/wit/workitemtypes"):
+            return work_item_response()
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    caps = AzureDevOpsProvider().probe_token_capabilities(_project(), "PAT")
+
+    assert caps.issues_create is False
+    assert caps.issues_modify is False
+    assert caps.pulls_create is True
+    assert caps.pulls_modify is True
+    assert caps.pulls_merge is True
+    assert caps.reason == "work_items_unavailable"
+
+
+def test_token_probe_work_item_401_yields_partial_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same as the parametrized 401 case above, kept as its own named
+    test per the plan (the primary regression test for the reported
+    defect) so it reads clearly in isolation and in CI output.
+
+    Expected RED: identical reason as the parametrized cases — the probe
+    never issues the second call today.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/connectionData"):
+            return _json({"authenticatedUser": {"id": "u1"}})
+        if req.url.path.endswith("/_apis/wit/workitemtypes"):
+            return _json({"message": "unauthorized"}, status_code=401)
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    caps = AzureDevOpsProvider().probe_token_capabilities(_project(), "PAT")
+
+    assert caps.issues_create is False
+    assert caps.issues_modify is False
+    assert caps.pulls_create is True
+    assert caps.pulls_modify is True
+    assert caps.pulls_merge is True
+    assert caps.reason == "work_items_unavailable"
+
+
+def test_token_probe_work_item_transport_error_yields_partial_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transport failure on the *second* call (connectionData already
+    succeeded) must NOT be remapped to `network_error` — one uniform
+    partial result, no all-or-nothing collapse (plan step 3).
+
+    Expected RED: today the second call never happens, so this transport
+    failure is never triggered and the probe returns all-True.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/connectionData"):
+            return _json({"authenticatedUser": {"id": "u1"}})
+        if req.url.path.endswith("/_apis/wit/workitemtypes"):
+            raise httpx.ConnectError("connection refused", request=req)
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    caps = AzureDevOpsProvider().probe_token_capabilities(_project(), "PAT")
+
+    assert caps.issues_create is False
+    assert caps.issues_modify is False
+    assert caps.pulls_create is True
+    assert caps.pulls_modify is True
+    assert caps.pulls_merge is True
+    assert caps.reason == "work_items_unavailable"
 
 
 def test_token_probe_401_means_bad_credentials(
@@ -1119,9 +1315,69 @@ def test_token_probe_403_means_invisible(monkeypatch: pytest.MonkeyPatch) -> Non
     assert caps.reason == "repo_invisible_to_token"
 
 
-def test_token_probe_empty_token() -> None:
+def test_token_probe_empty_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The empty-token guard must short-circuit before any HTTP call is
+    made — mirrors `test_resolve_viewer_login_empty_token_makes_no_http_call`
+    in `tests/test_azuredevops_viewer_identity.py`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for an empty token")
+
+    seen = _install_mock(monkeypatch, handler)
     caps = AzureDevOpsProvider().probe_token_capabilities(_project(), "")
     assert caps.reason == "bad_credentials"
+    assert len(seen) == 0
+
+
+def test_token_probe_bad_credentials_skips_work_item_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behavioural requirement 3: an org-level connectionData failure
+    must short-circuit before the work-item call — no extra round-trip,
+    and the pre-existing `bad_credentials` reason must not be disturbed
+    by the new partial-flags logic.
+
+    This test passes already today (the probe never makes a second call
+    at all yet), but it pins the "skip on org-level failure" branch so a
+    later refactor that always issues the work-item call cannot silently
+    regress it.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/_apis/connectionData"):
+            return _json({"message": "TF400813"}, status_code=401)
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    caps = AzureDevOpsProvider().probe_token_capabilities(_project(), "PAT")
+
+    assert caps.reason == "bad_credentials"
+    assert not any(r.url.path.endswith("workitemtypes") for r in seen)
+
+
+def test_probe_docstring_discloses_unverified_surfaces() -> None:
+    """Behavioural requirement 6 (plan step 6): the probe's docstring
+    must disclose that `pulls_*` remain optimistic (never verified
+    against a real write) and that pipeline access is never probed at
+    all — there is no dedicated pipeline flag on `TokenCapabilities`.
+
+    Expected RED: `probe_token_capabilities` currently has no docstring
+    at all, so `inspect.getdoc` returns `None` and the first assertion
+    fails.
+    """
+    doc = inspect.getdoc(AzureDevOpsProvider.probe_token_capabilities)
+    assert doc is not None, (
+        "probe_token_capabilities has no docstring — it must disclose "
+        "what it does and does not verify"
+    )
+    assert "optimistic" in doc
+    assert "pulls" in doc
+    assert "pipeline" in doc
+    assert "no dedicated pipeline flag" in doc, (
+        f"docstring must use the pinned phrase 'no dedicated pipeline "
+        f"flag': {doc!r}"
+    )
+    assert "work_items_unavailable" in doc
 
 
 # ---------- duplicate_of double-count guard ---------------------------------

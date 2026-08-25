@@ -603,6 +603,40 @@ class TestTokenAvailableField:
         assert "token_available" in d
         assert d["token_available"] is False
 
+    def test_token_available_docstring_disclaims_authentication(self) -> None:
+        """Ticket #231 (Finding 2, step 8): `token_available` currently has
+        no docstring, which lets callers conflate "token_env is set" with
+        "the token actually authenticates" — the exact confusion the
+        `probe_token_capabilities` partial-flags work exists to correct.
+
+        Pydantic's `@computed_field` auto-populates
+        `ComputedFieldInfo.description` from the wrapped property's
+        docstring when no explicit `description=` is passed, so a real
+        docstring on the property is enough to satisfy this without any
+        schema change.
+
+        Expected RED: today the property has no docstring, so
+        `description` is `None` and this test fails at the first
+        `assert ... is not None`.
+        """
+        from lib_python_projects import ProjectConfig
+
+        info = ProjectConfig.model_computed_fields["token_available"]
+        doc = info.description
+        assert doc is not None, (
+            "token_available has no description — add a docstring to the "
+            "property so pydantic's computed_field picks it up"
+        )
+        assert "token_env" in doc or "environment" in doc, (
+            f"description does not explain the env-var-only meaning: {doc!r}"
+        )
+        assert ("not evidence" in doc or "does not mean" in doc) and (
+            "authenticat" in doc or "authoriz" in doc
+        ), (
+            "description does not explicitly disclaim authentication/"
+            f"authorization: {doc!r}"
+        )
+
 
 class TestPipelinesPermissions:
     """`PipelinesPermissions` is new in ticket #200 — a `pipelines.trigger`
