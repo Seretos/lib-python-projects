@@ -1141,6 +1141,7 @@ class TestTokenCapabilitiesPartialFlagsContract:
 
         names = {f.name for f in dataclasses.fields(TokenCapabilities)}
         assert not any("pipeline" in n for n in names)
+        assert not any("board" in n for n in names)
 
 
 # ---------- ticket #240: parse_diff_hunk_ranges (R4) ---------------------------
