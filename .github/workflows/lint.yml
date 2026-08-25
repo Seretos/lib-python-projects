@@ -10,16 +10,18 @@ name: lint
 #     triggered by a PR — there is no run that could fail in CI.
 #   * GitHub's "Invalid workflow file" annotation is NOT a blocking status
 #     check, so it doesn't stop a merge; it only surfaces on the Actions tab
-#     after the push lands on main.
+#     after the merge lands on main.
 #
 # actionlint validates the YAML, the ${{ }} expressions and referenced
 # contexts (e.g. inputs.*), and action versions for every workflow — so the
 # next column-0 heredoc (or any other malformed workflow) fails the PR
 # instead of main. Add this as a required status check in branch protection
 # to make the gate enforcing rather than advisory.
+#
+# PR-only trigger (consistent with test.yml): code only reaches main via
+# PRs (branch protection is active), so a push trigger would only
+# duplicate runs without adding coverage.
 on:
-  push:
-    branches: ["**"]
   pull_request:
 
 permissions:
