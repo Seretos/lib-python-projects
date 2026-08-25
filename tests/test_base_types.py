@@ -1002,3 +1002,47 @@ class TestNotFoundMessage:
         from lib_python_projects.providers.base import _not_found_message
 
         assert _not_found_message("ticket", "acme#999") == "ticket 'acme#999' not found"
+
+
+# ---------- ticket #237: Relation vs Ticket.id docstring contrast ----------
+
+
+def test_relation_docstring_contrasts_ticket_id_formats() -> None:
+    """Ticket #237: `Relation`'s docstring already states the `"#N"` /
+    `"owner/repo#N"` `ticket_id` format, but never says this is
+    *deliberately* a different format from `Ticket.id` (the bare
+    provider-native id, e.g. issue.number / iid). A reader could
+    reasonably — and wrongly — assume the two line up. This guard locks
+    in the tightened docstring's explicit contrast, following the repo's
+    established `inspect.getdoc` pattern (see
+    `test_pullrequest_docstring_documents_per_path_mergeability`),
+    including the `__dict__` own-entry check that bypasses
+    `inspect.getdoc`'s MRO fallback to `object.__doc__` — without it,
+    this test would still pass even if the docstring were deleted
+    entirely.
+
+    Expected RED: the current docstring never mentions `Ticket.id`.
+    """
+    from lib_python_projects.providers.base import Relation
+
+    assert Relation.__dict__["__doc__"] is not None
+    doc = inspect.getdoc(Relation)
+    assert doc is not None
+
+    # The docstring must name `Ticket.id` explicitly and say the two
+    # formats are deliberately different, not an oversight.
+    assert "Ticket.id" in doc
+    assert "deliberately different" in doc
+
+    # It must characterise `Ticket.id`'s format (bare provider-native id)
+    # to make the contrast concrete, not just assert "different" in the
+    # abstract.
+    assert "bare provider-native id" in doc
+
+    # `owner/repo#N` is read-path-only today (write targets are
+    # same-project-only on every provider) -- the docstring should say so
+    # explicitly, contrasting the read path against a write-path
+    # restriction. A bare "read" substring alone could be satisfied by
+    # unrelated prose, so require both sides of the contrast.
+    assert "read" in doc.lower()
+    assert "write" in doc.lower()
