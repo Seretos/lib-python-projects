@@ -4626,3 +4626,26 @@ def test_list_pr_files_404_on_changes_raises_named_pr_error(
         AzureDevOpsProvider().list_pr_files(_project(), token="t", pr_id="7")
     assert exc.value.status == 404
     assert "PR 'azure-tests#7' not found" in exc.value.message
+
+
+def test_list_pr_files_404_on_iterations_raises_named_pr_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nonexistent PR 404s on the FIRST call (`/iterations`, nested
+    directly under the PR resource) — not the `/changes` call. That must
+    translate to the same named error as the `/changes`-404 case and as
+    `get_pr`'s own PR-fetch 404, not leak a raw `AzureDevOpsError`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if req.method == "GET" and req.url.path.endswith("/iterations"):
+            return _json({"message": "not found"}, status_code=404)
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().list_pr_files(_project(), token="t", pr_id="7")
+    assert exc.value.status == 404
+    assert "PR 'azure-tests#7' not found" in exc.value.message

@@ -3982,7 +3982,10 @@ class AzureDevOpsProvider(
         `_resolve_repository_id` -> `GET .../pullrequests/{id}/iterations`
         (take the highest `id`) -> `GET .../iterations/{iterationId}/changes`.
         Folder entries (`item.isFolder`) are skipped. Empty `iterations`
-        returns `[]` without making the `/changes` call at all.
+        returns `[]` without making the `/changes` call at all. A 404 on
+        EITHER the `iterations` call or the `changes` call is translated to
+        the same named `AzureDevOpsError` (a nonexistent PR realistically
+        404s on `iterations`, the resource nested directly under the PR).
         """
         repo_id = self._resolve_repository_id(project, token)
         base_path = (
@@ -3991,7 +3994,14 @@ class AzureDevOpsProvider(
         )
         with _client(project, token) as c:
             resp = c.get(f"{base_path}/iterations", params=_api_version_params())
-        _check(resp)
+        try:
+            _check(resp)
+        except AzureDevOpsError as exc:
+            if exc.status == 404:
+                raise AzureDevOpsError(
+                    404, _not_found_message("PR", f"{project.id}#{pr_id}")
+                ) from exc
+            raise
         iterations = resp.json().get("value") or []
         if not iterations:
             return []
