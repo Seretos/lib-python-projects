@@ -46,7 +46,7 @@ ListStatus = Literal["open", "closed", "any"]
 
 @dataclass
 class Ticket:
-    id: str               # provider-native id (issue.number / iid) as string
+    id: str               # provider-native id (issue.number / iid) as string, deliberately bare -- see `Relation.ticket_id` for the `#`-prefixed form
     title: str
     body: str
     status: Status
@@ -350,6 +350,21 @@ class Relation:
     `"closed"`, `"merged"`, or `""` when the provider didn't report one.
     `is_pull_request` is true when the other side is a PR/MR. `title`
     is best-effort and may be empty if the provider didn't return it.
+
+    `ticket_id`'s `#`-prefixed format is deliberately different from
+    `Ticket.id`, which is the bare provider-native id (e.g.
+    `issue.number` / `iid`) as a plain string with no `#`. The two serve
+    different purposes: `Ticket.id` is the identifier you pass back into
+    provider calls (`get_ticket`, `add_relation`, ...), while
+    `Relation.ticket_id` is a human/agent-facing reference string. Do
+    not assume the two line up character-for-character, even for the
+    same ticket.
+
+    The `"owner/repo#N"` cross-repo form only ever arises on the *read*
+    path (`get_ticket`'s relation discovery) today — every provider's
+    *write* path (`add_relation`) rejects a cross-repo write target:
+    GitHub's `_parse_relation_target` raises `NotImplementedError` for
+    it, and GitLab / Azure DevOps write targets are same-project only.
 
     When `resolved` is ``False``, the relation was derived from a
     body/text scan and the target was not independently fetched.

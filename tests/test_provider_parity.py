@@ -7,6 +7,7 @@ atomic add_relation + timestamp normalisation + label sort.
 from __future__ import annotations
 
 import json
+import re
 from typing import Callable
 
 import httpx
@@ -75,6 +76,27 @@ def _install_github_mock(monkeypatch, handler):
             transport=transport,
         )
     monkeypatch.setattr(github_provider, "_client", fake_client)
+
+
+# ---------- ticket #237: Relation.ticket_id "#N"/"owner/repo#N" parity -----
+#
+# `Relation.ticket_id` is deliberately a different format from `Ticket.id`
+# (bare provider-native id) — see the tightened docstring in base.py. These
+# two tests lock in that every construction site across all three
+# providers, on both the write path (`add_relation`) and the read path
+# (`get_ticket`), emits the "#N" (same-repo) / "owner/repo#N" (cross-repo)
+# shape consistently. The namespace prefix allows any number of "/"-separated
+# segments (e.g. GitLab's "group/subgroup/project#123"), not just a single
+# "owner/repo" pair.
+_RELATION_REF_RE = re.compile(r"^(?:[\w.-]+(?:/[\w.-]+)*)?#\d+$")
+
+
+def test_relation_ref_re_accepts_nested_namespace_prefix():
+    """The namespace prefix is not limited to a single "owner/repo" pair —
+    it must also accept a multi-segment path like GitLab's nested
+    "group/subgroup/project#123", even though no fixture in this module
+    currently produces one."""
+    assert _RELATION_REF_RE.match("group/subgroup/project#123")
 
 
 # ---------- finding 1: GitLab pipeline status kwarg + tuple return ----------
@@ -1701,6 +1723,395 @@ def test_add_relation_parent_places_ticket_as_parent_on_all_providers(monkeypatc
     )
     assert captured["patch"][0]["value"]["rel"] == "System.LinkTypes.Hierarchy-Forward"
     assert ado_rel.kind == "parent"
+
+
+# ---------- ticket #237: Relation.ticket_id format parity (write path) -----
+
+
+def test_add_relation_ticket_id_is_hash_prefixed_on_all_providers(monkeypatch):
+    """Cross-provider parity: every `add_relation` construction site emits
+    `Relation.ticket_id` in the "#N" (same-repo) form — locking in the
+    already-correct write-path convention across all nine sites cited by
+    ticket #237's inventory that are reachable from `add_relation`:
+    GitLab `_gitlab_post_issue_link` (relates_to), `_gitlab_mark_duplicate_of`
+    (duplicate_of via the links-POST-409 fallback), `_gitlab_add_hierarchy_relation`
+    (parent/child via Work Items GraphQL); Azure DevOps's single `add_relation`
+    choke point (kind-independent); GitHub's `_ref_for` same-repo branch via
+    `_map_relation_from_sub_issue` (parent/child)."""
+
+    # ---- GitHub: kind="parent" -> _ref_for's same-repo branch. ----
+    def gh_handler(req):
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/7":
+            return _resp({
+                "number": 7, "title": "Child", "body": "", "state": "open",
+                "user": {"login": "a"}, "assignees": [], "labels": [],
+                "html_url": "https://github.com/acme/backend/issues/7",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "id": 7001,
+            })
+        if path == "/repos/acme/backend/issues/3/sub_issues" and req.method == "GET":
+            return _resp([])
+        if path == "/repos/acme/backend/issues/3/sub_issues" and req.method == "POST":
+            assert json.loads(req.content.decode("utf-8")) == {"sub_issue_id": 7001}
+            return _resp({
+                "number": 7, "title": "Child", "body": "", "state": "open",
+                "user": {"login": "a"}, "assignees": [], "labels": [],
+                "html_url": "https://github.com/acme/backend/issues/7",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "id": 7001,
+            })
+        raise AssertionError(f"unexpected GitHub request: {req.method} {path}")
+
+    _install_github_mock(monkeypatch, gh_handler)
+    # Bare numeric target (not pre-"#"-prefixed): proves the "#" is added
+    # by the code (from the response's `number` field via `_ref_for`),
+    # not merely echoed back from the caller-supplied string.
+    gh_rel = GitHubProvider().add_relation(
+        _github_project("acme/backend"), token="t", ticket_id="3", kind="parent", target="7",
+    )
+    assert gh_rel.ticket_id == "#7"
+    assert _RELATION_REF_RE.match(gh_rel.ticket_id)
+
+    # ---- GitLab: kind="relates_to" -> _gitlab_post_issue_link. ----
+    def gl_relates_handler(req):
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _resp({"id": 42})
+        if req.method == "POST" and "/issues/5/links" in url:
+            return _resp({
+                "target_issue": {
+                    "iid": 9, "title": "Target", "state": "opened",
+                    "web_url": "https://gitlab.com/acme/backend/-/issues/9",
+                }
+            })
+        raise AssertionError(f"unexpected GitLab request: {req.method} {url}")
+
+    _install_gitlab_mock(monkeypatch, gl_relates_handler)
+    # Bare numeric target: proves the "#" is added by the code (from the
+    # parsed `target_issue_iid`), not merely echoed back verbatim.
+    gl_relates_rel = GitLabProvider().add_relation(
+        _gitlab_project("acme/backend"), "t", "5", "relates_to", "9",
+    )
+    assert gl_relates_rel.ticket_id == "#9"
+    assert _RELATION_REF_RE.match(gl_relates_rel.ticket_id)
+
+    # ---- GitLab: kind="duplicate_of" with the links POST 409ing ->
+    # _gitlab_mark_duplicate_of's fallback synthesis (the happy path
+    # returns _gitlab_post_issue_link's own Relation instead, so a 409
+    # is required to actually reach this site). ----
+    def gl_dup_handler(req):
+        url = str(req.url)
+        if url.endswith("/projects/acme%2Fbackend"):
+            return _resp({"id": 42})
+        if req.method == "GET" and url.endswith("/issues/5"):
+            return _resp({
+                "iid": 5, "description": "original body", "labels": [],
+                "state": "opened", "title": "Source",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/5",
+            })
+        if req.method == "POST" and "/issues/5/links" in url:
+            return _resp({"message": "Issue(s) already assigned"}, 409)
+        if req.method == "GET" and url.endswith("/issues/12"):
+            return _resp({
+                "iid": 12, "title": "Target", "state": "opened",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/12",
+            })
+        if req.method == "PUT" and url.endswith("/issues/5"):
+            return _resp({"iid": 5, "state": "closed", "description": ""})
+        raise AssertionError(f"unexpected GitLab request: {req.method} {url}")
+
+    _install_gitlab_mock(monkeypatch, gl_dup_handler)
+    # Bare numeric target: same rationale as above.
+    gl_dup_rel = GitLabProvider().add_relation(
+        _gitlab_project("acme/backend"), "t", "5", "duplicate_of", "12",
+    )
+    assert gl_dup_rel.ticket_id == "#12"
+    assert _RELATION_REF_RE.match(gl_dup_rel.ticket_id)
+
+    # ---- GitLab: kind="parent" -> _gitlab_add_hierarchy_relation (Work
+    # Items GraphQL). ----
+    def gl_parent_handler(req):
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = json.loads(req.content.decode("utf-8"))
+            if "workItemUpdate" in body["query"]:
+                return _resp({"data": {"workItemUpdate": {
+                    "workItem": {
+                        "id": "gid://gitlab/WorkItem/5", "iid": 5,
+                        "widgets": [{"parent": {
+                            "id": "gid://gitlab/WorkItem/20", "iid": 20,
+                            "title": "Epic 20",
+                            "webUrl": "https://gitlab.com/acme/backend/-/issues/20",
+                            "state": "OPEN",
+                        }}],
+                    },
+                    "errors": [],
+                }}})
+            iid = int(body["variables"]["iid"])
+            if iid == 5:
+                return _resp({"data": {"project": {"workItems": {"nodes": [{
+                    "id": "gid://gitlab/WorkItem/5", "iid": 5, "title": "T",
+                    "webUrl": "https://gitlab.com/acme/backend/-/issues/5",
+                    "state": "OPEN", "widgets": [{"parent": None}],
+                }]}}}})
+            if iid == 20:
+                return _resp({"data": {"project": {"workItems": {"nodes": [{
+                    "id": "gid://gitlab/WorkItem/20", "iid": 20, "title": "Epic 20",
+                    "webUrl": "https://gitlab.com/acme/backend/-/issues/20",
+                    "state": "OPEN", "widgets": [{"parent": None}],
+                }]}}}})
+        raise AssertionError(f"unexpected GitLab request: {req.method} {url}")
+
+    _install_gitlab_mock(monkeypatch, gl_parent_handler)
+    # Bare numeric target: same rationale as above.
+    gl_parent_rel = GitLabProvider().add_relation(
+        _gitlab_project("acme/backend"), "t", "5", "parent", "20",
+    )
+    assert gl_parent_rel.ticket_id == "#20"
+    assert _RELATION_REF_RE.match(gl_parent_rel.ticket_id)
+
+    # ---- Azure DevOps: kind="parent" and kind="relates_to" -> the single
+    # add_relation choke point (kind-independent). ----
+    captured: dict = {}
+
+    def ado_parent_handler(req):
+        path = req.url.path
+        if req.method == "GET" and "/workitems/5" in path:
+            return _resp({"id": 5, "relations": []})
+        if req.method == "PATCH" and "/workitems/5" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _resp({"id": 5})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            ids = json.loads(req.content.decode("utf-8"))["ids"]
+            return _resp({
+                "value": [
+                    {"id": wid, "fields": {
+                        "System.Title": f"target {wid}", "System.State": "Active",
+                    }}
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected ADO request: {req.method} {path}")
+
+    _install_azuredevops_mock(monkeypatch, ado_parent_handler)
+    ado_parent_rel = AzureDevOpsProvider().add_relation(
+        _ado_project(), token="t", ticket_id="5", kind="parent", target="9",
+    )
+    assert ado_parent_rel.ticket_id == "#9"
+    assert _RELATION_REF_RE.match(ado_parent_rel.ticket_id)
+
+    def ado_relates_handler(req):
+        path = req.url.path
+        if req.method == "GET" and "/workitems/5" in path:
+            return _resp({"id": 5, "relations": []})
+        if req.method == "PATCH" and "/workitems/5" in path:
+            captured["patch"] = json.loads(req.content.decode("utf-8"))
+            return _resp({"id": 5})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            ids = json.loads(req.content.decode("utf-8"))["ids"]
+            return _resp({
+                "value": [
+                    {"id": wid, "fields": {
+                        "System.Title": f"target {wid}", "System.State": "Active",
+                    }}
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected ADO request: {req.method} {path}")
+
+    _install_azuredevops_mock(monkeypatch, ado_relates_handler)
+    ado_relates_rel = AzureDevOpsProvider().add_relation(
+        _ado_project(), token="t", ticket_id="5", kind="relates_to", target="11",
+    )
+    assert ado_relates_rel.ticket_id == "#11"
+    assert _RELATION_REF_RE.match(ado_relates_rel.ticket_id)
+
+
+# ---------- ticket #237: Relation.ticket_id format parity (read path) ------
+
+
+def test_relation_ticket_id_is_hash_prefixed_on_read_across_providers(monkeypatch):
+    """Cross-provider parity: every `get_ticket`-reachable relation
+    construction site emits `Relation.ticket_id` in the "#N" (same-repo) /
+    "owner/repo#N" (cross-repo) form — locking in the read-path convention,
+    including all three branches of GitHub's `_ref_to_relation` (self-repo
+    qualified, cross-repo, and bare `#N`)."""
+
+    # ---- GitHub: cross-repo parent, same-repo child, closes (self-repo
+    # qualified ref), mentions (bare ref), duplicate_of (cross-repo ref via
+    # the 404 fallback) -- exercises all three `_ref_to_relation` branches. ----
+    def gh_handler(req):
+        path = req.url.path
+        if path == "/repos/Seretos/agent-project-issues/issues/42":
+            return _resp({
+                "number": 42, "title": "T", "state": "open",
+                "user": {"login": "a"}, "assignees": [], "labels": [],
+                "html_url": "https://github.com/Seretos/agent-project-issues/issues/42",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "body": (
+                    "Fixes Seretos/agent-project-issues#77\n"
+                    "see #88\n"
+                    "Duplicate of otherowner/other-repo#99\n"
+                ),
+                "parent": {
+                    "number": 5, "title": "Cross Epic", "state": "open",
+                    "html_url": "https://github.com/otherowner/other-repo/issues/5",
+                    "repository": {"full_name": "otherowner/other-repo"},
+                },
+            })
+        if path == "/repos/Seretos/agent-project-issues/issues/42/comments":
+            return _resp([])
+        if path == "/repos/Seretos/agent-project-issues/issues/42/sub_issues":
+            return _resp([{
+                "number": 15, "title": "Child", "state": "open",
+                "html_url": "https://github.com/Seretos/agent-project-issues/issues/15",
+                "user": {"login": "a"}, "assignees": [], "labels": [],
+                "repository": {"full_name": "Seretos/agent-project-issues"},
+            }])
+        if path == "/repos/Seretos/agent-project-issues/issues/42/timeline":
+            return _resp([])
+        if "/dependencies/" in path:
+            return _resp([])
+        if path == "/repos/otherowner/other-repo/issues/99":
+            return _resp({}, 404)
+        raise AssertionError(f"unexpected GitHub request: {req.method} {path}")
+
+    monkeypatch.setenv("PROJECT_ISSUES_MENTIONS_SCAN_DEPTH", "0")
+    _install_github_mock(monkeypatch, gh_handler)
+    _, _, gh_relations, _ = GitHubProvider().get_ticket(
+        _github_project(), token="t", ticket_id="42",
+    )
+
+    gh_parent = next(r for r in gh_relations if r.kind == "parent")
+    assert gh_parent.ticket_id == "otherowner/other-repo#5"  # :1181 cross-repo
+    gh_child = next(r for r in gh_relations if r.kind == "child")
+    assert gh_child.ticket_id == "#15"  # :1180 same-repo (via _ref_for)
+    gh_closes = next(r for r in gh_relations if r.kind == "closes")
+    assert gh_closes.ticket_id == "#77"  # :1385 self-repo qualified
+    gh_mentions = [r for r in gh_relations if r.kind == "mentions"]
+    assert [r.ticket_id for r in gh_mentions] == ["#88"]  # :1391 bare
+    gh_dup = [r for r in gh_relations if r.kind == "duplicate_of"]
+    assert len(gh_dup) == 1  # :1388 cross-repo, via the 404-fallback
+    assert gh_dup[0].ticket_id == "otherowner/other-repo#99"
+    assert gh_dup[0].resolved is False
+    # Dedupe collapse: the plain-ref scan also matches
+    # "otherowner/other-repo#99" as a `mentions` candidate, but
+    # `_dedupe_relations` drops it in favor of the stronger `duplicate_of`
+    # label for the same target -- exactly one relation survives for it.
+    assert not [
+        r for r in gh_relations
+        if r.kind == "mentions" and r.ticket_id == "otherowner/other-repo#99"
+    ]
+    for r in gh_relations:
+        assert _RELATION_REF_RE.match(r.ticket_id), r
+
+    # ---- GitLab: relates_to (links), closed_by (MR), hierarchy parent
+    # (GraphQL), mentions (body scan) -- all four feed through _make_relation. ----
+    def gl_handler(req):
+        url = str(req.url)
+        if url.endswith("/issues/5/links"):
+            return _resp([{
+                "iid": 9, "link_type": "relates_to", "title": "Related issue",
+                "web_url": "https://gitlab.com/acme/backend/-/issues/9",
+                "state": "opened", "references": {"relative": "#9"},
+            }])
+        if url.endswith("/issues/5/closed_by"):
+            return _resp([{
+                "iid": 21, "title": "Closing MR", "state": "opened",
+                "web_url": "https://gitlab.com/acme/backend/-/merge_requests/21",
+            }])
+        if "/issues/5/notes" in url:
+            return _resp([])
+        if url.endswith("issues/5"):
+            return _resp({
+                "iid": 5, "title": "T", "description": "See #77",
+                "state": "opened", "author": {"username": "a"}, "assignees": [],
+                "labels": [], "web_url": "https://gitlab.com/acme/backend/-/issues/5",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            })
+        if url.endswith("/api/graphql"):
+            body = json.loads(req.content.decode("utf-8"))
+            iid = int(body["variables"]["iid"])
+            if iid == 5:
+                return _resp({"data": {"project": {"workItems": {"nodes": [{
+                    "id": "gid://gitlab/WorkItem/5", "iid": 5, "title": "T",
+                    "webUrl": "https://gitlab.com/acme/backend/-/issues/5",
+                    "state": "OPEN",
+                    "widgets": [{"parent": {
+                        "id": "gid://gitlab/WorkItem/3", "iid": 3,
+                        "title": "Epic",
+                        "webUrl": "https://gitlab.com/acme/backend/-/issues/3",
+                        "state": "OPEN",
+                    }}],
+                }]}}}})
+            raise AssertionError(f"unexpected GraphQL iid: {iid}")
+        raise AssertionError(f"unexpected GitLab request: {req.method} {url}")
+
+    _install_gitlab_mock(monkeypatch, gl_handler)
+    _, _, gl_relations, _ = GitLabProvider().get_ticket(
+        _gitlab_project("acme/backend"), "t", "5",
+    )
+
+    gl_relates = next(r for r in gl_relations if r.kind == "relates_to")
+    assert gl_relates.ticket_id == "#9"
+    gl_closed_by = next(r for r in gl_relations if r.kind == "closed_by")
+    assert gl_closed_by.ticket_id == "#21"
+    gl_parent = next(r for r in gl_relations if r.kind == "parent")
+    assert gl_parent.ticket_id == "#3"
+    gl_mentions = next(r for r in gl_relations if r.kind == "mentions")
+    assert gl_mentions.ticket_id == "#77"
+    for r in gl_relations:
+        assert _RELATION_REF_RE.match(r.ticket_id), r
+
+    # ---- Azure DevOps: typed parent relation, body-scan mentions. ----
+    _cache_clear_all()
+
+    def ado_handler(req):
+        path = req.url.path
+        if "/_apis/wit/workitems/5" in path and "/comments" not in path:
+            return _resp({
+                "id": 5,
+                "fields": {
+                    "System.Title": "T", "System.Description": "See #77",
+                    "System.State": "New",
+                    "System.CreatedDate": "2024-01-01T00:00:00Z",
+                    "System.ChangedDate": "2024-01-01T00:00:00Z",
+                },
+                "relations": [{
+                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "url": "https://dev.azure.com/seredos/_apis/wit/workItems/3",
+                }],
+            })
+        if path.endswith("/_apis/wit/workItems/5/comments"):
+            return _resp({"comments": [], "continuationToken": None})
+        if path.endswith("/_apis/wit/workitemsbatch"):
+            ids = json.loads(req.content.decode("utf-8"))["ids"]
+            return _resp({
+                "value": [
+                    {"id": wid, "fields": {
+                        "System.Title": f"target {wid}", "System.State": "Active",
+                    }}
+                    for wid in ids
+                ]
+            })
+        raise AssertionError(f"unexpected ADO request: {req.method} {path}")
+
+    _install_azuredevops_mock(monkeypatch, ado_handler)
+    _, _, ado_relations, _ = AzureDevOpsProvider().get_ticket(
+        _azuredevops_project(), token="t", ticket_id="5",
+    )
+
+    ado_parent = next(r for r in ado_relations if r.kind == "parent")
+    assert ado_parent.ticket_id == "#3"
+    ado_mentions = next(r for r in ado_relations if r.kind == "mentions")
+    assert ado_mentions.ticket_id == "#77"
+    for r in ado_relations:
+        assert _RELATION_REF_RE.match(r.ticket_id), r
 
 
 # ---------- ticket #152: FailingJob.annotations shape parity ----------------
