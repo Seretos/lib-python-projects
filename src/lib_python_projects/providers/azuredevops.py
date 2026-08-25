@@ -6113,6 +6113,60 @@ class AzureDevOpsProvider(
     def probe_token_capabilities(
         self, project: ProjectConfig, token: str
     ) -> TokenCapabilities:
+        """Probe how far `token` actually reaches, in two stages.
+
+        1. An **org-scoped** `GET {org}/_apis/connectionData` call proves
+           the token authenticates at all against this organization. A
+           failure here (401/403/404/other non-2xx/transport error) is a
+           provider-level failure: all five flags come back False and the
+           call short-circuits before any further request — including the
+           empty-token guard above, which never issues an HTTP call at
+           all.
+        2. Once that succeeds, a second, **project**-scoped
+           `GET {org}/{project}/_apis/wit/workitemtypes` call (same shape
+           `_list_work_item_types` uses, but issued as a raw GET here —
+           not routed through `_check()`, since this probe's contract is
+           "return, never raise") exercises the same auth path
+           `create_ticket`/work-item writes actually use. A PAT scoped to
+           e.g. "Code" but not "Work Items" can authenticate for
+           `connectionData` and still 401 here, which is exactly the
+           reported defect this second call catches.
+
+        Outcome mapping when `connectionData` already succeeded:
+
+        - work-item call 2xx with a parseable JSON body -> all five flags
+          True, `reason=None` (today's result, unchanged).
+        - work-item call non-2xx, a transport error, or a 2xx response
+          whose body isn't valid JSON (ADO answers some unauthenticated
+          requests with an HTML sign-in page under a 2xx status) ->
+          **partial** result: `issues_create=False`, `issues_modify=False`,
+          `reason="work_items_unavailable"`. The `pulls_*` flags keep the
+          provider-level (`connectionData`) result — True — since that
+          surface was not exercised by this failure. A transport failure
+          on this second call is deliberately NOT remapped to
+          `network_error`; there is one uniform partial result for any
+          work-item-probe failure, since `connectionData` already proved
+          the network path itself is fine.
+
+        Neither call is memoized — the work-item GET is issued fresh on
+        every invocation. A TTL cache here would let a revoked work-item
+        permission read "clean" for up to the cache's lifetime, which is
+        the exact staleness bug this ticket exists to fix.
+
+        What this does **not** verify: `pulls_create`/`pulls_modify`/
+        `pulls_merge` stay **optimistic** — they are never checked against
+        a real pull-request write, only inferred from `connectionData`
+        succeeding. Pipeline access is likewise never probed at all — this
+        method issues no request against the Azure Pipelines/build
+        surface, and there is no dedicated pipeline flag on
+        `TokenCapabilities` to carry such a result even if it were probed.
+        Concretely, `loader._capabilities_to_permissions` only maps
+        `issues.*`/`pulls.*` from this result, so
+        `Permissions.pipelines.trigger` and `Permissions.board.manage`
+        stay at their `False` defaults regardless of what this probe
+        returns — a `reason=None` here is not evidence that pipeline or
+        board operations will succeed.
+        """
         if not token:
             return TokenCapabilities(reason="bad_credentials")
         try:
@@ -6131,11 +6185,49 @@ class AzureDevOpsProvider(
             return TokenCapabilities(reason="repo_invisible_to_token")
         if not resp.is_success:
             return TokenCapabilities(reason="permissions_field_missing")
-        # PAT scopes aren't enumerable through public REST. We can probe
-        # individual write surfaces by doing zero-effect operations, but
-        # that costs round-trips. Defer to the configured permissions
-        # block — connectionData proves the token is valid for *this*
-        # organization, which is the most useful capability bit.
+        # Second, project-scoped probe: exercises the same auth path the
+        # work-item write surface (create_ticket, etc.) actually uses.
+        # Issued fresh every call — no memoization by design (see
+        # docstring): a TTL cache would reintroduce the exact staleness
+        # bug ticket #231 exists to fix.
+        try:
+            with _client(project, token) as c:
+                wi_resp = c.get(
+                    f"{_project_scope(project)}/_apis/wit/workitemtypes",
+                    params=_api_version_params(),
+                )
+        except httpx.HTTPError:
+            return TokenCapabilities(
+                issues_create=False,
+                issues_modify=False,
+                pulls_create=True,
+                pulls_modify=True,
+                pulls_merge=True,
+                reason="work_items_unavailable",
+            )
+        if wi_resp.is_success:
+            try:
+                wi_resp.json()
+            except ValueError:
+                wi_resp_ok = False
+            else:
+                wi_resp_ok = True
+        else:
+            wi_resp_ok = False
+        if not wi_resp_ok:
+            return TokenCapabilities(
+                issues_create=False,
+                issues_modify=False,
+                pulls_create=True,
+                pulls_modify=True,
+                pulls_merge=True,
+                reason="work_items_unavailable",
+            )
+        # PAT scopes aren't enumerable through public REST beyond the two
+        # probes above. Defer to the configured permissions block —
+        # connectionData + the work-item probe prove the token is valid
+        # for this organization/project, which is the most useful
+        # capability signal available without issuing zero-effect writes.
         return TokenCapabilities(
             issues_create=True,
             issues_modify=True,

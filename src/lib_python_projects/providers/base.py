@@ -1301,9 +1301,24 @@ class TokenCapabilities:
       didn't populate `permissions` on the response (classic PAT
       sometimes, or unexpected payload shape). Combined with all-False
       flags this preserves today's hardcoded-False default behavior.
+    - `"work_items_unavailable"` — provider-level auth succeeded (e.g.
+      Azure DevOps's org-scoped `connectionData` call), but a
+      project-scoped probe of the work-item surface did not answer
+      (non-2xx, an unparseable body, or a transport error on that
+      second call). `issues_create`/`issues_modify` are False; the
+      `pulls_*` flags carry the provider-level result and remain
+      unverified against a real pull-request write. There is no
+      pipeline or board flag on this dataclass, so pipeline/board access
+      is never represented here regardless of `reason`.
 
-    When `reason` is not `None`, all boolean flags should be False —
-    the caller must not grant any operation based on a failed probe.
+    When `reason` is not `None`, the flags reflect what could be
+    confirmed. A provider-level failure (`bad_credentials`,
+    `repo_invisible_to_token`, `network_error`,
+    `permissions_field_missing`) sets all flags False. A partial, surface-specific failure
+    — currently `work_items_unavailable` — may leave another surface's
+    flags True where that surface's own check succeeded. Callers must
+    therefore branch on the individual flags and must not assume
+    all-False from the mere presence of a `reason`.
     """
 
     issues_create: bool = False
@@ -1320,7 +1335,9 @@ class TokenCapabilityProvider:
 
     Implementations MUST NOT raise on expected failure modes (401, 404,
     network error, missing field) — they must return a `TokenCapabilities`
-    with `reason` set and all flags False so the caller can degrade
+    with `reason` set and the flags reflecting what could be confirmed —
+    all False for a provider-level failure, or a **partial, surface-specific failure**
+    leaving unaffected surfaces' flags True — so the caller can degrade
     gracefully. Only programming errors (bad project shape, etc.) should
     propagate.
     """
