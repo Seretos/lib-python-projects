@@ -1,8 +1,9 @@
 name: tests
 
-# Runs pytest on every push to any branch and on every PR. Distinct
-# from release.yml which is workflow_dispatch-driven and produces the
-# release-branch + tag.
+# Runs pytest on every PR only. Distinct from release.yml which is
+# workflow_dispatch-driven and produces the release-branch + tag. Code
+# only reaches main via PRs (branch protection is active), so a push
+# trigger would only duplicate runs without adding coverage.
 #
 # Matrix: windows-latest + ubuntu-22.04. The 22.04 pin (not
 # ubuntu-latest) matches the WSL2 / plugin-binary glibc target, so a
@@ -13,8 +14,6 @@ name: tests
 # CI needs that branch to exist on the lib-python-config remote — if a
 # config-side fix needs to ship first, release it before retrying.
 on:
-  push:
-    branches: ["**"]
   pull_request:
 
 permissions:
