@@ -3064,3 +3064,255 @@ def test_list_pr_reviews_approvals_endpoint_unavailable_returns_empty_list(
     _install_mock(monkeypatch, handler)
     reviews = GitLabProvider().list_pr_reviews(_project(), "t", "9")
     assert reviews == []
+
+
+# ---------- ticket #240: list_pr_files (R2) ----------------------------------
+#
+# GET /projects/:id/merge_requests/:iid/changes (the legacy/universal
+# endpoint) — NOT /diffs. Read from the whole-MR-object response
+# (unpaginated); `changes` holds one entry per file, `overflow` signals a
+# possibly-truncated result.
+
+
+def _changes_response(changes: list[dict], overflow: bool | None = None) -> dict:
+    payload: dict = {"iid": 7, "changes": changes}
+    if overflow is not None:
+        payload["overflow"] = overflow
+    return payload
+
+
+def _change_entry(
+    new_path: str,
+    old_path: str | None = None,
+    diff: str | None = None,
+    new_file: bool = False,
+    deleted_file: bool = False,
+    renamed_file: bool = False,
+) -> dict:
+    return {
+        "new_path": new_path,
+        "old_path": old_path if old_path is not None else new_path,
+        "new_file": new_file,
+        "deleted_file": deleted_file,
+        "renamed_file": renamed_file,
+        "diff": diff if diff is not None else "",
+    }
+
+
+def test_list_pr_files_returns_paths_patch_and_line_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requests `/merge_requests/7/changes` (never `/diffs`); maps
+    `new_path` (preferred over `old_path`), a modified entry's
+    `change_type`, the `diff` string verbatim as `patch`, and
+    `line_ranges` via the shared `parse_diff_hunk_ranges` helper.
+    `additions`/`deletions` stay `None` — GitLab's changes payload
+    carries no such counts. `old_path` is deliberately different from
+    `new_path` here (this is not a rename — `renamed_file` stays
+    `False`) so that `path == new_path` can only pass if the mapper
+    prefers `new_path` over `old_path`, per the plan's `new_path or
+    old_path` -> `path` rule."""
+    diff = "@@ -1,3 +1,4 @@ def foo():\n context\n+new\n"
+    entry = _change_entry("src/app.py", old_path="src/app_before.py", diff=diff)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        assert url.split("?")[0].endswith("/merge_requests/7/changes")
+        if "/diffs" in url:
+            raise AssertionError(f"must not hit /diffs: {url}")
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+
+    from lib_python_projects.providers.base import DiffHunkRange
+
+    assert len(result) == 1
+    f = result[0]
+    assert f.path == "src/app.py"
+    assert f.previous_path is None
+    assert f.change_type == "modified"
+    assert f.patch == diff
+    assert f.line_ranges == [DiffHunkRange("LEFT", 1, 3), DiffHunkRange("RIGHT", 1, 4)]
+    assert f.additions is None
+    assert f.deletions is None
+
+
+def test_list_pr_files_new_file_maps_added(monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = _change_entry("src/new.py", new_file=True)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result[0].change_type == "added"
+
+
+def test_list_pr_files_deleted_file_maps_removed(monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = _change_entry("src/gone.py", deleted_file=True)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result[0].change_type == "removed"
+
+
+def test_list_pr_files_renamed_file_sets_previous_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = _change_entry(
+        "new/path.py", old_path="old/path.py", renamed_file=True,
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result[0].change_type == "renamed"
+    assert result[0].previous_path == "old/path.py"
+
+
+def test_list_pr_files_non_renamed_with_differing_paths_leaves_previous_path_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`previous_path` is populated ONLY when `renamed_file` is true —
+    even if `old_path`/`new_path` happen to differ for some other
+    reason, it must not leak through."""
+    entry = _change_entry(
+        "new/path.py", old_path="old/path.py", renamed_file=False,
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result[0].change_type == "modified"
+    assert result[0].previous_path is None
+
+
+def test_list_pr_files_missing_changes_key_returns_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"iid": 7})
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result == []
+
+
+def test_list_pr_files_empty_changes_returns_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result == []
+
+
+def test_list_pr_files_overflow_true_warns_and_returns_partial(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`overflow: true` signals a possibly-truncated result. The
+    (possibly truncated) `changes` are returned as-is — never raised —
+    with one `log.warning` on `project-issues.gitlab` mentioning the MR
+    id and 'incomplete'."""
+    import logging
+
+    entry = _change_entry("src/app.py")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry], overflow=True))
+
+    _install_mock(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING, logger="project-issues.gitlab"):
+        result = GitLabProvider().list_pr_files(_project(), "t", "7")
+
+    assert len(result) == 1
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"Expected exactly one warning, got {warnings}"
+    record = warnings[0]
+    assert record.name == "project-issues.gitlab"
+    assert "7" in record.message
+    assert "incomplete" in record.message.lower()
+
+
+def test_list_pr_files_overflow_false_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    entry = _change_entry("src/app.py")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry], overflow=False))
+
+    _install_mock(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING, logger="project-issues.gitlab"):
+        GitLabProvider().list_pr_files(_project(), "t", "7")
+
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_list_pr_files_overflow_absent_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    entry = _change_entry("src/app.py")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING, logger="project-issues.gitlab"):
+        GitLabProvider().list_pr_files(_project(), "t", "7")
+
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_list_pr_files_pr_not_found_404_becomes_named_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 404 whose message is NOT the project-not-found shape means the
+    MR itself doesn't exist inside a project that does -> rewrapped as
+    the canonical `PR '<project>#<id>' not found` (mirrors `get_pr`)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "404 Not found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert exc.value.status == 404
+    assert "PR 'acme#7' not found" in exc.value.message
+
+
+def test_list_pr_files_project_not_found_404_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine `404 Project Not Found` (the project path itself fails
+    to resolve) must surface as itself, never relabelled `PR '...' not
+    found` (mirrors `get_pr`'s project-vs-PR 404 split)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "404 Project Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert exc.value.status == 404
+    assert "PR" not in exc.value.message
+    assert "Project Not Found" in exc.value.message

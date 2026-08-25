@@ -28,6 +28,7 @@ from lib_python_projects.providers.base import (
     BulkTicketResult,
     CIConfigurationProvider,
     Comment,
+    DiffHunkRange,
     DiscoveredProject,
     FailingJob,
     FailureAnnotation,
@@ -35,8 +36,11 @@ from lib_python_projects.providers.base import (
     Label,
     normalize_timestamp,
     now_utc,
+    parse_diff_hunk_ranges,
     PipelineFailure,
     PipelineRun,
+    PRDiffProvider,
+    PRFileDiff,
     PRFilters,
     ProjectDiscoveryResult,
     ProviderError,
@@ -403,6 +407,32 @@ def _map_review_comment(raw: dict) -> ReviewComment:
         updated_at=normalize_timestamp(raw.get("updated_at") or ""),
         url=raw.get("html_url") or None,
         discussion_id=discussion_id,
+    )
+
+
+def _map_pr_file(raw: dict) -> PRFileDiff:
+    """Translate a GitHub `/pulls/{n}/files` item into `PRFileDiff`.
+
+    `previous_path` is populated only when `status == "renamed"` — a
+    stray `previous_filename` on a non-renamed entry is ignored. `patch`
+    is absent from the payload for binary/oversized files; `patch`
+    stays `None` and `line_ranges` becomes the supported-but-empty `[]`
+    (via `parse_diff_hunk_ranges(None)`), never `None` — GitHub supports
+    diff positions in general, this file just has none.
+    """
+    change_type = raw.get("status") or "changed"
+    patch = raw.get("patch")
+    previous_path = (
+        raw.get("previous_filename") if change_type == "renamed" else None
+    )
+    return PRFileDiff(
+        path=raw.get("filename", ""),
+        change_type=change_type,
+        previous_path=previous_path,
+        patch=patch,
+        line_ranges=parse_diff_hunk_ranges(patch),
+        additions=raw.get("additions"),
+        deletions=raw.get("deletions"),
     )
 
 
@@ -3066,7 +3096,10 @@ def _trigger_sleep(seconds: float) -> None:
 
 
 class GitHubProvider(
-    TokenProjectDiscoveryProvider, ViewerIdentityProvider, CIConfigurationProvider
+    TokenProjectDiscoveryProvider,
+    ViewerIdentityProvider,
+    CIConfigurationProvider,
+    PRDiffProvider,
 ):
     def probe_token_capabilities(
         self, project: ProjectConfig, token: str
@@ -5078,6 +5111,50 @@ class GitHubProvider(
                     ) from exc
                 raise
             return _map_comment(r.json())
+
+    def list_pr_files(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        pr_id: str,
+    ) -> list[PRFileDiff]:
+        """List a PR's changed files, patch text and parsed diff line ranges.
+
+        Hits `GET /repos/{o}/{r}/pulls/{n}/files` with `per_page=100`,
+        paginated via the `Link` header (`_has_next_link`), capped at 30
+        pages (3000 files). Hitting the cap does not raise — it returns
+        the files fetched so far and emits one `log.warning` on this
+        module's logger, matching `_find_pending_review`'s existing
+        truncate-and-warn convention.
+        """
+        files: list[PRFileDiff] = []
+        page = 1
+        with _client(token) as client:
+            while True:
+                try:
+                    r = client.get(
+                        f"{_repo_path(project)}/pulls/{pr_id}/files",
+                        params={"per_page": 100, "page": page},
+                    )
+                    _check(r)
+                except GitHubError as exc:
+                    if exc.status == 404:
+                        raise GitHubError(
+                            404, _not_found_message("PR", f"{project.id}#{pr_id}"),
+                        ) from exc
+                    raise
+                files.extend(_map_pr_file(it) for it in r.json())
+                if not _has_next_link(r.headers.get("Link")):
+                    break
+                page += 1
+                if page > 30:
+                    log.warning(
+                        "list_pr_files for %s/%s#%s hit the 30-page"
+                        " pagination cap — result is incomplete",
+                        project.owner, project.repo, pr_id,
+                    )
+                    break
+        return files
 
     def list_pr_review_comments(
         self,

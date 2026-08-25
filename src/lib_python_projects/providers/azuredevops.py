@@ -65,6 +65,9 @@ from lib_python_projects.providers.base import (
     Label,
     LabelOperationUnsupported,
     now_utc,
+    PRDiffProvider,
+    PRFileChangeType,
+    PRFileDiff,
     PRFilters,
     PipelineFailure,
     PipelineRun,
@@ -1337,6 +1340,50 @@ def _map_thread_comment_for_review(
     )
 
 
+def _map_ado_pr_file(entry: dict) -> PRFileDiff:
+    """Translate an `iterations/{id}/changes` `changeEntries` item into
+    `PRFileDiff`. File-level only: `patch`/`line_ranges`/`additions`/
+    `deletions` are always `None` (see `AzureDevOpsProvider`'s
+    `SUPPORTS_DIFF_LINE_RANGES = False`).
+
+    `changeType` may be a compound string (e.g. `"edit, rename"`) —
+    matched by substring, `rename` checked first so a compound value is
+    still recognized as a rename. `previous_path` (from
+    `sourceServerItem`, leading `/` stripped) is populated ONLY for
+    entries mapped to `"renamed"`, defaulting to `None` if the field is
+    absent, rather than raising.
+    """
+    item = entry.get("item") or {}
+    path = (item.get("path") or "").lstrip("/")
+    change_type_raw = (entry.get("changeType") or "").lower()
+    if "rename" in change_type_raw:
+        change_type: PRFileChangeType = "renamed"
+    elif "add" in change_type_raw:
+        change_type = "added"
+    elif "edit" in change_type_raw:
+        change_type = "modified"
+    elif "delete" in change_type_raw:
+        change_type = "removed"
+    else:
+        change_type = "changed"
+
+    previous_path = None
+    if change_type == "renamed":
+        source = entry.get("sourceServerItem")
+        if source:
+            previous_path = source.lstrip("/")
+
+    return PRFileDiff(
+        path=path,
+        change_type=change_type,
+        previous_path=previous_path,
+        patch=None,
+        line_ranges=None,
+        additions=None,
+        deletions=None,
+    )
+
+
 def _map_thread_comment(
     thread: dict,
     raw: dict,
@@ -2055,8 +2102,15 @@ class AzureDevOpsProvider(
     TokenProjectDiscoveryProvider,
     ViewerIdentityProvider,
     CIConfigurationProvider,
+    PRDiffProvider,
 ):
     """Azure DevOps provider.
+
+    Deliberately file-level only for PR diff discovery
+    (`SUPPORTS_DIFF_LINE_RANGES = False`): Azure's PR API exposes no
+    per-file diff hunk positions, so `list_pr_files`'s `patch`/
+    `line_ranges` are permanently `None` here — an accepted provider
+    limitation, not a bug.
 
     Implements the same surface as `GitHubProvider` and `GitLabProvider`
     (see `providers/base.py`). Module-level helpers carry the per-request
@@ -2064,6 +2118,8 @@ class AzureDevOpsProvider(
     across calls (the tool layer instantiates one `_PROVIDERS["azuredevops"]`
     at import time).
     """
+
+    SUPPORTS_DIFF_LINE_RANGES = False
 
     # ---------- shared scaffolding -----------------------------------------
 
@@ -3913,6 +3969,54 @@ class AzureDevOpsProvider(
                 if raw.get("commentType") == "system":
                     continue
                 out.append(_map_thread_comment(thread, raw, project, str(pr_id)))
+        return out
+
+    def list_pr_files(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        pr_id: str,
+    ) -> list[PRFileDiff]:
+        """List a PR's changed files (file-level only — see class docstring).
+
+        `_resolve_repository_id` -> `GET .../pullrequests/{id}/iterations`
+        (take the highest `id`) -> `GET .../iterations/{iterationId}/changes`.
+        Folder entries (`item.isFolder`) are skipped. Empty `iterations`
+        returns `[]` without making the `/changes` call at all.
+        """
+        repo_id = self._resolve_repository_id(project, token)
+        base_path = (
+            f"{_project_scope(project)}/_apis/git/repositories/"
+            f"{quote(repo_id, safe='')}/pullrequests/{quote(str(pr_id), safe='')}"
+        )
+        with _client(project, token) as c:
+            resp = c.get(f"{base_path}/iterations", params=_api_version_params())
+        _check(resp)
+        iterations = resp.json().get("value") or []
+        if not iterations:
+            return []
+        iteration_id = max(it.get("id", 0) for it in iterations)
+
+        with _client(project, token) as c:
+            resp2 = c.get(
+                f"{base_path}/iterations/{iteration_id}/changes",
+                params=_api_version_params(),
+            )
+        try:
+            _check(resp2)
+        except AzureDevOpsError as exc:
+            if exc.status == 404:
+                raise AzureDevOpsError(
+                    404, _not_found_message("PR", f"{project.id}#{pr_id}"),
+                ) from exc
+            raise
+
+        out: list[PRFileDiff] = []
+        for entry in resp2.json().get("changeEntries") or []:
+            item = entry.get("item") or {}
+            if item.get("isFolder"):
+                continue
+            out.append(_map_ado_pr_file(entry))
         return out
 
     def list_pr_review_comments(

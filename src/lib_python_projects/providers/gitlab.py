@@ -50,14 +50,18 @@ from lib_python_projects.providers.base import (
     BulkTicketResult,
     CIConfigurationProvider,
     Comment,
+    DiffHunkRange,
     DiscoveredProject,
     FailingJob,
     FieldSpec,
     Label,
     normalize_timestamp,
     now_utc,
+    parse_diff_hunk_ranges,
     PipelineFailure,
     PipelineRun,
+    PRDiffProvider,
+    PRFileDiff,
     PRFilters,
     ProjectDiscoveryResult,
     ProviderError,
@@ -472,6 +476,40 @@ def _map_issue(raw: dict, project: ProjectConfig | None = None) -> Ticket:
         created_at=normalize_timestamp(raw.get("created_at") or ""),
         updated_at=normalize_timestamp(raw.get("updated_at") or ""),
         milestone=(raw.get("milestone") or {}).get("title"),
+    )
+
+
+def _map_pr_file(raw: dict) -> PRFileDiff:
+    """Translate a GitLab `/merge_requests/:iid/changes` entry into
+    `PRFileDiff`.
+
+    `path` prefers `new_path` over `old_path` (the plan's `new_path or
+    old_path` rule) — needed so a rename that changed the path still
+    reports the current one. `previous_path` is populated ONLY when
+    `renamed_file` is true, never merely because `old_path != new_path`.
+    `additions`/`deletions` stay `None` — the `changes` payload carries
+    no such counts.
+    """
+    new_path = raw.get("new_path")
+    old_path = raw.get("old_path")
+    renamed = bool(raw.get("renamed_file"))
+    if raw.get("new_file"):
+        change_type = "added"
+    elif raw.get("deleted_file"):
+        change_type = "removed"
+    elif renamed:
+        change_type = "renamed"
+    else:
+        change_type = "modified"
+    diff = raw.get("diff")
+    return PRFileDiff(
+        path=new_path or old_path or "",
+        change_type=change_type,
+        previous_path=old_path if renamed else None,
+        patch=diff,
+        line_ranges=parse_diff_hunk_ranges(diff),
+        additions=None,
+        deletions=None,
     )
 
 
@@ -2018,6 +2056,7 @@ class GitLabProvider(
     TokenProjectDiscoveryProvider,
     ViewerIdentityProvider,
     CIConfigurationProvider,
+    PRDiffProvider,
 ):
     """GitLab REST v4 provider.
 
@@ -3449,6 +3488,47 @@ class GitLabProvider(
                         discussion_id=discussion_id,
                     ))
             return out
+
+    def list_pr_files(
+        self,
+        project: ProjectConfig,
+        token: str | None,
+        pr_id: str,
+    ) -> list[PRFileDiff]:
+        """List an MR's changed files, diff text and parsed diff line ranges.
+
+        Hits `GET /projects/:id/merge_requests/:iid/changes` — the
+        legacy/universal endpoint, deliberately NOT `/diffs` — and reads
+        the whole-MR-object response (unpaginated): `changes` holds one
+        entry per file.
+
+        Known limitation: on a very large diff GitLab may cap `changes`
+        and set the sibling `overflow: true` flag. That is not raised —
+        the (possibly truncated) `changes` are returned as-is, with one
+        `log.warning` mentioning the MR id and "incomplete", mirroring
+        this codebase's existing truncate-and-warn convention (see
+        GitHub's `_find_pending_review`).
+        """
+        path = _project_path(project)
+        with _client(project, token) as client:
+            r = client.get(f"/projects/{path}/merge_requests/{pr_id}/changes")
+            try:
+                _check(r)
+            except GitLabError as exc:
+                if exc.status == 404 and not _is_project_not_found_message(exc.message):
+                    raise GitLabError(
+                        404, _not_found_message("PR", f"{project.id}#{pr_id}"),
+                    ) from exc
+                raise
+            data = r.json()
+            changes = data.get("changes") or []
+            if data.get("overflow"):
+                log.warning(
+                    "list_pr_files for %s#%s: GitLab reported overflow=true"
+                    " — result is incomplete",
+                    project.id, pr_id,
+                )
+            return [_map_pr_file(it) for it in changes]
 
     def list_pr_reviews(
         self,

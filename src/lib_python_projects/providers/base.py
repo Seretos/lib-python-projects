@@ -759,6 +759,114 @@ class Review:
     commit_sha: str | None = None
 
 
+# ---------- PR diff discovery (ticket #240) -----------------------------------
+
+
+PRFileChangeType = Literal[
+    "added", "modified", "removed", "renamed", "copied", "changed", "unchanged",
+]
+
+
+@dataclass
+class DiffHunkRange:
+    """A single commentable line range on one side of a diff hunk.
+
+    `side` is `"LEFT"` (pre-change) or `"RIGHT"` (post-change). `start`
+    and `end` are both inclusive, 1-based line numbers on that side.
+    """
+
+    side: str
+    start: int
+    end: int
+
+
+@dataclass
+class PRFileDiff:
+    """A single changed file in a pull request, as returned by
+    `PRDiffProvider.list_pr_files`.
+
+    Tri-state contract for `line_ranges` (and, in parallel, `patch`):
+      - `None` — the provider cannot supply diff positions at all
+        (Azure DevOps, `SUPPORTS_DIFF_LINE_RANGES = False`).
+      - `[]` — the provider supports positions in general but this
+        particular file has none (e.g. a binary or oversized file with
+        no patch text).
+      - non-empty `list[DiffHunkRange]` — real commentable ranges,
+        parsed from the file's patch via `parse_diff_hunk_ranges`.
+
+    `previous_path` is populated ONLY when `change_type == "renamed"`,
+    on every provider — `None` in every other case, even when the
+    upstream payload happens to carry a former-path field (e.g. a
+    stray `previous_filename`/`sourceServerItem` on a non-rename entry
+    is deliberately ignored).
+    """
+
+    path: str
+    change_type: PRFileChangeType
+    previous_path: str | None = None
+    patch: str | None = None
+    line_ranges: list[DiffHunkRange] | None = None
+    additions: int | None = None
+    deletions: int | None = None
+
+
+class PRDiffProvider:
+    """Mixin/interface: providers that can enumerate a PR's changed files
+    and diff positions before a review comment is posted implement this
+    method.
+
+    `SUPPORTS_DIFF_LINE_RANGES` tells callers, without making a network
+    call, whether this provider can ever populate `patch`/`line_ranges`
+    on the returned `PRFileDiff` entries. It is `True` on GitHub and
+    GitLab; Azure DevOps sets it `False` because its PR API exposes no
+    per-file diff hunk positions — `patch`/`line_ranges` are permanently
+    `None` there, and `list_pr_files` is file-level only.
+    """
+
+    SUPPORTS_DIFF_LINE_RANGES: bool = True
+
+    def list_pr_files(
+        self, project, token: str | None, pr_id: str
+    ) -> list[PRFileDiff]:
+        raise NotImplementedError
+
+
+_HUNK_HEADER_RE = re.compile(
+    r"^@@ -(?P<left_start>\d+)(?:,(?P<left_count>\d+))? "
+    r"\+(?P<right_start>\d+)(?:,(?P<right_count>\d+))? @@"
+)
+
+
+def parse_diff_hunk_ranges(patch: str | None) -> list[DiffHunkRange]:
+    """Parse `@@ -a,b +c,d @@` hunk headers into `DiffHunkRange` entries.
+
+    For each recognized header: a `LEFT` range `[a, a+b-1]` when `b > 0`
+    (omitted `b` means `1`), and a `RIGHT` range `[c, c+d-1]` when `d > 0`
+    (omitted `d` means `1`). A header with `b == 0`/`d == 0` emits
+    nothing for that side. `None`/empty input, or input with no
+    recognizable header at all, returns `[]`. A malformed header does
+    not abort the whole patch — it is skipped and parsing continues with
+    any remaining, valid headers in the same patch.
+    """
+    if not patch:
+        return []
+
+    ranges: list[DiffHunkRange] = []
+    for line in patch.splitlines():
+        m = _HUNK_HEADER_RE.match(line)
+        if not m:
+            continue
+        left_start = int(m.group("left_start"))
+        left_count = int(m.group("left_count") or "1")
+        right_start = int(m.group("right_start"))
+        right_count = int(m.group("right_count") or "1")
+        if left_count > 0:
+            ranges.append(DiffHunkRange("LEFT", left_start, left_start + left_count - 1))
+        if right_count > 0:
+            ranges.append(DiffHunkRange("RIGHT", right_start, right_start + right_count - 1))
+    return ranges
+
+
 def review_decision_from_states(states: list[str]) -> str | None:
     """Derive a coarse review decision from a list of normalized review states.
 

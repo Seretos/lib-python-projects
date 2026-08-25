@@ -10,6 +10,9 @@ Covers:
 - `add_pr_review_comment` diff-anchored thread + reply path
 - `submit_pr_review` reviewer-vote mapping
 - `list_pr_review_comments` thread-with-context filtering
+- `list_pr_files` (ticket #240): file-level-only diff discovery via the
+  iterations/changes endpoints — `patch`/`line_ranges` are always `None`
+  (`SUPPORTS_DIFF_LINE_RANGES = False`)
 """
 from __future__ import annotations
 
@@ -4413,3 +4416,213 @@ def test_add_pr_comment_converts_markdown_to_html(
     )
     content = captured["body"]["comments"][0]["content"]
     assert "<strong>bold</strong>" in content, repr(content)
+
+
+# ---------- ticket #240: list_pr_files (R3, file-level only) ----------------
+#
+# Azure's PR API exposes no per-file diff hunk positions: `patch`/
+# `line_ranges` are permanently `None` on this provider
+# (`SUPPORTS_DIFF_LINE_RANGES = False`). Discovery is
+# `_resolve_repository_id` -> `GET .../pullrequests/{id}/iterations`
+# (take the highest `id`) -> `GET .../iterations/{iterationId}/changes`.
+
+
+def _iterations_response(ids: list[int]) -> httpx.Response:
+    return _json({"value": [{"id": i} for i in ids]})
+
+
+def _change_entry(
+    path: str,
+    change_type: str = "edit",
+    is_folder: bool = False,
+    source_server_item: str | None = None,
+) -> dict:
+    entry: dict = {
+        "item": {"path": path, "isFolder": is_folder},
+        "changeType": change_type,
+    }
+    if source_server_item is not None:
+        entry["sourceServerItem"] = source_server_item
+    return entry
+
+
+def _changes_response(entries: list[dict]) -> httpx.Response:
+    return _json({"changeEntries": entries})
+
+
+def test_list_pr_files_is_file_level_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolves the repo id, fetches `/iterations`, uses the HIGHEST
+    iteration id for the `/changes` call, strips the leading `/` from
+    paths, maps `add`/`edit`/`delete` -> `added`/`modified`/`removed`,
+    and every result has `patch is None and line_ranges is None`
+    (Azure is deliberately file-level only)."""
+    seen_changes_paths: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if req.method == "GET" and req.url.path.endswith("/iterations"):
+            return _iterations_response([1, 2])
+        if req.method == "GET" and "/iterations/" in req.url.path and req.url.path.endswith("/changes"):
+            seen_changes_paths.append(req.url.path)
+            return _changes_response([
+                _change_entry("/src/app.py", change_type="add"),
+                _change_entry("/src/util.py", change_type="edit"),
+                _change_entry("/src/old.py", change_type="delete"),
+            ])
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_pr_files(_project(), token="t", pr_id="7")
+
+    assert len(seen_changes_paths) == 1
+    assert seen_changes_paths[0].endswith("/iterations/2/changes")
+
+    by_path = {f.path: f for f in result}
+    assert set(by_path) == {"src/app.py", "src/util.py", "src/old.py"}
+    assert by_path["src/app.py"].change_type == "added"
+    assert by_path["src/util.py"].change_type == "modified"
+    assert by_path["src/old.py"].change_type == "removed"
+    for f in result:
+        assert f.patch is None
+        assert f.line_ranges is None
+        assert f.additions is None
+        assert f.deletions is None
+
+
+def test_list_pr_files_skips_folder_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if req.method == "GET" and req.url.path.endswith("/iterations"):
+            return _iterations_response([1])
+        if req.method == "GET" and req.url.path.endswith("/changes"):
+            return _changes_response([
+                _change_entry("/src/app.py", change_type="edit"),
+                _change_entry("/src/subdir", change_type="edit", is_folder=True),
+            ])
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_pr_files(_project(), token="t", pr_id="7")
+    assert [f.path for f in result] == ["src/app.py"]
+
+
+def test_list_pr_files_rename_sets_previous_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`changeType` containing `rename` (including the compound
+    `"edit, rename"`) maps to `"renamed"`; `previous_path` comes from
+    `sourceServerItem` with its leading `/` stripped."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if req.method == "GET" and req.url.path.endswith("/iterations"):
+            return _iterations_response([1])
+        if req.method == "GET" and req.url.path.endswith("/changes"):
+            return _changes_response([
+                _change_entry(
+                    "/src/new.py",
+                    change_type="edit, rename",
+                    source_server_item="/src/old.py",
+                ),
+            ])
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_pr_files(_project(), token="t", pr_id="7")
+    assert result[0].path == "src/new.py"
+    assert result[0].change_type == "renamed"
+    assert result[0].previous_path == "src/old.py"
+
+
+def test_list_pr_files_edit_with_source_server_item_stays_modified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`previous_path` is populated ONLY for entries mapped to
+    `"renamed"` — a stray `sourceServerItem` on a plain `edit` entry
+    must not leak through."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if req.method == "GET" and req.url.path.endswith("/iterations"):
+            return _iterations_response([1])
+        if req.method == "GET" and req.url.path.endswith("/changes"):
+            return _changes_response([
+                _change_entry(
+                    "/src/app.py",
+                    change_type="edit",
+                    source_server_item="/src/app.py",
+                ),
+            ])
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_pr_files(_project(), token="t", pr_id="7")
+    assert result[0].change_type == "modified"
+    assert result[0].previous_path is None
+
+
+def test_list_pr_files_rename_without_source_server_item_previous_path_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `"rename"` entry with `sourceServerItem` absent must not crash
+    — `previous_path` falls back to `None`."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if req.method == "GET" and req.url.path.endswith("/iterations"):
+            return _iterations_response([1])
+        if req.method == "GET" and req.url.path.endswith("/changes"):
+            return _changes_response([
+                _change_entry("/src/new.py", change_type="rename"),
+            ])
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_pr_files(_project(), token="t", pr_id="7")
+    assert result[0].change_type == "renamed"
+    assert result[0].previous_path is None
+
+
+def test_list_pr_files_empty_iterations_returns_empty_no_second_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if req.method == "GET" and req.url.path.endswith("/iterations"):
+            return _iterations_response([])
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    result = AzureDevOpsProvider().list_pr_files(_project(), token="t", pr_id="7")
+    assert result == []
+    assert not any(r.url.path.endswith("/changes") for r in seen)
+
+
+def test_list_pr_files_404_on_changes_raises_named_pr_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        if req.method == "GET" and req.url.path.endswith("/iterations"):
+            return _iterations_response([1])
+        if req.method == "GET" and req.url.path.endswith("/changes"):
+            return _json({"message": "not found"}, status_code=404)
+        raise AssertionError(f"unexpected {req.method} {req.url.path}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(AzureDevOpsError) as exc:
+        AzureDevOpsProvider().list_pr_files(_project(), token="t", pr_id="7")
+    assert exc.value.status == 404
+    assert "PR 'azure-tests#7' not found" in exc.value.message

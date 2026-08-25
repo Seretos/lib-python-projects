@@ -58,6 +58,8 @@ from lib_python_projects.providers.base import (
     # Pipeline trigger / run filtering / refs / releases (ticket #200):
     Ref, Release, EVENT_ALIASES, resolve_event_alias, apply_run_filters,
     now_utc,
+    # PR diff discovery (ticket #240):
+    PRFileDiff, DiffHunkRange, PRDiffProvider, parse_diff_hunk_ranges,
 )
 ```
 
