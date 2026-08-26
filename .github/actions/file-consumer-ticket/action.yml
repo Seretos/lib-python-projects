@@ -1,0 +1,44 @@
+name: 'File consumer dependency-update ticket'
+description: >-
+  Files (or reuses) a chore(deps) ticket in a downstream consumer repo,
+  embedding the source release's changelog verbatim under a
+  "### What changed" heading (falls back to a link to the release page
+  when the changelog cannot be fetched or is empty).
+
+inputs:
+  version:
+    description: 'Release version being bumped to (semver, no leading v)'
+    required: true
+  source_repo:
+    description: 'owner/repo of the release source (used for the changelog lookup)'
+    required: true
+  consumer_repo:
+    description: 'owner/repo of the ticket-filing target'
+    required: true
+  gh_token:
+    description: >-
+      Token gh uses both for the consumer-repo issue calls and for the
+      `gh release view` lookup against source_repo.
+    required: true
+
+outputs:
+  issue_url:
+    description: 'URL of the filed or reused issue (empty if filing failed)'
+    value: ${{ steps.file.outputs.issue_url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: file
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        VERSION: ${{ inputs.version }}
+        SOURCE_REPO: ${{ inputs.source_repo }}
+        CONSUMER_REPO: ${{ inputs.consumer_repo }}
+        GH_TOKEN: ${{ inputs.gh_token }}
+      # ci/ lives at the repo root (see ci/__init__.py) -- working-directory
+      # ensures `python3 -m ci.bump_ticket` can import it as `ci.*`
+      # regardless of what the calling workflow's default working directory
+      # is set to.
+      run: python3 -m ci.bump_ticket

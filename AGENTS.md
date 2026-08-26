@@ -60,14 +60,29 @@ After every release, `release.yml` automatically opens a
 `Seretos/agent-project-issues` (via `PROJECTS_TICKET_TOKEN`) and
 `Seretos/workboard` (via `WORKBOARD_TICKET_TOKEN`). Each consumer has its own
 dedicated step; both are `continue-on-error: true` so a missing or invalid
-token for one consumer never blocks the release or the other consumer.
+token for one consumer never blocks the release or the other consumer. The
+ticket body embeds the release's changelog verbatim under a
+`### What changed` heading, positioned before `### Action required` — if the
+changelog can't be fetched (or is empty), the step warns and substitutes a
+link to the release page under the same heading, then still files the
+ticket. Both filing steps and both board steps delegate to two local
+composite actions (`.github/actions/file-consumer-ticket` and
+`.github/actions/add-to-board`) shared across `release.yml` and
+`ticket.yml`, so the enriched body and the board placement below are
+defined once.
+
 Immediately after each ticket step, a follow-up step adds that issue to the
 `users/Seretos/projects/2` board via `gh project item-add`, reusing that same
 consumer's ticket token (`PROJECTS_TICKET_TOKEN` or `WORKBOARD_TICKET_TOKEN`),
-so bump tickets show up on the board without manual triage. No separate board
-token is needed — each per-consumer token is a classic PAT that also carries
-the `project` scope. The board-add step is skipped cleanly if the ticket step
-produced no issue URL.
+and sets its Status to **Backlog** (not Todo) — the project id, the Status
+field id, and the Backlog option id are all resolved at runtime via `gh`,
+never hardcoded, so bump tickets land ready for triage rather than already
+in the active column. No separate board token is needed — each per-consumer
+token is a classic PAT that also carries the `project` scope. The board-add
+step is skipped cleanly if the ticket step produced no issue URL, and a
+board-add failure (e.g. the Status field can't be resolved) only warns —
+it never fails the ticket-filing job, since the ticket itself already
+exists and is usable without a board placement.
 
 **If the automatic step was skipped or failed**, re-file manually by running
 the `open-dep-ticket` workflow (`.github/workflows/ticket.yml`) via
@@ -101,3 +116,34 @@ before the first release.
 Without the `project` scope on these tokens, the board-add step is silently
 skipped (`continue-on-error`) and the ticket still opens normally — it just
 won't appear on board `2`.
+
+**`ci/` package invariants.** Both composite actions' logic lives in the
+plain-source `ci/` package at the repo root (`ci/gh.py`, `ci/actions_io.py`,
+`ci/bump_ticket.py`, `ci/board.py` — not installed as part of the
+distribution; each action's `run:` line invokes it as `python3 -m
+ci.<module>`). This replaced an earlier bash implementation that shipped six
+review-round bugs in a row (silent `jq`/`gh api --jq` misuse, CLI-side
+filtering swallowing real failures, an undeclared `jq` runtime dependency,
+pagination that silently truncated past the default page, and a board write
+that could land an item outside Backlog on a partial failure). `ci/` closes
+that whole bug class *structurally*, not by patching each one after the
+fact — a future change here must preserve these invariants (enforced by
+`tests/test_ci_gh_discipline.py`, which source-scans every module under
+`ci/`):
+
+- every `gh` invocation goes through the single choke point in `ci/gh.py`
+  (`run_gh`, `gh_json`, `gh_paginate_rest`) — no other module spawns a
+  process directly;
+- no CLI-side filtering/paging flags anywhere (`gh`'s own query-filter,
+  quiet-JSON, templating, or automatic-pagination flags) — every response is
+  parsed as JSON in Python instead, and REST pagination is followed
+  explicitly, one page at a time, via `gh_paginate_rest`;
+- no shell execution, and no external `jq` (or any other) runtime
+  dependency — standard library only, no third-party imports anywhere under
+  `ci/`;
+- board writes are resolve-then-mutate: `ci/board.py`'s
+  `resolve_backlog_target` fully resolves the project id, the Status field
+  id, and the Backlog option id (read-only calls only) *before*
+  `place_in_backlog` ever runs the first mutating call — a resolution
+  failure means the item is never added to the board at all, never added
+  and then stranded outside Backlog.
