@@ -675,15 +675,39 @@ class ReviewComment:
         diff. `None` when the position is unresolvable (e.g. outdated
         comment whose anchor moved out of the latest diff).
       - `original_line`: the line as of `original_commit_sha`. GitHub
-        only; GitLab leaves it `None`.
+        populates this field on review comments. GitLab, on write:
+        `add_pr_review_comment`'s LEFT-side new-thread path sets it to
+        the resolved old-side line number (the pre-change line the
+        LEFT anchor was walked to); the RIGHT/default new-thread path
+        and replies leave it `None`. GitLab, on read:
+        `list_pr_review_comments` (the only GitLab read surface
+        returning `ReviewComment`) surfaces it from the note's own
+        `position.old_line` whenever GitLab's diff position carries
+        one — this covers any LEFT-anchored comment regardless of how
+        it was originally written, not just ones created via the
+        write path above — and stays `None` when the position has no
+        `old_line` (a pure RIGHT/addition anchor).
       - `side`: `"LEFT"` for a deletion-side anchor, `"RIGHT"` for the
-        addition side. `None` for GitLab (uses `old_line`/`new_line`
-        directly). Note: `side` and `url` may differ between the
-        `add_pr_review_comment` response and the same comment as returned
-        by `get_pr`. GitLab does not echo `side` on write and constructs
-        the `url` only after the comment is saved, so the write response
-        carries `side=None` and an empty or provisional `url`; the
-        authoritative values are available via `get_pr` afterwards.
+        addition side. On GitLab's `add_pr_review_comment`, a RIGHT/
+        default new-thread comment and any reply carry `side=None`
+        (uses `old_line`/`new_line` directly); a LEFT-side new-thread
+        comment (`side="LEFT"`) is the one exception and echoes back
+        `side="LEFT"` literally. Note: `side` and `url` may differ
+        between the `add_pr_review_comment` response and the same
+        comment as returned by `get_pr`. On the RIGHT/reply paths,
+        GitLab does not echo `side` on write and constructs the `url`
+        only after the comment is saved, so the write response carries
+        `side=None` and an empty or provisional `url`; the authoritative
+        values are available via `get_pr` afterwards.
+
+        Known limitation: a GitLab LEFT comment on a context line reads
+        back via `list_pr_review_comments` as `side="RIGHT"`, not
+        `"LEFT"` — the write response's `side="LEFT"` reflects the
+        caller's request, not a property preserved in GitLab's data.
+        GitLab's single-line comment position provides no field to
+        distinguish that case from an ordinary RIGHT-anchored comment,
+        so a later read cannot recover it. This is a known, accepted
+        limitation of GitLab's API, not a code defect.
       - `commit_sha`: the diff base the comment was anchored against.
       - `in_reply_to`: the id of the comment / discussion this is a
         reply to, or `None` for new threads. On GitHub this is the

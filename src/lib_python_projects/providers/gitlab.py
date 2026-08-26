@@ -55,6 +55,7 @@ from lib_python_projects.providers.base import (
     FailingJob,
     FieldSpec,
     Label,
+    _HUNK_HEADER_RE,
     normalize_timestamp,
     now_utc,
     parse_diff_hunk_ranges,
@@ -511,6 +512,113 @@ def _map_pr_file(raw: dict) -> PRFileDiff:
         additions=None,
         deletions=None,
     )
+
+
+def _resolve_left_position_lines(
+    diff_text: str | None, old_line: int,
+) -> tuple[int, int | None] | None:
+    """Walk a unified diff hunk to resolve a LEFT-side (pre-change) line.
+
+    Returns `(old_line, new_line)` where `new_line` is the matching
+    post-change line number for a context line, or `None` for a
+    removed line. Returns `None` when `old_line` falls in no hunk (or
+    `diff_text` is falsy).
+
+    A `@@ -a,b +c,d @@` header (matched via the shared
+    `base._HUNK_HEADER_RE`) seeds `old = a`, `new = c`. Body lines then
+    advance the counters: `' '`/empty (context) advances both, `'-'`
+    (removal) advances `old` only, `'+'` (addition) advances `new`
+    only. A `'\\ No newline at end of file'` marker is recognized
+    BEFORE the context check and advances neither counter. A line
+    starting with `@@` at column 0 that does not match
+    `_HUNK_HEADER_RE` is a malformed header: it clears both counters to
+    the un-attributable state (same as before the first header), so
+    every following body line advances nothing and can never match,
+    until the next valid `@@` header reseeds the counters from its own
+    `a`/`c`.
+    """
+    if not diff_text:
+        return None
+    old: int | None = None
+    new: int | None = None
+    for raw_line in diff_text.splitlines():
+        if raw_line.startswith("@@"):
+            m = _HUNK_HEADER_RE.match(raw_line)
+            if m:
+                old = int(m.group("left_start"))
+                new = int(m.group("right_start"))
+            else:
+                old = None
+                new = None
+            continue
+        if old is None:
+            continue
+        if raw_line.startswith("\\"):
+            continue
+        if raw_line.startswith(" ") or raw_line == "":
+            if old == old_line:
+                return (old, new)
+            old += 1
+            new += 1
+            continue
+        if raw_line.startswith("-"):
+            if old == old_line:
+                return (old, None)
+            old += 1
+            continue
+        if raw_line.startswith("+"):
+            new += 1
+            continue
+    return None
+
+
+def _find_change_entry_for_path(changes: list[dict], path: str | None) -> dict | None:
+    """Find the `changes[]` entry matching `path`, for the LEFT-side
+    (pre-change) lookup only.
+
+    Structural (order-independent) precedence, evaluated as three full
+    passes over `changes` — never "whichever the list happens to
+    iterate first":
+
+    1. An entry with `renamed_file is True` and `old_path == path`:
+       a definite rename-away from `path`, with genuine pre-change
+       lines to resolve against. This wins even when another entry
+       (an unrelated new file added back at that same `path`) would
+       *also* satisfy `old_path == path` — this codebase's own
+       `_change_entry` test-fixture convention (and GitLab's actual
+       payload shape) has a brand-new file's `old_path` default to
+       equal its `new_path`, so a plain `old_path == path` check alone
+       cannot tell a rename-away from an added-back new file; only the
+       `renamed_file` flag can. Checking this tier as its own full
+       pass (rather than "first old_path match found") is what makes
+       the result independent of the input list's order.
+    2. Otherwise, an entry where `old_path == path` (covers the
+       ordinary modify case where `old_path == new_path == path`, and
+       any other old_path match not already caught by tier 1).
+    3. Otherwise, an entry where `new_path == path` (covers added
+       files and any other new_path-only match).
+
+    LEFT resolves pre-change content: tiers 1 and 2 have genuine
+    old-side lines at `path` to resolve against; a pure new_path-only
+    match (tier 3) is a brand new file whose diff is a pure
+    `@@ -0,0 +1,N @@` addition with no old-side content at all.
+    """
+    # Prefer the rename-away entry: an added-back file at this same path
+    # is always a pure addition with no old-side content, so it could
+    # never resolve a LEFT position anyway — preferring it here would
+    # only trade a useful match for a guaranteed 422. This precedence is
+    # deliberate and is locked in by
+    # test_add_pr_review_comment_left_side_prefers_renamed_away_regardless_of_list_order.
+    for entry in changes:
+        if entry.get("renamed_file") and entry.get("old_path") == path:
+            return entry
+    for entry in changes:
+        if entry.get("old_path") == path:
+            return entry
+    for entry in changes:
+        if entry.get("new_path") == path:
+            return entry
+    return None
 
 
 def _map_note(
@@ -3584,10 +3692,50 @@ class GitLabProvider(
         Routing:
           - **Reply** (`in_reply_to=<discussion_id>`): POST
             `.../discussions/{discussion_id}/notes` with the body only.
-          - **New thread**: POST `.../discussions` with a `position`
-            object carrying `base_sha` (read from the MR), `start_sha`
-            (same), `head_sha` (= `commit_sha`), `new_path`/`old_path`
+            `side` is ignored entirely (even `"LEFT"`) — replies never
+            look at diff position, and the returned `side` stays `None`.
+          - **New thread, RIGHT/default** (`side` anything other than
+            `"LEFT"`, case-insensitively — the exact rule Azure DevOps
+            uses: `(side or "RIGHT").upper() == "LEFT"`): POST
+            `.../discussions` with a `position` object carrying
+            `base_sha`/`start_sha` (read from a plain MR GET),
+            `head_sha` (= `commit_sha`), `new_path`/`old_path`
             (= `path`), `new_line` (= `line`), and `position_type=text`.
+            Unchanged from before this method supported `side`.
+
+            Known limitation: RIGHT-side comments on unchanged/context
+            lines are not resolved to a matching old_line; this is a
+            known pre-existing limitation and is out of scope for this
+            change.
+          - **New thread, LEFT** (`side="LEFT"`, case-insensitively):
+            issues one GET to `.../changes` (the same endpoint
+            `list_pr_files` uses) instead of the plain MR GET, so
+            `diff_refs` comes from that same payload. The matching
+            `changes[]` entry is found via `_find_change_entry_for_path`,
+            whose structural (order-independent) precedence is: (1) a
+            `renamed_file=True` entry with `old_path == path` — a
+            definite rename-away with real pre-change content; (2) any
+            other `old_path == path` match; (3) a `new_path == path`
+            match (added files). It is walked via
+            `_resolve_left_position_lines` to resolve the real
+            `(old_line, new_line)` pair for the requested `line`. The
+            posted `position` sets `old_line` always and `new_line`
+            only when resolved (key omitted, never `null`), and
+            `old_path`/`new_path` come from the matched entry's own
+            fields (so a rename resolves correctly). When the path has
+            no diff data (missing from `changes`, or present but with
+            an empty/binary diff) or the line falls in no hunk, raises
+            `GitLabError(422, ...)` naming `path`, `line`, `side`, and
+            the MR id instead of posting an invalid position. The
+            returned `ReviewComment.side` is set to `"LEFT"` literally.
+
+            Known limitation: a LEFT comment on a removed line reads
+            back correctly as `"LEFT"` via `list_pr_review_comments`; a
+            LEFT comment on a context line will read back as `"RIGHT"`
+            instead, since GitLab's single-line comment position has no
+            field to distinguish the two cases. This write response's
+            `side="LEFT"` describes what was requested, not something
+            recoverable on a later read for that case.
 
         New-thread mode requires `path`, `line`, and `commit_sha` to be
         set; the caller (tool layer) validates that.
@@ -3633,22 +3781,64 @@ class GitLabProvider(
 
             # New thread — GitLab needs base_sha and start_sha alongside
             # head_sha; fetch them from the MR's diff_refs.
-            mr_r = client.get(
-                f"/projects/{repo_path}/merge_requests/{pr_id}",
-            )
-            _check(mr_r)
-            diff_refs = mr_r.json().get("diff_refs") or {}
-            base_sha = diff_refs.get("base_sha") or commit_sha
-            start_sha = diff_refs.get("start_sha") or commit_sha
-            position = {
-                "base_sha": base_sha,
-                "start_sha": start_sha,
-                "head_sha": commit_sha,
-                "position_type": "text",
-                "new_path": path,
-                "old_path": path,
-                "new_line": line,
-            }
+            is_left = (side or "RIGHT").upper() == "LEFT"
+            if is_left:
+                # Same endpoint list_pr_files uses — one GET gives us
+                # both diff_refs and the changes[] diff text, so the
+                # LEFT branch stays at exactly one network GET.
+                changes_r = client.get(
+                    f"/projects/{repo_path}/merge_requests/{pr_id}/changes",
+                )
+                _check(changes_r)
+                changes_data = changes_r.json()
+                diff_refs = changes_data.get("diff_refs") or {}
+                base_sha = diff_refs.get("base_sha") or commit_sha
+                start_sha = diff_refs.get("start_sha") or commit_sha
+                changes = changes_data.get("changes") or []
+                entry = _find_change_entry_for_path(changes, path)
+                diff_text = entry.get("diff") if entry else None
+                if entry is None or not diff_text:
+                    raise GitLabError(
+                        422,
+                        f"GitLab MR !{pr_id}: path '{path}' has no diff "
+                        f"data to resolve line {line} for side=LEFT",
+                    )
+                resolved = _resolve_left_position_lines(diff_text, line)
+                if resolved is None:
+                    raise GitLabError(
+                        422,
+                        f"GitLab MR !{pr_id}: line {line} of '{path}' is "
+                        f"not part of any diff hunk (side=LEFT)",
+                    )
+                old_line, new_line = resolved
+                position = {
+                    "base_sha": base_sha,
+                    "start_sha": start_sha,
+                    "head_sha": commit_sha,
+                    "position_type": "text",
+                    "new_path": entry.get("new_path"),
+                    "old_path": entry.get("old_path"),
+                    "old_line": old_line,
+                }
+                if new_line is not None:
+                    position["new_line"] = new_line
+            else:
+                mr_r = client.get(
+                    f"/projects/{repo_path}/merge_requests/{pr_id}",
+                )
+                _check(mr_r)
+                diff_refs = mr_r.json().get("diff_refs") or {}
+                base_sha = diff_refs.get("base_sha") or commit_sha
+                start_sha = diff_refs.get("start_sha") or commit_sha
+                position = {
+                    "base_sha": base_sha,
+                    "start_sha": start_sha,
+                    "head_sha": commit_sha,
+                    "position_type": "text",
+                    "new_path": path,
+                    "old_path": path,
+                    "new_line": line,
+                }
             r = client.post(
                 f"/projects/{repo_path}/merge_requests/{pr_id}/discussions",
                 json={"body": prefixed, "position": position},
@@ -3674,13 +3864,32 @@ class GitLabProvider(
                 )
             else:
                 _new_thread_url = note_raw.get("web_url") or ""
+            if is_left:
+                returned_line = new_line
+                returned_original_line = old_line
+                returned_side = "LEFT"
+                # Mirror `list_pr_review_comments`'s own
+                # `pos.get("new_path") or pos.get("old_path")` derivation
+                # so a write response and a later read agree on `path` by
+                # construction, not by coincidence (ticket #240 review
+                # finding): for a renamed file, `entry` (matched above via
+                # `_find_change_entry_for_path`) carries the real
+                # `new_path`/`old_path`, which can differ from the
+                # caller's raw `path` argument (e.g. the pre-rename path).
+                returned_path = entry.get("new_path") or entry.get("old_path")
+            else:
+                returned_line = line
+                returned_original_line = None
+                returned_side = None
+                returned_path = path
             return ReviewComment(
                 id=str(note_raw.get("id", "")),
                 author=(note_raw.get("author") or {}).get("username", ""),
                 body=note_raw.get("body") or "",
-                path=path,
-                line=line,
-                side=None,
+                path=returned_path,
+                line=returned_line,
+                original_line=returned_original_line,
+                side=returned_side,
                 commit_sha=commit_sha or None,
                 in_reply_to=None,
                 created_at=normalize_timestamp(note_raw.get("created_at") or ""),
