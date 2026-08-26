@@ -1,0 +1,34 @@
+name: 'Add ticket to project board (Backlog)'
+description: >-
+  Adds an issue to a user-owned Projects v2 board and sets its Status to
+  Backlog. Project id, the Status field id, and the Backlog option id are
+  all resolved at runtime via `gh` -- never hardcoded.
+
+inputs:
+  issue_url:
+    description: 'URL of the issue to add to the board'
+    required: true
+  board_owner:
+    description: 'Owner of the user-owned Projects v2 board (e.g. "Seretos")'
+    required: true
+  board_number:
+    description: 'Project number (e.g. "2")'
+    required: true
+  gh_token:
+    description: 'Token gh uses for project item-add/view/field-list/item-edit'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        ISSUE_URL: ${{ inputs.issue_url }}
+        BOARD_OWNER: ${{ inputs.board_owner }}
+        BOARD_NUMBER: ${{ inputs.board_number }}
+        GH_TOKEN: ${{ inputs.gh_token }}
+      # ci/ lives at the repo root (see ci/__init__.py) -- working-directory
+      # ensures `python3 -m ci.board` can import it as `ci.*` regardless of
+      # what the calling workflow's default working directory is set to.
+      run: python3 -m ci.board

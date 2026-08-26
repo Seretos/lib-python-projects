@@ -37,7 +37,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# "." (repo root) is needed so the top-level `ci/` package (#243 generation
+# 2 -- plain source, never installed, imported only by the composite
+# actions and this test suite) is importable as `ci.*`.
+pythonpath = ["src", "."]
 addopts = "-ra --strict-markers"
 # thread-based timeout (not the "signal" default): signal-based timeouts
 # don't work on Windows and can't interrupt blocking socket I/O, thread-based
