@@ -3178,7 +3178,13 @@ class GitLabProvider(
         ticket_id: str,
         body: str,
     ) -> Comment:
-        """Post a note on an issue. The AI-comment prefix is applied."""
+        """Post a note on an issue. The AI-comment prefix is applied.
+
+        GitLab's issue and merge-request id-spaces (iids) are
+        **disjoint** — an MR iid passed here as `ticket_id` targets an
+        unrelated issue if one happens to exist with that same iid,
+        otherwise it **404**s. Use `add_pr_comment` for merge requests.
+        """
         if not body or not body.strip():
             raise ValueError("body must not be empty")
         prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
@@ -3649,6 +3655,15 @@ class GitLabProvider(
         the same key but a different `title`/`head`/`base` raises
         `IdempotencyConflict`. `None`/`""` (the default) disables
         idempotency entirely.
+
+        **Zero-diff MRs.** An MR created with `head` and `base` having
+        identical content (a zero-diff MR) is created successfully by
+        this call, but is **not mergeable**: GitLab reports a blocking
+        `detailed_merge_status` (e.g. `"commits_status"` as one example —
+        not the only possible value), and `merge_pr` surfaces that as a
+        405 naming the blocking reason. `create_pr` itself does not
+        detect, reject, or raise on this case — give the source branch a
+        real commit before expecting the MR to merge.
         """
         if idempotency_key:
             replay = _idempotency.lookup(
