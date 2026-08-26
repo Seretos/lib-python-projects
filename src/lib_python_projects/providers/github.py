@@ -667,37 +667,112 @@ def _cleanup_orphaned_pending_review(
         )
 
 
-def _review_comment_node_id(
-    client: httpx.Client, project: ProjectConfig, comment_id: str,
-) -> str:
-    """Resolve a REST review-comment id to its GraphQL `node_id`.
+def _lookup_review_comment(
+    client: httpx.Client, project: ProjectConfig, pr_id: str, comment_id: str,
+) -> dict | None:
+    """Resolve a REST review-comment id to its raw payload, tolerant of
+    comments still attached to an unsubmitted PENDING review.
 
-    Needed to translate the caller's `in_reply_to` (a REST id) into the
-    id GraphQL's `addPullRequestReviewComment(inReplyTo:)` demands.
+    `GET /repos/{o}/{r}/pulls/comments/{id}` does not serve a comment
+    that still belongs to the caller's own unsubmitted PENDING review —
+    which is exactly the kind of comment this library creates, so
+    replying to our own previous inline comment 404s there. On a 404
+    (and only a 404 — any other error propagates) this falls back to
+    scanning `GET /pulls/{n}/comments?per_page=100`, paginated with the
+    same `_has_next_link` + `page`-increment recipe as
+    `_find_pending_review` (same 100-page cap and warning) — that
+    endpoint DOES return the caller's own pending comments
+    (`list_pr_review_comments` already relies on this). Returns `None`
+    when the comment is found on neither.
     """
     r = client.get(f"{_repo_path(project)}/pulls/comments/{comment_id}")
-    _check(r)
-    return r.json()["node_id"]
+    if r.status_code != 404:
+        _check(r)
+        return r.json()
+    page = 1
+    while True:
+        r = client.get(
+            f"{_repo_path(project)}/pulls/{pr_id}/comments",
+            params={"per_page": 100, "page": page},
+        )
+        _check(r)
+        for it in r.json():
+            if str(it.get("id")) == str(comment_id):
+                return it
+        if not _has_next_link(r.headers.get("Link")):
+            return None
+        page += 1
+        if page > 100:
+            log.warning(
+                "review-comment fallback lookup for %s/%s#%s hit the"
+                " %d-page pagination cap while looking for comment %s"
+                " — result may be incomplete",
+                project.owner, project.repo, pr_id, page - 1, comment_id,
+            )
+            return None
 
 
-def _fetch_review_comment(
-    client: httpx.Client, project: ProjectConfig, comment_id: str,
-) -> ReviewComment:
-    """Fetch a single review comment by id and map it to `ReviewComment`.
+def _review_thread_anchor_node_id(
+    client: httpx.Client, project: ProjectConfig, pr_id: str, comment_id: str,
+) -> tuple[str, dict]:
+    """Resolve the GraphQL `node_id` of a reply target's THREAD ANCHOR,
+    plus the anchor's raw REST payload.
 
-    Used after the GraphQL create/reply mutations, whose responses only
-    select `databaseId` — this re-fetches the REST shape so every
-    `add_pr_review_comment` branch returns an identically-shaped result
-    via the one existing `_map_review_comment` mapper.
+    Needed to translate the caller's `in_reply_to` (a REST comment id)
+    into the id GraphQL's `addPullRequestReviewComment(inReplyTo:)`
+    demands — that mutation wants the top-of-thread anchor comment, not
+    an arbitrary comment in the thread (see `_map_review_comment`'s
+    `discussion_id` rule: the top-of-thread note's id IS the anchor).
+
+    Returns `(node_id, anchor_raw)`. The raw dict is exposed (ticket
+    #241) so `add_pr_review_comment`'s reply branch can inherit the
+    anchor's `path`/`line`/`side`/`commit_id` as its synthesized
+    fallback when the post-write confirmation lookup misses — a reply
+    necessarily lands at the same diff position as its parent/anchor
+    comment, so this data must not be discarded in favour of `None`.
     """
-    r = client.get(f"{_repo_path(project)}/pulls/comments/{comment_id}")
-    _check(r)
-    return _map_review_comment(r.json())
+    raw = _lookup_review_comment(client, project, pr_id, comment_id)
+    if raw is None:
+        raise GitHubError(404, _not_found_message("review comment", comment_id))
+    anchor_id = raw.get("in_reply_to_id") or raw.get("id")
+    if str(anchor_id) == str(raw.get("id")):
+        return raw["node_id"], raw
+    anchor = _lookup_review_comment(client, project, pr_id, str(anchor_id))
+    if anchor is None:
+        raise GitHubError(404, _not_found_message("review comment", comment_id))
+    return anchor["node_id"], anchor
+
+
+def _lookup_review_comment_safe(
+    client: httpx.Client, project: ProjectConfig, pr_id: str, comment_id: str,
+) -> dict:
+    """Best-effort confirmation lookup — never raises.
+
+    Used after the GraphQL create/reply mutations already landed the
+    write server-side: the confirmation *read* that follows must never
+    turn a successful mutation into a reported failure just because the
+    comment isn't visible yet on this endpoint (still PENDING) or the
+    lookup fails for some other reason (rate limit, network blip, …).
+    Same "best-effort: never raises" precedent as
+    `_cleanup_orphaned_pending_review`. The catch is deliberately broad
+    (`except Exception`, not `except GitHubError`) because
+    `RateLimitError` is a sibling of `GitHubError` under `ProviderError`
+    and must not leak either.
+    """
+    try:
+        return _lookup_review_comment(client, project, pr_id, comment_id) or {}
+    except Exception as exc:
+        log.warning(
+            "could not confirm review comment %s on %s/%s#%s after a"
+            " successful write — returning a synthesized result instead: %s",
+            comment_id, project.owner, project.repo, pr_id, exc,
+        )
+        return {}
 
 
 def _latest_pending_review_comment(
     client: httpx.Client, project: ProjectConfig, pr_id: str, review_id: str,
-) -> dict:
+) -> dict | None:
     """Return the most recently added comment on a pending review.
 
     `POST /pulls/{n}/reviews` (seeded creation) does not echo the
@@ -705,13 +780,63 @@ def _latest_pending_review_comment(
     new-thread/no-pending-review-yet branch of `add_pr_review_comment`
     re-fetches via `GET /pulls/{n}/reviews/{review_id}/comments` and
     takes the last item.
+
+    Returns `None` instead of raising when the confirmation read comes
+    back empty (`[]`, the comment isn't visible on this endpoint yet) or
+    404s (`_check` would otherwise raise) — a successful mutation must
+    never be reported as a failure just because this best-effort
+    confirmation read misses.
     """
     r = client.get(
         f"{_repo_path(project)}/pulls/{pr_id}/reviews/{review_id}/comments",
         params={"per_page": 100},
     )
+    if r.status_code == 404:
+        return None
     _check(r)
-    return r.json()[-1]
+    items = r.json()
+    return items[-1] if items else None
+
+
+def _review_comment_result(
+    *,
+    comment_id: str,
+    raw: dict,
+    body: str,
+    path: str | None,
+    line: int | None,
+    side: str | None,
+    commit_sha: str | None,
+    in_reply_to: str | None,
+) -> ReviewComment:
+    """Build the immediate `ReviewComment` response from known call
+    params, letting a non-null server-confirmed payload override them.
+
+    Pure — no HTTP. Layers a synthesized raw dict (built from the
+    params the caller already knows are true, since the mutation that
+    created this comment already succeeded) UNDER `raw` (the server's
+    confirmation-read payload, when available) and feeds the merged
+    dict to the one existing `_map_review_comment`, so mapping stays in
+    a single place. Precedence is strict: only `raw`'s *non-null* keys
+    override the synthesized defaults — a server payload that omits or
+    nulls a field (e.g. `line`/`side`/`original_line` on a still-pending
+    comment) must not blank out a good synthesized value.
+    """
+    synthesized: dict[str, Any] = {
+        "id": comment_id,
+        "body": body,
+        "path": path,
+        "line": line,
+        "original_line": line,
+        "side": side,
+        "commit_id": commit_sha,
+        "in_reply_to_id": in_reply_to,
+        "created_at": "",
+        "updated_at": "",
+        "html_url": None,
+    }
+    merged = {**synthesized, **{k: v for k, v in raw.items() if v is not None}}
+    return _map_review_comment(merged)
 
 
 def _map_pr(raw: dict) -> PullRequest:
@@ -5289,8 +5414,8 @@ class GitHubProvider(
                     # server — that would leave it dangling with no way
                     # for the caller to clean it up.
                     try:
-                        parent_node_id = _review_comment_node_id(
-                            client, project, in_reply_to,
+                        parent_node_id, anchor_raw = _review_thread_anchor_node_id(
+                            client, project, pr_id, in_reply_to,
                         )
                     except GitHubError as exc:
                         if exc.status == 404:
@@ -5324,7 +5449,33 @@ class GitHubProvider(
                                 client, project, pr_id, pending,
                             )
                         raise
-                    return _fetch_review_comment(client, project, comment_id)
+                    return _review_comment_result(
+                        comment_id=comment_id,
+                        raw=_lookup_review_comment_safe(client, project, pr_id, comment_id),
+                        body=prefixed,
+                        # Ticket #241: seed the synthesized fallback from
+                        # the anchor/parent comment's own position — a
+                        # reply necessarily lands at the same diff
+                        # position as its parent — instead of discarding
+                        # it in favour of None when the confirmation
+                        # lookup above misses.
+                        path=anchor_raw.get("path"),
+                        line=anchor_raw.get("line"),
+                        side=anchor_raw.get("side"),
+                        commit_sha=anchor_raw.get("commit_id"),
+                        # Fix-round 3 nit: seed from the resolved thread
+                        # ANCHOR's own id, not the caller's raw
+                        # `in_reply_to` argument — when the caller passed
+                        # a mid-thread (non-anchor) comment id and
+                        # `_review_thread_anchor_node_id` walked up to the
+                        # true anchor, `anchor_raw["id"]` is that anchor;
+                        # falling back to the caller's argument here would
+                        # point the synthesized `in_reply_to` at the
+                        # mid-thread comment instead. Only used when the
+                        # confirmation lookup above misses (`raw` has no
+                        # non-null `in_reply_to_id` to override it).
+                        in_reply_to=str(anchor_raw.get("id", in_reply_to)),
+                    )
                 if pending is None:
                     # Ticket #208: this is the direct functional
                     # descendant of the old single-POST implementation's
@@ -5350,7 +5501,23 @@ class GitHubProvider(
                     comment = _latest_pending_review_comment(
                         client, project, pr_id, str(created["id"]),
                     )
-                    return _map_review_comment(comment)
+                    # A2a: when the confirmation lookup misses entirely
+                    # (404 or `[]`), there is no comment id anywhere in
+                    # the review-create response — substituting the
+                    # review id would be actively harmful since callers
+                    # pass `ReviewComment.id` back as `in_reply_to`, so
+                    # the returned id is deliberately `""` here.
+                    raw = comment or {}
+                    return _review_comment_result(
+                        comment_id=str(raw.get("id") or ""),
+                        raw=raw,
+                        body=prefixed,
+                        path=path,
+                        line=line,
+                        side=side,
+                        commit_sha=commit_sha,
+                        in_reply_to=None,
+                    )
                 pending_commit_sha = pending.get("commit_id")
                 if commit_sha is not None and commit_sha != pending_commit_sha:
                     raise ValueError(
@@ -5364,7 +5531,16 @@ class GitHubProvider(
                 comment_id = _add_thread_to_pending_review(
                     client, pending["node_id"], path, line, side, prefixed,
                 )
-                return _fetch_review_comment(client, project, comment_id)
+                return _review_comment_result(
+                    comment_id=comment_id,
+                    raw=_lookup_review_comment_safe(client, project, pr_id, comment_id),
+                    body=prefixed,
+                    path=path,
+                    line=line,
+                    side=side,
+                    commit_sha=commit_sha or pending.get("commit_id"),
+                    in_reply_to=None,
+                )
         except GitHubError as exc:
             if exc.status == 422:
                 raise GitHubError(

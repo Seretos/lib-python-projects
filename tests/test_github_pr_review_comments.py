@@ -582,6 +582,10 @@ def test_add_pr_review_comment_reply_with_bad_parent_leaves_no_pending_review(
             return _json([])
         if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/99999":
             return _json({"message": "Not Found"}, status_code=404)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/comments":
+            # A1's fallback listing: the 404 above is genuine, the parent
+            # id isn't on the fallback listing either.
+            return _json([])
         raise AssertionError(f"unexpected request: {req.method} {path}")
 
     seen = _install_mock(monkeypatch, handler)
@@ -907,3 +911,634 @@ def test_find_pending_review_logs_warning_when_pagination_cap_hit(
         f"Expected owner/repo#pr_id in warning: {combined!r}"
     )
     assert "100" in combined, f"Expected the page cap in warning: {combined!r}"
+
+
+# =============================================================================
+# WP #241 (bundles #233 + #234): reliable add_pr_review_comment writes
+# =============================================================================
+#
+# Behaviour 1 (#233 bug 1): reply mode must resolve the *thread anchor*
+# node id, with a pending-comment-aware fallback when the single-comment
+# REST endpoint 404s (it does not serve comments still attached to an
+# unsubmitted PENDING review — precisely the shape this library creates).
+#
+# Behaviour 2 (#233 bug 2): a successful mutation must never be reported
+# as a failure just because the post-write confirmation *read* 404s (or
+# otherwise fails) — the pending comment it's trying to re-fetch may not
+# be visible on that endpoint yet/at all.
+#
+# Behaviour 3 (#234 finding 1): when the immediate response is synthesized
+# from known call params (because the confirmation read came back empty),
+# `line`/`side`/`original_line` must be filled from those params instead
+# of surfacing as `null`.
+
+
+def test_reply_to_pending_parent_falls_back_to_pr_comments_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behaviour 1 driving test. Replying to a comment that still belongs
+    to our own unsubmitted PENDING review 404s on the single-comment
+    endpoint (`GET /pulls/comments/{id}`) — that endpoint does not serve
+    pending-review comments. The fix must fall back to scanning
+    `GET /pulls/{n}/comments?per_page=100` (which DOES return the
+    caller's own pending comments) to resolve the thread-anchor node id,
+    then proceed with the GraphQL reply mutation.
+
+    RED reason (today): `_review_comment_node_id` only tries the
+    single-comment GET; a 404 there is rewrapped straight into
+    `GitHubError(404, "review comment 'X' not found")` and the GraphQL
+    mutation is never sent."""
+    pending = _pending_review()
+    parent = _comment(8100, node_id="PARENT_NODE_8100")
+    reply = _comment(9200, in_reply_to_id=8100)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8100":
+            return _json({"message": "Not Found"}, status_code=404)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/comments":
+            assert dict(req.url.params).get("per_page") == "100"
+            return _json([parent])
+        if req.method == "POST" and path == "/graphql":
+            gql = _body(req)
+            assert "addPullRequestReviewComment" in gql["query"]
+            assert gql["variables"]["inReplyTo"] == "PARENT_NODE_8100"
+            return _json(
+                {"data": {"addPullRequestReviewComment": {"comment": {"databaseId": 9200}}}}
+            )
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/9200":
+            return _json(reply)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(), token="t", pr_id="7", body="reply text", in_reply_to="8100",
+    )
+    assert result.id == "9200"
+    assert result.in_reply_to == "8100"
+
+
+def test_reply_to_a_reply_uses_anchor_node_id_not_the_replys_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behaviour 1 edge case: replying to a comment that is ITSELF a
+    reply must resolve to the thread ANCHOR's node id (its
+    `in_reply_to_id`), not the directly-addressed comment's own node id
+    — `addPullRequestReviewThread(inReplyTo:)` wants the anchor.
+
+    RED reason (today): `_review_comment_node_id` returns the directly-
+    fetched comment's own `node_id` unconditionally, never looking at
+    `in_reply_to_id` — so the mutation is sent with the wrong (non-
+    anchor) node id."""
+    pending = _pending_review()
+    mid_reply = _comment(
+        8100, node_id="MID_NODE_8100", in_reply_to_id=8050,
+    )
+    anchor = _comment(8050, node_id="ANCHOR_NODE_8050")
+    reply = _comment(9201, in_reply_to_id=8100)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8100":
+            return _json(mid_reply)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8050":
+            return _json(anchor)
+        if req.method == "POST" and path == "/graphql":
+            gql = _body(req)
+            assert gql["variables"]["inReplyTo"] == "ANCHOR_NODE_8050"
+            return _json(
+                {"data": {"addPullRequestReviewComment": {"comment": {"databaseId": 9201}}}}
+            )
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/9201":
+            return _json(reply)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(), token="t", pr_id="7", body="reply text", in_reply_to="8100",
+    )
+    assert result.id == "9201"
+
+
+def test_reply_fallback_listing_spans_two_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behaviour 1 edge case: the `GET /pulls/{n}/comments` fallback
+    listing must paginate — a PR with more than 100 review comments can
+    have the pending-review parent sitting on page 2+.
+
+    RED reason (today): no fallback listing is attempted at all, so the
+    call 404s regardless of how many pages exist."""
+    pending = _pending_review()
+    parent = _comment(8200, node_id="PARENT_NODE_8200")
+    page1 = [_comment(7000 + i) for i in range(100)]
+    reply = _comment(9202, in_reply_to_id=8200)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8200":
+            return _json({"message": "Not Found"}, status_code=404)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/comments":
+            page = dict(req.url.params).get("page", "1")
+            if page == "1":
+                return _json(
+                    page1,
+                    headers={
+                        "Link": (
+                            '<https://api.github.com/repos/acme/backend'
+                            '/pulls/7/comments?page=2>; rel="next"'
+                        )
+                    },
+                )
+            if page == "2":
+                return _json([parent])
+            raise AssertionError(f"unexpected page: {page}")
+        if req.method == "POST" and path == "/graphql":
+            gql = _body(req)
+            assert gql["variables"]["inReplyTo"] == "PARENT_NODE_8200"
+            return _json(
+                {"data": {"addPullRequestReviewComment": {"comment": {"databaseId": 9202}}}}
+            )
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/9202":
+            return _json(reply)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(), token="t", pr_id="7", body="reply text", in_reply_to="8200",
+    )
+    assert result.id == "9202"
+
+
+def test_reply_missing_comment_and_anchor_everywhere_still_reports_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behaviour 1 edge case (additional coverage — may already pass):
+    when the requested comment 404s AND the fallback listing does not
+    contain it either, `add_pr_review_comment` must still raise the same
+    `"review comment 'X' not found"` message (byte-identical to today's
+    contract) and must NOT create a pending review on the server."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/99999":
+            return _json({"message": "Not Found"}, status_code=404)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/comments":
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    with pytest.raises(github_mod.GitHubError) as exc:
+        GitHubProvider().add_pr_review_comment(
+            _project(), token="t", pr_id="7", body="reply", in_reply_to="99999",
+        )
+    assert exc.value.status == 404
+    assert "review comment" in exc.value.message
+    assert "99999" in exc.value.message
+    assert not any(
+        r.method == "POST" and r.url.path == "/repos/acme/backend/pulls/7/reviews"
+        for r in seen
+    )
+
+
+def test_new_thread_returns_comment_when_confirmation_lookup_404s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behaviour 2 driving test. A pending review already exists; the
+    GraphQL `addPullRequestReviewThread` mutation succeeds and returns
+    `databaseId: 9100` — the comment genuinely got created server-side —
+    but every subsequent confirmation read 404s (the comment still
+    belongs to an unsubmitted PENDING review, which the single-comment
+    REST endpoint doesn't serve). The call must NOT raise: it must
+    synthesize the result from the known call params instead.
+
+    RED reason (today): `_fetch_review_comment`'s 404 propagates
+    straight out of `add_pr_review_comment` as the call's own failure,
+    even though the mutation already succeeded."""
+    pending = _pending_review()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "POST" and path == "/graphql":
+            gql = _body(req)
+            assert "addPullRequestReviewThread" in gql["query"]
+            return _json(
+                {
+                    "data": {
+                        "addPullRequestReviewThread": {
+                            "thread": {"comments": {"nodes": [{"databaseId": 9100}]}}
+                        }
+                    }
+                }
+            )
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/9100":
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="7",
+        body="nit",
+        path="src/foo.py",
+        line=15,
+        side="RIGHT",
+        commit_sha="abc123",
+    )
+    assert result.id == "9100"
+    assert result.body == "#ai-generated\n\nnit"
+    assert result.path == "src/foo.py"
+    assert result.line == 15
+    assert result.side == "RIGHT"
+    assert result.url is None
+    assert result.created_at == ""
+    assert result.updated_at == ""
+
+
+def test_reply_returns_comment_when_confirmation_lookup_404s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behaviour 2 edge case: same non-fatal-confirmation contract on
+    the reply branch. The GraphQL reply mutation succeeds, but the
+    confirmation GET 404s. Must not raise.
+
+    RED reason (today): `_fetch_review_comment`'s 404 propagates out of
+    the reply branch's `return _fetch_review_comment(...)` call
+    unchanged.
+
+    Ticket #241 fix-round finding 1: the reply branch already fetched
+    the parent/anchor comment's raw payload (to resolve the GraphQL
+    `node_id` for `inReplyTo`), which carries the thread's real
+    `path`/`line`/`side`/`commit_id` — a reply necessarily lands at the
+    same diff position as its parent. On a confirmation-lookup miss,
+    those values must seed the synthesized fallback instead of being
+    discarded in favour of `None`. The parent fixture (`_comment`'s
+    defaults) has `path="src/foo.py"`, `line=10`, `side="RIGHT"`,
+    `commit_id="abc123"` — assert the result inherits exactly those."""
+    pending = _pending_review()
+    parent = _comment(8300, node_id="PARENT_NODE_8300")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8300":
+            return _json(parent)
+        if req.method == "POST" and path == "/graphql":
+            return _json(
+                {"data": {"addPullRequestReviewComment": {"comment": {"databaseId": 9300}}}}
+            )
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/9300":
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(), token="t", pr_id="7", body="reply text", in_reply_to="8300",
+    )
+    assert result.id == "9300"
+    assert result.in_reply_to == "8300"
+    assert result.body == "#ai-generated\n\nreply text"
+    assert result.url is None
+    assert result.created_at == ""
+    assert result.updated_at == ""
+    assert result.path == "src/foo.py"
+    assert result.line == 10
+    assert result.side == "RIGHT"
+    assert result.commit_sha == "abc123"
+
+
+def test_reply_to_a_reply_seeds_in_reply_to_from_anchor_on_confirmation_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fix-round 3 nit. Double-edge case: the caller replies to a
+    MID-THREAD comment (8100, itself a reply to anchor 8050 — so
+    `_review_thread_anchor_node_id` walks up), AND the post-write
+    confirmation lookup for the new reply (9201) misses entirely (the
+    direct GET 404s, and the paginated fallback listing finds no match
+    either). The synthesized `in_reply_to` must come from the resolved
+    thread ANCHOR (8050), not the caller's original mid-thread argument
+    (8100) — a reply's `in_reply_to` should always point at the true
+    anchor, matching what `_map_review_comment`'s `discussion_id` rule
+    already promises for read paths.
+
+    RED reason (pre-fix): the synthesized fallback used the caller's
+    raw `in_reply_to` argument (`"8100"`) unconditionally, so
+    `result.in_reply_to == "8100"` instead of the true anchor `"8050"`.
+    """
+    pending = _pending_review()
+    mid_reply = _comment(8100, node_id="MID_NODE_8100", in_reply_to_id=8050)
+    anchor = _comment(8050, node_id="ANCHOR_NODE_8050")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8100":
+            return _json(mid_reply)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8050":
+            return _json(anchor)
+        if req.method == "POST" and path == "/graphql":
+            gql = _body(req)
+            assert gql["variables"]["inReplyTo"] == "ANCHOR_NODE_8050"
+            return _json(
+                {"data": {"addPullRequestReviewComment": {"comment": {"databaseId": 9201}}}}
+            )
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/9201":
+            # Confirmation lookup misses entirely: direct GET 404s...
+            return _json({"message": "Not Found"}, status_code=404)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/comments":
+            # ...and the paginated fallback scan finds no match either.
+            assert dict(req.url.params).get("per_page") == "100"
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(), token="t", pr_id="7", body="reply text", in_reply_to="8100",
+    )
+    assert result.id == "9201"
+    assert result.in_reply_to == "8050"
+
+
+def test_new_thread_confirmation_rate_limit_error_does_not_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behaviour 2 edge case: the confirmation read can fail with a
+    `RateLimitError` (403, not 404) rather than a 404 — the "never fail
+    after a successful mutation" contract must not be narrowed to just
+    `GitHubError(404)`. `RateLimitError` is a sibling of `GitHubError`
+    under `ProviderError`, so a narrow `except GitHubError` would leak
+    it.
+
+    RED reason (today): nothing catches the confirmation read's
+    exceptions at all, so the `RateLimitError` propagates straight out
+    of `add_pr_review_comment` as the call's own failure."""
+    pending = _pending_review()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "POST" and path == "/graphql":
+            return _json(
+                {
+                    "data": {
+                        "addPullRequestReviewThread": {
+                            "thread": {"comments": {"nodes": [{"databaseId": 9101}]}}
+                        }
+                    }
+                }
+            )
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/9101":
+            return _json(
+                {"message": "rate limited"},
+                status_code=403,
+                headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": "0"},
+            )
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="7",
+        body="nit",
+        path="src/foo.py",
+        line=16,
+        side="RIGHT",
+        commit_sha="abc123",
+    )
+    assert result.id == "9101"
+    assert result.path == "src/foo.py"
+    assert result.line == 16
+
+
+def test_seeded_create_returns_empty_id_when_confirmation_lookup_misses_entirely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behaviour 2 edge case, pins the A2a documented tradeoff: on the
+    seeded-create branch (no pending review yet), when the confirmation
+    listing `GET /pulls/{n}/reviews/{review_id}/comments` comes back
+    empty (`[]`) — the created review genuinely has no comment attached
+    yet — the call must still return a `ReviewComment`, not raise. Its
+    `id` is the best available value: `""` (never the *review* id, which
+    would be actively harmful if later used as `in_reply_to`). All other
+    fields (path/line/side/body) must still be filled from the known
+    call params.
+
+    RED reason (today): `_latest_pending_review_comment` does
+    `r.json()[-1]` on an empty list, raising `IndexError` straight out
+    of `add_pr_review_comment`."""
+    created_review = _pending_review(review_id=950, node_id="REVIEW_NODE_950")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([])
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json(created_review)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews/950/comments":
+            return _json([])
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="7",
+        body="nit",
+        path="src/foo.py",
+        line=17,
+        side="RIGHT",
+        commit_sha="abc123",
+    )
+    assert result.id == ""
+    assert result.path == "src/foo.py"
+    assert result.line == 17
+    assert result.side == "RIGHT"
+    assert "nit" in result.body
+
+
+def test_new_thread_fills_line_and_side_when_pending_payload_omits_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behaviour 3 driving test. Seeded-create branch: the confirmation
+    payload (a *pending*-review comment) omits `line`/`original_line`/
+    `side` (`None`) — GitHub does not resolve those on a still-pending
+    comment. The immediate response must fill them from the known call
+    params (`line=1`, `side="RIGHT"`) instead of surfacing `null`.
+    Server-provided identity fields (id/created_at/html_url) must still
+    be preserved from the confirmation payload.
+
+    RED reason (today): `_map_review_comment` maps `raw.get("line")` /
+    `raw.get("original_line")` / `raw.get("side")` straight through as
+    `None` — the nulls pass through unfilled."""
+    created_review = _pending_review(review_id=960, node_id="REVIEW_NODE_960")
+    pending_comment = _comment(
+        9600,
+        path="src/foo.py",
+        line=None,
+        side=None,
+        original_line=None,
+        created_at="2024-02-02T00:00:00Z",
+        html_url="https://github.com/acme/backend/pull/7#discussion_r9600",
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([])
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json(created_review)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews/960/comments":
+            return _json([pending_comment])
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="7",
+        body="nit",
+        path="src/foo.py",
+        line=1,
+        side="RIGHT",
+        commit_sha="abc123",
+    )
+    assert result.id == "9600"
+    assert result.line == 1
+    assert result.original_line == 1
+    assert result.side == "RIGHT"
+    assert result.created_at == "2024-02-02T00:00:00Z"
+    assert result.url == "https://github.com/acme/backend/pull/7#discussion_r9600"
+
+
+def test_new_thread_server_resolved_line_wins_over_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behaviour 3 edge case: when the confirmation payload DOES carry a
+    non-null `line` (the server resolved it, e.g. to `2`) that differs
+    from the caller's requested `line` (`1`), the server's value must
+    win — `_review_comment_result` only fills in the synthesized default
+    when the server payload is null/missing for that field, it never
+    overrides a genuine non-null server value."""
+    created_review = _pending_review(review_id=970, node_id="REVIEW_NODE_970")
+    pending_comment = _comment(
+        9700,
+        path="src/foo.py",
+        line=2,
+        side="RIGHT",
+        original_line=2,
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([])
+        if req.method == "POST" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json(created_review)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews/970/comments":
+            return _json([pending_comment])
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="7",
+        body="nit",
+        path="src/foo.py",
+        line=1,
+        side="RIGHT",
+        commit_sha="abc123",
+    )
+    assert result.id == "9700"
+    assert result.line == 2
+    assert result.original_line == 2
+
+
+# ---------- pure unit tests of `_review_comment_result` (no HTTP) -----------
+
+
+def test_review_comment_result_prefers_server_non_null_over_synthesized() -> None:
+    """`_review_comment_result` is a pure function: given a server `raw`
+    payload with non-null values, those values must win over the
+    synthesized defaults built from the call params — across fields in
+    general, not only the ones already covered by the HTTP-level tests
+    above."""
+    raw = {
+        "id": 4242,
+        "body": "server body",
+        "path": "server/path.py",
+        "line": 99,
+        "original_line": 98,
+        "side": "LEFT",
+        "commit_id": "server-sha",
+        "in_reply_to_id": None,
+        "created_at": "2024-03-03T00:00:00Z",
+        "updated_at": "2024-03-04T00:00:00Z",
+        "html_url": "https://github.com/acme/backend/pull/7#discussion_r4242",
+        "user": {"login": "reviewer"},
+    }
+
+    result = github_mod._review_comment_result(
+        comment_id="123",
+        raw=raw,
+        body="synthesized body",
+        path="synth/path.py",
+        line=1,
+        side="RIGHT",
+        commit_sha="synth-sha",
+        in_reply_to=None,
+    )
+
+    assert result.id == "4242"
+    assert result.body == "server body"
+    assert result.path == "server/path.py"
+    assert result.line == 99
+    assert result.original_line == 98
+    assert result.side == "LEFT"
+    assert result.commit_sha == "server-sha"
+    assert result.created_at == "2024-03-03T00:00:00Z"
+    assert result.updated_at == "2024-03-04T00:00:00Z"
+    assert result.url == "https://github.com/acme/backend/pull/7#discussion_r4242"
+    assert result.author == "reviewer"
+
+
+def test_review_comment_result_falls_back_to_synthesized_when_raw_empty() -> None:
+    """Pure unit test: an empty `raw` (confirmation lookup missed
+    entirely) must fall back to every synthesized field, byte-identical
+    to the call params."""
+    result = github_mod._review_comment_result(
+        comment_id="123",
+        raw={},
+        body="synthesized body",
+        path="synth/path.py",
+        line=1,
+        side="RIGHT",
+        commit_sha="synth-sha",
+        in_reply_to="999",
+    )
+
+    assert result.id == "123"
+    assert result.body == "synthesized body"
+    assert result.path == "synth/path.py"
+    assert result.line == 1
+    assert result.original_line == 1
+    assert result.side == "RIGHT"
+    assert result.commit_sha == "synth-sha"
+    assert result.in_reply_to == "999"
+    assert result.created_at == ""
+    assert result.updated_at == ""
+    assert result.url is None
