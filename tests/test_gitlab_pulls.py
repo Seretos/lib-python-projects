@@ -732,7 +732,9 @@ def test_gitlab_list_pr_reviews_and_get_pr_reviews_agree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`list_pr_reviews` and `get_pr`'s `pr.reviews` are built from the
-    same `_reviews_from_approvals` helper, so they must not diverge."""
+    same `_reviews_from_approvals` + `_merge_reviews` helpers (WP #241
+    adds a marked `request_changes` note from bob alongside alice's live
+    approval), so the two surfaces must not diverge."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         url = str(req.url)
@@ -746,7 +748,16 @@ def test_gitlab_list_pr_reviews_and_get_pr_reviews_agree(
         if url.endswith("merge_requests/5"):
             return _json(_mr_payload(5))
         if "merge_requests/5/notes" in url:
-            return _json([])
+            return _json([
+                {
+                    "id": 1,
+                    "body": "#ai-generated\n#ai-review-request-changes\n\nfix X",
+                    "author": {"username": "bob"},
+                    "created_at": "2024-03-01T00:00:00Z",
+                    "updated_at": "2024-03-01T00:00:00Z",
+                    "system": False,
+                },
+            ])
         return _json({}, status_code=404)
 
     _install_mock(monkeypatch, handler)
@@ -754,6 +765,8 @@ def test_gitlab_list_pr_reviews_and_get_pr_reviews_agree(
     standalone = GitLabProvider().list_pr_reviews(_project(), "t", "5")
     assert [rv.author for rv in pr.reviews] == [rv.author for rv in standalone]
     assert [rv.state for rv in pr.reviews] == [rv.state for rv in standalone]
+    assert [rv.author for rv in pr.reviews] == ["bob", "alice"]
+    assert [rv.state for rv in pr.reviews] == ["request_changes", "approve"]
 
 
 def test_gitlab_list_prs_does_not_fetch_approvals(
@@ -1325,6 +1338,9 @@ def test_merge_pr_merge_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
         # catch-all below, since a bare MR payload has no "approved_by").
         if req.method == "GET" and url.endswith("/approvals"):
             return _json({"approved": False, "approved_by": []})
+        # WP #241: merge_pr now also fetches notes (for marked reviews).
+        if req.method == "GET" and "/notes" in url:
+            return _json([])
         if req.method == "GET":
             return _json(_mr_payload(5, state="merged"))
         return _json({}, status_code=404)
@@ -1346,6 +1362,9 @@ def test_merge_pr_squash_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
         # Ticket #214: merge_pr now fetches approvals after the re-fetch.
         if req.method == "GET" and url.endswith("/approvals"):
             return _json({"approved": False, "approved_by": []})
+        # WP #241: merge_pr now also fetches notes (for marked reviews).
+        if req.method == "GET" and "/notes" in url:
+            return _json([])
         if req.method == "GET":
             return _json(_mr_payload(5, state="merged"))
         return _json({}, status_code=404)
@@ -1379,7 +1398,8 @@ def test_merge_pr_refetches_after_merge(
     """Mirror GitHub provider's pattern: after merge, do a fresh GET to
     pick up post-merge state mutations (merge_commit_sha, etc.). Also
     covers ticket #214: a third call fetches approvals so the returned
-    PR carries review data without a follow-up get_pr."""
+    PR carries review data without a follow-up get_pr. WP #241 adds a
+    fourth call fetching notes (for marked review reconstruction)."""
     seen_methods: list[str] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -1389,19 +1409,24 @@ def test_merge_pr_refetches_after_merge(
             return _json(_mr_payload(5, state="merged"))
         if req.method == "GET" and url.endswith("/approvals"):
             return _json({"approved": False, "approved_by": []})
+        if req.method == "GET" and "/notes" in url:
+            return _json([])
         if req.method == "GET":
             return _json(_mr_payload(5, state="merged"))
         return _json({}, 404)
 
     _install_mock(monkeypatch, handler)
     GitLabProvider().merge_pr(_project(), "t", "5", merge_method="merge")
-    # Sequence: PUT /merge, GET /merge_requests/5, GET .../approvals.
+    # Sequence: PUT /merge, GET /merge_requests/5, GET .../approvals,
+    # GET .../notes.
     assert seen_methods[0].startswith("PUT")
     assert seen_methods[0].endswith("/merge")
     assert seen_methods[1].startswith("GET")
     assert seen_methods[1].endswith("/merge_requests/5")
     assert seen_methods[2].startswith("GET")
     assert seen_methods[2].endswith("/merge_requests/5/approvals")
+    assert seen_methods[3].startswith("GET")
+    assert seen_methods[3].endswith("/merge_requests/5/notes")
 
 
 def test_merge_pr_commit_message_routed_per_strategy(
@@ -1419,6 +1444,9 @@ def test_merge_pr_commit_message_routed_per_strategy(
         # Ticket #214: merge_pr now fetches approvals after the re-fetch.
         if req.method == "GET" and url.endswith("/approvals"):
             return _json({"approved": False, "approved_by": []})
+        # WP #241: merge_pr now also fetches notes (for marked reviews).
+        if req.method == "GET" and "/notes" in url:
+            return _json([])
         return _json(_mr_payload(5, state="merged"))
 
     _install_mock(monkeypatch, handler)
@@ -1450,6 +1478,9 @@ def test_gitlab_merge_pr_default_merge_method(
         # Ticket #214: merge_pr now fetches approvals after the re-fetch.
         if req.method == "GET" and url.endswith("/approvals"):
             return _json({"approved": False, "approved_by": []})
+        # WP #241: merge_pr now also fetches notes (for marked reviews).
+        if req.method == "GET" and "/notes" in url:
+            return _json([])
         return _json(_mr_payload(5, state="merged"))
 
     _install_mock(monkeypatch, handler)
@@ -1466,9 +1497,13 @@ def test_gitlab_merge_pr_squash_with_commit_title(
     captured: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
         if req.method == "PUT":
             captured["body"] = json.loads(req.content.decode())
             return _json(_mr_payload(5, state="merged"))
+        # WP #241: merge_pr now also fetches notes (for marked reviews).
+        if req.method == "GET" and "/notes" in url:
+            return _json([])
         return _json(_mr_payload(5, state="merged"))
 
     _install_mock(monkeypatch, handler)
@@ -1575,6 +1610,53 @@ def test_merge_pr_approvals_error_does_not_mask_successful_merge(
         "5" in record.message and "approvals" in record.message.lower()
         for record in caplog.records
     )
+
+
+def test_merge_pr_approvals_error_still_attempts_notes_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #241 fix-round finding 2: a genuine (non-403/404)
+    approvals-fetch failure must not prevent the notes fetch from even
+    being attempted — the two best-effort fetches are independent, the
+    same way `list_pr_reviews` already calls them as two top-level
+    statements. `/approvals` 500s here, but `/notes` is healthy and
+    carries a marked `request_changes` note from bob: that review must
+    still show up in `pr.reviews`, proving the notes fetch actually ran
+    despite the approvals failure.
+
+    RED reason (today): both fetches share one `try`/`except` block, so
+    the `/approvals` 500 raises before the `_fetch_mr_notes` line is
+    ever reached — `pr.reviews` comes back `[]` even though `/notes`
+    would have answered successfully."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "PUT" and url.endswith("/merge"):
+            return _json(_mr_payload(5, state="merged"))
+        if req.method == "GET" and url.endswith("/approvals"):
+            return _json({"message": "Internal Server Error"}, status_code=500)
+        if req.method == "GET" and url.endswith("/merge_requests/5"):
+            return _json(_mr_payload(5, state="merged"))
+        if req.method == "GET" and "merge_requests/5/notes" in url:
+            return _json([
+                {
+                    "id": 1,
+                    "body": "#ai-generated\n#ai-review-request-changes\n\nfix X",
+                    "author": {"username": "bob"},
+                    "created_at": "2024-03-01T00:00:00Z",
+                    "updated_at": "2024-03-01T00:00:00Z",
+                    "system": False,
+                },
+            ])
+        return _json({}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    pr = GitLabProvider().merge_pr(_project(), "t", "5", merge_method="merge")
+
+    assert pr.status == "merged"
+    assert [rv.author for rv in pr.reviews] == ["bob"]
+    assert [rv.state for rv in pr.reviews] == ["request_changes"]
+    assert pr.approvals_received is None
 
 
 def test_merge_pr_squash_also_populates_reviews(
@@ -2199,7 +2281,10 @@ def test_submit_pr_review_approve_with_body_posts_note(
         _project(), "t", "5", state="approve", body="lgtm",
     )
     assert review.state == "approve"
-    assert captured["body"]["body"].startswith("#ai-generated\n\n")
+    # WP #241: the note body now also carries the review-state marker.
+    assert captured["body"]["body"].startswith(
+        "#ai-generated\n#ai-review-approve\n\n"
+    )
 
 
 def test_submit_pr_review_request_changes_unapproves_then_notes(

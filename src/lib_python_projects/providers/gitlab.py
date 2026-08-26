@@ -913,13 +913,15 @@ def _reviews_from_approvals(approvals: dict | None) -> list[Review]:
     GitLab has no review-object endpoint — unlike GitHub/Azure DevOps,
     there is nothing that models a submitted "review" as a distinct
     resource, so this emits one `Review(state="approve", ...)` per entry
-    in the `approved_by[]` array. **Known limitation**:
-    request_changes/comment-style reviews are posted as plain notes on
-    GitLab (see `submit_pr_review`), which are indistinguishable from
-    ordinary MR comments once posted — those are therefore NOT
-    recoverable here; only approvals are. The approvals payload also
-    carries no per-approver timestamp or note body, so `body` and `url`
-    are `None` and `submitted_at` is `""` for every entry — this mirrors
+    in the `approved_by[]` array. request_changes/comment-style reviews
+    are posted as plain notes on GitLab (see `submit_pr_review`) — those
+    are recovered separately via `_reviews_from_notes` (WP #241), which
+    reconstructs them from the `#ai-review-<state>` marker line
+    `submit_pr_review` now stamps on every note-posting branch;
+    `_merge_reviews` combines the two sources for the read surfaces
+    (`get_pr`, `list_pr_reviews`, `merge_pr`). This function on its own
+    only ever sees approvals, so `body`/`url` stay `None` and
+    `submitted_at` stays `""` for every entry it returns — this mirrors
     the `Review.body`/`Review.url` "null means not applicable"
     convention documented on the dataclass.
     """
@@ -937,6 +939,305 @@ def _reviews_from_approvals(approvals: dict | None) -> list[Review]:
         )
         for entry in approved_by
     ]
+
+
+# ---------- WP #241: recover request_changes/comment reviews from marked ---
+# notes and merge them with the approvals-derived entries above ------------
+
+_REVIEW_MARKER_APPROVE = "#ai-review-approve"
+_REVIEW_MARKER_REQUEST_CHANGES = "#ai-review-request-changes"
+_REVIEW_MARKER_COMMENT = "#ai-review-comment"
+
+_REVIEW_MARKER_TO_STATE = {
+    _REVIEW_MARKER_APPROVE: "approve",
+    _REVIEW_MARKER_REQUEST_CHANGES: "request_changes",
+    _REVIEW_MARKER_COMMENT: "comment",
+}
+
+# Matches any bare `#<kebab>` marker line (generic — not scoped to a
+# specific marker vocabulary), used by `_review_marker_state` to skip
+# past a leading `#ai-generated`/`#ai-modified` line without requiring
+# the review marker to sit at an exact line number.
+_GENERIC_MARKER_LINE_RE = re.compile(r"^#[A-Za-z][\w-]*$")
+
+
+def _with_review_marker(body: str, marker: str, markers: MarkerSet) -> str:
+    """Build a note body carrying both the AI-attribution marker and a
+    review-state marker, e.g.:
+
+        #ai-generated
+        #ai-review-request-changes
+
+        <body>
+
+    `MarkerSet.strip_re` matches ANY leading `#ai-<kebab>` line
+    (generic, not just its own configured names) — so piping this
+    through `ensure_comment_prefix` would silently eat the review
+    marker line along with the attribution one. Built directly instead:
+    strip any existing leading attribution marker from `body`, then
+    prepend both marker lines as a fixed two-line header.
+    """
+    stripped = strip_leading_ai_marker(body, markers=markers).rstrip("\n")
+    return f"#{markers.generated}\n{marker}\n\n{stripped}"
+
+
+def _review_marker_state(body: str | None) -> str | None:
+    """Detect a `#ai-review-<state>` marker among `body`'s leading lines.
+
+    Tolerant of the marker not being exactly line 2 — a later
+    `apply_body_marker` re-stamp of the attribution line shifts the
+    review marker to line 3. Walks leading lines, skipping blanks and
+    any generic `#<kebab>` marker line (e.g. `#ai-generated`), and
+    returns the state the first time a review-marker line is seen.
+    Stops (returns `None`) at the first non-blank, non-marker line —
+    a review marker deep in a comment's prose does not count. The
+    marker line itself is never stripped from the note's own `body`.
+    """
+    if not body:
+        return None
+    for line in body.split("\n"):
+        stripped_line = line.strip()
+        if not stripped_line:
+            continue
+        state = _REVIEW_MARKER_TO_STATE.get(stripped_line)
+        if state is not None:
+            return state
+        if _GENERIC_MARKER_LINE_RE.match(stripped_line):
+            continue
+        return None
+    return None
+
+
+def _reviews_from_notes(
+    notes: list[dict], project: ProjectConfig, mr_iid: str | int,
+) -> list[Review]:
+    """Reconstruct `Review` objects from marked, non-system notes.
+
+    One `Review` per note whose body carries a `#ai-review-<state>`
+    marker (see `_review_marker_state`), in the same order `notes`
+    arrives in (callers fetch with `sort=asc&order_by=created_at`, so
+    this is chronological). `id`/`author`/`body`/`url`/`submitted_at`
+    are all sourced via `_map_note` so the URL-synthesis precedence and
+    timestamp normalisation stay identical to every other note-mapping
+    call site; `body` is the note's raw body verbatim, marker line
+    included. `commit_sha` is always `None` — GitLab reviews aren't
+    pinned to a commit.
+    """
+    reviews: list[Review] = []
+    for note in notes:
+        if note.get("system", False):
+            continue
+        state = _review_marker_state(note.get("body"))
+        if state is None:
+            continue
+        mapped = _map_note(note, project, mr_iid)
+        reviews.append(
+            Review(
+                id=mapped.id,
+                state=state,  # type: ignore[arg-type]
+                author=mapped.author,
+                body=mapped.body,
+                url=mapped.url,
+                submitted_at=mapped.created_at,
+                commit_sha=None,
+            )
+        )
+    return reviews
+
+
+def _current_marked_state_by_author(note_reviews: list[Review]) -> dict[str, str]:
+    """Author -> their most recent marked `approve`/`request_changes`
+    state, ignoring `comment`-state entries (decision-neutral — a
+    marked comment never represents an approve/request_changes stance).
+
+    Assumes `note_reviews` is already chronological (the order
+    `_reviews_from_notes` returns) — a later entry for the same author
+    overwrites an earlier one, so the dict ends up holding each
+    author's LATEST marked stance.
+    """
+    result: dict[str, str] = {}
+    for rv in note_reviews:
+        if rv.state not in ("approve", "request_changes"):
+            continue
+        result[rv.author] = rv.state
+    return result
+
+
+def _merge_reviews(
+    note_reviews: list[Review], approvals: dict | None,
+) -> list[Review]:
+    """Combine marked-note reviews with the live approvals-derived ones.
+
+    Marked entries first (chronological, full history), then every
+    `_reviews_from_approvals(approvals)` entry, unfiltered.
+
+    Historically this suppressed an approvals-derived entry for authors
+    whose current marked state (`_current_marked_state_by_author`) was
+    `"approve"`, on the theory that a marked `approve` note and a live
+    approval by the same author always describe the SAME event (so only
+    the marked note, which carries a real body/url/timestamp, needs to
+    surface).
+
+    That theory silently breaks for a real GitLab sequence this
+    function cannot tell apart from the same-event case (WP #241 review
+    finding R1): author X approves-with-a-body (a marked `approve` note
+    IS written) -> later plain-unapproves (no note — GitLab's bare
+    "revoke approval" action, and any unapprove not routed through this
+    library's own `request_changes` path, posts nothing marker-bearing)
+    -> later bare-reapproves (no note either, by `submit_pr_review`'s
+    own design). The live approval is now a genuinely NEW, current
+    event, but `_current_marked_state_by_author` still reports X's
+    *stale* marked note as `"approve"` — and GitLab's `/approvals`
+    endpoint carries no per-approval-event id or timestamp
+    (`_reviews_from_approvals`), so `(note_reviews, approvals)` is
+    LITERALLY the same pair of arguments in both the same-event case and
+    the stale-marker case: no rule expressed purely in terms of these
+    two inputs can treat them differently. There is no positive,
+    already-fetched signal available here to correlate "this live
+    approval IS that marked note's event" vs. "this live approval is a
+    NEW event that merely looks identical."
+
+    Given that, dedup on marked-`approve` state has been removed
+    entirely: an approvals-derived entry always surfaces, even when an
+    author's latest marked state is `"approve"`. This deliberately
+    trades an occasional duplicate-looking pair in the ordinary case
+    (marked `approve(body=…)` + a live approval that genuinely is the
+    same event) for NEVER silently dropping an author's live, current
+    approval — the latter is the exact class of bug #233/#234 were
+    about, and is strictly worse than a harmless-looking duplicate. See
+    `test_merge_reviews_does_not_suppress_duplicate_approve_from_same_author`
+    and
+    `test_merge_reviews_keeps_live_approve_after_unapprove_then_bare_reapprove`
+    for the pinned contract. No per-author dedupe of history either way
+    — a stale `request_changes` note stays in the list even after a
+    later `approve`.
+    """
+    return [*note_reviews, *_reviews_from_approvals(approvals)]
+
+
+def _decision_with_marker_override(
+    base: str | None, note_reviews: list[Review], approvals: dict | None,
+) -> str | None:
+    """Override `review_decision` to `CHANGES_REQUESTED` when a marked
+    `request_changes` note's author is not currently a live approver.
+
+    Starts from each author's current marked state
+    (`_current_marked_state_by_author` — `comment`-state entries never
+    contribute here, so a comment-only marked note can never trigger
+    this override). Any author present in the live `approved_by[]`
+    then has their current state forced to `"approve"` regardless of
+    what they last marked — approve wins. If any author's resulting
+    current state is `request_changes`, the decision is promoted to
+    `"CHANGES_REQUESTED"`; otherwise `base` (whatever `_map_mr` already
+    computed from the approvals gate) is returned untouched.
+
+    `approvals is None` is a degrade sentinel from `_fetch_mr_approvals`
+    (the approvals endpoint 403/404'd) — live approval state is genuinely
+    unknown, not "zero approvals". Promoting a marked `request_changes`
+    note to `CHANGES_REQUESTED` on that path would be permanent and
+    uncorrectable (an author's later live approval could never surface),
+    so the override is skipped entirely and `base` is returned untouched.
+    This is distinct from `approvals == {}` or an empty `approved_by[]`,
+    which are meaningful "zero approvals" signals and still allow the
+    override to apply normally.
+    """
+    if approvals is None:
+        return base
+    current = _current_marked_state_by_author(note_reviews)
+    approved_by = approvals.get("approved_by") or []
+    for entry in approved_by:
+        author = (entry.get("user") or {}).get("username", "")
+        if author:
+            current[author] = "approve"
+    if any(state == "request_changes" for state in current.values()):
+        return "CHANGES_REQUESTED"
+    return base
+
+
+# Same 100-page cap (10,000 notes) + warning convention as GitHub's
+# `_lookup_review_comment` fallback scan (github.py ~line 705) and this
+# file's own `list_pr_files` overflow warning — a runaway/misbehaving
+# `X-Next-Page` header must not spin the walk forever.
+_MR_NOTES_PAGE_CAP = 100
+
+
+def _fetch_mr_notes_page(
+    client: httpx.Client, path: str, iid: str | int, page: int,
+) -> httpx.Response:
+    """Fetch a single page of an MR's notes, oldest-first."""
+    return client.get(
+        f"/projects/{path}/merge_requests/{iid}/notes",
+        params={
+            "per_page": 100, "sort": "asc", "order_by": "created_at", "page": page,
+        },
+    )
+
+
+def _walk_mr_notes(
+    client: httpx.Client,
+    path: str,
+    iid: str | int,
+    first_page: httpx.Response,
+) -> list[dict]:
+    """Paginate through the rest of an MR's notes given an already
+    fetched (and already `_check`ed / degrade-handled) first page.
+
+    Follows `X-Next-Page` the same way project-discovery pagination
+    (~line 2547) and issue-notes pagination (~line 3190) already do in
+    this file, capped at `_MR_NOTES_PAGE_CAP` pages with a `log.warning`
+    if the walk is cut short. Without this, any MR with more than 100
+    notes silently lost everything past the oldest 100 — including
+    `#ai-review-*` marker notes posted later, which are now the sole
+    data source for marked-review reconstruction (WP #241).
+    """
+    notes = list(first_page.json())
+    r = first_page
+    page = 1
+    while True:
+        next_page = (r.headers.get("X-Next-Page") or "").strip()
+        if not next_page:
+            break
+        page += 1
+        if page > _MR_NOTES_PAGE_CAP:
+            log.warning(
+                "MR %s#%s: notes pagination hit the %d-page cap — "
+                "result may be incomplete",
+                path, iid, _MR_NOTES_PAGE_CAP,
+            )
+            break
+        r = _fetch_mr_notes_page(client, path, iid, int(next_page))
+        _check(r)
+        notes.extend(r.json())
+    return notes
+
+
+def _fetch_mr_notes(
+    client: httpx.Client, path: str, iid: str | int,
+) -> list[dict]:
+    """Fetch ALL pages of an MR's notes, degrading to `[]` on 403/404.
+
+    Factored out so `list_pr_reviews` and `merge_pr` can reuse it
+    without a second round trip diverging in shape. Mirrors
+    `_fetch_mr_approvals`'s degrade-on-403/404 contract exactly — a
+    restricted token scope or self-hosted edition without note access
+    yields `[]` rather than raising, so the marked-review reconstruction
+    just comes up empty instead of breaking the whole call. Only the
+    FIRST page's status is checked for the degrade condition; once page
+    1 succeeds, subsequent page fetches use the normal strict `_check`
+    (a mid-walk failure propagates, which `merge_pr` already wraps in
+    its own best-effort try/except, and which `list_pr_reviews` lets
+    propagate like any other read failure).
+
+    `get_pr`'s own notes fetch stays strict on page 1 too (it needs
+    `comments[]` too, where a silent empty list would be misleading),
+    but shares this function's `_walk_mr_notes` pagination walk rather
+    than duplicating the page-walk logic.
+    """
+    r = _fetch_mr_notes_page(client, path, iid, 1)
+    if r.status_code in (403, 404):
+        return []
+    _check(r)
+    return _walk_mr_notes(client, path, iid, r)
 
 
 # GitLab pipeline statuses we treat as terminal — anything else is
@@ -3256,7 +3557,10 @@ class GitLabProvider(
              `None` rather than raising. (See `_fetch_mr_approvals`,
              which implements this fetch+degrade logic.)
           3. `GET /projects/:id/merge_requests/:iid/notes` — the
-             discussion notes.
+             discussion notes, paginated across ALL pages via
+             `_walk_mr_notes` (not just the first 100) so a marked
+             review note posted after an MR's 100th note still feeds
+             `reviews[]`/`review_decision` (WP #241 fix round 3).
 
         `list_prs` deliberately skips step (2) by default to avoid an
         N+1 round trip across the listing — unless the caller opts in
@@ -3265,10 +3569,16 @@ class GitLabProvider(
         need accurate approval state on a single MR should always use
         `get_pr`.
 
-        `pr.reviews` is synthesized from the same approvals payload via
-        `_reviews_from_approvals` — no extra round trip. On the
-        degraded (403/404) approvals path, `pr.reviews` stays `[]` while
-        the rest of the MR data is still returned (ticket #148).
+        `pr.reviews` merges the same approvals payload
+        (`_reviews_from_approvals`) with any marked request_changes/
+        comment/approve review notes reconstructed from step (3)'s
+        notes fetch — no extra round trip (WP #241, see
+        `_merge_reviews`). `pr.review_decision` is likewise overridden
+        via `_decision_with_marker_override` when a marked
+        `request_changes` note's author is not a live approver. On the
+        degraded (403/404) approvals path, the approvals-derived half
+        stays `[]`/unoverridden while the rest of the MR data is still
+        returned (ticket #148).
         """
         path = _project_path(project)
         with _client(project, token) as client:
@@ -3284,20 +3594,25 @@ class GitLabProvider(
             raw_mr = r.json()
             approvals = _fetch_mr_approvals(client, path, pr_id)
             pr = _map_mr(raw_mr, project, approvals=approvals)
-            pr.reviews = _reviews_from_approvals(approvals)
-            c = client.get(
-                f"/projects/{path}/merge_requests/{pr_id}/notes",
-                params={"per_page": 100, "sort": "asc", "order_by": "created_at"},
-            )
+            c = _fetch_mr_notes_page(client, path, pr_id, 1)
             _check(c)
+            raw_notes = _walk_mr_notes(client, path, pr_id, c)
+            note_reviews = _reviews_from_notes(raw_notes, project, pr_id)
+            pr.reviews = _merge_reviews(note_reviews, approvals)
+            pr.review_decision = _decision_with_marker_override(
+                pr.review_decision, note_reviews, approvals,
+            )
             # Positional (diff-anchored) notes are surfaced via
             # `list_pr_review_comments` as `ReviewComment`. Keep this
             # list to true discussion-only notes — mirrors GitHub where
             # the issue-comments and review-comments endpoints are
-            # physically separate.
+            # physically separate. Marked review notes (WP #241) route
+            # only into `reviews[]` above, never into `comments[]`.
             comments = [
-                _map_note(it, project) for it in c.json()
-                if not it.get("system", False) and not it.get("position")
+                _map_note(it, project) for it in raw_notes
+                if not it.get("system", False)
+                and not it.get("position")
+                and _review_marker_state(it.get("body")) is None
             ]
         return pr, comments
 
@@ -3644,36 +3959,37 @@ class GitLabProvider(
         token: str | None,
         pr_id: str,
     ) -> list[Review]:
-        """List reviews on an MR, synthesized from the approvals state.
+        """List reviews on an MR, merging the approvals state with any
+        marked `request_changes`/`comment`/`approve` review notes.
 
         GitLab has no review-object endpoint — unlike GitHub/Azure DevOps,
         there is nothing that models a submitted "review" as a distinct
         resource. This method hits `GET /projects/:id/merge_requests/
-        :iid/approvals` (the same endpoint `get_pr` already uses) and
-        synthesizes one `Review(state="approve", ...)` per entry in the
-        `approved_by[]` array, via the shared `_reviews_from_approvals`
-        helper (also used by `get_pr`, so the two paths can't diverge).
+        :iid/approvals` (the same endpoint `get_pr` already uses) for the
+        live approve-state entries (`_reviews_from_approvals`), and
+        `GET .../notes` (via `_fetch_mr_notes`) for request_changes/
+        comment-style reviews (WP #241): those are posted as plain notes
+        on GitLab, indistinguishable from ordinary MR comments once
+        posted, EXCEPT for the `#ai-review-<state>` marker line
+        `submit_pr_review` now stamps on every note-posting branch —
+        `_reviews_from_notes` reconstructs a `Review` from any note
+        carrying that marker. `_merge_reviews` combines the two sources
+        (also used by `get_pr` and `merge_pr`, so all three read
+        surfaces can't diverge); see its docstring for the exact
+        same-author-same-state dedupe rule.
 
-        **Known limitation**: request_changes/comment-style reviews are
-        posted as plain notes on GitLab (see `submit_pr_review`), which
-        are indistinguishable from ordinary MR comments once posted —
-        there is no marker separating a "review comment" note from a
-        regular discussion note. Those are therefore NOT recoverable via
-        this method; only approvals are. The approvals payload also
-        carries no per-approver timestamp or note body, so `body` and
-        `url` are `None` and `submitted_at` is `""` for every entry —
-        this mirrors the `Review.body`/`Review.url` "null means not
-        applicable" convention documented on the dataclass.
-
-        If the approvals endpoint is unavailable (403 restricted scope,
-        404 self-hosted edition without the approvals API), this
-        degrades to `[]` rather than raising — same graceful fallback
-        `get_pr` uses for the same endpoint.
+        If either the approvals or the notes endpoint is unavailable
+        (403 restricted scope, 404 self-hosted edition without the API),
+        that source degrades to `[]`/`None` rather than raising — same
+        graceful fallback `get_pr` uses for the approvals endpoint,
+        extended here to notes via `_fetch_mr_notes`.
         """
         path = _project_path(project)
         with _client(project, token) as client:
             approvals = _fetch_mr_approvals(client, path, pr_id)
-            return _reviews_from_approvals(approvals)
+            raw_notes = _fetch_mr_notes(client, path, pr_id)
+            note_reviews = _reviews_from_notes(raw_notes, project, pr_id)
+            return _merge_reviews(note_reviews, approvals)
 
     def add_pr_review_comment(
         self,
@@ -3942,11 +4258,14 @@ class GitLabProvider(
                 )
                 _check(r)
                 note_raw: dict | None = None
+                marked_body: str | None = None
                 if body:
-                    prefixed = ensure_comment_prefix(body, markers=markers)
+                    marked_body = _with_review_marker(
+                        body, _REVIEW_MARKER_APPROVE, markers,
+                    )
                     rn = client.post(
                         f"/projects/{path}/merge_requests/{pr_id}/notes",
-                        json={"body": prefixed},
+                        json={"body": marked_body},
                     )
                     _check(rn)
                     note_raw = rn.json()
@@ -3968,7 +4287,13 @@ class GitLabProvider(
                     _approve_author = (note_raw.get("author") or {}).get(
                         "username", ""
                     )
-                    _approve_body: str | None = note_raw.get("body", "")
+                    # `Review.body` is the full marked body byte-identical
+                    # to what was POSTed — fall back to the locally
+                    # constructed marked string rather than trusting a
+                    # server echo that may omit/empty `body`.
+                    _approve_body: str | None = note_raw.get("body") or marked_body
+                    _approve_id = str(note_raw.get("id", ""))
+                    _approve_submitted_at = note_raw.get("created_at") or ""
                 else:
                     # No note was posted — the `/approve` response is a
                     # *MergeRequestApproval* object, which carries
@@ -3977,23 +4302,27 @@ class GitLabProvider(
                     # the acting user via the authenticated-identity
                     # endpoint instead of guessing from `approved_by[]`
                     # (which can list multiple approvers). There is also
-                    # no note-specific body/url to report for a bare
-                    # approve, so both are genuinely absent (`None`) —
-                    # see `Review.body`/`Review.url` docstring.
+                    # no note-specific body/url/timestamp to report for a
+                    # bare approve, so body/url are genuinely absent
+                    # (`None`) and submitted_at is `""` — see
+                    # `Review.body`/`Review.url` docstring. `id` is the
+                    # acting user's own id, never the MR's `iid` (that
+                    # would misrepresent WHO approved).
                     ru = client.get("/user")
                     _check(ru)
-                    _approve_author = ru.json().get("username", "")
+                    ru_json = ru.json()
+                    _approve_author = ru_json.get("username", "")
                     _approve_body = None
                     _approve_url = None
+                    _approve_id = str(ru_json.get("id", ""))
+                    _approve_submitted_at = ""
                 return Review(
-                    id=str((note_raw or {}).get("id") or mr_raw.get("iid", "")),
+                    id=_approve_id,
                     state="approve",
                     author=_approve_author,
                     body=_approve_body,
                     url=_approve_url,
-                    submitted_at=(note_raw or {}).get("created_at")
-                    or mr_raw.get("updated_at")
-                    or "",
+                    submitted_at=_approve_submitted_at,
                     commit_sha=None,
                 )
 
@@ -4005,10 +4334,12 @@ class GitLabProvider(
                 )
                 if ru.status_code not in (200, 201, 204, 404, 409):
                     _check(ru)
-                prefixed = ensure_comment_prefix(body or "", markers=markers)
+                marked_body = _with_review_marker(
+                    body or "", _REVIEW_MARKER_REQUEST_CHANGES, markers,
+                )
                 rn = client.post(
                     f"/projects/{path}/merge_requests/{pr_id}/notes",
-                    json={"body": prefixed},
+                    json={"body": marked_body},
                 )
                 _check(rn)
                 note_raw = rn.json()
@@ -4029,17 +4360,19 @@ class GitLabProvider(
                     id=str(note_raw.get("id", "")),
                     state="request_changes",
                     author=(note_raw.get("author") or {}).get("username", ""),
-                    body=note_raw.get("body", ""),
+                    body=note_raw.get("body") or marked_body,
                     url=_rc_url,
                     submitted_at=note_raw.get("created_at") or "",
                     commit_sha=None,
                 )
 
             # state == "comment"
-            prefixed = ensure_comment_prefix(body or "", markers=markers)
+            marked_body = _with_review_marker(
+                body or "", _REVIEW_MARKER_COMMENT, markers,
+            )
             rn = client.post(
                 f"/projects/{path}/merge_requests/{pr_id}/notes",
-                json={"body": prefixed},
+                json={"body": marked_body},
             )
             _check(rn)
             note_raw = rn.json()
@@ -4060,7 +4393,7 @@ class GitLabProvider(
                 id=str(note_raw.get("id", "")),
                 state="comment",
                 author=(note_raw.get("author") or {}).get("username", ""),
-                body=note_raw.get("body", ""),
+                body=note_raw.get("body") or marked_body,
                 url=_comment_url,
                 submitted_at=note_raw.get("created_at") or "",
                 commit_sha=None,
@@ -4249,18 +4582,39 @@ class GitLabProvider(
             # #214), so a caller doesn't need a follow-up get_pr to see
             # review data on a just-merged MR. Best-effort: never mask an
             # already-successful merge — a failure here just falls back
-            # to `approvals=None`, reproducing today's `_map_mr(raw_mr,
-            # project)` (no approvals) behaviour.
+            # to `approvals=None`/no marked-note reviews, reproducing
+            # today's `_map_mr(raw_mr, project)` (no approvals) behaviour.
+            # WP #241: the notes fetch (for marked request_changes/
+            # comment/approve reviews) degrades the same best-effort way
+            # an approvals-endpoint failure already does — but ticket
+            # #241 fix-round finding 2: each fetch gets its OWN try/except
+            # so a genuine (non-403/404, since those already degrade to
+            # []/None internally — see `_fetch_mr_approvals`/
+            # `_fetch_mr_notes`) failure in one never prevents the other
+            # from even being attempted, matching `list_pr_reviews`'s
+            # existing independent-statements pattern.
             approvals: dict | None = None
+            raw_notes: list[dict] = []
             try:
                 approvals = _fetch_mr_approvals(client, path, pr_id)
             except Exception:
                 log.warning(
                     "MR %s: failed to fetch approvals after merge; "
-                    "returning merged MR with empty reviews", pr_id,
+                    "returning merged MR with approvals=None", pr_id,
+                )
+            try:
+                raw_notes = _fetch_mr_notes(client, path, pr_id)
+            except Exception:
+                log.warning(
+                    "MR %s: failed to fetch notes after merge; "
+                    "returning merged MR with no marked-note reviews", pr_id,
                 )
             pr = _map_mr(raw_mr, project, approvals=approvals)
-            pr.reviews = _reviews_from_approvals(approvals)
+            note_reviews = _reviews_from_notes(raw_notes, project, pr_id)
+            pr.reviews = _merge_reviews(note_reviews, approvals)
+            pr.review_decision = _decision_with_marker_override(
+                pr.review_decision, note_reviews, approvals,
+            )
             return pr
 
     # ---------- relations (write side) ---------------------------------------

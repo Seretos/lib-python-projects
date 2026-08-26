@@ -218,7 +218,14 @@ def test_add_pr_review_comment_reply_404_names_review_comment(
 
     Ticket #205 fix-round 2's invariant still holds: the node-id lookup
     happens BEFORE any pending review is created, so no
-    `POST /pulls/55/reviews` should ever be issued for this failure."""
+    `POST /pulls/55/reviews` should ever be issued for this failure.
+
+    WP #241 (`_lookup_review_comment`): a 404 from the single-comment
+    endpoint now falls back to a paginated scan of
+    `GET /pulls/55/comments` before giving up — this comment id is
+    genuinely absent from both, so the fallback listing also comes back
+    empty and the final result is unchanged (still a 404 named after the
+    originally-requested comment id)."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
@@ -226,6 +233,8 @@ def test_add_pr_review_comment_reply_404_names_review_comment(
             return _json([])
         if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/123":
             return _json({"message": "Not Found"}, status_code=404)
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/55/comments":
+            return _json([])
         raise AssertionError(f"unexpected request: {req.method} {path}")
 
     seen = _install_mock(monkeypatch, handler)
