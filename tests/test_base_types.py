@@ -1142,3 +1142,120 @@ class TestTokenCapabilitiesPartialFlagsContract:
         names = {f.name for f in dataclasses.fields(TokenCapabilities)}
         assert not any("pipeline" in n for n in names)
         assert not any("board" in n for n in names)
+
+
+# ---------- ticket #240: parse_diff_hunk_ranges (R4) ---------------------------
+
+
+class TestParseDiffHunkRanges:
+    """`parse_diff_hunk_ranges(patch)` is the shared helper (imported by
+    both github.py and gitlab.py) that turns `@@ -a,b +c,d @@` hunk
+    headers into `DiffHunkRange` entries: a `LEFT` range `[a, a+b-1]`
+    when `b > 0`, a `RIGHT` range `[c, c+d-1]` when `d > 0`, omitted
+    counts mean `1`, and `None`/empty/malformed input returns `[]`."""
+
+    def test_multi_hunk_yields_all_ranges_in_order(self) -> None:
+        """Two hunks -> all four ranges, LEFT then RIGHT per hunk, in
+        the order the hunks appear in the patch."""
+        from lib_python_projects.providers.base import (
+            DiffHunkRange, parse_diff_hunk_ranges,
+        )
+
+        patch = (
+            "@@ -10,5 +12,7 @@ def foo():\n"
+            " context\n"
+            "-old\n"
+            "+new\n"
+            "@@ -30,3 +35,4 @@ def bar():\n"
+            " context\n"
+            "+added\n"
+        )
+        ranges = parse_diff_hunk_ranges(patch)
+        assert ranges == [
+            DiffHunkRange("LEFT", 10, 14),
+            DiffHunkRange("RIGHT", 12, 18),
+            DiffHunkRange("LEFT", 30, 32),
+            DiffHunkRange("RIGHT", 35, 38),
+        ]
+
+    def test_none_and_empty_return_empty_list(self) -> None:
+        from lib_python_projects.providers.base import parse_diff_hunk_ranges
+
+        assert parse_diff_hunk_ranges(None) == []
+        assert parse_diff_hunk_ranges("") == []
+
+    def test_omitted_counts_default_to_single_line_ranges(self) -> None:
+        """`@@ -5 +5 @@` (both counts omitted) means a single-line hunk
+        on each side: `b`/`d` default to `1`."""
+        from lib_python_projects.providers.base import (
+            DiffHunkRange, parse_diff_hunk_ranges,
+        )
+
+        ranges = parse_diff_hunk_ranges("@@ -5 +5 @@\n-old\n+new\n")
+        assert ranges == [
+            DiffHunkRange("LEFT", 5, 5),
+            DiffHunkRange("RIGHT", 5, 5),
+        ]
+
+    def test_pure_addition_omits_left_side(self) -> None:
+        """`b == 0` (pure addition, `-0,0`) emits nothing for LEFT."""
+        from lib_python_projects.providers.base import (
+            DiffHunkRange, parse_diff_hunk_ranges,
+        )
+
+        ranges = parse_diff_hunk_ranges("@@ -0,0 +1,3 @@\n+a\n+b\n+c\n")
+        assert ranges == [DiffHunkRange("RIGHT", 1, 3)]
+
+    def test_pure_deletion_omits_right_side(self) -> None:
+        """`d == 0` (pure deletion, `+0,0`) emits nothing for RIGHT."""
+        from lib_python_projects.providers.base import (
+            DiffHunkRange, parse_diff_hunk_ranges,
+        )
+
+        ranges = parse_diff_hunk_ranges("@@ -1,3 +0,0 @@\n-a\n-b\n-c\n")
+        assert ranges == [DiffHunkRange("LEFT", 1, 3)]
+
+    def test_trailing_section_context_after_header_is_ignored(self) -> None:
+        """The free-text section-heading suffix after the second `@@`
+        (e.g. `def foo():`) must not interfere with parsing."""
+        from lib_python_projects.providers.base import (
+            DiffHunkRange, parse_diff_hunk_ranges,
+        )
+
+        ranges = parse_diff_hunk_ranges(
+            "@@ -1,3 +1,4 @@ def foo(arg1, arg2):\n context\n+new\n"
+        )
+        assert ranges == [
+            DiffHunkRange("LEFT", 1, 3),
+            DiffHunkRange("RIGHT", 1, 4),
+        ]
+
+    def test_garbage_text_with_no_hunk_headers_returns_empty_list(self) -> None:
+        from lib_python_projects.providers.base import parse_diff_hunk_ranges
+
+        assert parse_diff_hunk_ranges("this is not a diff at all\njust text\n") == []
+
+    def test_mixed_valid_and_malformed_headers_skips_only_the_malformed_one(
+        self,
+    ) -> None:
+        """A malformed hunk header must not nuke the whole patch to `[]`
+        — only that header is skipped; a recognizable header elsewhere in
+        the same patch is still parsed. `'malformed input returns []'`
+        means 'no recognizable headers at all', not 'any single malformed
+        header nukes everything' (round-2 plan note)."""
+        from lib_python_projects.providers.base import (
+            DiffHunkRange, parse_diff_hunk_ranges,
+        )
+
+        patch = (
+            "@@ garbage not a real header @@\n"
+            "+stray\n"
+            "@@ -20,2 +22,3 @@ def baz():\n"
+            " context\n"
+            "+new\n"
+        )
+        ranges = parse_diff_hunk_ranges(patch)
+        assert ranges == [
+            DiffHunkRange("LEFT", 20, 21),
+            DiffHunkRange("RIGHT", 22, 24),
+        ]

@@ -2597,3 +2597,67 @@ def test_is_ci_configured_401_raises_not_false(
         provider.is_ci_configured(project, "t")
     # Every provider's error type carries `.status`.
     assert getattr(exc.value, "status", None) == 401
+
+
+# ---------- ticket #240: PRDiffProvider / list_pr_files parity --------------
+
+
+def test_all_providers_expose_pr_diff_methods():
+    """All three providers must expose `list_pr_files` as a callable with
+    the shared `(project, token, pr_id)` signature — the `PRDiffProvider`
+    marker/mixin contract from `providers/base.py` (ticket #240). Azure
+    DevOps is deliberately file-level only: `SUPPORTS_DIFF_LINE_RANGES`
+    is `False` there, `True` on GitHub/GitLab."""
+    import inspect
+
+    from lib_python_projects.providers.base import PRDiffProvider
+
+    for provider_cls in _provider_classes():
+        assert issubclass(provider_cls, PRDiffProvider), (
+            f"{provider_cls.__name__} must implement PRDiffProvider"
+        )
+        assert callable(getattr(provider_cls, "list_pr_files", None)), (
+            f"{provider_cls.__name__}.list_pr_files must be callable"
+        )
+        sig = inspect.signature(getattr(provider_cls, "list_pr_files"))
+        params = list(sig.parameters)
+        assert params == ["self", "project", "token", "pr_id"], (
+            f"{provider_cls.__name__}.list_pr_files must be "
+            f"(self, project, token, pr_id), got {params}"
+        )
+
+    from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+    from lib_python_projects.providers.github import GitHubProvider
+    from lib_python_projects.providers.gitlab import GitLabProvider
+
+    assert GitHubProvider.SUPPORTS_DIFF_LINE_RANGES is True
+    assert GitLabProvider.SUPPORTS_DIFF_LINE_RANGES is True
+    assert AzureDevOpsProvider.SUPPORTS_DIFF_LINE_RANGES is False
+
+
+def test_pr_file_diff_dataclasses_importable_from_base():
+    """`PRFileDiff`/`DiffHunkRange` must be importable from
+    `providers.base` with the exact field sets the plan specifies —
+    including the tri-state `line_ranges`/`patch` fields and the
+    rename-only `previous_path`."""
+    import dataclasses
+
+    from lib_python_projects.providers.base import DiffHunkRange, PRFileDiff
+
+    hunk_fields = {f.name for f in dataclasses.fields(DiffHunkRange)}
+    assert hunk_fields == {"side", "start", "end"}
+
+    file_fields = {f.name for f in dataclasses.fields(PRFileDiff)}
+    assert file_fields == {
+        "path", "change_type", "previous_path", "patch",
+        "line_ranges", "additions", "deletions",
+    }
+
+    # The five fields beyond path/change_type must genuinely default —
+    # constructing with only the two required fields must succeed.
+    minimal = PRFileDiff(path="a.py", change_type="modified")
+    assert minimal.previous_path is None
+    assert minimal.patch is None
+    assert minimal.line_ranges is None
+    assert minimal.additions is None
+    assert minimal.deletions is None

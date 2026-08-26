@@ -675,15 +675,39 @@ class ReviewComment:
         diff. `None` when the position is unresolvable (e.g. outdated
         comment whose anchor moved out of the latest diff).
       - `original_line`: the line as of `original_commit_sha`. GitHub
-        only; GitLab leaves it `None`.
+        populates this field on review comments. GitLab, on write:
+        `add_pr_review_comment`'s LEFT-side new-thread path sets it to
+        the resolved old-side line number (the pre-change line the
+        LEFT anchor was walked to); the RIGHT/default new-thread path
+        and replies leave it `None`. GitLab, on read:
+        `list_pr_review_comments` (the only GitLab read surface
+        returning `ReviewComment`) surfaces it from the note's own
+        `position.old_line` whenever GitLab's diff position carries
+        one — this covers any LEFT-anchored comment regardless of how
+        it was originally written, not just ones created via the
+        write path above — and stays `None` when the position has no
+        `old_line` (a pure RIGHT/addition anchor).
       - `side`: `"LEFT"` for a deletion-side anchor, `"RIGHT"` for the
-        addition side. `None` for GitLab (uses `old_line`/`new_line`
-        directly). Note: `side` and `url` may differ between the
-        `add_pr_review_comment` response and the same comment as returned
-        by `get_pr`. GitLab does not echo `side` on write and constructs
-        the `url` only after the comment is saved, so the write response
-        carries `side=None` and an empty or provisional `url`; the
-        authoritative values are available via `get_pr` afterwards.
+        addition side. On GitLab's `add_pr_review_comment`, a RIGHT/
+        default new-thread comment and any reply carry `side=None`
+        (uses `old_line`/`new_line` directly); a LEFT-side new-thread
+        comment (`side="LEFT"`) is the one exception and echoes back
+        `side="LEFT"` literally. Note: `side` and `url` may differ
+        between the `add_pr_review_comment` response and the same
+        comment as returned by `get_pr`. On the RIGHT/reply paths,
+        GitLab does not echo `side` on write and constructs the `url`
+        only after the comment is saved, so the write response carries
+        `side=None` and an empty or provisional `url`; the authoritative
+        values are available via `get_pr` afterwards.
+
+        Known limitation: a GitLab LEFT comment on a context line reads
+        back via `list_pr_review_comments` as `side="RIGHT"`, not
+        `"LEFT"` — the write response's `side="LEFT"` reflects the
+        caller's request, not a property preserved in GitLab's data.
+        GitLab's single-line comment position provides no field to
+        distinguish that case from an ordinary RIGHT-anchored comment,
+        so a later read cannot recover it. This is a known, accepted
+        limitation of GitLab's API, not a code defect.
       - `commit_sha`: the diff base the comment was anchored against.
       - `in_reply_to`: the id of the comment / discussion this is a
         reply to, or `None` for new threads. On GitHub this is the
@@ -757,6 +781,114 @@ class Review:
     url: str | None
     submitted_at: str
     commit_sha: str | None = None
+
+
+# ---------- PR diff discovery (ticket #240) -----------------------------------
+
+
+PRFileChangeType = Literal[
+    "added", "modified", "removed", "renamed", "copied", "changed", "unchanged",
+]
+
+
+@dataclass
+class DiffHunkRange:
+    """A single commentable line range on one side of a diff hunk.
+
+    `side` is `"LEFT"` (pre-change) or `"RIGHT"` (post-change). `start`
+    and `end` are both inclusive, 1-based line numbers on that side.
+    """
+
+    side: str
+    start: int
+    end: int
+
+
+@dataclass
+class PRFileDiff:
+    """A single changed file in a pull request, as returned by
+    `PRDiffProvider.list_pr_files`.
+
+    Tri-state contract for `line_ranges` (and, in parallel, `patch`):
+      - `None` — the provider cannot supply diff positions at all
+        (Azure DevOps, `SUPPORTS_DIFF_LINE_RANGES = False`).
+      - `[]` — the provider supports positions in general but this
+        particular file has none (e.g. a binary or oversized file with
+        no patch text).
+      - non-empty `list[DiffHunkRange]` — real commentable ranges,
+        parsed from the file's patch via `parse_diff_hunk_ranges`.
+
+    `previous_path` is populated ONLY when `change_type == "renamed"`,
+    on every provider — `None` in every other case, even when the
+    upstream payload happens to carry a former-path field (e.g. a
+    stray `previous_filename`/`sourceServerItem` on a non-rename entry
+    is deliberately ignored).
+    """
+
+    path: str
+    change_type: PRFileChangeType
+    previous_path: str | None = None
+    patch: str | None = None
+    line_ranges: list[DiffHunkRange] | None = None
+    additions: int | None = None
+    deletions: int | None = None
+
+
+class PRDiffProvider:
+    """Mixin/interface: providers that can enumerate a PR's changed files
+    and diff positions before a review comment is posted implement this
+    method.
+
+    `SUPPORTS_DIFF_LINE_RANGES` tells callers, without making a network
+    call, whether this provider can ever populate `patch`/`line_ranges`
+    on the returned `PRFileDiff` entries. It is `True` on GitHub and
+    GitLab; Azure DevOps sets it `False` because its PR API exposes no
+    per-file diff hunk positions — `patch`/`line_ranges` are permanently
+    `None` there, and `list_pr_files` is file-level only.
+    """
+
+    SUPPORTS_DIFF_LINE_RANGES: bool = True
+
+    def list_pr_files(
+        self, project, token: str | None, pr_id: str
+    ) -> list[PRFileDiff]:
+        raise NotImplementedError
+
+
+_HUNK_HEADER_RE = re.compile(
+    r"^@@ -(?P<left_start>\d+)(?:,(?P<left_count>\d+))? "
+    r"\+(?P<right_start>\d+)(?:,(?P<right_count>\d+))? @@"
+)
+
+
+def parse_diff_hunk_ranges(patch: str | None) -> list[DiffHunkRange]:
+    """Parse `@@ -a,b +c,d @@` hunk headers into `DiffHunkRange` entries.
+
+    For each recognized header: a `LEFT` range `[a, a+b-1]` when `b > 0`
+    (omitted `b` means `1`), and a `RIGHT` range `[c, c+d-1]` when `d > 0`
+    (omitted `d` means `1`). A header with `b == 0`/`d == 0` emits
+    nothing for that side. `None`/empty input, or input with no
+    recognizable header at all, returns `[]`. A malformed header does
+    not abort the whole patch — it is skipped and parsing continues with
+    any remaining, valid headers in the same patch.
+    """
+    if not patch:
+        return []
+
+    ranges: list[DiffHunkRange] = []
+    for line in patch.splitlines():
+        m = _HUNK_HEADER_RE.match(line)
+        if not m:
+            continue
+        left_start = int(m.group("left_start"))
+        left_count = int(m.group("left_count") or "1")
+        right_start = int(m.group("right_start"))
+        right_count = int(m.group("right_count") or "1")
+        if left_count > 0:
+            ranges.append(DiffHunkRange("LEFT", left_start, left_start + left_count - 1))
+        if right_count > 0:
+            ranges.append(DiffHunkRange("RIGHT", right_start, right_start + right_count - 1))
+    return ranges
 
 
 def review_decision_from_states(states: list[str]) -> str | None:

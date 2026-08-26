@@ -3064,3 +3064,801 @@ def test_list_pr_reviews_approvals_endpoint_unavailable_returns_empty_list(
     _install_mock(monkeypatch, handler)
     reviews = GitLabProvider().list_pr_reviews(_project(), "t", "9")
     assert reviews == []
+
+
+# ---------- ticket #240: list_pr_files (R2) ----------------------------------
+#
+# GET /projects/:id/merge_requests/:iid/changes (the legacy/universal
+# endpoint) — NOT /diffs. Read from the whole-MR-object response
+# (unpaginated); `changes` holds one entry per file, `overflow` signals a
+# possibly-truncated result.
+
+
+def _changes_response(changes: list[dict], overflow: bool | None = None) -> dict:
+    payload: dict = {"iid": 7, "changes": changes}
+    if overflow is not None:
+        payload["overflow"] = overflow
+    return payload
+
+
+def _change_entry(
+    new_path: str,
+    old_path: str | None = None,
+    diff: str | None = None,
+    new_file: bool = False,
+    deleted_file: bool = False,
+    renamed_file: bool = False,
+) -> dict:
+    return {
+        "new_path": new_path,
+        "old_path": old_path if old_path is not None else new_path,
+        "new_file": new_file,
+        "deleted_file": deleted_file,
+        "renamed_file": renamed_file,
+        "diff": diff if diff is not None else "",
+    }
+
+
+def test_list_pr_files_returns_paths_patch_and_line_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requests `/merge_requests/7/changes` (never `/diffs`); maps
+    `new_path` (preferred over `old_path`), a modified entry's
+    `change_type`, the `diff` string verbatim as `patch`, and
+    `line_ranges` via the shared `parse_diff_hunk_ranges` helper.
+    `additions`/`deletions` stay `None` — GitLab's changes payload
+    carries no such counts. `old_path` is deliberately different from
+    `new_path` here (this is not a rename — `renamed_file` stays
+    `False`) so that `path == new_path` can only pass if the mapper
+    prefers `new_path` over `old_path`, per the plan's `new_path or
+    old_path` -> `path` rule."""
+    diff = "@@ -1,3 +1,4 @@ def foo():\n context\n+new\n"
+    entry = _change_entry("src/app.py", old_path="src/app_before.py", diff=diff)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        assert url.split("?")[0].endswith("/merge_requests/7/changes")
+        if "/diffs" in url:
+            raise AssertionError(f"must not hit /diffs: {url}")
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+
+    from lib_python_projects.providers.base import DiffHunkRange
+
+    assert len(result) == 1
+    f = result[0]
+    assert f.path == "src/app.py"
+    assert f.previous_path is None
+    assert f.change_type == "modified"
+    assert f.patch == diff
+    assert f.line_ranges == [DiffHunkRange("LEFT", 1, 3), DiffHunkRange("RIGHT", 1, 4)]
+    assert f.additions is None
+    assert f.deletions is None
+
+
+def test_list_pr_files_new_file_maps_added(monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = _change_entry("src/new.py", new_file=True)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result[0].change_type == "added"
+
+
+def test_list_pr_files_deleted_file_maps_removed(monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = _change_entry("src/gone.py", deleted_file=True)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result[0].change_type == "removed"
+
+
+def test_list_pr_files_renamed_file_sets_previous_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = _change_entry(
+        "new/path.py", old_path="old/path.py", renamed_file=True,
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result[0].change_type == "renamed"
+    assert result[0].previous_path == "old/path.py"
+
+
+def test_list_pr_files_non_renamed_with_differing_paths_leaves_previous_path_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`previous_path` is populated ONLY when `renamed_file` is true —
+    even if `old_path`/`new_path` happen to differ for some other
+    reason, it must not leak through."""
+    entry = _change_entry(
+        "new/path.py", old_path="old/path.py", renamed_file=False,
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result[0].change_type == "modified"
+    assert result[0].previous_path is None
+
+
+def test_list_pr_files_missing_changes_key_returns_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"iid": 7})
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result == []
+
+
+def test_list_pr_files_empty_changes_returns_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result == []
+
+
+def test_list_pr_files_overflow_true_warns_and_returns_partial(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`overflow: true` signals a possibly-truncated result. The
+    (possibly truncated) `changes` are returned as-is — never raised —
+    with one `log.warning` on `project-issues.gitlab` mentioning the MR
+    id and 'incomplete'."""
+    import logging
+
+    entry = _change_entry("src/app.py")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry], overflow=True))
+
+    _install_mock(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING, logger="project-issues.gitlab"):
+        result = GitLabProvider().list_pr_files(_project(), "t", "7")
+
+    assert len(result) == 1
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"Expected exactly one warning, got {warnings}"
+    record = warnings[0]
+    assert record.name == "project-issues.gitlab"
+    assert "7" in record.message
+    assert "incomplete" in record.message.lower()
+
+
+def test_list_pr_files_overflow_false_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    entry = _change_entry("src/app.py")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry], overflow=False))
+
+    _install_mock(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING, logger="project-issues.gitlab"):
+        GitLabProvider().list_pr_files(_project(), "t", "7")
+
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_list_pr_files_overflow_absent_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    entry = _change_entry("src/app.py")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING, logger="project-issues.gitlab"):
+        GitLabProvider().list_pr_files(_project(), "t", "7")
+
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_list_pr_files_pr_not_found_404_becomes_named_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 404 whose message is NOT the project-not-found shape means the
+    MR itself doesn't exist inside a project that does -> rewrapped as
+    the canonical `PR '<project>#<id>' not found` (mirrors `get_pr`)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "404 Not found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert exc.value.status == 404
+    assert "PR 'acme#7' not found" in exc.value.message
+
+
+def test_list_pr_files_project_not_found_404_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine `404 Project Not Found` (the project path itself fails
+    to resolve) must surface as itself, never relabelled `PR '...' not
+    found` (mirrors `get_pr`'s project-vs-PR 404 split)."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json({"message": "404 Project Not Found"}, status_code=404)
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert exc.value.status == 404
+    assert "PR" not in exc.value.message
+    assert "Project Not Found" in exc.value.message
+
+
+# ---------- ticket #240 (attempt 2, R3): add_pr_review_comment `side` -------
+#
+# GitLab's write path ignores its own `side` parameter and always posts
+# `new_line=line`. On `side="LEFT"` it must instead resolve the real
+# `(old_line, new_line)` pair from the MR diff (via one GET to the same
+# `/changes` endpoint `list_pr_files` uses) and post a valid GitLab
+# `position`. RIGHT/default/reply stay byte-identical, including their
+# network-call count.
+
+
+def _changes_payload_for_review(
+    mr_iid: int,
+    changes: list[dict],
+    diff_refs: dict | None = None,
+) -> dict:
+    """Like `_changes_response`, but also carries `diff_refs` — the
+    LEFT branch reads `/changes` (not the plain MR GET) so `diff_refs`
+    must come from the same payload."""
+    payload = _changes_response(changes)
+    payload["iid"] = mr_iid
+    payload["diff_refs"] = diff_refs or {
+        "base_sha": "b1", "start_sha": "s1", "head_sha": "h1",
+    }
+    return payload
+
+
+def _left_side_handler(
+    changes: list[dict],
+    captured: dict | None = None,
+    post_response: dict | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Shared handler shape for the LEFT-side tests: serves both the
+    `/changes` endpoint (what the fixed LEFT branch must hit) and the
+    plain MR GET (what today's unfixed code still hits) so a failing
+    assertion — not a transport 404 — is what demonstrates RED."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        path_only = url.split("?")[0]
+        if req.method == "GET" and path_only.endswith("merge_requests/5/changes"):
+            return _json(_changes_payload_for_review(5, changes))
+        if req.method == "GET" and path_only.endswith("merge_requests/5"):
+            return _json(
+                _mr_payload(
+                    5,
+                    diff_refs={"base_sha": "b1", "start_sha": "s1", "head_sha": "h1"},
+                )
+            )
+        if req.method == "POST" and path_only.endswith("merge_requests/5/discussions"):
+            body = json.loads(req.content.decode())
+            if captured is not None:
+                captured["body"] = body
+            resp = post_response or {
+                "id": "disc-left",
+                "notes": [{
+                    "id": 55, "body": body["body"],
+                    "author": {"username": "alice"},
+                    "created_at": "t", "web_url": "url",
+                }],
+            }
+            return _json(resp)
+        return _json({}, status_code=404)
+
+    return handler
+
+
+def test_add_pr_review_comment_left_side_posts_old_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement 1 (driving): a LEFT-side comment on a deleted line
+    posts a valid GitLab position — `old_line` set, `new_line` key
+    omitted entirely (GitLab rejects `new_line: null`, not merely a
+    `None` value)."""
+    diff = "@@ -1,3 +1,2 @@\n alpha\n-beta\n gamma\n"
+    entry = _change_entry("src/app.py", diff=diff)
+    captured: dict = {}
+
+    seen = _install_mock(monkeypatch, _left_side_handler([entry], captured))
+    rc = GitLabProvider().add_pr_review_comment(
+        _project(), "t", "5",
+        body="left comment", path="src/app.py", line=2, side="LEFT",
+        commit_sha="h1",
+    )
+    # The LEFT branch must stay at exactly one network GET (to
+    # `/changes`, which also carries diff_refs) plus the discussions
+    # POST — never the plain MR GET *and* a `/changes` GET.
+    assert len(seen) == 2
+    assert any(str(r.url).split("?")[0].endswith("merge_requests/5/changes") for r in seen)
+    assert not any(
+        str(r.url).split("?")[0].endswith("merge_requests/5")
+        and r.method == "GET"
+        for r in seen
+    )
+    position = captured["body"]["position"]
+    assert position["old_line"] == 2
+    assert "new_line" not in position
+    assert position["position_type"] == "text"
+    assert position["base_sha"] == "b1"
+    assert position["start_sha"] == "s1"
+    assert position["head_sha"] == "h1"
+    # Additional coverage (requirement 2's removal-line half): the
+    # return shape echoes the caller's requested side and the resolved
+    # line pair — may already pass once the driving assertions above do,
+    # written together per the plan.
+    assert rc.side == "LEFT"
+    assert rc.original_line == 2
+    assert rc.line is None
+
+
+def test_add_pr_review_comment_left_side_lowercase_treated_as_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Additional coverage: `side='left'` (lowercase) behaves exactly
+    like `'LEFT'` — Azure's exact normalization rule
+    `(side or "RIGHT").upper() == "LEFT"`."""
+    diff = "@@ -1,3 +1,2 @@\n alpha\n-beta\n gamma\n"
+    entry = _change_entry("src/app.py", diff=diff)
+    captured: dict = {}
+
+    _install_mock(monkeypatch, _left_side_handler([entry], captured))
+    GitLabProvider().add_pr_review_comment(
+        _project(), "t", "5",
+        body="left comment", path="src/app.py", line=2, side="left",
+        commit_sha="h1",
+    )
+    position = captured["body"]["position"]
+    assert position["old_line"] == 2
+    assert "new_line" not in position
+
+
+def test_add_pr_review_comment_left_side_context_line_sets_both_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement 2 (driving): a LEFT-side comment on a context line
+    posts BOTH line numbers (GitLab rejects a context-line position
+    unless both are present) and the return reports `side="LEFT"` —
+    not re-derived from which fields happen to be populated."""
+    diff = "@@ -1,2 +1,2 @@\n alpha\n beta\n"
+    entry = _change_entry("src/app.py", diff=diff)
+    captured: dict = {}
+
+    _install_mock(monkeypatch, _left_side_handler([entry], captured))
+    rc = GitLabProvider().add_pr_review_comment(
+        _project(), "t", "5",
+        body="left ctx", path="src/app.py", line=1, side="LEFT",
+        commit_sha="h1",
+    )
+    position = captured["body"]["position"]
+    assert position["old_line"] == 1
+    assert position["new_line"] == 1
+    assert rc.side == "LEFT"
+    assert rc.original_line == 1
+    assert rc.line == 1
+
+
+def test_add_pr_review_comment_right_side_makes_no_changes_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement 3 (driving, lock-in/characterization): the RIGHT
+    path issues exactly the same two requests it does today (MR GET +
+    discussions POST) and never touches `/changes`. This must already
+    pass — it exists to catch a regression in the shared branch the
+    moment the LEFT work lands, not to demonstrate new behaviour."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.split("?")[0].endswith("merge_requests/5"):
+            return _json(
+                _mr_payload(
+                    5,
+                    diff_refs={"base_sha": "b1", "start_sha": "s1", "head_sha": "h1"},
+                )
+            )
+        if req.method == "POST" and url.endswith("merge_requests/5/discussions"):
+            return _json({
+                "id": "disc-right",
+                "notes": [{
+                    "id": 60, "body": "right side",
+                    "author": {"username": "alice"},
+                    "created_at": "t", "web_url": "url",
+                }],
+            })
+        return _json({}, status_code=404)
+
+    seen = _install_mock(monkeypatch, handler)
+    rc = GitLabProvider().add_pr_review_comment(
+        _project(), "t", "5",
+        body="right side", path="src/foo.py", line=10, side="RIGHT",
+        commit_sha="h1",
+    )
+    assert len(seen) == 2
+    assert not any("/changes" in str(r.url) for r in seen)
+    assert rc.side is None
+
+
+def test_add_pr_review_comment_default_and_lowercase_right_take_right_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Additional coverage: `side=None` and `side='right'` both take the
+    RIGHT path unchanged (Azure's rule maps anything that is not
+    literally 'LEFT', case-insensitively, to RIGHT). This already
+    passes — today's code ignores `side` entirely, so every non-LEFT
+    value already behaves this way."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if req.method == "GET" and url.split("?")[0].endswith("merge_requests/5"):
+            return _json(
+                _mr_payload(
+                    5,
+                    diff_refs={"base_sha": "b1", "start_sha": "s1", "head_sha": "h1"},
+                )
+            )
+        if req.method == "POST" and url.endswith("merge_requests/5/discussions"):
+            return _json({
+                "id": "disc-right",
+                "notes": [{
+                    "id": 61, "body": "right side",
+                    "author": {"username": "alice"},
+                    "created_at": "t", "web_url": "url",
+                }],
+            })
+        return _json({}, status_code=404)
+
+    for side_value in (None, "right"):
+        seen = _install_mock(monkeypatch, handler)
+        rc = GitLabProvider().add_pr_review_comment(
+            _project(), "t", "5",
+            body="right side", path="src/foo.py", line=10, side=side_value,
+            commit_sha="h1",
+        )
+        assert not any("/changes" in str(r.url) for r in seen)
+        assert rc.side is None
+
+
+def test_add_pr_review_comment_reply_ignores_left_side_no_changes_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Additional coverage: the reply path (`in_reply_to` set) ignores
+    `side` entirely, even `side='LEFT'`, and issues no `/changes` call —
+    already true today since replies never look at diff position."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if (
+            req.method == "POST"
+            and "/discussions/disc-A/notes" in req.url.path
+        ):
+            return _json({
+                "id": 62, "body": "agreed",
+                "author": {"username": "alice"},
+                "created_at": "t", "web_url": "url",
+            })
+        return _json({}, status_code=404)
+
+    seen = _install_mock(monkeypatch, handler)
+    rc = GitLabProvider().add_pr_review_comment(
+        _project(), "t", "5",
+        body="agreed", in_reply_to="disc-A", side="LEFT",
+    )
+    assert len(seen) == 1
+    assert not any("/changes" in str(r.url) for r in seen)
+    assert rc.side is None
+
+
+def test_add_pr_review_comment_left_side_unresolvable_line_raises_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement 4 (driving): a LEFT anchor whose line falls in no
+    hunk raises `GitLabError(422)` naming the path/line, instead of
+    posting a wrong position — mirrors GitHub's 422 convention for an
+    unprocessable review-comment anchor."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    diff = "@@ -1,2 +1,2 @@\n alpha\n beta\n"
+    entry = _change_entry("src/app.py", diff=diff)
+
+    seen = _install_mock(monkeypatch, _left_side_handler([entry]))
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_pr_review_comment(
+            _project(), "t", "5",
+            body="left", path="src/app.py", line=99, side="LEFT",
+            commit_sha="h1",
+        )
+    assert exc.value.status == 422
+    assert "src/app.py" in exc.value.message
+    assert "99" in exc.value.message
+    assert not any(r.method == "POST" for r in seen)
+
+
+def test_add_pr_review_comment_left_side_unresolvable_reasons_are_distinguishable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Additional coverage for requirement 4: two distinct 422 reasons
+    per the plan — (a) file not present in the MR `changes` at all, or
+    present but carrying no diff text (binary/overflow-truncated); (b)
+    file found but the line is in no hunk. Messages must be
+    distinguishable; exact wording is an implementation choice, not
+    pinned here — (a) and its no-diff-text variant share one reason,
+    which differs from (b)'s.
+
+    (Test-critic note, applied): the "missing entirely" and "no diff
+    text" calls deliberately use the SAME `path`/`line` so the equality
+    assertion below proves the two code paths genuinely share one
+    reason — not merely that they happen to be called with matching
+    arguments. Both messages must still retain `path`/`line`/`side`/the
+    MR id, verified against reason (b)'s call below."""
+    from lib_python_projects.providers.gitlab import GitLabError
+
+    # (a) file missing from `changes` entirely.
+    _install_mock(monkeypatch, _left_side_handler([]))
+    with pytest.raises(GitLabError) as exc_missing:
+        GitLabProvider().add_pr_review_comment(
+            _project(), "t", "5",
+            body="left", path="src/app.py", line=1, side="LEFT",
+            commit_sha="h1",
+        )
+    assert exc_missing.value.status == 422
+
+    # (a') file present but with no diff text (binary file, or dropped
+    # by GitLab's `overflow` truncation). Same path/line as (a).
+    empty_diff_entry = _change_entry("src/app.py", diff="")
+    _install_mock(monkeypatch, _left_side_handler([empty_diff_entry]))
+    with pytest.raises(GitLabError) as exc_empty_diff:
+        GitLabProvider().add_pr_review_comment(
+            _project(), "t", "5",
+            body="left", path="src/app.py", line=1, side="LEFT",
+            commit_sha="h1",
+        )
+    assert exc_empty_diff.value.status == 422
+
+    # (b) file found, diff present, but the line is in no hunk.
+    diff = "@@ -1,2 +1,2 @@\n alpha\n beta\n"
+    entry = _change_entry("src/app.py", diff=diff)
+    _install_mock(monkeypatch, _left_side_handler([entry]))
+    with pytest.raises(GitLabError) as exc_line_missing:
+        GitLabProvider().add_pr_review_comment(
+            _project(), "t", "5",
+            body="left", path="src/app.py", line=99, side="LEFT",
+            commit_sha="h1",
+        )
+    assert exc_line_missing.value.status == 422
+
+    assert exc_missing.value.message == exc_empty_diff.value.message
+    assert exc_missing.value.message != exc_line_missing.value.message
+    # Both reasons must still name path, line, side, and the MR id.
+    for exc in (exc_missing, exc_empty_diff):
+        assert "src/app.py" in exc.value.message
+        assert "1" in exc.value.message
+        assert "LEFT" in exc.value.message
+        assert "5" in exc.value.message
+    assert "src/app.py" in exc_line_missing.value.message
+    assert "99" in exc_line_missing.value.message
+    assert "LEFT" in exc_line_missing.value.message
+    assert "5" in exc_line_missing.value.message
+
+
+def test_add_pr_review_comment_left_side_renamed_file_matched_via_old_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Additional coverage for requirement 4: a LEFT anchor legitimately
+    names the pre-image path of a rename, so the entry is matched via
+    `old_path`. The posted position must use the entry's real
+    `old_path`/`new_path`, not `path` duplicated onto both keys —
+    otherwise a LEFT comment on a renamed file can't be anchored.
+
+    Also covers a distinct, later-found bug (review round 4 on #240):
+    the RETURNED `ReviewComment.path` must reflect the matched entry's
+    real `new_path` (`"new/path.py"`), not the caller's raw `path`
+    argument (`"old/path.py"`) — otherwise the write response and a
+    later `list_pr_review_comments()` read (which derives `path` from
+    `position.new_path or position.old_path`) disagree about which
+    file the comment lives on."""
+    diff = "@@ -1,2 +1,2 @@\n alpha\n beta\n"
+    entry = _change_entry(
+        "new/path.py", old_path="old/path.py", diff=diff, renamed_file=True,
+    )
+    captured: dict = {}
+
+    _install_mock(monkeypatch, _left_side_handler([entry], captured))
+    rc = GitLabProvider().add_pr_review_comment(
+        _project(), "t", "5",
+        body="renamed left", path="old/path.py", line=1, side="LEFT",
+        commit_sha="h1",
+    )
+    position = captured["body"]["position"]
+    assert position["old_path"] == "old/path.py"
+    assert position["new_path"] == "new/path.py"
+    assert position["old_line"] == 1
+    assert position["new_line"] == 1
+    assert rc.path == "new/path.py"
+
+
+def test_add_pr_review_comment_left_side_prefers_renamed_away_regardless_of_list_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bugfix (review finding on #240, round 2): the round-1 fix's rule
+    — "an entry matched via `old_path` wins over one matched only via
+    `new_path`" — is order-dependent, not structural, and does NOT
+    actually disambiguate the collision it was meant to solve. In this
+    codebase's own `_change_entry` convention (mirroring GitLab's real
+    payload shape) a genuinely NEW file's `old_path` defaults to equal
+    its `new_path` — so in a collision between a rename-away entry
+    (`old_path="dup.py"`, `renamed_file=True`) and a separately
+    added-back new file landing at that same path (`old_path` defaults
+    to `"dup.py"` too), BOTH entries satisfy `old_path == path`. The
+    round-1 code just returned whichever the list happened to iterate
+    first. The only structural (order-independent) distinguisher is
+    `renamed_file`: a `renamed_file=True` entry with `old_path == path`
+    is a genuine rename-away with real pre-change content and must win
+    over the added-back entry regardless of which one the `/changes`
+    payload lists first. This test proves the fix is order-independent
+    by running the identical collision fixture in both list orders and
+    asserting the same (correct) entry wins both times."""
+    renamed_away = _change_entry(
+        "renamed.py", old_path="dup.py", renamed_file=True,
+        diff="@@ -1,2 +1,2 @@\n omega\n psi\n",
+    )
+    added_back = _change_entry(
+        "dup.py", old_path=None, new_file=True,
+        diff="@@ -0,0 +1,2 @@\n+alpha\n+beta\n",
+    )
+
+    for order_name, changes in (
+        ("renamed_away-first", [renamed_away, added_back]),
+        ("added_back-first", [added_back, renamed_away]),
+    ):
+        captured: dict = {}
+        _install_mock(
+            monkeypatch, _left_side_handler(changes, captured),
+        )
+        GitLabProvider().add_pr_review_comment(
+            _project(), "t", "5",
+            body="dup", path="dup.py", line=1, side="LEFT",
+            commit_sha="h1",
+        )
+        position = captured["body"]["position"]
+        # Matched via the rename-away entry (renamed_file=True,
+        # old_path == "dup.py"), never the added-back entry — the
+        # added-back entry's pure-addition diff has no old-side lines
+        # and could not have resolved old_line=1 at all. Must hold in
+        # BOTH list orders, or the precedence is order-dependent again.
+        assert position["old_path"] == "dup.py", order_name
+        assert position["new_path"] == "renamed.py", order_name
+        assert position["old_line"] == 1, order_name
+        assert position["new_line"] == 1, order_name
+
+
+# ---------- ticket #240 (attempt 2, R3): _resolve_left_position_lines ------
+
+
+def test_resolve_left_position_lines_walks_hunks() -> None:
+    """Requirement 5 (driving): walks a unified diff hunk — a header
+    seeds (old, new); `' '` context advances both, `'-'` advances old
+    only, `'+'` advances new only. Returns `(old_line, new_line_or_None)`
+    for the requested `old_line`, or `None` when it falls in no hunk.
+    Fails today with `AttributeError` — the helper does not exist yet."""
+    diff = "@@ -1,3 +1,2 @@\n alpha\n-beta\n gamma\n"
+    assert gitlab_mod._resolve_left_position_lines(diff, 1) == (1, 1)
+    assert gitlab_mod._resolve_left_position_lines(diff, 2) == (2, None)
+    assert gitlab_mod._resolve_left_position_lines(diff, 3) == (3, 2)
+
+
+def test_resolve_left_position_lines_missing_line_returns_none() -> None:
+    """Additional coverage: a line outside every hunk resolves to
+    `None`."""
+    diff = "@@ -1,2 +1,2 @@\n alpha\n beta\n"
+    assert gitlab_mod._resolve_left_position_lines(diff, 99) is None
+
+
+def test_resolve_left_position_lines_none_or_empty_diff_returns_none() -> None:
+    """Additional coverage: `None`/empty diff text -> `None`."""
+    assert gitlab_mod._resolve_left_position_lines(None, 1) is None
+    assert gitlab_mod._resolve_left_position_lines("", 1) is None
+
+
+def test_resolve_left_position_lines_no_header_returns_none() -> None:
+    """Additional coverage: diff with no recognizable `@@` header at
+    all -> `None`."""
+    assert (
+        gitlab_mod._resolve_left_position_lines("just some text\nno header\n", 1)
+        is None
+    )
+
+
+def test_resolve_left_position_lines_multi_hunk_second_hunk() -> None:
+    """Additional coverage: a multi-hunk diff resolves correctly in the
+    second hunk, using that hunk's own header to reseed the counters."""
+    diff = (
+        "@@ -1,2 +1,2 @@\n alpha\n beta\n"
+        "@@ -10,2 +9,2 @@\n gamma\n-delta\n"
+    )
+    assert gitlab_mod._resolve_left_position_lines(diff, 10) == (10, 9)
+    assert gitlab_mod._resolve_left_position_lines(diff, 11) == (11, None)
+
+
+def test_resolve_left_position_lines_no_newline_marker_skipped() -> None:
+    """Additional coverage: a `\\ No newline at end of file` marker line
+    is skipped without advancing either counter.
+
+    Verified by querying a line AFTER the marker in an asymmetric hunk
+    (old count 3, new count 2, with a removal following the marker): a
+    walker that mistakenly treats the marker as a context line would
+    advance both counters on it, so the `-beta` removal line — not
+    `gamma` — would appear to be old-line 3 and the query would
+    resolve to `(3, None)` instead of the correct `(3, 2)` (gamma's
+    real position). Querying the marker's own line would not catch
+    this, since both the correct and buggy walk happen to agree there."""
+    diff = "@@ -1,3 +1,2 @@\n alpha\n\\ No newline at end of file\n-beta\n gamma\n"
+    assert gitlab_mod._resolve_left_position_lines(diff, 3) == (3, 2)
+
+
+def test_resolve_left_position_lines_addition_only_hunk_no_old_line_resolves() -> None:
+    """Additional coverage: a `+`-only hunk (pure insertion) never
+    advances/matches the old side, so any `old_line` query misses."""
+    diff = "@@ -1,0 +1,2 @@\n+alpha\n+beta\n"
+    assert gitlab_mod._resolve_left_position_lines(diff, 1) is None
+
+
+def test_resolve_left_position_lines_malformed_header_invalidates_region() -> None:
+    """Requirement 5 (driving for the malformed-header behaviour): the
+    worked example from the plan, verbatim. A malformed `@@` header (one
+    that starts a line at column 0 but doesn't match `_HUNK_HEADER_RE`)
+    enters an un-attributable state — old/new counters cleared, the
+    orphaned body region invisible rather than attributed to the
+    previous hunk's trailing counters — and parsing resumes cleanly at
+    the next valid header, reseeding from its own a/c."""
+    diff = (
+        "@@ -1,2 +1,2 @@\n"
+        " alpha\n"
+        "-beta\n"
+        "+gamma\n"
+        "@@ -bogus +header @@\n"
+        " delta\n"
+        "-epsilon\n"
+        "@@ -20,2 +20,2 @@\n"
+        " zeta\n"
+        "-eta\n"
+    )
+    assert gitlab_mod._resolve_left_position_lines(diff, 1) == (1, 1)
+    assert gitlab_mod._resolve_left_position_lines(diff, 2) == (2, None)
+    assert gitlab_mod._resolve_left_position_lines(diff, 3) is None
+    assert gitlab_mod._resolve_left_position_lines(diff, 4) is None
+    assert gitlab_mod._resolve_left_position_lines(diff, 20) == (20, 20)
+    assert gitlab_mod._resolve_left_position_lines(diff, 21) == (21, None)
