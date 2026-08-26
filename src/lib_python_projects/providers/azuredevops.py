@@ -3562,6 +3562,13 @@ class AzureDevOpsProvider(
         ticket_id: str,
         body: str,
     ) -> Comment:
+        """Post a comment on a work item.
+
+        Azure DevOps's work-item and pull-request id-spaces are
+        **disjoint** — a PR id passed here as `ticket_id` targets an
+        unrelated work item if one happens to exist with that same id,
+        otherwise it **404**s. Use `add_pr_comment` for pull requests.
+        """
         if not body or not body.strip():
             raise ValueError("body must not be empty")
         body_with_marker = ensure_comment_prefix(body, markers=_marker_set(project))

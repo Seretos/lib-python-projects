@@ -966,6 +966,27 @@ def test_create_pr_draft_omitted_when_false(
     assert "draft" not in captured["body"]
 
 
+def test_create_pr_docstring_documents_zero_diff_mr_case() -> None:
+    """create_pr's docstring (ticket #239) must warn that a zero-diff MR
+    (identical head/base content) is created successfully but is not
+    mergeable until it has a real diff, and must point at merge_pr as
+    where the blocking status surfaces.
+
+    Per plan-critic feedback: do NOT hard-assert the literal
+    'commits_status' string as a guaranteed value for every zero-diff MR —
+    the docstring may mention it as an example, but the core requirement
+    is the zero-diff / not-mergeable concept plus a pointer to merge_pr.
+    """
+    import inspect
+
+    doc = inspect.getdoc(GitLabProvider.create_pr)
+    assert doc is not None
+    doc_lower = doc.lower()
+    assert "zero-diff" in doc_lower or "zero diff" in doc_lower
+    assert "not mergeable" in doc_lower or "not be mergeable" in doc_lower
+    assert "merge_pr" in doc
+
+
 def test_create_pr_applies_custom_auto_label_and_body_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

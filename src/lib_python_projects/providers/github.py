@@ -2970,6 +2970,20 @@ def _assert_labels_exist(
         _check(r)
 
 
+def _normalize_github_color(color: str) -> str:
+    """Strip a single leading '#' from *color* for GitHub's label API.
+
+    GitHub's REST API wants a bare 6-hex-digit string (e.g. ``"ededed"``)
+    and rejects a leading ``#``. This only strips that one leading
+    character — no whitespace trim, no case fold, no hex validation.
+    Garbage input (e.g. ``"not-a-hex-color"``) passes through unchanged
+    so GitHub's own 422 validation error surfaces accurately.
+    """
+    if color.startswith("#"):
+        return color[1:]
+    return color
+
+
 def _label_present(payload: dict, name: str) -> bool:
     """True iff GitHub's response payload includes a label named `name`.
 
@@ -4506,6 +4520,17 @@ class GitHubProvider(
         ticket_id: str,
         body: str,
     ) -> Comment:
+        """Post a comment on an issue (POSTs to
+        `/repos/{owner}/{repo}/issues/{ticket_id}/comments`).
+
+        GitHub **aliases** issues and pull requests in this id-space —
+        passing a PR number here silently succeeds and posts to that PR's
+        conversation tab instead of failing. This is GitHub-specific
+        behaviour and **not portable**: GitLab and Azure DevOps have
+        disjoint ticket/PR id-spaces, where the equivalent mistake 404s or
+        targets an unrelated item instead. Use `add_pr_comment` when you
+        mean a PR.
+        """
         if not body or not body.strip():
             raise ValueError("body must not be empty")
         prefixed = ensure_comment_prefix(body, markers=_marker_set(project))
@@ -5049,6 +5074,13 @@ class GitHubProvider(
         draft: bool | None = None,
     ) -> PullRequest:
         """Update a PR's title/body/state/base, plus label/assignee/reviewer deltas.
+
+        **Not atomic.** `labels_add` is validated up front via
+        `_assert_labels_exist`; an unknown label aborts before anything
+        is applied. Past that point the stages — title/body/base →
+        labels → assignees → reviewers → draft toggle — commit in
+        sequence with **NO rollback**, so a failure in a later stage
+        leaves earlier stages already applied.
 
         `status` accepts `"open"` or `"closed"` only. To merge a PR call
         `merge_pr` — `status="merged"` is rejected by the tool layer.
@@ -6714,12 +6746,14 @@ class GitHubProvider(
         errors (e.g. invalid color) fall through to `_check(r)` so the
         original GitHub error text surfaces accurately.
 
-        `color` is a 6-hex string without `#` (e.g. ``"ededed"``).
-        Defaults to ``"ededed"`` when not supplied.
+        `color` is a 6-hex string, with or without a leading `#` (a
+        leading `#` is stripped before sending — GitHub's API rejects
+        it). Defaults to ``"ededed"`` when not supplied.
         """
+        raw_color = color if color is not None else "ededed"
         payload: dict[str, Any] = {
             "name": name,
-            "color": color if color is not None else "ededed",
+            "color": _normalize_github_color(raw_color),
         }
         if description is not None:
             payload["description"] = description
@@ -6761,6 +6795,9 @@ class GitHubProvider(
 
         Uses `PATCH /repos/{owner}/{repo}/labels/{name}`.
         404 → `GitHubError(404, "label '{name}' not found in {project.id}")`.
+
+        Colour normalization same as `create_label` (a leading `#` is
+        stripped; no default is injected when `color` is `None`).
         """
         if new_name is None and color is None and description is None:
             raise ValueError(
@@ -6770,7 +6807,7 @@ class GitHubProvider(
         if new_name is not None:
             payload["new_name"] = new_name
         if color is not None:
-            payload["color"] = color
+            payload["color"] = _normalize_github_color(color)
         if description is not None:
             payload["description"] = description
         with _client(token) as client:

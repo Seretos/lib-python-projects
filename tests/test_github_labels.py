@@ -219,6 +219,65 @@ def test_create_label_403_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     assert exc.value.status == 403
 
 
+# ---------- create_label / update_label color normalization (ticket #236) -----
+
+
+def test_create_label_hash_prefixed_color_normalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_label: a '#'-prefixed color is stripped to bare hex before
+    being sent — GitHub's API rejects a leading '#'."""
+    response_payload = _label_payload("fix", "ff00ff", "")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        assert body["color"] == "ff00ff"
+        return _json(response_payload, status_code=201)
+
+    _install_mock(monkeypatch, handler)
+    label = GitHubProvider().create_label(
+        _project(), token="t", name="fix", color="#ff00ff"
+    )
+    assert label.color == "ff00ff"
+
+
+def test_create_label_hash_prefixed_and_bare_hex_produce_identical_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A '#'-prefixed color and the equivalent bare-hex color must produce
+    an identical outgoing payload."""
+    captured: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(req.content))
+        return _json(_label_payload("fix", "ff00ff", ""), status_code=201)
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().create_label(_project(), token="t", name="fix", color="#ff00ff")
+    GitHubProvider().create_label(_project(), token="t", name="fix", color="ff00ff")
+    assert captured[0] == captured[1]
+
+
+def test_create_label_garbage_color_passes_through_unmodified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-hex garbage colors are not validated/normalized locally beyond
+    the leading-'#' strip — they pass through unchanged so GitHub's own
+    422 validation error surfaces (see
+    test_create_label_non_conflict_422_surfaces_github_message)."""
+    captured: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(req.content))
+        return _json(_label_payload("x", "not-a-hex-color", ""), status_code=201)
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().create_label(
+        _project(), token="t", name="x", color="not-a-hex-color"
+    )
+    assert captured[0]["color"] == "not-a-hex-color"
+
+
 # ---------- update_label ------------------------------------------------------
 
 
@@ -268,6 +327,44 @@ def test_update_label_no_fields_raises_valueerror(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(ValueError, match="at least one of"):
         GitHubProvider().update_label(_project(), token="t", name="some-label")
     assert seen == [], "no HTTP call should have been made"
+
+
+def test_update_label_hash_prefixed_color_normalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_label: a '#'-prefixed color is stripped to bare hex before
+    being sent, same normalization as create_label."""
+    response_payload = _label_payload("relabeled", "00ff00", "")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        assert body["color"] == "00ff00"
+        return _json(response_payload)
+
+    _install_mock(monkeypatch, handler)
+    label = GitHubProvider().update_label(
+        _project(), token="t", name="old-label", color="#00ff00"
+    )
+    assert label.color == "00ff00"
+
+
+def test_update_label_no_color_sends_no_color_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_label with color=None (only new_name supplied) sends no
+    'color' key at all — no default is injected, unlike create_label."""
+    captured: list[dict] = []
+    response_payload = _label_payload("renamed-only", "ededed", "")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(req.content))
+        return _json(response_payload)
+
+    _install_mock(monkeypatch, handler)
+    GitHubProvider().update_label(
+        _project(), token="t", name="old-label", new_name="renamed-only"
+    )
+    assert "color" not in captured[0]
 
 
 # ---------- delete_label ------------------------------------------------------
@@ -577,6 +674,57 @@ def test_update_pr_labels_add_unknown_raises(monkeypatch: pytest.MonkeyPatch) ->
     assert not any(
         r.method == "PATCH" and "/pulls/10" in r.url.path for r in seen
     )
+
+
+def test_update_pr_docstring_documents_non_atomicity() -> None:
+    """update_pr's docstring (ticket #238) must state that labels_add
+    existence is validated up front (nothing applied on failure), and that
+    the stages past that point — title/body/base, labels, assignees,
+    reviewers, draft toggle — commit in sequence with NO rollback, so a
+    later-stage failure can leave earlier stages already applied. Must not
+    claim atomicity or rollback anywhere, and must document the stages in
+    their actual commit order."""
+    import inspect
+
+    doc = inspect.getdoc(GitHubProvider.update_pr)
+    assert doc is not None
+    doc_lower = doc.lower()
+    # Up-front validation, nothing applied on failure.
+    assert "_assert_labels_exist" in doc or "up front" in doc_lower
+    # Explicit non-atomicity / no-rollback framing.
+    assert "not atomic" in doc_lower
+    assert "no rollback" in doc_lower
+
+    # No claim of the opposite (rollback-on-failure) semantics, however
+    # it's phrased — a docstring that says stages ARE rolled back must
+    # fail here even though it also contains "no rollback" elsewhere.
+    assert "rolled back" not in doc_lower
+    assert "rolls back" not in doc_lower
+    assert "roll back on" not in doc_lower
+
+    # The staged commit order is spelled out in the actual commit order:
+    # title/body/base, then labels, then assignees, then reviewers, then
+    # the draft toggle. A docstring that lists the stages out of order
+    # (e.g. reversed) must fail here, not just contain the five words
+    # unordered somewhere in the text.
+    #
+    # Scope the ordering check to the stage-order sentence itself (the
+    # "title/body/base -> labels -> assignees -> reviewers -> draft
+    # toggle" list), not the whole docstring: earlier text mentions
+    # "labels_add"/"_assert_labels_exist" (both contain "labels") ahead
+    # of the actual stage list, so a whole-docstring first-occurrence
+    # .index() would find those incidental mentions instead of the real
+    # staged order and could pass even for a docstring listing the
+    # stages out of order.
+    stage_order_marker = "title/body/base"
+    assert stage_order_marker in doc_lower
+    stage_order_text = doc_lower[doc_lower.index(stage_order_marker):]
+    title_idx = stage_order_text.index("title")
+    labels_idx = stage_order_text.index("labels")
+    assignees_idx = stage_order_text.index("assignees")
+    reviewers_idx = stage_order_text.index("reviewers")
+    draft_idx = stage_order_text.index("draft")
+    assert title_idx < labels_idx < assignees_idx < reviewers_idx < draft_idx
 
 
 # ---------- per-project configurable auto_labels (ticket #153) ---------------
