@@ -274,7 +274,14 @@ class TestTokenDiscoveryFallback:
 
     @staticmethod
     def _full_caps() -> TokenCapabilities:
-        return TokenCapabilities(
+        # Ticket #252 (reviewer finding, gen 2, 4th raise): this fixture
+        # stands in for a genuine probe result fed into
+        # `_capabilities_to_permissions`, so it must go through
+        # `probed_result(...)` like a real `probe_token_capabilities` call
+        # site would -- otherwise `probed` defaults False and `.confirmed`
+        # (hence `Permissions.verified`) would read False below, which is
+        # not what these tests are exercising.
+        return TokenCapabilities.probed_result(
             issues_create=True,
             issues_modify=True,
             pulls_create=True,
@@ -537,6 +544,130 @@ class TestTokenDiscoveryFallback:
         assert len(stub_cls.call_log) == 1  # type: ignore[attr-defined]
         assert stub_cls.call_log[0]["limit"] == 9999  # type: ignore[attr-defined]
 
+    # ------------------------------------------------------------------
+    # Ticket #252 — R2: a probed project's permissions carry the probe
+    # verdict (`verified=True`, `reason=caps.reason`), instead of the
+    # probe's `reason` being silently dropped by
+    # `_capabilities_to_permissions`.
+    # ------------------------------------------------------------------
+
+    def test_probed_permissions_carry_probe_verdict(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `work_items_unavailable` probe reason survives onto the
+        resulting project's `permissions` block instead of being dropped —
+        mixed flags (issues False, pulls True) are preserved alongside it.
+        """
+        # probed_result(...) so this stands in for a genuine probe result
+        # (see `_full_caps` above for why bare construction won't do).
+        caps = TokenCapabilities.probed_result(
+            issues_create=False,
+            issues_modify=False,
+            pulls_create=True,
+            pulls_modify=True,
+            pulls_merge=False,
+            reason="work_items_unavailable",
+        )
+        dp = DiscoveredProject(
+            provider="azuredevops",
+            path="acme-org/acme-project/acme-repo",
+            permissions=caps,
+        )
+        stub_cls = self._make_stub_provider([dp])
+        self._patch_registry(
+            monkeypatch, [("AZURE_DEVOPS_TOKEN", "azuredevops", stub_cls)]
+        )
+        monkeypatch.setenv("AZURE_DEVOPS_TOKEN", "ado_fake")
+
+        result = load_projects(cwd=tmp_path)
+
+        assert result.state == "ok"
+        assert len(result.projects) == 1
+        perms = result.projects[0].permissions
+        assert perms.verified is True
+        assert perms.reason == "work_items_unavailable"
+        assert perms.issues.create is False
+        assert perms.pulls.create is True
+
+    def test_probed_permissions_total_failure_marks_unverified(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round 5 (review finding): a probe that returns no usable signal
+        at all (e.g. `bad_credentials`) must NOT be stamped `verified=True`
+        — every flag in that case is just its unconfirmed `False` default,
+        not a confirmed denial. Contrast with
+        `test_probed_permissions_carry_probe_verdict` above, where
+        `work_items_unavailable` is a *partial* failure (pulls genuinely
+        confirmed) and correctly stays `verified=True`.
+        """
+        caps = TokenCapabilities(reason="bad_credentials")
+        dp = DiscoveredProject(
+            provider="github",
+            path="acme/backend",
+            permissions=caps,
+        )
+        stub_cls = self._make_stub_provider([dp])
+        self._patch_registry(monkeypatch, [("GITHUB_TOKEN", "github", stub_cls)])
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_fake")
+
+        result = load_projects(cwd=tmp_path)
+
+        assert result.state == "ok"
+        assert len(result.projects) == 1
+        perms = result.projects[0].permissions
+        assert perms.verified is False
+        assert perms.reason == "bad_credentials"
+        assert perms.issues.create is False
+        assert perms.pulls.create is False
+
+    def test_probed_permissions_clean_probe_has_no_reason(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A clean probe (`reason=None`) still marks `verified=True`, with
+        `reason` staying `None` — distinct from the config/git-remote
+        "not_probed" case (see `TestPermissionsVerification`)."""
+        dp = DiscoveredProject(
+            provider="github",
+            path="acme/backend",
+            permissions=self._full_caps(),
+        )
+        stub_cls = self._make_stub_provider([dp])
+        self._patch_registry(monkeypatch, [("GITHUB_TOKEN", "github", stub_cls)])
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_fake")
+
+        result = load_projects(cwd=tmp_path)
+
+        assert result.state == "ok"
+        perms = result.projects[0].permissions
+        assert perms.verified is True
+        assert perms.reason is None
+
+    def test_probed_permissions_verified_does_not_cover_board_or_pipelines(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round 3 (review finding): `TokenCapabilities` has no `board`/
+        `pipelines` fields at all — `_capabilities_to_permissions` never
+        probes them — so even on a fully-clean probe (`verified=True`,
+        `reason=None`), `board.manage`/`pipelines.trigger` must stay at
+        their all-False, never-probed defaults rather than being read as
+        confirmed negatives."""
+        dp = DiscoveredProject(
+            provider="github",
+            path="acme/frontend",
+            permissions=self._full_caps(),
+        )
+        stub_cls = self._make_stub_provider([dp])
+        self._patch_registry(monkeypatch, [("GITHUB_TOKEN", "github", stub_cls)])
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_fake")
+
+        result = load_projects(cwd=tmp_path)
+
+        assert result.state == "ok"
+        perms = result.projects[0].permissions
+        assert perms.verified is True
+        assert perms.board.manage is False
+        assert perms.pipelines.trigger is False
+
 
 class TestDefaultBranchField:
     """`default_branch` round-trips through the YAML loader (new in v0.2.0)."""
@@ -618,3 +749,119 @@ class TestAreaPathField:
         configured = [p for p in result.projects if p.source == "config"]
         assert len(configured) == 1
         assert configured[0].area_path is None
+
+
+class TestPermissionsVerification:
+    """Ticket #252, R1 — a config- or git-remote-sourced project's own
+    `permissions` block reports itself unverified. `Permissions.verified`
+    is True only for `source="token-discovery"` entries (see
+    `TestTokenDiscoveryFallback`'s R2 tests) — never for a bare YAML
+    declaration, and never forgeable by writing `verified: true` directly
+    into the YAML.
+    """
+
+    def test_config_sourced_permissions_report_unverified(
+        self, tmp_path: Path
+    ) -> None:
+        """A config-sourced project's declared permissions flags survive,
+        but `verified`/`reason` say they were never confirmed by a probe."""
+        _make_git_repo(tmp_path)
+        cfg = tmp_path / ".seretos" / "project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: a
+                provider: github
+                path: acme/backend
+                permissions:
+                  issues:
+                    create: true
+                    modify: true
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        configured = [p for p in result.projects if p.source == "config"]
+        assert len(configured) == 1
+        perms = configured[0].permissions
+        assert perms.verified is False
+        assert perms.reason == "not_probed"
+        assert perms.issues.create is True
+        assert perms.issues.modify is True
+
+    def test_config_permissions_forgery_blocked(self, tmp_path: Path) -> None:
+        """A YAML entry that writes `permissions.verified: true` directly
+        cannot forge a verified state — the loader forces it back to
+        unverified regardless of what the entry claims."""
+        _make_git_repo(tmp_path)
+        cfg = tmp_path / ".seretos" / "project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: a
+                provider: github
+                path: acme/backend
+                permissions:
+                  verified: true
+                  reason: "hand-forged"
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        configured = [p for p in result.projects if p.source == "config"]
+        assert len(configured) == 1
+        perms = configured[0].permissions
+        assert perms.verified is False
+        assert perms.reason == "not_probed"
+
+    def test_config_combined_forgery_source_and_verified_blocked(
+        self, tmp_path: Path
+    ) -> None:
+        """R2 (review finding): a YAML entry can't forge *both* fields at
+        once either — declaring `source: token-discovery` **and**
+        `permissions.verified: true` together still comes back forced to
+        `source="config"` / unverified.
+
+        `_load_yaml_projects` unconditionally overrides `source` to
+        `"config"` for every YAML entry (`{**item, "source": "config"}`)
+        before `ProjectConfig` validation ever sees it, so the entry's own
+        `source: token-discovery` claim never reaches the model — this pins
+        that loader boundary specifically for the combined-forgery case,
+        distinct from `test_config_permissions_forgery_blocked` above (which
+        only forges `permissions.verified`, not `source`)."""
+        _make_git_repo(tmp_path)
+        cfg = tmp_path / ".seretos" / "project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: a
+                provider: github
+                path: acme/backend
+                source: token-discovery
+                permissions:
+                  verified: true
+                  reason: "hand-forged"
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        configured = [p for p in result.projects if p.id == "a"]
+        assert len(configured) == 1
+        project = configured[0]
+        assert project.source == "config"
+        perms = project.permissions
+        assert perms.verified is False
+        assert perms.reason == "not_probed"
+
+    def test_git_remote_autodiscovered_permissions_unverified(
+        self, tmp_path: Path
+    ) -> None:
+        """The CWD-repo auto-discovered (`source="git-remote"`) entry never
+        passes `permissions` at all — the invariant must still force it
+        unverified via the shared `ProjectConfig` validator, not per-call-
+        site forcing in `autodiscover.py`."""
+        _make_git_repo(tmp_path, remote_url="git@github.com:acme/backend.git")
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        autos = [p for p in result.projects if p.source == "git-remote"]
+        assert len(autos) == 1
+        perms = autos[0].permissions
+        assert perms.verified is False
+        assert perms.reason == "not_probed"

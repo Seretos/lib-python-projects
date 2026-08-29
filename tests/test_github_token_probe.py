@@ -95,7 +95,10 @@ def test_token_probe_admin_grants_all(monkeypatch: pytest.MonkeyPatch) -> None:
 
     seen = _install_mock(monkeypatch, handler)
     caps = GitHubProvider().probe_token_capabilities(_project(), token="t")
-    assert caps == TokenCapabilities(
+    # probed_result(...) on the expected side too: the real probe result
+    # carries probed=True (ticket #252, gen 2, 4th raise), so a bare
+    # TokenCapabilities(...) here would never compare equal.
+    assert caps == TokenCapabilities.probed_result(
         issues_create=True, issues_modify=True,
         pulls_create=True, pulls_modify=True, pulls_merge=True,
         reason=None,

@@ -655,3 +655,94 @@ class TestPipelinesPermissions:
         perms = Permissions()
         assert isinstance(perms.pipelines, PipelinesPermissions)
         assert perms.pipelines.trigger is False
+
+
+class TestPermissionsVerifiedField:
+    """Ticket #252 gen 2 — `Permissions.verified` / `Permissions.reason`
+    on a bare `Permissions` instance. Since gen 2, these are derived,
+    non-input fields (private attrs + computed properties) that default
+    to unprobed on *any* `Permissions`, bare or nested inside a
+    `ProjectConfig` — there is no longer a separate `ProjectConfig`-level
+    validator that stamps the "not_probed" reason on top; see
+    `tests/test_loader.py::TestPermissionsVerification` for the
+    `ProjectConfig`/loader-level coverage of the same invariant, and only
+    `Permissions.from_probe` can produce a probed state (see
+    `test_forged_verified_unreachable_even_with_matching_source` below).
+    """
+
+    def test_bare_permissions_defaults_unverified_and_not_probed(self) -> None:
+        """A `Permissions` built directly (no `ProjectConfig` wrapper, no
+        `from_probe`) defaults to `verified=False, reason="not_probed"` —
+        the private-attr defaults are the single source of the "unprobed"
+        state, shared by bare `Permissions()` and any `ProjectConfig`'s
+        nested `permissions` alike."""
+        from lib_python_projects import Permissions
+
+        perms = Permissions()
+        assert perms.verified is False
+        assert perms.reason == "not_probed"
+
+    def test_permissions_serializes_verified_and_reason_at_same_level(self) -> None:
+        """`verified`/`reason` sit in the same `permissions` object as
+        `issues`/`pulls`/`board`/`pipelines` — the same nesting level a
+        renderer already walks — not a separate top-level block."""
+        p = _make_project()
+        dumped = p.model_dump()["permissions"]
+        assert set(dumped.keys()) == {
+            "issues",
+            "pulls",
+            "board",
+            "pipelines",
+            "verified",
+            "reason",
+        }
+        assert dumped["verified"] is False
+        assert dumped["reason"] == "not_probed"
+
+    def test_forged_verified_unreachable_even_with_matching_source(self) -> None:
+        """Ticket #252 gen 2 (R1): `permissions.verified` must be
+        unforgeable *at the model*, not merely gated by `source` — the
+        gen-1 `_check_permissions_verification` validator only resets
+        `verified`/`reason` when `source != "token-discovery"`, so a
+        `ProjectConfig` built directly (e.g. `model_validate`, bypassing
+        the loader boundary that always forces `source="config"`) with a
+        forged `source="token-discovery"` *and* a hand-forged
+        `permissions.verified=True` sails straight through unchanged.
+        `verified`/`reason` must instead be derived, non-input fields that
+        only a real probe (`Permissions.from_probe`) can set — regardless
+        of what `source` the caller claims. Declared `issues`/`pulls`
+        flags must still survive untouched."""
+        p = ProjectConfig.model_validate(
+            {
+                "id": "x",
+                "provider": "github",
+                "path": "acme/backend",
+                "source": "token-discovery",
+                "permissions": {
+                    "issues": {"create": True, "modify": True},
+                    "pulls": {"create": True},
+                    "verified": True,
+                    "reason": "hand-forged",
+                },
+            }
+        )
+        assert p.permissions.verified is False
+        assert p.permissions.reason == "not_probed"
+        assert p.permissions.issues.create is True
+        assert p.permissions.issues.modify is True
+        assert p.permissions.pulls.create is True
+
+    def test_direct_constructor_forgery_also_unreachable(self) -> None:
+        """Test-critic note: the design (`PrivateAttr` + `computed_field`)
+        is inherently unreachable from `__init__` too, not just from
+        `model_validate` on a mapping — pin that down directly. A direct
+        `Permissions(verified=True, reason="x")` call does not raise (the
+        `mode="before"` validator silently drops the two computed-only
+        keys before field validation, the same as it does for a mapping
+        routed through `model_validate`) and does not produce a forged
+        `verified=True`."""
+        from lib_python_projects import Permissions
+
+        perms = Permissions(verified=True, reason="x")  # type: ignore[call-arg]
+        assert perms.verified is False
+        assert perms.reason == "not_probed"

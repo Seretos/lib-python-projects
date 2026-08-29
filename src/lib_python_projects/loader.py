@@ -79,8 +79,41 @@ _TOKEN_PROVIDERS: list[tuple[str, str, type]] = [
 
 
 def _capabilities_to_permissions(caps: TokenCapabilities) -> Permissions:
-    """Map ``TokenCapabilities`` booleans to the nested ``Permissions`` model."""
-    return Permissions(
+    """Map ``TokenCapabilities`` booleans to the nested ``Permissions`` model.
+
+    Ticket #252: a token-discovery result was actually probed by a live
+    `probe_token_capabilities` call, and the probe's `reason` (e.g.
+    `"work_items_unavailable"`, or `None` on a clean probe) is carried over
+    instead of being silently dropped.
+
+    `verified` is set to `caps.confirmed`, not stamped unconditionally
+    (round 5 finding): `TokenCapabilities.confirmed` is `False` whenever
+    the probe returned no usable signal at all (e.g. `"bad_credentials"`,
+    `"network_error"`) — in that case every flag above is just its
+    unconfirmed `False` default, and a caller reading `verified=True`
+    alongside all-`False` flags could otherwise misread that as "confirmed
+    no access" rather than "the probe never got an answer". `confirmed` is
+    `True` for a fully clean probe (`reason is None`) and for a partial,
+    surface-specific failure (`"work_items_unavailable"`,
+    `"insufficient_scope"`) where at least one flag is genuinely
+    confirmed even though not every flag is — see
+    `TokenCapabilities.confirmed`'s docstring in `providers/base.py` for
+    the full reason-by-reason breakdown.
+
+    This function has no way to tell "genuinely exercised" from
+    "optimistically inferred" apart *per flag* even when `confirmed` is
+    True — e.g. Azure DevOps's `pulls_create`/`pulls_modify`/`pulls_merge`
+    are optimistically carried over from a successful `connectionData`
+    call, never confirmed by an actual pull-request write probe, while its
+    `issues_*` genuinely is exercised (a real work-item call). `verified`
+    is therefore a whole-block, provider-reported signal, not a per-flag
+    write-capability guarantee. `TokenCapabilities` also has no
+    `board`/`pipelines` fields, so `board`/`pipelines` are left at their
+    `BoardPermissions`/`PipelinesPermissions` all-`False` defaults,
+    unprobed, regardless of `verified`. See `Permissions.verified`'s
+    docstring in `models.py` for the consolidated caller-facing contract.
+    """
+    return Permissions.from_probe(
         issues=IssuesPermissions(
             create=caps.issues_create,
             modify=caps.issues_modify,
@@ -90,6 +123,8 @@ def _capabilities_to_permissions(caps: TokenCapabilities) -> Permissions:
             modify=caps.pulls_modify,
             merge=caps.pulls_merge,
         ),
+        confirmed=caps.confirmed,
+        reason=caps.reason,
     )
 
 
