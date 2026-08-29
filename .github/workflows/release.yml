@@ -114,20 +114,43 @@ jobs:
           git push origin "$BRANCH" --force
           git push origin "$TAG"
 
+      - name: Compute previous release tag
+        # Feeds "Create GitHub Release" below: the greatest v* tag strictly
+        # below this release's version, so --generate-notes only covers the
+        # delta since the previous release instead of every commit back to
+        # this repo's very first one (#251). Never fails the release itself
+        # -- ci.prev_tag.run degrades to an empty previous_tag (a warning,
+        # not an error) on any gh lookup failure or on a first release.
+        id: prev_tag
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 -m ci.prev_tag
+
       - name: Create GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          REPO: ${{ github.repository }}
+          PREV_TAG: ${{ steps.prev_tag.outputs.previous_tag }}
         run: |
-          TAG="v${{ inputs.version }}"
+          TAG="v$VERSION"
           PRE_FLAG=""
-          if [[ "${{ inputs.version }}" == *-* ]]; then
+          if [[ "$VERSION" == *-* ]]; then
             PRE_FLAG="--prerelease"
           fi
+          NOTES_START_TAG_FLAG=()
+          if [[ -n "$PREV_TAG" ]]; then
+            NOTES_START_TAG_FLAG=(--notes-start-tag "$PREV_TAG")
+          fi
           gh release create "$TAG" \
-            --repo "${{ github.repository }}" \
+            --repo "$REPO" \
             --title "$TAG" \
             --generate-notes \
+            "${NOTES_START_TAG_FLAG[@]}" \
             $PRE_FLAG
 
       - name: Open dependency-update ticket in consumers

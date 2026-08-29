@@ -47,6 +47,11 @@ def main() -> int:
         return 0
 
     if noun == "api":
+        path = args[1] if len(args) > 1 else ""
+        if path.split("?", 1)[0].endswith("/releases"):
+            # ci.prev_tag's published-release listing (`gh api repos/.../releases?...`).
+            print(os.environ.get("FAKE_GH_RELEASES_PAGE_JSON", "[]"))
+            return 0
         # The idempotency probe (`gh api repos/.../issues?state=open&...`).
         # An empty JSON array means "no existing issue" -- falls through to
         # creation, exercising the same path as the happy-path Layer 1 test.
