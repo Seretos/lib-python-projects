@@ -1112,16 +1112,19 @@ def test_new_thread_returns_comment_when_confirmation_lookup_404s(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Behaviour 2 driving test. A pending review already exists; the
-    GraphQL `addPullRequestReviewThread` mutation succeeds and returns
-    `databaseId: 9100` — the comment genuinely got created server-side —
-    but every subsequent confirmation read 404s (the comment still
-    belongs to an unsubmitted PENDING review, which the single-comment
-    REST endpoint doesn't serve). The call must NOT raise: it must
-    synthesize the result from the known call params instead.
+    GraphQL `addPullRequestReviewThread` mutation succeeds and returns a
+    comment node carrying no identity fields at all — just
+    `databaseId: 9100` — the mutation payload itself is the only source
+    of truth now (ticket #253 removed the post-write confirmation read
+    entirely, so there is no fallback read left to stub). The call must
+    NOT raise, and must synthesize the missing fields from the known
+    call params.
 
-    RED reason (today): `_fetch_review_comment`'s 404 propagates
-    straight out of `add_pr_review_comment` as the call's own failure,
-    even though the mutation already succeeded."""
+    This is no longer a RED-producing case post-#253 (there is no
+    confirmation read left to 404): it stays as coverage for the
+    "mutation payload carries no identity fields" contract — the merge
+    in `_review_comment_result` must fall back to the synthesized
+    call-param values exactly like it does for a null REST field."""
     pending = _pending_review()
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -1140,8 +1143,6 @@ def test_new_thread_returns_comment_when_confirmation_lookup_404s(
                     }
                 }
             )
-        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/9100":
-            return _json({"message": "Not Found"}, status_code=404)
         raise AssertionError(f"unexpected request: {req.method} {path}")
 
     _install_mock(monkeypatch, handler)
@@ -1168,23 +1169,22 @@ def test_new_thread_returns_comment_when_confirmation_lookup_404s(
 def test_reply_returns_comment_when_confirmation_lookup_404s(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Behaviour 2 edge case: same non-fatal-confirmation contract on
-    the reply branch. The GraphQL reply mutation succeeds, but the
-    confirmation GET 404s. Must not raise.
-
-    RED reason (today): `_fetch_review_comment`'s 404 propagates out of
-    the reply branch's `return _fetch_review_comment(...)` call
-    unchanged.
+    """Behaviour 2 edge case: same "mutation payload carries no identity
+    fields" contract on the reply branch. The GraphQL reply mutation
+    succeeds but its comment node carries only `databaseId: 9300` — no
+    confirmation read is left to fall back on post-#253, so this pins
+    the synthesized-fallback contract for the reply shape specifically.
 
     Ticket #241 fix-round finding 1: the reply branch already fetched
     the parent/anchor comment's raw payload (to resolve the GraphQL
     `node_id` for `inReplyTo`), which carries the thread's real
     `path`/`line`/`side`/`commit_id` — a reply necessarily lands at the
-    same diff position as its parent. On a confirmation-lookup miss,
-    those values must seed the synthesized fallback instead of being
-    discarded in favour of `None`. The parent fixture (`_comment`'s
-    defaults) has `path="src/foo.py"`, `line=10`, `side="RIGHT"`,
-    `commit_id="abc123"` — assert the result inherits exactly those."""
+    same diff position as its parent. When the mutation payload doesn't
+    supply those fields, those anchor-derived values must seed the
+    synthesized fallback instead of being discarded in favour of `None`.
+    The parent fixture (`_comment`'s defaults) has `path="src/foo.py"`,
+    `line=10`, `side="RIGHT"`, `commit_id="abc123"` — assert the result
+    inherits exactly those."""
     pending = _pending_review()
     parent = _comment(8300, node_id="PARENT_NODE_8300")
 
@@ -1198,8 +1198,6 @@ def test_reply_returns_comment_when_confirmation_lookup_404s(
             return _json(
                 {"data": {"addPullRequestReviewComment": {"comment": {"databaseId": 9300}}}}
             )
-        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/9300":
-            return _json({"message": "Not Found"}, status_code=404)
         raise AssertionError(f"unexpected request: {req.method} {path}")
 
     _install_mock(monkeypatch, handler)
@@ -1466,6 +1464,414 @@ def test_new_thread_server_resolved_line_wins_over_requested(
     assert result.id == "9700"
     assert result.line == 2
     assert result.original_line == 2
+
+
+# ---------- ticket #253: identity fields straight from the mutation --------
+#
+# `_lookup_review_comment_safe`'s post-write confirmation read can miss for
+# a comment still inside an unsubmitted PENDING review — GitHub's single-
+# comment REST endpoint doesn't serve those. When it misses, today's code
+# swallows the miss (by design, see `_lookup_review_comment_safe`'s
+# docstring) and falls back to the synthesized defaults, which have no
+# `author`/`created_at`/`updated_at`/`url` at all. The fix asks both GraphQL
+# mutations for those fields directly in their selection sets and reads them
+# out of the mutation response itself, removing the need for the
+# confirmation read. These tests stub the mutation response WITHOUT a
+# `/pulls/comments/{id}` branch, so any confirmation GET the current code
+# still issues either hits the file's `raise AssertionError("unexpected
+# request…")` (swallowed by `_lookup_review_comment_safe`'s broad `except
+# Exception`) or is caught directly by the `not any(...)` assertion below —
+# either way, the identity fields stay empty today.
+
+
+def test_reply_populates_author_timestamp_and_url_from_mutation_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1 driving test: a reply whose GraphQL mutation response carries
+    the identity fields must return them directly, with no post-write
+    confirmation GET at all.
+
+    RED reason (today): `_reply_in_pending_review`'s mutation selection
+    set asks only for `comment{databaseId}}` — every other field on the
+    mutation's response node is ignored. `add_pr_review_comment` then
+    calls `_lookup_review_comment_safe(...)`, which DOES issue
+    `GET /repos/acme/backend/pulls/comments/9003` (recorded in `seen`)
+    even though this handler has no branch for it; the handler's
+    `raise AssertionError("unexpected request…")` is swallowed by that
+    helper's deliberately broad `except Exception` (best-effort, "never
+    fail after a successful mutation"), so the call does not raise —
+    it silently returns `author == ""`, `created_at == ""`, `url is
+    None` instead of the mutation's values, and the `not any(...)`
+    assertion below fails because that confirmation GET did happen.
+
+    Test-critic F1/F2 (ticket #253 dispatch): the query-shape check below
+    asserts on the selection-set fragment itself (`"author{login}"` /
+    `"originalLine"` / `"diffSide"` / `"replyTo{databaseId}"` /
+    `"commit{oid}"`), not a bare `"line" in query` substring scan — `line`
+    already appears as a bare input-argument name (`line:$line` doesn't
+    apply to this mutation, but `diffSide`/`originalLine`/etc. as bare
+    words could still coincidentally match elsewhere, so the assertion
+    targets text that can only appear inside the selection set). The
+    mutation node's `path`/`diffSide`/`commit.oid`/`replyTo.databaseId`
+    are also deliberately set to values that DIFFER from the anchor
+    comment's (`path="src/foo.py"`, `side="RIGHT"`, `commit_id="abc123"`,
+    own id `8001`) — proving these come from the mutation payload, not
+    silently falling through to the anchor/call-param seed the way a
+    partial implementation (one that dropped these keys from
+    `_graphql_comment_raw`) would.
+    """
+    pending = _pending_review()
+    parent = _comment(8001, node_id="PARENT_NODE_8001")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8001":
+            return _json(parent)
+        if req.method == "POST" and path == "/graphql":
+            gql = _body(req)
+            query = gql["query"]
+            assert "addPullRequestReviewComment" in query
+            for fragment in (
+                "author{login}", "originalLine", "diffSide",
+                "replyTo{databaseId}", "commit{oid}", "createdAt", "updatedAt", "url",
+            ):
+                assert fragment in query, f"mutation query missing {fragment!r}: {query}"
+            return _json(
+                {
+                    "data": {
+                        "addPullRequestReviewComment": {
+                            "comment": {
+                                "databaseId": 9003,
+                                "author": {"login": "reviewer"},
+                                "body": "#ai-generated\n\nreply text",
+                                # Deliberately diverges from the anchor
+                                # comment's path/side/commit (all
+                                # "src/foo.py"/"RIGHT"/"abc123") and from
+                                # the anchor's own id (8001) — mutation
+                                # values must win, not the anchor seed.
+                                "path": "src/mutation-path.py",
+                                "line": 10,
+                                "originalLine": 10,
+                                "diffSide": "LEFT",
+                                "commit": {"oid": "mutation-sha"},
+                                "replyTo": {"databaseId": 9999},
+                                "createdAt": "2024-03-03T00:00:00Z",
+                                "updatedAt": "2024-03-03T00:00:00Z",
+                                "url": "https://github.com/acme/backend/pull/7#discussion_r9003",
+                            }
+                        }
+                    }
+                }
+            )
+        # Deliberately no `/pulls/comments/9003` branch — see module note.
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(), token="t", pr_id="7", body="reply text", in_reply_to="8001",
+    )
+    assert result.id == "9003"
+    assert result.author == "reviewer"
+    assert result.created_at == "2024-03-03T00:00:00Z"
+    assert result.updated_at == "2024-03-03T00:00:00Z"
+    assert result.url == "https://github.com/acme/backend/pull/7#discussion_r9003"
+    # Mutation payload wins over the anchor/call-param seed (test-critic F2).
+    assert result.path == "src/mutation-path.py"
+    assert result.line == 10
+    assert result.side == "LEFT"
+    assert result.commit_sha == "mutation-sha"
+    assert result.in_reply_to == "9999"
+    assert result.discussion_id == "9999"
+    # R2: no post-write single-comment GET at all.
+    assert not any(
+        r.method == "GET" and r.url.path == "/repos/acme/backend/pulls/comments/9003"
+        for r in seen
+    )
+
+
+def test_new_thread_populates_author_timestamp_and_url_from_mutation_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1(a) — the shared second call site: a new-thread comment added to
+    an EXISTING pending review (`_add_thread_to_pending_review`,
+    `addPullRequestReviewThread`) must get the same treatment. Also pins
+    `discussion_id` for a new thread: the comment's OWN id (9002), not an
+    anchor — there is no anchor, this starts a new thread.
+
+    RED reason (today): same shape as the reply test above —
+    `_add_thread_to_pending_review`'s selection set asks only for
+    `thread{comments(first:1){nodes{databaseId}}}}`, so
+    `_lookup_review_comment_safe`'s confirmation GET (unstubbed here) is
+    swallowed and the identity fields stay empty/None.
+
+    Test-critic F1/F2 (ticket #253 dispatch): the query-shape check
+    targets the selection-set fragment itself, not a bare `"line" in
+    query` scan (see the reply test's docstring for why). The mutation
+    node's `path`/`diffSide`/`commit.oid` also deliberately DIFFER from
+    the caller's own params (`path="src/bar.py"`, `side="RIGHT"`,
+    `commit_sha="abc123"`), proving the mutation payload — not the
+    call-param seed — is what the result reflects.
+    """
+    pending = _pending_review()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "POST" and path == "/graphql":
+            gql = _body(req)
+            query = gql["query"]
+            assert "addPullRequestReviewThread" in query
+            for fragment in (
+                "author{login}", "originalLine", "diffSide",
+                "replyTo{databaseId}", "commit{oid}", "createdAt", "updatedAt", "url",
+            ):
+                assert fragment in query, f"mutation query missing {fragment!r}: {query}"
+            return _json(
+                {
+                    "data": {
+                        "addPullRequestReviewThread": {
+                            "thread": {
+                                "comments": {
+                                    "nodes": [
+                                        {
+                                            "databaseId": 9002,
+                                            "author": {"login": "reviewer"},
+                                            "body": "#ai-generated\n\nsecond nit",
+                                            # Deliberately diverges from
+                                            # the caller's own
+                                            # path/side/commit_sha params
+                                            # ("src/bar.py"/"RIGHT"/
+                                            # "abc123") — mutation values
+                                            # must win, not the call-param
+                                            # seed.
+                                            "path": "src/mutation-bar.py",
+                                            "line": 20,
+                                            "originalLine": 20,
+                                            "diffSide": "LEFT",
+                                            "commit": {"oid": "mutation-thread-sha"},
+                                            "replyTo": None,
+                                            "createdAt": "2024-03-03T00:00:00Z",
+                                            "updatedAt": "2024-03-03T00:00:00Z",
+                                            "url": "https://github.com/acme/backend/pull/7#discussion_r9002",
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            )
+        # Deliberately no `/pulls/comments/9002` branch — see module note.
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="7",
+        body="second nit",
+        path="src/bar.py",
+        line=20,
+        side="RIGHT",
+        commit_sha="abc123",
+    )
+    assert result.id == "9002"
+    assert result.author == "reviewer"
+    assert result.created_at == "2024-03-03T00:00:00Z"
+    assert result.updated_at == "2024-03-03T00:00:00Z"
+    assert result.url == "https://github.com/acme/backend/pull/7#discussion_r9002"
+    assert result.discussion_id == "9002"
+    # Mutation payload wins over the call-param seed (test-critic F2).
+    assert result.path == "src/mutation-bar.py"
+    assert result.side == "LEFT"
+    assert result.commit_sha == "mutation-thread-sha"
+    assert not any(
+        r.method == "GET" and r.url.path == "/repos/acme/backend/pulls/comments/9002"
+        for r in seen
+    )
+
+
+def test_reply_populates_empty_author_when_mutation_author_is_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1(b): a mutation response with `author: null` (GitHub can omit
+    the author, e.g. a deleted/anonymized account) must not crash — it
+    maps to `author == ""`, same convention as every other
+    `_map_review_comment` caller, while `created_at`/`updated_at`/`url`
+    are still populated from the same payload.
+
+    RED reason (today): identical swallow-and-synthesize path as the
+    main driving test — `created_at`/`updated_at`/`url` come back empty/
+    None regardless of `author`, so the non-author assertions fail.
+    """
+    pending = _pending_review()
+    parent = _comment(8002, node_id="PARENT_NODE_8002")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/comments/8002":
+            return _json(parent)
+        if req.method == "POST" and path == "/graphql":
+            return _json(
+                {
+                    "data": {
+                        "addPullRequestReviewComment": {
+                            "comment": {
+                                "databaseId": 9004,
+                                "author": None,
+                                "path": "src/foo.py",
+                                "line": 10,
+                                "originalLine": 10,
+                                "diffSide": "RIGHT",
+                                "commit": {"oid": "abc123"},
+                                "replyTo": {"databaseId": 8002},
+                                "createdAt": "2024-03-03T00:00:00Z",
+                                "updatedAt": "2024-03-03T00:00:00Z",
+                                "url": "https://github.com/acme/backend/pull/7#discussion_r9004",
+                            }
+                        }
+                    }
+                }
+            )
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(), token="t", pr_id="7", body="reply text", in_reply_to="8002",
+    )
+    assert result.id == "9004"
+    assert result.author == ""
+    assert result.created_at == "2024-03-03T00:00:00Z"
+    assert result.updated_at == "2024-03-03T00:00:00Z"
+    assert result.url == "https://github.com/acme/backend/pull/7#discussion_r9004"
+
+
+def test_new_thread_mutation_resolved_line_wins_over_requested_no_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1(c): mirrors `test_new_thread_server_resolved_line_wins_over_requested`'s
+    "server value wins" contract onto the mutation-derived raw dict, with
+    no confirmation GET involved at all — a mutation response
+    `line`/`originalLine` that differs from the caller's requested value
+    must still win.
+
+    RED reason (today): the mutation response's `line`/`originalLine`
+    are ignored entirely (only `databaseId` is parsed today); with no
+    `/pulls/comments/9005` stub, the confirmation lookup's exception is
+    swallowed and the result falls back to the synthesized (requested)
+    `line=1`, not the server's `2`.
+    """
+    pending = _pending_review()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "POST" and path == "/graphql":
+            return _json(
+                {
+                    "data": {
+                        "addPullRequestReviewThread": {
+                            "thread": {
+                                "comments": {
+                                    "nodes": [
+                                        {
+                                            "databaseId": 9005,
+                                            "line": 2,
+                                            "originalLine": 2,
+                                            "diffSide": "RIGHT",
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            )
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="7",
+        body="nit",
+        path="src/bar.py",
+        line=1,
+        side="RIGHT",
+        commit_sha="abc123",
+    )
+    assert result.id == "9005"
+    assert result.line == 2
+    assert result.original_line == 2
+    assert not any(
+        r.method == "GET" and r.url.path == "/repos/acme/backend/pulls/comments/9005"
+        for r in seen
+    )
+
+
+def test_new_thread_mutation_null_line_falls_back_to_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1(c), second half: a mutation response with `line: null` (server
+    didn't resolve it) must fall back to the caller's requested `line`,
+    exactly like the confirmation-read path already does.
+
+    Note: this assertion already passes today (both before and after the
+    fix, `line` ends up `1` either way — today via the synthesized
+    fallback after the swallowed confirmation miss, post-fix via the
+    non-null merge rule on a null mutation field) — recorded here as
+    edge-case coverage for the merge contract, not as a RED-producing
+    driving test.
+    """
+    pending = _pending_review()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path == "/repos/acme/backend/pulls/7/reviews":
+            return _json([pending])
+        if req.method == "POST" and path == "/graphql":
+            return _json(
+                {
+                    "data": {
+                        "addPullRequestReviewThread": {
+                            "thread": {
+                                "comments": {
+                                    "nodes": [
+                                        {
+                                            "databaseId": 9006,
+                                            "line": None,
+                                            "originalLine": None,
+                                            "diffSide": None,
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            )
+        raise AssertionError(f"unexpected request: {req.method} {path}")
+
+    _install_mock(monkeypatch, handler)
+    result = GitHubProvider().add_pr_review_comment(
+        _project(),
+        token="t",
+        pr_id="7",
+        body="nit",
+        path="src/bar.py",
+        line=1,
+        side="RIGHT",
+        commit_sha="abc123",
+    )
+    assert result.id == "9006"
+    assert result.line == 1
+    assert result.side == "RIGHT"
 
 
 # ---------- pure unit tests of `_review_comment_result` (no HTTP) -----------
