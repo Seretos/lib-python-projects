@@ -98,6 +98,8 @@ class FakeGitHub:
         self.calls: list[list[str]] = []
 
         self._releases: dict[tuple[str, str], Optional[str]] = {}
+        self._tags: dict[str, list[str]] = {}
+        self._release_tags: dict[str, list[dict]] = {}
 
         self._issues: list[_Issue] = []
         self._next_issue_id = 1
@@ -123,6 +125,40 @@ class FakeGitHub:
         simulator holds no such release -- a lookup then behaves like a
         real 404 (non-zero exit), never a blanket canned response."""
         self._releases[(repo, tag)] = body
+
+    def add_tag(self, repo: str, name: str) -> None:
+        """Seed a Git tag ``name`` that is ALSO backed by a *published*
+        GitHub Release -- appears in both ``gh api repos/{repo}/tags`` and
+        ``gh api repos/{repo}/releases`` for ``repo``, exactly like a tag
+        this repo's own release workflow pushed and then successfully
+        published a Release for. Call order determines listing order (the
+        real endpoint has its own ordering, but a correct caller sorts by
+        semver itself rather than relying on listing order --
+        ``ci.prev_tag``'s driving tests seed tags out of order on purpose to
+        prove that)."""
+        self._tags.setdefault(repo, []).append(name)
+        self._release_tags.setdefault(repo, []).append({"tag_name": name, "draft": False})
+
+    def add_unreleased_tag(self, repo: str, name: str) -> None:
+        """Seed a Git tag ``name`` that exists (appears in
+        ``gh api repos/{repo}/tags``) but has NO backing GitHub Release
+        (absent from ``gh api repos/{repo}/releases``) -- the round-3 review
+        finding, #251: this repo's release workflow pushes the tag and
+        creates the Release in two separate, non-atomic steps, so a runner
+        failure or transient ``gh`` outage between them can leave exactly
+        this state in production. A caller that (still) lists raw tags
+        instead of published releases would wrongly consider this tag a
+        valid ``--notes-start-tag`` candidate."""
+        self._tags.setdefault(repo, []).append(name)
+
+    def add_draft_release_tag(self, repo: str, name: str) -> None:
+        """Seed a *draft* GitHub Release's tag -- present in both listings
+        (a real ``gh api repos/{repo}/releases`` response does include
+        drafts a token with push access can see) but not yet "published"
+        for ``ci.prev_tag``'s purposes, so it must never be selected as
+        ``--notes-start-tag``."""
+        self._tags.setdefault(repo, []).append(name)
+        self._release_tags.setdefault(repo, []).append({"tag_name": name, "draft": True})
 
     def add_open_issue(self, repo: str, title: str, *, is_pull_request: bool = False) -> str:
         return self._create_issue(repo, title, body="", label=None, is_pull_request=is_pull_request)
@@ -310,17 +346,27 @@ class FakeGitHub:
 
         parsed = urlparse(ns.path)
         parts = parsed.path.strip("/").split("/")
-        if len(parts) != 4 or parts[0] != "repos" or parts[3] != "issues":
+        if len(parts) != 4 or parts[0] != "repos" or parts[3] not in ("issues", "tags", "releases"):
             return self._fail(check, f"unsupported gh api path: {ns.path}")
 
         repo = f"{parts[1]}/{parts[2]}"
         query = parse_qs(parsed.query)
-        state = (query.get("state") or ["all"])[0]
         per_page = int((query.get("per_page") or ["30"])[0])
         page = int((query.get("page") or ["1"])[0])
-
-        matching = [i for i in self._issues if i.repo == repo and (state == "all" or i.state == state)]
         start = (page - 1) * per_page
+
+        if parts[3] == "tags":
+            names = self._tags.get(repo, [])
+            page_names = names[start : start + per_page]
+            return json.dumps([{"name": name} for name in page_names])
+
+        if parts[3] == "releases":
+            entries = self._release_tags.get(repo, [])
+            page_entries = entries[start : start + per_page]
+            return json.dumps(list(page_entries))
+
+        state = (query.get("state") or ["all"])[0]
+        matching = [i for i in self._issues if i.repo == repo and (state == "all" or i.state == state)]
         page_items = matching[start : start + per_page]
 
         payload = [
