@@ -166,6 +166,18 @@ shape as `board`/`issues`/`pulls` — unknown keys raise, and a `projects.yml`
 that omits `pipelines` entirely still loads unchanged (the field defaults
 via `Field(default_factory=PipelinesPermissions)`).
 
+`permissions` also carries `verified` and `reason` (ticket #252) — these say
+whether the flags above were confirmed by a live capability probe rather
+than merely declared here. They are **derived, not YAML-settable at all**:
+`verified`/`reason` are computed from private, non-input state that only a
+real probe (`Permissions.from_probe`) can write, so nothing in `projects.yml`
+— including `permissions.verified: true` — can ever produce `verified=true`;
+a config entry always sees `verified: false, reason: "not_probed"`,
+regardless of what it writes or what `source` it claims. `verified` only
+covers `issues`/`pulls` — the probe never touches `board` or `pipelines`, so
+those stay at their `False` defaults regardless of what `verified`/`reason`
+report.
+
 ### Triggering a run and resolving it
 
 ```python

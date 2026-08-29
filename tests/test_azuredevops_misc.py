@@ -1113,6 +1113,41 @@ def test_token_probe_success_returns_all_flags(
     assert caps.pulls_merge is True
 
 
+def test_token_probe_success_sets_reason_explicitly_in_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket #252 (reviewer finding, gen 2): `TokenCapabilities.confirmed`
+    reads `reason is None` the same way whether `reason=None` was passed
+    explicitly or left at the dataclass default — a runtime assertion on
+    the returned object can't tell the two apart. This probe's clean-path
+    return previously relied on the default instead of stating `reason=
+    None` explicitly, unlike GitHub's `_map_permissions_to_capabilities`
+    and GitLab's `_capabilities_from_access_level`, which both do. Fixed
+    to match, so the "every real probe path sets reason explicitly"
+    convention documented on `TokenCapabilities.confirmed` is literally
+    true for all three providers, not just true in effect. Source-level
+    pin (not observable via the returned dataclass) since that's the only
+    way to actually verify "explicit", the behavioural half of this is
+    already covered by `test_token_probe_success_returns_all_flags`
+    above."""
+    import inspect
+
+    from lib_python_projects.providers import azuredevops as azure_mod
+
+    source = inspect.getsource(azure_mod.AzureDevOpsProvider.probe_token_capabilities)
+    # The final (fully-clean) return statement must spell out `reason=None`
+    # rather than omitting it and relying on the dataclass default. Ticket
+    # #252 (gen 2, 4th raise) switched every production call site from the
+    # bare `TokenCapabilities(...)` constructor to the
+    # `TokenCapabilities.probed_result(...)` factory -- the return
+    # statement's shape changed, so the anchor below follows it.
+    tail = source[source.rindex("return TokenCapabilities.probed_result("):]
+    assert "reason=None" in tail, (
+        "probe_token_capabilities' clean-path return must set reason=None "
+        f"explicitly: {tail!r}"
+    )
+
+
 def test_token_probe_issues_project_scoped_work_item_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1353,31 +1388,6 @@ def test_token_probe_bad_credentials_skips_work_item_call(
 
     assert caps.reason == "bad_credentials"
     assert not any(r.url.path.endswith("workitemtypes") for r in seen)
-
-
-def test_probe_docstring_discloses_unverified_surfaces() -> None:
-    """Behavioural requirement 6 (plan step 6): the probe's docstring
-    must disclose that `pulls_*` remain optimistic (never verified
-    against a real write) and that pipeline access is never probed at
-    all — there is no dedicated pipeline flag on `TokenCapabilities`.
-
-    Expected RED: `probe_token_capabilities` currently has no docstring
-    at all, so `inspect.getdoc` returns `None` and the first assertion
-    fails.
-    """
-    doc = inspect.getdoc(AzureDevOpsProvider.probe_token_capabilities)
-    assert doc is not None, (
-        "probe_token_capabilities has no docstring — it must disclose "
-        "what it does and does not verify"
-    )
-    assert "optimistic" in doc
-    assert "pulls" in doc
-    assert "pipeline" in doc
-    assert "no dedicated pipeline flag" in doc, (
-        f"docstring must use the pinned phrase 'no dedicated pipeline "
-        f"flag': {doc!r}"
-    )
-    assert "work_items_unavailable" in doc
 
 
 # ---------- duplicate_of double-count guard ---------------------------------

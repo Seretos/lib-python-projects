@@ -17,7 +17,14 @@ from __future__ import annotations
 import os
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    computed_field,
+    model_validator,
+)
 
 from lib_python_config import LoadResult
 from lib_python_projects.markers import AI_GENERATED_LABEL, AI_MODIFIED_LABEL
@@ -61,6 +68,147 @@ class Permissions(BaseModel):
     pulls: PullsPermissions = Field(default_factory=PullsPermissions)
     board: BoardPermissions = Field(default_factory=BoardPermissions)
     pipelines: PipelinesPermissions = Field(default_factory=PipelinesPermissions)
+    # Ticket #252 gen 2: `verified`/`reason` are *derived*, non-input state
+    # — private attributes exposed as read-only `@computed_field`
+    # properties, not settable fields. They are unreachable from
+    # `__init__`/`model_validate`/YAML (the `mode="before"` validator below
+    # strips any `verified`/`reason` keys out of mapping input before
+    # field validation ever sees them) — only `Permissions.from_probe`, the
+    # sole writer, can produce `verified=True` through this library's public
+    # construction/validation surface (`__init__` with a mapping,
+    # `model_validate`, YAML loading); it does not and cannot prevent code
+    # that already holds a `Permissions` instance from directly mutating
+    # `_verified`/`_reason`, a general Python-language limitation shared by
+    # every "private attribute" pattern, not a gap specific to this design.
+    # This closes the gap the
+    # earlier `source`-gated approach left open: a `ProjectConfig` built
+    # directly (e.g. `model_validate`, bypassing the loader boundary that
+    # forces `source="config"`) with a forged `source="token-discovery"`
+    # *and* a hand-forged `permissions.verified=True` no longer sails
+    # through — `verified`/`reason` are simply not settable input at all,
+    # regardless of what `source` claims.
+    #
+    # Full contract, one paragraph: `verified=True` means a capability
+    # probe ran *and* returned a usable signal — check `reason`. When
+    # `reason is None`, the probe was fully clean and every issues/pulls
+    # flag reflects an attempted independent confirmation (subject to each
+    # provider's own sub-flag inference caveats — e.g. Azure DevOps's
+    # `pulls_*` flags are inferred from a successful `connectionData` call,
+    # not a real pull-request write check; see
+    # `AzureDevOpsProvider.probe_token_capabilities`'s docstring). When
+    # `reason` is a *partial* code (`"work_items_unavailable"`,
+    # `"insufficient_scope"`), at least one flag is genuinely confirmed but
+    # not every flag is. `verified=False` means the probe either never ran
+    # (`reason="not_probed"`, the default for any `Permissions` that was
+    # never routed through `from_probe`) or ran but returned no usable
+    # signal at all (`"bad_credentials"`, `"network_error"`,
+    # `"repo_invisible_to_token"`, `"permissions_field_missing"`, GitHub's
+    # `"http_<code>"`) — in that case every issues/pulls flag is just its
+    # unconfirmed `False` default, not a confirmed denial. `board`/
+    # `pipelines` are never probed by `TokenCapabilities` at all and stay
+    # at their all-False defaults *regardless* of `verified` — always read
+    # them as unprobed placeholders, never as confirmed negatives. See
+    # `TokenCapabilities.confirmed` in `providers/base.py`, which is the
+    # single source of truth `loader._capabilities_to_permissions` uses to
+    # compute this flag via `from_probe`.
+    #
+    # Round-trip note: `Permissions.model_dump()` followed by
+    # `Permissions(**dump)` (the shape `ProjectConfig.model_dump()` +
+    # reload also goes through) does not raise, and preserves values for
+    # any *unprobed* instance (both sides `verified=False`,
+    # `reason="not_probed"`) — but a *probed* instance downgrades to
+    # unprobed on reload, since the dump is shape-identical to a forgery
+    # and re-validation has no way to tell them apart. This is accepted,
+    # not fixed: nothing in this library dumps a probed `Permissions` and
+    # then re-validates it (the loader only validates fresh YAML; the
+    # auto-discovery/token-discovery paths pass a `Permissions` *instance*
+    # through untouched, and pydantic never revalidates instances by
+    # default). A consumer that serializes a probed project across a
+    # process boundary and revalidates it must treat the result as
+    # unprobed.
+    _verified: bool = PrivateAttr(default=False)
+    _reason: str | None = PrivateAttr(default="not_probed")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _strip_forged_verification(cls, data: Any) -> Any:
+        """Drop any `verified`/`reason` keys from mapping input.
+
+        `verified`/`reason` are computed, not settable — this keeps
+        `extra="forbid"` from rejecting them when they show up in
+        `model_dump()` output (both the two-key case dumped by this model
+        itself, and the case where a caller hand-writes them into YAML),
+        while making sure they can never actually set the underlying
+        private attributes. Non-mapping input (e.g. another `Permissions`
+        instance, whose fields pydantic reads directly) passes through
+        unchanged.
+        """
+        if isinstance(data, dict):
+            data = {k: v for k, v in data.items() if k not in ("verified", "reason")}
+        return data
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def verified(self) -> bool:
+        """True only when a live capability probe returned a usable
+        signal — see the class docstring above for the full contract.
+        Read-only: derived from a private attribute only
+        `Permissions.from_probe` can set."""
+        return self._verified
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def reason(self) -> str | None:
+        """Stable identifier for why the flags are unverified, or why a
+        probe didn't come back clean — see the class docstring above.
+        Read-only: derived from a private attribute only
+        `Permissions.from_probe` can set."""
+        return self._reason
+
+    @classmethod
+    def from_probe(
+        cls,
+        *,
+        issues: IssuesPermissions | None = None,
+        pulls: PullsPermissions | None = None,
+        board: BoardPermissions | None = None,
+        pipelines: PipelinesPermissions | None = None,
+        confirmed: bool,
+        reason: str | None,
+    ) -> "Permissions":
+        """Sole writer of `verified`/`reason` — the only way to produce a
+        `Permissions` with `verified=True` through this library's public
+        construction/validation surface (`__init__` with a mapping,
+        `model_validate`, YAML loading). This does not and cannot prevent
+        direct mutation of the private attributes by code that already
+        holds a `Permissions` instance and chooses to bypass the public
+        API — a general Python-language limitation shared by every
+        "private attribute" pattern, not a gap specific to this design.
+        Takes plain `bool`/`str | None`
+        for `confirmed`/`reason` (not a provider-specific type) so this
+        module keeps zero provider imports; callers (e.g.
+        `loader._capabilities_to_permissions`) translate their own
+        provider-facing result into these plain values first.
+
+        This is an internal API for translating an already-completed,
+        real capability probe (`TokenCapabilities.confirmed`/`.reason`)
+        into stored `Permissions` state — not a public convenience
+        constructor. It intentionally trusts its caller: nothing stops a
+        caller from passing `confirmed=True` with a fabricated `reason`,
+        but the one production call site (`loader._capabilities_to_permissions`)
+        only ever forwards values read off a real `TokenCapabilities`
+        instance returned by a provider's `probe_token_capabilities`, never
+        arbitrary or user/YAML-controlled input.
+        """
+        perms = cls(
+            issues=issues if issues is not None else IssuesPermissions(),
+            pulls=pulls if pulls is not None else PullsPermissions(),
+            board=board if board is not None else BoardPermissions(),
+            pipelines=pipelines if pipelines is not None else PipelinesPermissions(),
+        )
+        perms._verified = confirmed
+        perms._reason = reason
+        return perms
 
 
 class AutoLabels(BaseModel):
@@ -381,6 +529,13 @@ class ProjectConfig(BaseModel):
                     f"empty segment in {self.path!r}"
                 )
         return self
+
+    # `source` is provenance labelling only (ticket #252 gen 2): it no
+    # longer gates anything. `Permissions.verified`/`.reason` are derived,
+    # non-input fields (see `Permissions` above) that only
+    # `Permissions.from_probe` can set to a probed state — so an entry's
+    # claimed `source` (including a forged `source="token-discovery"`)
+    # cannot, by itself, produce `verified=True`.
 
     # --- Backward-compat derived properties ----------------------------------
 

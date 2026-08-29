@@ -219,9 +219,9 @@ def _capabilities_from_access_level(level: int | None) -> TokenCapabilities:
       - None (field missing)       → unknown, all False
     """
     if level is None:
-        return TokenCapabilities(reason="permissions_field_missing")
+        return TokenCapabilities.probed_result(reason="permissions_field_missing")
     if level >= 40:
-        return TokenCapabilities(
+        return TokenCapabilities.probed_result(
             issues_create=True,
             issues_modify=True,
             pulls_create=True,
@@ -230,7 +230,7 @@ def _capabilities_from_access_level(level: int | None) -> TokenCapabilities:
             reason=None,
         )
     if level >= 30:
-        return TokenCapabilities(
+        return TokenCapabilities.probed_result(
             issues_create=True,
             issues_modify=True,
             pulls_create=True,
@@ -238,7 +238,7 @@ def _capabilities_from_access_level(level: int | None) -> TokenCapabilities:
             pulls_merge=False,
             reason=None,
         )
-    return TokenCapabilities(reason="insufficient_scope")
+    return TokenCapabilities.probed_result(reason="insufficient_scope")
 
 
 def _check(resp: httpx.Response) -> None:
@@ -2502,27 +2502,27 @@ class GitLabProvider(
             with _client(project, token) as client:
                 r = client.get("/personal_access_tokens/self")
         except httpx.HTTPError:
-            return TokenCapabilities(reason="network_error")
+            return TokenCapabilities.probed_result(reason="network_error")
         if r.status_code == 401:
-            return TokenCapabilities(reason="bad_credentials")
+            return TokenCapabilities.probed_result(reason="bad_credentials")
         if r.status_code == 404:
-            return TokenCapabilities(reason="bad_credentials")
+            return TokenCapabilities.probed_result(reason="bad_credentials")
         if not r.is_success:
-            return TokenCapabilities(reason="network_error")
+            return TokenCapabilities.probed_result(reason="network_error")
         try:
             payload = r.json()
         except Exception:
-            return TokenCapabilities(reason="permissions_field_missing")
+            return TokenCapabilities.probed_result(reason="permissions_field_missing")
         scopes = payload.get("scopes")
         if not isinstance(scopes, list):
-            return TokenCapabilities(reason="permissions_field_missing")
+            return TokenCapabilities.probed_result(reason="permissions_field_missing")
         if "api" in scopes:
-            return TokenCapabilities(
+            return TokenCapabilities.probed_result(
                 issues_create=True, issues_modify=True,
                 pulls_create=True, pulls_modify=True, pulls_merge=True,
                 reason=None,
             )
-        return TokenCapabilities(reason="insufficient_scope")
+        return TokenCapabilities.probed_result(reason="insufficient_scope")
 
     # ---------- viewer identity (ViewerIdentityProvider) -----------------------
 

@@ -6289,7 +6289,7 @@ class AzureDevOpsProvider(
         board operations will succeed.
         """
         if not token:
-            return TokenCapabilities(reason="bad_credentials")
+            return TokenCapabilities.probed_result(reason="bad_credentials")
         try:
             with _client(project, token) as c:
                 # connectionData is still a preview API — the stable
@@ -6299,13 +6299,13 @@ class AzureDevOpsProvider(
                     params={"api-version": "7.1-preview.1"},
                 )
         except httpx.HTTPError:
-            return TokenCapabilities(reason="network_error")
+            return TokenCapabilities.probed_result(reason="network_error")
         if resp.status_code == 401:
-            return TokenCapabilities(reason="bad_credentials")
+            return TokenCapabilities.probed_result(reason="bad_credentials")
         if resp.status_code in (403, 404):
-            return TokenCapabilities(reason="repo_invisible_to_token")
+            return TokenCapabilities.probed_result(reason="repo_invisible_to_token")
         if not resp.is_success:
-            return TokenCapabilities(reason="permissions_field_missing")
+            return TokenCapabilities.probed_result(reason="permissions_field_missing")
         # Second, project-scoped probe: exercises the same auth path the
         # work-item write surface (create_ticket, etc.) actually uses.
         # Issued fresh every call — no memoization by design (see
@@ -6318,7 +6318,7 @@ class AzureDevOpsProvider(
                     params=_api_version_params(),
                 )
         except httpx.HTTPError:
-            return TokenCapabilities(
+            return TokenCapabilities.probed_result(
                 issues_create=False,
                 issues_modify=False,
                 pulls_create=True,
@@ -6336,7 +6336,7 @@ class AzureDevOpsProvider(
         else:
             wi_resp_ok = False
         if not wi_resp_ok:
-            return TokenCapabilities(
+            return TokenCapabilities.probed_result(
                 issues_create=False,
                 issues_modify=False,
                 pulls_create=True,
@@ -6349,12 +6349,13 @@ class AzureDevOpsProvider(
         # connectionData + the work-item probe prove the token is valid
         # for this organization/project, which is the most useful
         # capability signal available without issuing zero-effect writes.
-        return TokenCapabilities(
+        return TokenCapabilities.probed_result(
             issues_create=True,
             issues_modify=True,
             pulls_create=True,
             pulls_modify=True,
             pulls_merge=True,
+            reason=None,
         )
 
     # ---------- viewer identity ------------------------------------------

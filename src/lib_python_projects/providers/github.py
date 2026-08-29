@@ -3191,7 +3191,7 @@ def _map_permissions_to_capabilities(perms: dict) -> TokenCapabilities:
     triage = bool(perms.get("triage")) or push
     # `pull` is the read flag; not needed for any of the write bits
     # because triage/push/maintain/admin all imply read.
-    return TokenCapabilities(
+    return TokenCapabilities.probed_result(
         issues_create=push,
         issues_modify=triage,
         pulls_create=push,
@@ -3254,25 +3254,25 @@ class GitHubProvider(
             with _client(token) as client:
                 r = client.get(_repo_path(project))
         except httpx.HTTPError:
-            return TokenCapabilities(reason="network_error")
+            return TokenCapabilities.probed_result(reason="network_error")
         if r.status_code == 401:
-            return TokenCapabilities(reason="bad_credentials")
+            return TokenCapabilities.probed_result(reason="bad_credentials")
         if r.status_code == 404:
-            return TokenCapabilities(reason="repo_invisible_to_token")
+            return TokenCapabilities.probed_result(reason="repo_invisible_to_token")
         if not r.is_success:
             # Treat other unexpected statuses the same way as a missing
             # field: don't grant any write capability, but record what
             # happened so a caller can debug.
-            return TokenCapabilities(
+            return TokenCapabilities.probed_result(
                 reason=f"http_{r.status_code}"
             )
         try:
             body = r.json()
         except ValueError:
-            return TokenCapabilities(reason="permissions_field_missing")
+            return TokenCapabilities.probed_result(reason="permissions_field_missing")
         perms = body.get("permissions") if isinstance(body, dict) else None
         if not isinstance(perms, dict):
-            return TokenCapabilities(reason="permissions_field_missing")
+            return TokenCapabilities.probed_result(reason="permissions_field_missing")
         return _map_permissions_to_capabilities(perms)
 
     def resolve_viewer_login(

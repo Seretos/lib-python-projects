@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 
 _TIMESTAMP_FRACTION_RE = re.compile(
@@ -1433,24 +1433,40 @@ class TokenCapabilities:
       didn't populate `permissions` on the response (classic PAT
       sometimes, or unexpected payload shape). Combined with all-False
       flags this preserves today's hardcoded-False default behavior.
-    - `"work_items_unavailable"` — provider-level auth succeeded (e.g.
-      Azure DevOps's org-scoped `connectionData` call), but a
+    - `"http_<code>"`            — GitHub only: any other unexpected
+      non-2xx status (e.g. `"http_500"`).
+    - `"insufficient_scope"`     — GitLab only: the token's access level
+      was successfully read and confirmed below Developer (< 30), so
+      every flag is a genuine confirmed negative, not a missing answer.
+    - `"work_items_unavailable"` — Azure DevOps only: provider-level auth
+      succeeded (e.g. the org-scoped `connectionData` call), but a
       project-scoped probe of the work-item surface did not answer
       (non-2xx, an unparseable body, or a transport error on that
       second call). `issues_create`/`issues_modify` are False; the
       `pulls_*` flags carry the provider-level result and remain
-      unverified against a real pull-request write. There is no
-      pipeline or board flag on this dataclass, so pipeline/board access
-      is never represented here regardless of `reason`.
+      unverified against a real pull-request write. This is a
+      **partial, surface-specific failure** — one surface's flags are
+      genuine, the other's are not. There is no pipeline or board flag
+      on this dataclass, so pipeline/board access is never represented
+      here regardless of `reason`.
 
     When `reason` is not `None`, the flags reflect what could be
-    confirmed. A provider-level failure (`bad_credentials`,
+    confirmed — which is not the same as "every flag is a confirmed
+    answer". A provider-level failure (`bad_credentials`,
     `repo_invisible_to_token`, `network_error`,
-    `permissions_field_missing`) sets all flags False. A partial, surface-specific failure
-    — currently `work_items_unavailable` — may leave another surface's
-    flags True where that surface's own check succeeded. Callers must
-    therefore branch on the individual flags and must not assume
-    all-False from the mere presence of a `reason`.
+    `permissions_field_missing`, GitHub's `http_<code>`) means the probe
+    got no usable signal at all, so every flag is just its unconfirmed
+    `False` default. A **partial, surface-specific failure**
+    (`work_items_unavailable`, or GitLab's `insufficient_scope`, which
+    is a confirmed-negative rather than a missing answer) leaves at
+    least one surface's flags genuinely confirmed even though not every
+    flag is. Callers must therefore branch on the individual flags and
+    `reason` together and must not assume all-False from the mere
+    presence of a `reason`, nor assume every flag was independently
+    confirmed just because `reason is None` — see `confirmed` below for
+    the single coarse signal this dataclass offers, and each provider's
+    `probe_token_capabilities` docstring for sub-flag inference caveats
+    (e.g. Azure DevOps's `pulls_*` is inferred, never write-tested).
     """
 
     issues_create: bool = False
@@ -1459,6 +1475,115 @@ class TokenCapabilities:
     pulls_modify: bool = False
     pulls_merge: bool = False
     reason: str | None = None
+
+    # True only for an instance built via `probed_result()` below — i.e. a
+    # genuine `probe_token_capabilities` call site. `False` on bare/default
+    # construction (`TokenCapabilities()`). This is what makes "genuinely
+    # probed" observable independent of `reason`'s nullability (ticket #252,
+    # reviewer finding, gen 2, 4th raise): `reason is None` alone can't
+    # distinguish "never probed" from "probed cleanly", but `probed` can.
+    # See `confirmed` and `probed_result` below.
+    probed: bool = False
+
+    # Reason codes under which the probe still returned a usable signal —
+    # a fully clean probe (`reason is None`, handled separately by
+    # `confirmed` below) or a partial, surface-specific failure where at
+    # least one flag reflects genuinely confirmed state. Every other
+    # reason — including GitHub's dynamic `"http_<code>"` and any
+    # future/unrecognized reason — means the probe returned no usable
+    # signal at all. Deliberately an allowlist (fails toward
+    # "unconfirmed" for anything not explicitly known-safe) rather than a
+    # denylist of known failure codes, so a new failure reason a provider
+    # starts returning tomorrow is unconfirmed by default instead of
+    # silently passing through as verified.
+    _PARTIAL_SIGNAL_REASONS: ClassVar[frozenset[str]] = frozenset(
+        {"work_items_unavailable", "insufficient_scope"}
+    )
+
+    @property
+    def confirmed(self) -> bool:
+        """True when this probe returned a usable signal, False when it
+        returned none at all — or when this instance was never actually
+        probed.
+
+        This is the single source of truth `_capabilities_to_permissions`
+        (loader.py) uses to stamp `Permissions.verified` — it is
+        deliberately a coarse, whole-dataclass signal, not a per-flag
+        verification granularity (out of scope for this dataclass; see
+        each provider's `probe_token_capabilities` docstring for which
+        individual flags are inferred rather than independently
+        confirmed even when `confirmed` is True).
+
+        Requires BOTH:
+
+        - `self.probed` — this instance was built by `probed_result()`,
+          i.e. a genuine `probe_token_capabilities` call site, never bare/
+          default construction.
+        - `reason is None` (a fully clean probe; every flag was at least
+          attempted to be confirmed by the provider, subject to that
+          provider's own inference caveats) or `reason` is
+          `"work_items_unavailable"` / `"insufficient_scope"` (a partial,
+          surface-specific failure; at least one flag is genuinely
+          confirmed even though not every flag is). Any other reason
+          (`"bad_credentials"`, `"repo_invisible_to_token"`,
+          `"network_error"`, `"permissions_field_missing"`, GitHub's
+          `"http_<code>"`, or anything unrecognized) means the probe got
+          no usable signal at all; every flag above is just its
+          unconfirmed `False` default, not a confirmed grant or denial.
+
+        Structural fix (ticket #252, reviewer finding, gen 2, 4th raise):
+        earlier rounds relied on a docstring caveat alone to warn that a
+        bare `TokenCapabilities()` also has `reason is None` and therefore
+        misreported `confirmed=True` — a promise the code shape didn't
+        enforce, so the same finding kept getting re-raised against
+        unchanged code. `probed` closes that gap structurally instead:
+        bare construction now defaults `probed=False`, so `confirmed` is
+        `False` regardless of `reason`, and every production
+        `probe_token_capabilities` implementation (GitHub, GitLab, Azure
+        DevOps) is required to build its result via `probed_result()`
+        rather than the bare constructor — enforced by
+        `test_no_bare_token_capabilities_construction_in_provider_modules`
+        in `tests/test_base_types.py`, which source-scans all three
+        provider modules for a stray bare `TokenCapabilities(` call.
+        """
+        return self.probed and (
+            self.reason is None or self.reason in self._PARTIAL_SIGNAL_REASONS
+        )
+
+    @classmethod
+    def probed_result(
+        cls,
+        *,
+        issues_create: bool = False,
+        issues_modify: bool = False,
+        pulls_create: bool = False,
+        pulls_modify: bool = False,
+        pulls_merge: bool = False,
+        reason: str | None = None,
+    ) -> "TokenCapabilities":
+        """Construct a `TokenCapabilities` for a genuine
+        `probe_token_capabilities` call site, stamping `probed=True`.
+
+        This is the ONLY sanctioned way to get `probed=True` — it is what
+        lets `confirmed` trust `reason is None` to mean a real, completed
+        probe rather than an unprobed default (ticket #252, reviewer
+        finding, gen 2, 4th raise). Every production
+        `probe_token_capabilities` implementation (GitHub, GitLab, Azure
+        DevOps) must build its return value through this factory instead
+        of the bare dataclass constructor. Test fixtures and other
+        internal/test-only construction should keep using
+        `TokenCapabilities(...)` directly, which defaults `probed=False`
+        — the safe "not a real probe" default.
+        """
+        return cls(
+            issues_create=issues_create,
+            issues_modify=issues_modify,
+            pulls_create=pulls_create,
+            pulls_modify=pulls_modify,
+            pulls_merge=pulls_merge,
+            reason=reason,
+            probed=True,
+        )
 
 
 class TokenCapabilityProvider:
@@ -1472,6 +1597,11 @@ class TokenCapabilityProvider:
     leaving unaffected surfaces' flags True — so the caller can degrade
     gracefully. Only programming errors (bad project shape, etc.) should
     propagate.
+
+    Every return value MUST be built via `TokenCapabilities.probed_result(...)`,
+    never the bare `TokenCapabilities(...)` constructor — that is the only
+    way `probed=True` gets set, which is what makes `.confirmed` trustworthy
+    (ticket #252, reviewer finding, gen 2, 4th raise).
     """
 
     def probe_token_capabilities(

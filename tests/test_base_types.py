@@ -1144,6 +1144,111 @@ class TestTokenCapabilitiesPartialFlagsContract:
         assert not any("board" in n for n in names)
 
 
+# ---------- ticket #252 (reviewer finding, gen 2, 4th raise): structural fix --
+
+
+class TestTokenCapabilitiesProbedFlag:
+    """Round 4 supersedes rounds 1-3's docstring-only fix with a structural
+    one. `TokenCapabilities.confirmed` used to return `True` whenever
+    `reason is None`, which is also the bare/default-construction value —
+    so `TokenCapabilities()` built with no arguments misreported
+    `confirmed=True`, and a docstring caveat alone did not stop Codex from
+    re-flagging the same code shape three rounds running (it evaluates the
+    shape, not the docstring's promise).
+
+    The fix: a new `probed: bool = False` field makes "genuinely probed"
+    observable independent of `reason`'s nullability. `confirmed` now
+    requires `self.probed` as well. Every production
+    `probe_token_capabilities` call site (GitHub, GitLab, Azure DevOps)
+    must go through the new `TokenCapabilities.probed_result(...)` factory,
+    which is the only way to get `probed=True` — enforced by the source-scan
+    guard below so a future bare-constructor call site can't silently
+    regress this.
+
+    Expected RED (before the fix): `probed` doesn't exist on the dataclass,
+    `confirmed` on a bare instance still reads `True`, and every provider
+    module still constructs `TokenCapabilities` directly.
+    """
+
+    def test_bare_construction_reads_as_unconfirmed(self) -> None:
+        """The exact footgun rounds 1-3 could only document is now
+        structurally impossible to hit by accident: a bare
+        `TokenCapabilities()` defaults `probed=False`, so `confirmed` is
+        `False` even though `reason` is also `None`."""
+        from lib_python_projects.providers.base import TokenCapabilities
+
+        caps = TokenCapabilities()
+        assert caps.reason is None
+        assert caps.probed is False
+        assert caps.confirmed is False
+
+    def test_probed_result_factory_stamps_probed_true(self) -> None:
+        """`TokenCapabilities.probed_result(...)` is the sanctioned way to
+        build a genuine probe result — it always sets `probed=True`, so a
+        clean result (`reason=None`) reads `confirmed=True`."""
+        from lib_python_projects.providers.base import TokenCapabilities
+
+        caps = TokenCapabilities.probed_result(
+            issues_create=True,
+            issues_modify=True,
+            pulls_create=True,
+            pulls_modify=True,
+            pulls_merge=True,
+            reason=None,
+        )
+        assert caps.probed is True
+        assert caps.confirmed is True
+
+    def test_probed_result_partial_failure_still_confirmed(self) -> None:
+        """A partial, surface-specific failure reason built via the factory
+        still reads `confirmed=True` (mirrors the pre-existing
+        `_PARTIAL_SIGNAL_REASONS` contract, now gated on `probed` too)."""
+        from lib_python_projects.providers.base import TokenCapabilities
+
+        caps = TokenCapabilities.probed_result(reason="work_items_unavailable")
+        assert caps.probed is True
+        assert caps.confirmed is True
+
+    def test_probed_result_total_failure_reads_unconfirmed(self) -> None:
+        """A genuine probe that got no usable signal at all still reads
+        `confirmed=False` even though it went through the factory —
+        `probed=True` alone isn't sufficient, `reason` still gates it."""
+        from lib_python_projects.providers.base import TokenCapabilities
+
+        caps = TokenCapabilities.probed_result(reason="bad_credentials")
+        assert caps.probed is True
+        assert caps.confirmed is False
+
+    def test_no_bare_token_capabilities_construction_in_provider_modules(
+        self,
+    ) -> None:
+        """Structural guard: every real `probe_token_capabilities` call site
+        across all three providers must construct its result via
+        `TokenCapabilities.probed_result(...)`, never the bare dataclass
+        constructor — that is the only way `probed=True` gets set, which is
+        what makes `confirmed` trustworthy. Source-scans the three provider
+        modules for a stray bare `TokenCapabilities(` construction so a
+        future call site can't silently regress this back to the
+        unconfirmed-by-default footgun.
+        """
+        import re
+
+        from lib_python_projects.providers import azuredevops as azuredevops_mod
+        from lib_python_projects.providers import github as github_mod
+        from lib_python_projects.providers import gitlab as gitlab_mod
+
+        bare_ctor = re.compile(r"\bTokenCapabilities\(")
+        for mod in (github_mod, gitlab_mod, azuredevops_mod):
+            source = inspect.getsource(mod)
+            matches = bare_ctor.findall(source)
+            assert not matches, (
+                f"{mod.__name__} constructs TokenCapabilities directly "
+                f"({len(matches)} call site(s)) instead of via "
+                "TokenCapabilities.probed_result(...) -- probed=True would "
+                "never get set for a real probe result"
+            )
+
+
 # ---------- ticket #240: parse_diff_hunk_ranges (R4) ---------------------------
 
 
