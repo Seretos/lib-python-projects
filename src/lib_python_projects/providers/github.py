@@ -743,33 +743,6 @@ def _review_thread_anchor_node_id(
     return anchor["node_id"], anchor
 
 
-def _lookup_review_comment_safe(
-    client: httpx.Client, project: ProjectConfig, pr_id: str, comment_id: str,
-) -> dict:
-    """Best-effort confirmation lookup — never raises.
-
-    Used after the GraphQL create/reply mutations already landed the
-    write server-side: the confirmation *read* that follows must never
-    turn a successful mutation into a reported failure just because the
-    comment isn't visible yet on this endpoint (still PENDING) or the
-    lookup fails for some other reason (rate limit, network blip, …).
-    Same "best-effort: never raises" precedent as
-    `_cleanup_orphaned_pending_review`. The catch is deliberately broad
-    (`except Exception`, not `except GitHubError`) because
-    `RateLimitError` is a sibling of `GitHubError` under `ProviderError`
-    and must not leak either.
-    """
-    try:
-        return _lookup_review_comment(client, project, pr_id, comment_id) or {}
-    except Exception as exc:
-        log.warning(
-            "could not confirm review comment %s on %s/%s#%s after a"
-            " successful write — returning a synthesized result instead: %s",
-            comment_id, project.owner, project.repo, pr_id, exc,
-        )
-        return {}
-
-
 def _latest_pending_review_comment(
     client: httpx.Client, project: ProjectConfig, pr_id: str, review_id: str,
 ) -> dict | None:
@@ -1634,16 +1607,26 @@ def _set_pr_draft_via_graphql(
 # once a pending review exists, further comments (new threads and
 # replies alike) must go through these two mutations instead.
 
+# Ticket #253: select the full field set `_map_review_comment` consumes (via
+# `_graphql_comment_raw`) rather than bare `databaseId` — the mutation
+# response becomes a drop-in replacement for the deleted post-write
+# confirmation read, so the identity fields (author/timestamps/url) and the
+# server-resolved values (line/side/commit/replyTo) come straight from here.
+_REVIEW_COMMENT_NODE_FIELDS = (
+    "databaseId author{login} body path line originalLine diffSide"
+    " commit{oid} replyTo{databaseId} createdAt updatedAt url"
+)
 _ADD_REVIEW_THREAD_MUTATION = (
     "mutation($reviewId:ID!,$path:String!,$line:Int!,$side:DiffSide!,$body:String!){"
     "addPullRequestReviewThread(input:{pullRequestReviewId:$reviewId,path:$path,"
     "line:$line,side:$side,body:$body}){"
-    "thread{comments(first:1){nodes{databaseId}}}}}"
+    "thread{comments(first:1){nodes{" + _REVIEW_COMMENT_NODE_FIELDS + "}}}}}"
 )
 _ADD_REVIEW_COMMENT_REPLY_MUTATION = (
     "mutation($reviewId:ID!,$inReplyTo:ID!,$body:String!){"
     "addPullRequestReviewComment(input:{pullRequestReviewId:$reviewId,"
-    "inReplyTo:$inReplyTo,body:$body}){comment{databaseId}}}"
+    "inReplyTo:$inReplyTo,body:$body}){comment{"
+    + _REVIEW_COMMENT_NODE_FIELDS + "}}}"
 )
 
 
@@ -1688,6 +1671,38 @@ def _graphql_review_missing_payload(field: str, body: dict) -> GitHubError:
     )
 
 
+def _graphql_comment_raw(node: dict) -> dict:
+    """Translate a mutation-response comment node (selected via
+    `_REVIEW_COMMENT_NODE_FIELDS`) into the REST key shape
+    `_review_comment_result`/`_map_review_comment` already consume.
+
+    Ticket #253: this is what lets the mutation response stand in for the
+    deleted post-write confirmation read. `id` is read via a direct index
+    (not `.get`) deliberately — it preserves the pre-existing contract that
+    a payload missing `databaseId` raises `KeyError` rather than silently
+    producing an empty id. Every other key is `.get`-based; `None` values
+    are dropped by `_review_comment_result`'s existing non-null merge, so a
+    null mutation field falls back to the synthesized value exactly like a
+    null REST field does today.
+    """
+    commit = node.get("commit") or {}
+    reply_to = node.get("replyTo") or {}
+    return {
+        "id": node["databaseId"],
+        "user": node.get("author"),
+        "body": node.get("body"),
+        "path": node.get("path"),
+        "line": node.get("line"),
+        "original_line": node.get("originalLine"),
+        "side": node.get("diffSide"),
+        "commit_id": commit.get("oid"),
+        "in_reply_to_id": reply_to.get("databaseId"),
+        "created_at": node.get("createdAt"),
+        "updated_at": node.get("updatedAt"),
+        "html_url": node.get("url"),
+    }
+
+
 def _add_thread_to_pending_review(
     client: httpx.Client,
     review_node_id: str,
@@ -1695,12 +1710,14 @@ def _add_thread_to_pending_review(
     line: int | None,
     side: str,
     body: str,
-) -> str:
+) -> dict:
     """Add a new inline-comment thread to an existing pending review.
 
     GraphQL `addPullRequestReviewThread` — see the module note above on
-    why this can't be a REST call. Returns the new comment's REST id
-    (`databaseId`) as a string.
+    why this can't be a REST call. Returns the new comment translated to
+    REST key shape (see `_graphql_comment_raw`) — ticket #253: the mutation
+    response now carries the full field set, replacing the post-write
+    confirmation read that used to follow this call.
     """
     r = client.post(
         "/graphql",
@@ -1728,19 +1745,21 @@ def _add_thread_to_pending_review(
     if thread is None:
         raise _graphql_review_missing_payload("thread", resp_body)
     nodes = thread["comments"]["nodes"]
-    return str(nodes[0]["databaseId"])
+    return _graphql_comment_raw(nodes[0])
 
 
 def _reply_in_pending_review(
     client: httpx.Client, review_node_id: str, parent_node_id: str, body: str,
-) -> str:
+) -> dict:
     """Add a reply comment to an existing pending review.
 
     GraphQL `addPullRequestReviewComment` with `inReplyTo` — REST's
     reply shape (`POST .../comments` with `in_reply_to`) always
     auto-submits its own review, so replies route through GraphQL too
-    once a pending review is in play. Returns the new comment's REST id
-    (`databaseId`) as a string.
+    once a pending review is in play. Returns the new comment translated to
+    REST key shape (see `_graphql_comment_raw`) — ticket #253: the mutation
+    response now carries the full field set, replacing the post-write
+    confirmation read that used to follow this call.
     """
     r = client.post(
         "/graphql",
@@ -1762,7 +1781,7 @@ def _reply_in_pending_review(
     comment = (resp_body["data"]["addPullRequestReviewComment"] or {}).get("comment")
     if comment is None:
         raise _graphql_review_missing_payload("comment", resp_body)
-    return str(comment["databaseId"])
+    return _graphql_comment_raw(comment)
 
 
 # ---------- GraphQL: GitHub Projects v2 board support (ticket #118) --------
@@ -5468,7 +5487,7 @@ class GitHubProvider(
                                 ) from exc
                             raise
                     try:
-                        comment_id = _reply_in_pending_review(
+                        raw = _reply_in_pending_review(
                             client, pending["node_id"], parent_node_id, prefixed,
                         )
                     except Exception:
@@ -5481,9 +5500,12 @@ class GitHubProvider(
                                 client, project, pr_id, pending,
                             )
                         raise
+                    # Ticket #253: the mutation response now carries the
+                    # full field set directly (see `_graphql_comment_raw`) —
+                    # no post-write confirmation read needed.
                     return _review_comment_result(
-                        comment_id=comment_id,
-                        raw=_lookup_review_comment_safe(client, project, pr_id, comment_id),
+                        comment_id=str(raw["id"]),
+                        raw=raw,
                         body=prefixed,
                         # Ticket #241: seed the synthesized fallback from
                         # the anchor/parent comment's own position — a
@@ -5560,12 +5582,15 @@ class GitHubProvider(
                         f" or pass the pending review's own commit once a"
                         f" pending review already exists."
                     )
-                comment_id = _add_thread_to_pending_review(
+                raw = _add_thread_to_pending_review(
                     client, pending["node_id"], path, line, side, prefixed,
                 )
+                # Ticket #253: the mutation response now carries the full
+                # field set directly (see `_graphql_comment_raw`) — no
+                # post-write confirmation read needed.
                 return _review_comment_result(
-                    comment_id=comment_id,
-                    raw=_lookup_review_comment_safe(client, project, pr_id, comment_id),
+                    comment_id=str(raw["id"]),
+                    raw=raw,
                     body=prefixed,
                     path=path,
                     line=line,
