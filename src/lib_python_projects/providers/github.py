@@ -1613,14 +1613,14 @@ def _set_pr_draft_via_graphql(
 # confirmation read, so the identity fields (author/timestamps/url) and the
 # server-resolved values (line/side/commit/replyTo) come straight from here.
 _REVIEW_COMMENT_NODE_FIELDS = (
-    "databaseId author{login} body path line originalLine diffSide"
+    "databaseId author{login} body path line originalLine"
     " commit{oid} replyTo{databaseId} createdAt updatedAt url"
 )
 _ADD_REVIEW_THREAD_MUTATION = (
     "mutation($reviewId:ID!,$path:String!,$line:Int!,$side:DiffSide!,$body:String!){"
     "addPullRequestReviewThread(input:{pullRequestReviewId:$reviewId,path:$path,"
     "line:$line,side:$side,body:$body}){"
-    "thread{comments(first:1){nodes{" + _REVIEW_COMMENT_NODE_FIELDS + "}}}}}"
+    "thread{diffSide comments(first:1){nodes{" + _REVIEW_COMMENT_NODE_FIELDS + "}}}}}"
 )
 _ADD_REVIEW_COMMENT_REPLY_MUTATION = (
     "mutation($reviewId:ID!,$inReplyTo:ID!,$body:String!){"
@@ -1671,7 +1671,7 @@ def _graphql_review_missing_payload(field: str, body: dict) -> GitHubError:
     )
 
 
-def _graphql_comment_raw(node: dict) -> dict:
+def _graphql_comment_raw(node: dict, *, side: str | None = None) -> dict:
     """Translate a mutation-response comment node (selected via
     `_REVIEW_COMMENT_NODE_FIELDS`) into the REST key shape
     `_review_comment_result`/`_map_review_comment` already consume.
@@ -1684,6 +1684,16 @@ def _graphql_comment_raw(node: dict) -> dict:
     are dropped by `_review_comment_result`'s existing non-null merge, so a
     null mutation field falls back to the synthesized value exactly like a
     null REST field does today.
+
+    Ticket #257: `diffSide` is a field of `PullRequestReviewThread`, not
+    of `PullRequestReviewComment` — it can no longer be read off `node`
+    directly (GitHub rejects that selection with a 400). Callers that have
+    a thread in scope (`_add_thread_to_pending_review`) pass its
+    `diffSide` in via this keyword-only `side` param; callers that don't
+    (`_reply_in_pending_review`, whose mutation exposes no `thread` at
+    all) leave it `None`, which the non-null merge above then drops in
+    favour of the synthesized/anchor-seeded value — same fallback
+    behaviour as before ticket #253.
     """
     commit = node.get("commit") or {}
     reply_to = node.get("replyTo") or {}
@@ -1694,7 +1704,7 @@ def _graphql_comment_raw(node: dict) -> dict:
         "path": node.get("path"),
         "line": node.get("line"),
         "original_line": node.get("originalLine"),
-        "side": node.get("diffSide"),
+        "side": side,
         "commit_id": commit.get("oid"),
         "in_reply_to_id": reply_to.get("databaseId"),
         "created_at": node.get("createdAt"),
@@ -1745,7 +1755,9 @@ def _add_thread_to_pending_review(
     if thread is None:
         raise _graphql_review_missing_payload("thread", resp_body)
     nodes = thread["comments"]["nodes"]
-    return _graphql_comment_raw(nodes[0])
+    # Ticket #257: `diffSide` lives on the thread, not the comment node —
+    # read it here, one level up from `nodes[0]`.
+    return _graphql_comment_raw(nodes[0], side=thread.get("diffSide"))
 
 
 def _reply_in_pending_review(
