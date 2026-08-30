@@ -1,0 +1,109 @@
+{
+  "_provenance": {
+    "source": "hand-assembled from GitHub's public GraphQL API reference documentation (https://docs.github.com/en/graphql/reference/objects and https://docs.github.com/en/graphql/reference/mutations) for the exact types the two review-comment mutations traverse -- NOT derived from `_ADD_REVIEW_THREAD_MUTATION` / `_ADD_REVIEW_COMMENT_REPLY_MUTATION` or from `_REVIEW_COMMENT_NODE_FIELDS` under test. That independence is the whole point: a snapshot built from the query under test could never disagree with it.",
+    "fallback_reason": "The ideal way to build this snapshot would be a live `gh api graphql` introspection call against GitHub's real schema. That was not possible in this development environment: the `gh` CLI is disabled outright by a local pre-tool-use hook ('The gh CLI is disabled. Use the project-issues MCP instead.'), so no `gh api graphql` call -- authenticated or not -- can run here. This is a sandbox limitation of the environment the fix was written in, not a contingency named anywhere in ticket #257's plan text -- the plan itself is silent on how the snapshot should be generated. Given that constraint, this snapshot was hand-assembled from GitHub's published public GraphQL schema documentation instead (see `source` above for the exact reference pages and the independence rationale).",
+    "date": "2026-08-30",
+    "types_covered": [
+      "Mutation",
+      "AddPullRequestReviewThreadPayload",
+      "AddPullRequestReviewCommentPayload",
+      "PullRequestReviewThread",
+      "PullRequestReviewCommentConnection",
+      "PullRequestReviewComment",
+      "Commit",
+      "Actor"
+    ],
+    "regenerate_with": "Once `gh` access is available: for each type name run `gh api graphql -f query='{ __type(name:\"TYPE_NAME\"){ fields{ name type{ name kind ofType{ name kind ofType{ name } } } } } }'`, unwrap any `NON_NULL`/`LIST` wrapper to the leaf type name for each field, and write `{fieldName: leafTypeName}` into this file's `types[TYPE_NAME]`."
+  },
+  "types": {
+    "Mutation": {
+      "addPullRequestReviewThread": "AddPullRequestReviewThreadPayload",
+      "addPullRequestReviewComment": "AddPullRequestReviewCommentPayload"
+    },
+    "AddPullRequestReviewThreadPayload": {
+      "clientMutationId": "String",
+      "thread": "PullRequestReviewThread"
+    },
+    "AddPullRequestReviewCommentPayload": {
+      "clientMutationId": "String",
+      "comment": "PullRequestReviewComment"
+    },
+    "PullRequestReviewThread": {
+      "comments": "PullRequestReviewCommentConnection",
+      "diffSide": "DiffSide",
+      "id": "ID",
+      "isCollapsed": "Boolean",
+      "isOutdated": "Boolean",
+      "isResolved": "Boolean",
+      "line": "Int",
+      "originalLine": "Int",
+      "originalStartLine": "Int",
+      "path": "String",
+      "pullRequest": "PullRequest",
+      "repository": "Repository",
+      "resolvedBy": "User",
+      "startDiffSide": "DiffSide",
+      "startLine": "Int",
+      "subjectType": "PullRequestReviewThreadSubjectType",
+      "viewerCanReply": "Boolean",
+      "viewerCanResolve": "Boolean",
+      "viewerCanUnresolve": "Boolean"
+    },
+    "PullRequestReviewCommentConnection": {
+      "edges": "PullRequestReviewCommentEdge",
+      "nodes": "PullRequestReviewComment",
+      "pageInfo": "PageInfo",
+      "totalCount": "Int"
+    },
+    "PullRequestReviewComment": {
+      "author": "Actor",
+      "authorAssociation": "CommentAuthorAssociation",
+      "body": "String",
+      "bodyHTML": "HTML",
+      "bodyText": "String",
+      "commit": "Commit",
+      "createdAt": "DateTime",
+      "databaseId": "Int",
+      "diffHunk": "String",
+      "draftedAt": "DateTime",
+      "editor": "Actor",
+      "id": "ID",
+      "isMinimized": "Boolean",
+      "line": "Int",
+      "minimizedReason": "String",
+      "originalCommit": "Commit",
+      "originalLine": "Int",
+      "outdated": "Boolean",
+      "path": "String",
+      "pullRequest": "PullRequest",
+      "pullRequestReview": "PullRequestReview",
+      "reactionGroups": "ReactionGroup",
+      "reactions": "ReactionConnection",
+      "replyTo": "PullRequestReviewComment",
+      "resourcePath": "URI",
+      "state": "PullRequestReviewCommentState",
+      "updatedAt": "DateTime",
+      "url": "URI",
+      "viewerCanDelete": "Boolean",
+      "viewerCanMinimize": "Boolean",
+      "viewerCanReact": "Boolean",
+      "viewerCanUpdate": "Boolean",
+      "viewerCannotUpdateReasons": "CommentCannotUpdateReason",
+      "viewerDidAuthor": "Boolean"
+    },
+    "Commit": {
+      "oid": "GitObjectID",
+      "id": "ID",
+      "message": "String",
+      "committedDate": "DateTime",
+      "author": "GitActor",
+      "url": "URI"
+    },
+    "Actor": {
+      "avatarUrl": "URI",
+      "login": "String",
+      "resourcePath": "URI",
+      "url": "URI"
+    }
+  }
+}

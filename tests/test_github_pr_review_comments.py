@@ -1506,22 +1506,44 @@ def test_reply_populates_author_timestamp_and_url_from_mutation_payload(
 
     Test-critic F1/F2 (ticket #253 dispatch): the query-shape check below
     asserts on the selection-set fragment itself (`"author{login}"` /
-    `"originalLine"` / `"diffSide"` / `"replyTo{databaseId}"` /
-    `"commit{oid}"`), not a bare `"line" in query` substring scan — `line`
-    already appears as a bare input-argument name (`line:$line` doesn't
-    apply to this mutation, but `diffSide`/`originalLine`/etc. as bare
-    words could still coincidentally match elsewhere, so the assertion
-    targets text that can only appear inside the selection set). The
-    mutation node's `path`/`diffSide`/`commit.oid`/`replyTo.databaseId`
-    are also deliberately set to values that DIFFER from the anchor
-    comment's (`path="src/foo.py"`, `side="RIGHT"`, `commit_id="abc123"`,
-    own id `8001`) — proving these come from the mutation payload, not
-    silently falling through to the anchor/call-param seed the way a
-    partial implementation (one that dropped these keys from
-    `_graphql_comment_raw`) would.
+    `"originalLine"` / `"replyTo{databaseId}"` / `"commit{oid}"`), not a
+    bare `"line" in query` substring scan — `line` already appears as a
+    bare input-argument name (`line:$line` doesn't apply to this
+    mutation, but `originalLine`/etc. as bare words could still
+    coincidentally match elsewhere, so the assertion targets text that
+    can only appear inside the selection set). The mutation node's
+    `path`/`commit.oid`/`replyTo.databaseId` are also deliberately set to
+    values that DIFFER from the anchor comment's (`path="src/foo.py"`,
+    `commit_id="abc123"`, own id `8001`) — proving these come from the
+    mutation payload, not silently falling through to the anchor/call-
+    param seed the way a partial implementation (one that dropped these
+    keys from `_graphql_comment_raw`) would.
+
+    Ticket #257: `diffSide` is a `PullRequestReviewThread` field, not a
+    `PullRequestReviewComment` one — GitHub rejects it on this mutation's
+    comment selection with a 400 (see
+    `tests/test_github_graphql_selection_sets.py` for the schema-grounded
+    proof). `addPullRequestReviewComment`'s response exposes no `thread`
+    at all, so the reply's `side` has no server-resolved source here; it
+    must keep coming from the anchor seed (`anchor_raw.get("side")`,
+    already wired at `github.py:5518`) via `_review_comment_result`'s
+    non-null merge — same as before ticket #253, no new fallback needed.
+    RED reason (today): the shared `_REVIEW_COMMENT_NODE_FIELDS` constant
+    still asks for `diffSide` on this mutation's comment node, so the
+    `"diffSide" not in query` assertion below fails immediately.
+
+    Test-critic round 1: the anchor comment is deliberately given
+    `side="LEFT"` here — the default call param (`add_pr_review_comment`'s
+    `side="RIGHT"`) and `_comment()`'s own fixture default are both
+    `"RIGHT"`, so if the anchor's side matched that default too, nothing
+    in this test could distinguish "side genuinely sourced from the
+    resolved anchor comment" from "side hard-coded/defaulted to RIGHT
+    regardless of the anchor". Making the anchor's side differ from that
+    shared default closes that gap: `result.side == "LEFT"` only passes
+    if the implementation actually reads `anchor_raw.get("side")`.
     """
     pending = _pending_review()
-    parent = _comment(8001, node_id="PARENT_NODE_8001")
+    parent = _comment(8001, node_id="PARENT_NODE_8001", side="LEFT")
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
@@ -1534,10 +1556,16 @@ def test_reply_populates_author_timestamp_and_url_from_mutation_payload(
             query = gql["query"]
             assert "addPullRequestReviewComment" in query
             for fragment in (
-                "author{login}", "originalLine", "diffSide",
+                "author{login}", "originalLine",
                 "replyTo{databaseId}", "commit{oid}", "createdAt", "updatedAt", "url",
             ):
                 assert fragment in query, f"mutation query missing {fragment!r}: {query}"
+            # #257: this mutation's payload has no `thread`, so it must
+            # never ask for `diffSide` at all — there is nowhere on
+            # `PullRequestReviewComment` for GitHub to resolve it from.
+            assert "diffSide" not in query, (
+                f"reply mutation must not select diffSide (thread-only field): {query}"
+            )
             return _json(
                 {
                     "data": {
@@ -1547,14 +1575,13 @@ def test_reply_populates_author_timestamp_and_url_from_mutation_payload(
                                 "author": {"login": "reviewer"},
                                 "body": "#ai-generated\n\nreply text",
                                 # Deliberately diverges from the anchor
-                                # comment's path/side/commit (all
-                                # "src/foo.py"/"RIGHT"/"abc123") and from
-                                # the anchor's own id (8001) — mutation
-                                # values must win, not the anchor seed.
+                                # comment's path/commit (both
+                                # "src/foo.py"/"abc123") and from the
+                                # anchor's own id (8001) — mutation values
+                                # must win, not the anchor seed.
                                 "path": "src/mutation-path.py",
                                 "line": 10,
                                 "originalLine": 10,
-                                "diffSide": "LEFT",
                                 "commit": {"oid": "mutation-sha"},
                                 "replyTo": {"databaseId": 9999},
                                 "createdAt": "2024-03-03T00:00:00Z",
@@ -1580,6 +1607,11 @@ def test_reply_populates_author_timestamp_and_url_from_mutation_payload(
     # Mutation payload wins over the anchor/call-param seed (test-critic F2).
     assert result.path == "src/mutation-path.py"
     assert result.line == 10
+    # #257: no `diffSide` on this payload — side comes from the anchor
+    # comment's own side ("LEFT", deliberately non-default — see the
+    # test-critic note above), not the mutation (there is nothing to
+    # read from the mutation for it) and not the call/fixture default
+    # ("RIGHT").
     assert result.side == "LEFT"
     assert result.commit_sha == "mutation-sha"
     assert result.in_reply_to == "9999"
@@ -1609,10 +1641,33 @@ def test_new_thread_populates_author_timestamp_and_url_from_mutation_payload(
     Test-critic F1/F2 (ticket #253 dispatch): the query-shape check
     targets the selection-set fragment itself, not a bare `"line" in
     query` scan (see the reply test's docstring for why). The mutation
-    node's `path`/`diffSide`/`commit.oid` also deliberately DIFFER from
-    the caller's own params (`path="src/bar.py"`, `side="RIGHT"`,
-    `commit_sha="abc123"`), proving the mutation payload — not the
-    call-param seed — is what the result reflects.
+    node's `path`/`commit.oid` also deliberately DIFFER from the caller's
+    own params (`path="src/bar.py"`, `commit_sha="abc123"`), proving the
+    mutation payload — not the call-param seed — is what the result
+    reflects.
+
+    Ticket #257: `diffSide` is a `PullRequestReviewThread` field, not a
+    `PullRequestReviewComment` one (see
+    `tests/test_github_graphql_selection_sets.py` for the schema-grounded
+    proof) — `addPullRequestReviewThread`'s response DOES expose a
+    `thread`, so the fix selects `diffSide` one level up
+    (`thread{diffSide comments(...)}}`) instead of on the comment node.
+    The mock below nests `diffSide` there; the query-shape check below
+    only asserts on the real, already-imported production constant
+    (`github_mod._REVIEW_COMMENT_NODE_FIELDS`, the shared field list both
+    mutations build their comment-node selection from) rather than
+    re-deriving its own copy of "what the query should look like" — the
+    primary evidence for the fix is the observable `result.side` below.
+
+    RED reason (today): the shared `_REVIEW_COMMENT_NODE_FIELDS` constant
+    still includes `diffSide` in the comment node's own field list, so
+    the `assert "diffSide" not in github_mod._REVIEW_COMMENT_NODE_FIELDS`
+    check below fails immediately, before the mutation is even sent.
+    Independently (would also fail after that first assertion is fixed):
+    `_graphql_comment_raw` reads `"side": node.get("diffSide")` off the
+    *comment* node, which no longer carries it in this mock → `result.side`
+    would fall back to the caller's requested `"RIGHT"` instead of the
+    thread's `"LEFT"`.
     """
     pending = _pending_review()
 
@@ -1625,15 +1680,29 @@ def test_new_thread_populates_author_timestamp_and_url_from_mutation_payload(
             query = gql["query"]
             assert "addPullRequestReviewThread" in query
             for fragment in (
-                "author{login}", "originalLine", "diffSide",
+                "author{login}", "originalLine",
                 "replyTo{databaseId}", "commit{oid}", "createdAt", "updatedAt", "url",
             ):
                 assert fragment in query, f"mutation query missing {fragment!r}: {query}"
+            # #257: `diffSide` must be requested on `PullRequestReviewThread`
+            # (one level up from the comment node), never on the comment
+            # node's own field set — grounded in the production constant
+            # itself, not a re-derived query-string guess.
+            assert "diffSide" not in github_mod._REVIEW_COMMENT_NODE_FIELDS, (
+                "diffSide must not be part of the shared comment-node field "
+                f"list: {github_mod._REVIEW_COMMENT_NODE_FIELDS!r}"
+            )
+            assert "thread{diffSide" in query, (
+                f"thread mutation must select diffSide on the thread itself: {query}"
+            )
             return _json(
                 {
                     "data": {
                         "addPullRequestReviewThread": {
                             "thread": {
+                                # #257: diffSide now lives here, one level
+                                # up from the comment node.
+                                "diffSide": "LEFT",
                                 "comments": {
                                     "nodes": [
                                         {
@@ -1642,15 +1711,13 @@ def test_new_thread_populates_author_timestamp_and_url_from_mutation_payload(
                                             "body": "#ai-generated\n\nsecond nit",
                                             # Deliberately diverges from
                                             # the caller's own
-                                            # path/side/commit_sha params
-                                            # ("src/bar.py"/"RIGHT"/
-                                            # "abc123") — mutation values
-                                            # must win, not the call-param
-                                            # seed.
+                                            # path/commit_sha params
+                                            # ("src/bar.py"/"abc123") —
+                                            # mutation values must win,
+                                            # not the call-param seed.
                                             "path": "src/mutation-bar.py",
                                             "line": 20,
                                             "originalLine": 20,
-                                            "diffSide": "LEFT",
                                             "commit": {"oid": "mutation-thread-sha"},
                                             "replyTo": None,
                                             "createdAt": "2024-03-03T00:00:00Z",
@@ -1727,7 +1794,9 @@ def test_reply_populates_empty_author_when_mutation_author_is_null(
                                 "path": "src/foo.py",
                                 "line": 10,
                                 "originalLine": 10,
-                                "diffSide": "RIGHT",
+                                # #257: reply mutation payload never carries
+                                # diffSide (thread-only field, no thread is
+                                # exposed here) — omitted, not just null.
                                 "commit": {"oid": "abc123"},
                                 "replyTo": {"databaseId": 8002},
                                 "createdAt": "2024-03-03T00:00:00Z",
@@ -1784,7 +1853,10 @@ def test_new_thread_mutation_resolved_line_wins_over_requested_no_confirmation(
                                             "databaseId": 9005,
                                             "line": 2,
                                             "originalLine": 2,
-                                            "diffSide": "RIGHT",
+                                            # #257: diffSide lives on the
+                                            # thread, not the comment node
+                                            # — omitted here since this test
+                                            # doesn't exercise side at all.
                                         }
                                     ]
                                 }
@@ -1815,19 +1887,29 @@ def test_new_thread_mutation_resolved_line_wins_over_requested_no_confirmation(
     )
 
 
-def test_new_thread_mutation_null_line_falls_back_to_requested(
+def test_new_thread_mutation_null_line_and_null_diffside_fall_back_to_requested(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """R1(c), second half: a mutation response with `line: null` (server
     didn't resolve it) must fall back to the caller's requested `line`,
     exactly like the confirmation-read path already does.
 
-    Note: this assertion already passes today (both before and after the
-    fix, `line` ends up `1` either way — today via the synthesized
-    fallback after the swallowed confirmation miss, post-fix via the
-    non-null merge rule on a null mutation field) — recorded here as
-    edge-case coverage for the merge contract, not as a RED-producing
-    driving test.
+    Renamed from `..._null_line_falls_back_to_requested` (ticket #257
+    plan-critic note): the field now also under test is `thread.diffSide:
+    null` — nested under `thread` (a `PullRequestReviewThread` field,
+    ticket #257's whole point), not on the comment node — which must
+    fall back to the caller's requested `side` via the same non-null
+    merge rule as `line`. The comment node itself carries no `diffSide`
+    key at all, matching the field's real, fixed location on the wire.
+
+    Note: both assertions already pass today, before AND after the #257
+    fix — `line` because of the synthesized fallback after the swallowed
+    confirmation miss (today) / the non-null merge on a null mutation
+    field (post-fix); `side` because `_graphql_comment_raw` never reads
+    the (unread, pre-fix) thread-level value regardless, so it already
+    falls back to the caller's requested `"RIGHT"` through the existing
+    merge. Recorded here as edge-case coverage for the merge contract,
+    not as a RED-producing driving test.
     """
     pending = _pending_review()
 
@@ -1841,13 +1923,16 @@ def test_new_thread_mutation_null_line_falls_back_to_requested(
                     "data": {
                         "addPullRequestReviewThread": {
                             "thread": {
+                                # #257: diffSide lives here, one level up
+                                # from the comment node — null means the
+                                # server didn't resolve it.
+                                "diffSide": None,
                                 "comments": {
                                     "nodes": [
                                         {
                                             "databaseId": 9006,
                                             "line": None,
                                             "originalLine": None,
-                                            "diffSide": None,
                                         }
                                     ]
                                 }
