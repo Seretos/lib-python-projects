@@ -23,6 +23,7 @@ import pytest
 from lib_python_projects import ProjectConfig
 from lib_python_projects.providers import github as github_mod
 from lib_python_projects.providers.github import GitHubError, GitHubProvider
+from lib_python_projects.templates import validate_ticket_body
 
 
 def _project(path: str = "acme/widgets") -> ProjectConfig:
@@ -406,3 +407,76 @@ def test_list_issue_templates_auth_and_server_errors_propagate(
     with pytest.raises(GitHubError) as exc:
         GitHubProvider().list_issue_templates(_project(), "tok")
     assert exc.value.status == status
+
+
+# ---------- ticket #262: required_sections on a markdown-kind template -----
+#
+# `IssueTemplate.required_sections` doesn't exist yet -- every test below is
+# expected to fail with `AttributeError: 'IssueTemplate' object has no
+# attribute 'required_sections'` until phase=implement adds the property.
+
+DOC_MD_TEXT = (
+    "---\n"
+    "name: Doc Template\n"
+    'title: "[Doc]: "\n'
+    "labels: [\"docs\"]\n"
+    "---\n"
+    "## Setup\n"
+    "\n"
+    "Do X.\n"
+    "\n"
+    "### Details\n"
+    "\n"
+    "More info.\n"
+    "\n"
+    "```\n"
+    "## Not A Real Heading\n"
+    "```\n"
+    "\n"
+    "## Usage\n"
+    "\n"
+    "Do Y.\n"
+)
+
+
+def _doc_handler(req: httpx.Request) -> httpx.Response:
+    path = req.url.path
+    if path.endswith(f"/contents/{_DIR_PATH}"):
+        return _json([_dir_entry("doc.md", f"{_DIR_PATH}/doc.md")])
+    if path.endswith(f"{_DIR_PATH}/doc.md"):
+        return _content_response(DOC_MD_TEXT)
+    raise AssertionError(f"unexpected request: {req.method} {path}")
+
+
+def test_md_template_required_sections_match_validator_headings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`required_sections` for a `kind="markdown"` template must list exactly
+    the headings `validate_ticket_body` enforces, in document order -- no
+    heading literal is asserted directly, only structural consistency with
+    the validator (the same shared enumeration, per the plan)."""
+    _install_mock(monkeypatch, _doc_handler)
+    result = GitHubProvider().list_issue_templates(_project(), "tok")
+    assert len(result) == 1
+    tmpl = result[0]
+
+    sections = tmpl.required_sections
+    assert sections  # non-vacuity guard
+
+    violations = validate_ticket_body("plain prose, no headings anywhere", tmpl)
+    assert [v.field_label for v in violations] == sections
+    assert all(v.reason == "heading-missing" for v in violations)
+
+    satisfying_body = "\n\n".join(f"## {label}\n\nContent for {label}." for label in sections)
+    assert validate_ticket_body(satisfying_body, tmpl) == []
+
+
+def test_md_template_with_no_headings_has_empty_required_sections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_mock(monkeypatch, _standard_handler)
+    result = GitHubProvider().list_issue_templates(_project(), "tok")
+    note = {t.filename: t for t in result}["note.md"]
+
+    assert note.required_sections == []
+    assert validate_ticket_body("anything at all", note) == []

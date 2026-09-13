@@ -642,6 +642,68 @@ def test_helper_measurement_ticket_20_missing_acceptance_and_prior_attempts():
     }
 
 
+# ---------- ticket #262: structured, ordered `required_sections` accessor --
+#
+# `IssueTemplate.required_sections` doesn't exist yet -- every test below is
+# expected to fail with `AttributeError: 'IssueTemplate' object has no
+# attribute 'required_sections'` until phase=implement adds the property.
+
+
+def test_required_sections_matches_validator_for_form_template_mixing_field_types():
+    """`kind="form"`: `required_sections` must list exactly the required,
+    non-markdown fields' labels, in field order -- matching what
+    `validate_ticket_body` actually enforces against an empty body."""
+    tmpl = IssueTemplate(
+        name="t", filename="t.yml", kind="form",
+        fields=[
+            # required=True but type="markdown" -- must be excluded from
+            # both lists (markdown fields are never checked, plan requirement).
+            _field("Notes", type="markdown", required=True),
+            _field("Acceptance", type="textarea", required=True),
+            # optional -- must be excluded from both lists.
+            _field("Background", type="textarea", required=False),
+            _field("Priority", type="dropdown", required=True, options=["Low", "High"]),
+            _field(
+                "Confirmation", type="checkboxes", required=True,
+                options=["I have read the contributing guidelines", "This is not a duplicate"],
+            ),
+        ],
+    )
+    violations = templates.validate_ticket_body("", tmpl)
+    assert tmpl.required_sections == [v.field_label for v in violations]
+    assert "Notes" not in tmpl.required_sections, "required markdown-type field must be excluded"
+    assert "Background" not in tmpl.required_sections, "optional field must be excluded"
+
+
+def test_required_sections_empty_for_workitem_kind():
+    """`kind="workitem"`: `validate_ticket_body` always short-circuits to
+    `[]` (Azure DevOps work-item templates have no validation teeth), so
+    `required_sections` must also be `[]` even though the one field here is
+    `required=True` -- same shape as
+    test_workitem_kind_always_returns_no_violations above."""
+    tmpl = IssueTemplate(
+        name="Bug (Azure)", filename="", kind="workitem",
+        fields=[_field("Repro Steps", required=True, type="textarea")],
+    )
+    assert tmpl.required_sections == []
+    assert tmpl.required_sections == [v.field_label for v in templates.validate_ticket_body("", tmpl)]
+
+
+def test_required_sections_dedupes_repeated_markdown_heading():
+    """A `raw_body` repeating one heading must yield ONE listed section (not
+    one per occurrence) and, correspondingly, exactly one `heading-missing`
+    violation for that label when the body omits it entirely."""
+    tmpl = IssueTemplate(
+        name="Doc Template", filename="doc.md", kind="markdown",
+        raw_body="## Setup\n\nDo X.\n\n## Setup\n\nDo X again.\n\n## Usage\n\nDo Y.\n",
+    )
+    sections = tmpl.required_sections
+    assert len(sections) == len(set(sections)), "a repeated heading must be listed once, not per occurrence"
+
+    violations = templates.validate_ticket_body("no headings here at all", tmpl)
+    assert [v.field_label for v in violations] == sections
+
+
 def test_helper_measurement_ticket_25_clean_after_heading_rename():
     """Ticket #25's real body, after renaming/normalising its '##' headings
     to bug.yml's exact '### <label>' fields, validates clean."""

@@ -429,6 +429,28 @@ inputs) are never checked.
   required-ness the way GitHub forms do, so there's no validation teeth
   here yet.
 
+### `IssueTemplate.required_sections`
+
+A computed, read-only property listing the section labels a template
+actually requires, in order — the same labels `validate_ticket_body` would
+report as `"missing"`/`"heading-missing"` against an empty/heading-free
+body, so discovery code (e.g. a `list_ticket_templates` MCP tool) can show
+a template's required sections without re-parsing anything itself:
+
+```python
+template.required_sections
+# e.g. ["Summary", "Steps to Reproduce", "Expected Behavior"]
+```
+
+- **`kind="form"`**: the labels of fields that are `required=True` and not
+  `type="markdown"` (markdown-type fields are never checked — see above),
+  in field order.
+- **`kind="markdown"`**: every `##`/`###` heading in the template's
+  `raw_body`, in document order, de-duplicated (a heading repeated in the
+  template is listed once).
+- **`kind="workitem"`**: always `[]`, matching `validate_ticket_body`'s
+  unconditional `[]` for this kind.
+
 ### Known limitation: multi-select dropdowns
 
 GitHub issue-form dropdowns support `attributes.multiple: true`, letting a
