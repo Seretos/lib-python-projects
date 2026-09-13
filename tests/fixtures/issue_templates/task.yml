@@ -1,0 +1,44 @@
+name: Task
+title: "[Task]: "
+labels: ["task"]
+body:
+  - type: markdown
+    id: intro
+    attributes:
+      value: |
+        Thanks for filing a task! Please fill out the sections below.
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One-line summary of the task.
+      placeholder: ex. Update the deploy script
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Any extra context (optional).
+      placeholder: Add extra context here
+    validations:
+      required: false
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - Low
+        - Medium
+        - High
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have read the contributing guidelines
+          required: true
+        - label: This is not a duplicate
+          required: false

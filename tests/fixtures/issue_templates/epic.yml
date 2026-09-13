@@ -1,0 +1,42 @@
+name: Epic
+title: "[Epic]: "
+labels: ["epic"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please fill out the sections below to define this epic.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What outcome does this epic deliver?
+      placeholder: Describe the goal
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What's explicitly out of scope (optional)?
+      placeholder: Describe the scope
+    validations:
+      required: false
+  - type: checkboxes
+    id: risks
+    attributes:
+      label: Risks acknowledged
+      options:
+        - label: Reviewed by architecture
+          required: false
+  - type: dropdown
+    id: quarter
+    attributes:
+      label: Target Quarter
+      options:
+        - Q1
+        - Q2
+        - Q3
+        - Q4
+    validations:
+      required: false

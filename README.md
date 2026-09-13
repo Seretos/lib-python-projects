@@ -60,7 +60,12 @@ from lib_python_projects.providers.base import (
     now_utc,
     # PR diff discovery (ticket #240):
     PRFileDiff, DiffHunkRange, PRDiffProvider, parse_diff_hunk_ranges,
+    # Issue-template discovery (ticket #259):
+    IssueTemplate, TemplateField, TemplateViolation, IssueTemplateProvider,
 )
+
+# Provider-free issue-template validation/rendering (ticket #259):
+from lib_python_projects.templates import validate_ticket_body, render_skeleton
 ```
 
 ## Board support
@@ -342,6 +347,114 @@ no runs, ...) — it answers "is there CI at all," not "why no runs."
 `wait_for_run` never triggers this probe on any poll iteration — it polls
 through an internal unprobed helper, so a repeated `trigger_pipeline`
 wait loop doesn't pay for a CI-configuration check on every empty poll.
+
+## Reading issue templates & validating ticket bodies (ticket #259)
+
+`create_ticket` writes straight to the provider API — it never goes through
+a project's web-UI issue templates (GitHub issue forms, GitLab issue
+templates, Azure DevOps work-item templates), so nothing enforces that a
+ticket filed by an agent actually satisfies them. Two pieces close that
+gap: the `IssueTemplateProvider` mixin (read the templates) and the
+provider-free `lib_python_projects.templates` module (validate/render
+against them).
+
+### `IssueTemplateProvider`
+
+All three providers implement `list_issue_templates(project, token) ->
+list[IssueTemplate]`:
+
+```python
+from lib_python_projects.providers.github import GitHubProvider
+
+provider = GitHubProvider()
+templates = provider.list_issue_templates(project, token)
+# [] when the project has no templates configured at all.
+```
+
+| Provider | Source | `IssueTemplate.kind` |
+|---|---|---|
+| GitHub | `.github/ISSUE_TEMPLATE/*.yml`/`*.yaml` (issue forms) and `*.md` (legacy templates); `config.yml` is excluded | `"form"` for YAML forms, `"markdown"` for `.md` templates |
+| GitLab | `GET /projects/:id/templates/issues` | `"markdown"` always — GitLab issue templates are plain markdown, no field structure |
+| Azure DevOps | `GET .../_apis/wit/templates` for the project's default work-item type (resolved via `_default_work_item_type`, never hardcoded) | `"workitem"` always |
+
+Only a definitive "no templates" signal (404, empty listing) folds to
+`[]`; authentication failures (401/403) and server errors (5xx) propagate
+as the provider's native error type, mirroring `CIConfigurationProvider`'s
+contract above.
+
+### The `### <label>` section convention
+
+This is **GitHub's own** issue-form rendering, not a convention this
+library invented: when a contributor fills out a GitHub issue form, each
+field's answer is rendered into the issue body as a `### <label>` markdown
+heading followed by the answer (see GitHub's docs on ["Syntax for issue
+forms"](https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/syntax-for-issue-forms)).
+`lib_python_projects.templates` reuses that exact convention as the
+contract a submitted ticket body is checked against:
+
+```python
+from lib_python_projects import templates
+
+violations = templates.validate_ticket_body(ticket.body, template)
+# [] means the body satisfies every required field.
+for v in violations:
+    print(v.field_label, v.reason, "->", v.expected)
+
+skeleton = templates.render_skeleton(template)
+# a fillable "### <label>" skeleton — description/placeholder/dropdown
+# options rendered as HTML comments, checkboxes as real "- [ ] option"
+# lines, ready to hand to a human or an agent to fill in before
+# create_ticket.
+```
+
+`validate_ticket_body` mirrors GitHub's own form-submission semantics: a
+required field with no matching heading is `"missing"`; a heading present
+but empty (or left at GitHub's `_No response_` sentinel, after stripping
+HTML comments) is `"empty"`; content equal to the field's placeholder text
+is `"placeholder"`; an invalid dropdown selection is `"invalid-option"`;
+required checkboxes with nothing checked is `"no-option-checked"`.
+`type="markdown"` form fields (section headers/instructions, not real
+inputs) are never checked.
+
+### Markdown and work-item templates get lighter checks
+
+- **`kind="markdown"`** (GitLab templates, GitHub `.md` templates): there
+  are no fields to validate field-by-field, so `validate_ticket_body`
+  falls back to **heading-presence checking only** — every `##`/`###`
+  heading in the template's own body must appear as a heading line
+  (not merely mentioned in prose) in the submitted body, reported as
+  `reason="heading-missing"`.
+- **`kind="workitem"`** (Azure DevOps): `validate_ticket_body` always
+  returns `[]` — Azure work-item templates don't expose per-field
+  required-ness the way GitHub forms do, so there's no validation teeth
+  here yet.
+
+### Known limitation: multi-select dropdowns
+
+GitHub issue-form dropdowns support `attributes.multiple: true`, letting a
+contributor pick more than one option (GitHub renders the submitted answer
+as a comma-separated list in that case). `list_issue_templates`/
+`validate_ticket_body` don't parse or validate against `multiple` yet — a
+`dropdown` field is always treated as single-select, so a multi-select
+dropdown's rendered comma-separated answer will fail the `invalid-option`
+membership check even when every selected item is a real option. This is a
+deliberate, documented scope cut (not silent breakage): no crash, just a
+known gap to close in a follow-up ticket if multi-select dropdowns turn up
+in practice.
+
+### Known limitation: Azure DevOps `default_team` fallback
+
+Azure DevOps's `list_issue_templates` resolves the team-scoped URL via
+`_team_scope(project)`, which falls back to the project name when
+`ProjectConfig.default_team` is unset — this matches Azure DevOps's own
+convention and is usually correct. But if a project's default team was
+renamed away from the project name, that fallback produces a team-scoped
+URL that 404s, and `list_issue_templates`'s existing "404 means no
+templates" handling folds that straight into `[]` — indistinguishable from
+a project that genuinely has no templates. Set `default_team` explicitly on
+the project config whenever the project's default team isn't named after
+the project itself, or `list_issue_templates` will silently return `[]`
+instead of the real templates.
 
 ## Usage
 
