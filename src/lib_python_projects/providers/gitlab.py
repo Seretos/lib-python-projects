@@ -54,6 +54,8 @@ from lib_python_projects.providers.base import (
     DiscoveredProject,
     FailingJob,
     FieldSpec,
+    IssueTemplate,
+    IssueTemplateProvider,
     Label,
     _HUNK_HEADER_RE,
     normalize_timestamp,
@@ -2291,6 +2293,49 @@ def _fetch_gitlab_ci_config(
     )
 
 
+# ---------- issue-template discovery (ticket #259) --------------------------
+
+
+def _list_issue_templates(
+    client: httpx.Client, project_path: str,
+) -> list[IssueTemplate]:
+    """List every project-level issue description template.
+
+    `GET /projects/{id}/templates/issues` returns the listing (each entry
+    a `{"key", "name"}` pair); `GET .../templates/issues/{key}` returns
+    the template's own markdown `content`. Only 404 (or an empty listing)
+    folds to `[]`; other non-2xx responses propagate via `_check`.
+    """
+    r = client.get(f"/projects/{project_path}/templates/issues")
+    if r.status_code == 404:
+        return []
+    _check(r)
+    entries = r.json() or []
+    templates: list[IssueTemplate] = []
+    for entry in entries:
+        key = entry.get("key") or entry.get("name") or ""
+        if not key:
+            continue
+        detail_r = client.get(
+            f"/projects/{project_path}/templates/issues/{quote(key, safe='')}"
+        )
+        _check(detail_r)
+        payload = detail_r.json() or {}
+        name = payload.get("name") or key
+        templates.append(
+            IssueTemplate(
+                name=name,
+                filename=name,
+                title_prefix="",
+                labels=[],
+                kind="markdown",
+                fields=[],
+                raw_body=payload.get("content") or "",
+            )
+        )
+    return templates
+
+
 def _list_workflows(
     client: httpx.Client,
     project_path: str,
@@ -2466,6 +2511,7 @@ class GitLabProvider(
     ViewerIdentityProvider,
     CIConfigurationProvider,
     PRDiffProvider,
+    IssueTemplateProvider,
 ):
     """GitLab REST v4 provider.
 
@@ -4851,6 +4897,22 @@ class GitLabProvider(
         path = _project_path(project)
         with _client(project, token) as client:
             return bool(_list_workflows(client, path))
+
+    # ---------- issue-template discovery (ticket #259, IssueTemplateProvider) -
+
+    def list_issue_templates(
+        self, project: ProjectConfig, token: str | None
+    ) -> list[IssueTemplate]:
+        """List every project-level issue description template.
+
+        GitLab issue templates are plain markdown (no field/form
+        structure), so every result is `kind="markdown"`. 404 or an
+        empty listing folds to `[]`; 401/403/5xx propagate as
+        `GitLabError`.
+        """
+        path = _project_path(project)
+        with _client(project, token) as client:
+            return _list_issue_templates(client, path)
 
     # ---------- pipelines / CI runs ------------------------------------------
 

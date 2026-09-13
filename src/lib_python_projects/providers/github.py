@@ -1,6 +1,7 @@
 """GitHub provider — REST v3 implementation."""
 from __future__ import annotations
 
+import base64
 import dataclasses
 import logging
 import os
@@ -8,8 +9,10 @@ import posixpath
 import re
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
+from ruamel.yaml import YAML
 
 from lib_python_projects.models import ProjectConfig
 from lib_python_projects.markers import (
@@ -33,6 +36,8 @@ from lib_python_projects.providers.base import (
     FailingJob,
     FailureAnnotation,
     FieldSpec,
+    IssueTemplate,
+    IssueTemplateProvider,
     Label,
     normalize_timestamp,
     now_utc,
@@ -61,6 +66,7 @@ from lib_python_projects.providers.base import (
     ReviewState,
     Status,
     StatusSpec,
+    TemplateField,
     Ticket,
     TicketFilters,
     TokenCapabilities,
@@ -3270,6 +3276,7 @@ class GitHubProvider(
     ViewerIdentityProvider,
     CIConfigurationProvider,
     PRDiffProvider,
+    IssueTemplateProvider,
 ):
     def probe_token_capabilities(
         self, project: ProjectConfig, token: str
@@ -6220,6 +6227,23 @@ class GitHubProvider(
         with _client(token) as client:
             return _has_workflows(client, project)
 
+    # ---------- issue-template discovery (ticket #259, IssueTemplateProvider) --
+
+    def list_issue_templates(
+        self, project: ProjectConfig, token: str | None
+    ) -> list[IssueTemplate]:
+        """List every web-UI issue template (`.yml`/`.yaml` form,
+        `.md` template) defined under `.github/ISSUE_TEMPLATE`.
+
+        `config.yml` (GitHub's chooser configuration, never itself a
+        template) is excluded by filename, its content is never even
+        fetched. A file that fails to parse or isn't template-shaped is
+        skipped the same way. 404 on the directory listing folds to
+        `[]`; 401/403/5xx propagate as `GitHubError`.
+        """
+        with _client(token) as client:
+            return _list_issue_templates(client, project)
+
     # ---------- pipelines / CI runs -----------------------------------------
 
     def list_runs_for_branch(
@@ -7129,6 +7153,216 @@ def _resolve_commit(
         return False
     _check(r)
     return True
+
+
+# ---------- issue-template discovery (ticket #259) --------------------------
+
+_ISSUE_TEMPLATE_DIR = ".github/ISSUE_TEMPLATE"
+
+# Lazily-shared safe YAML loader -- GitHub issue-form YAML and `.md`
+# template front matter are both trusted repository content, but `typ="safe"`
+# avoids executing arbitrary tags regardless.
+_yaml_safe = YAML(typ="safe")
+
+# `.md` template front matter: a leading `---` delimiter, the YAML block,
+# then a closing `---` delimiter. DOTALL so `.` spans the front-matter body;
+# lazy `(.*?)` so the *first* closing `---` line ends the front matter
+# rather than some later `---` appearing in the template's own body text.
+_FRONT_MATTER_RE = re.compile(r"^---[ \t]*\n(.*?)\n---[ \t]*\n?", re.DOTALL)
+
+
+def _list_issue_templates(
+    client: httpx.Client, project: ProjectConfig,
+) -> list[IssueTemplate]:
+    """List every web-UI issue template under `.github/ISSUE_TEMPLATE`.
+
+    Only 404 on the directory listing is treated as "no templates" and
+    returns ``[]`` (mirrors `_list_workflows`'s error contract above).
+    `config.yml` is excluded by filename -- its content is never fetched.
+    A `.yml`/`.yaml` file that isn't form-shaped, or a `.md` file with no
+    parseable front matter, is skipped the same way `config.yml` is.
+    """
+    r = client.get(f"{_repo_path(project)}/contents/{_ISSUE_TEMPLATE_DIR}")
+    if r.status_code == 404:
+        return []
+    _check(r)
+    entries = r.json() or []
+    templates: list[IssueTemplate] = []
+    for entry in entries:
+        name = entry.get("name") or ""
+        if name == "config.yml":
+            continue
+        lower = name.lower()
+        if lower.endswith((".yml", ".yaml")):
+            parser = _parse_github_form_template
+        elif lower.endswith(".md"):
+            parser = _parse_github_markdown_template
+        else:
+            continue
+        path = entry.get("path") or f"{_ISSUE_TEMPLATE_DIR}/{name}"
+        content_r = client.get(
+            f"{_repo_path(project)}/contents/{quote(path, safe='/')}"
+        )
+        _check(content_r)
+        text = _decode_github_content(content_r.json() or {})
+        tmpl = parser(name, text)
+        if tmpl is not None:
+            templates.append(tmpl)
+    return templates
+
+
+def _decode_github_content(payload: dict) -> str:
+    """Decode a GitHub contents-API payload's base64 body to text.
+
+    Normalizes CRLF (`\\r\\n`) line endings to bare `\\n` here, once, at the
+    single point every issue-template file's content passes through --
+    rather than loosening `_FRONT_MATTER_RE` itself. A `.md` template
+    committed with CRLF is perfectly valid; without this, `_FRONT_MATTER_RE`
+    (which matches a bare `\\n` immediately after/before each `---`
+    delimiter) never matches and the template is silently dropped, the same
+    as a genuinely unparseable file. `_yaml_safe.load` (the `.yml`/`.yaml`
+    form-template path, and the front-matter YAML block itself) tolerates
+    CRLF natively per the YAML spec's line-break folding, so it needs no
+    separate handling -- normalizing once here keeps both paths consistent
+    without relying on that tolerance for the regex-based `.md` path.
+    """
+    content = payload.get("content", "") or ""
+    return base64.b64decode(content).decode("utf-8").replace("\r\n", "\n")
+
+
+def _normalize_labels(value: object) -> list[str]:
+    """Normalize a template's `labels` YAML value into `list[str]`.
+
+    GitHub's own default-generated `.md` legacy templates write `labels` as
+    a bare scalar string (`labels: bug`), not a YAML sequence -- naive
+    `list(value)` would silently explode that into `['b', 'u', 'g']`. A
+    scalar string is split on `,` and each piece stripped (mirroring
+    GitHub's own comma-separated front-matter convention), dropping empty
+    pieces; a real sequence is coerced element-wise to `str`; `None`/absent
+    -> `[]`.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [piece.strip() for piece in value.split(",") if piece.strip()]
+    return [str(item) for item in value]
+
+
+def _parse_github_form_field(item: dict) -> TemplateField | None:
+    """Translate one `body[]` entry of a GitHub issue-form YAML into a
+    `TemplateField`, branching on `item["type"]` per the provider-native
+    schema (see each branch's comment for the field-shape source)."""
+    item_type = item.get("type")
+    if not item_type:
+        return None
+    attrs = item.get("attributes") or {}
+    field_id = str(item.get("id") or "")
+
+    if item_type == "checkboxes":
+        # No `validations` block exists in GitHub's checkboxes schema --
+        # each option is its own `{label, required}` mapping, and the
+        # field's own `required` is true iff *any* option requires it.
+        raw_options = [o for o in (attrs.get("options") or []) if isinstance(o, dict)]
+        options = [str(o.get("label", "")) for o in raw_options]
+        required = any(bool(o.get("required")) for o in raw_options)
+        label = str(attrs.get("label") or field_id or "Notes")
+        return TemplateField(
+            label=label, field_id=field_id, type="checkboxes", required=required,
+            options=options, description=attrs.get("description"),
+            placeholder=attrs.get("placeholder"),
+        )
+
+    if item_type == "dropdown":
+        # `attributes.multiple` (GitHub's multi-select dropdown flag) is a
+        # documented, deliberate scope cut -- see README "Known limitation:
+        # multi-select dropdowns". It is not read here, and `TemplateField`
+        # carries no slot for it: a multi-select dropdown's submitted
+        # comma-separated answer is still validated as single-select.
+        options = [str(o) for o in (attrs.get("options") or [])]
+        required = bool((item.get("validations") or {}).get("required", False))
+        label = str(attrs.get("label") or field_id or "Notes")
+        return TemplateField(
+            label=label, field_id=field_id, type="dropdown", required=required,
+            options=options, description=attrs.get("description"),
+            placeholder=attrs.get("placeholder"),
+        )
+
+    if item_type == "markdown":
+        # `markdown` fields have no `label` attribute -- fall back to the
+        # field's own `id`, then the literal string "Notes".
+        required = bool((item.get("validations") or {}).get("required", False))
+        label = str(attrs.get("label") or field_id or "Notes")
+        return TemplateField(
+            label=label, field_id=field_id, type="markdown", required=required,
+            options=None, description=attrs.get("value"),
+            placeholder=attrs.get("placeholder"),
+        )
+
+    # `input` / `textarea`
+    required = bool((item.get("validations") or {}).get("required", False))
+    label = str(attrs.get("label") or field_id or "Notes")
+    return TemplateField(
+        label=label, field_id=field_id, type=str(item_type), required=required,
+        options=None, description=attrs.get("description"),
+        placeholder=attrs.get("placeholder"),
+    )
+
+
+def _parse_github_form_template(filename: str, text: str) -> IssueTemplate | None:
+    """Parse a `.yml`/`.yaml` issue-form template. Returns `None` (skip,
+    same as `config.yml`) when the file doesn't parse as YAML or isn't
+    form-shaped (no top-level `body` list)."""
+    try:
+        data = _yaml_safe.load(text)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    body = data.get("body")
+    if not isinstance(body, list):
+        return None
+    fields: list[TemplateField] = []
+    for item in body:
+        if not isinstance(item, dict):
+            continue
+        field = _parse_github_form_field(item)
+        if field is not None:
+            fields.append(field)
+    return IssueTemplate(
+        name=str(data.get("name") or ""),
+        filename=filename,
+        title_prefix=str(data.get("title") or ""),
+        labels=_normalize_labels(data.get("labels")),
+        kind="form",
+        fields=fields,
+    )
+
+
+def _parse_github_markdown_template(filename: str, text: str) -> IssueTemplate | None:
+    """Parse a `.md` issue template's `---` front matter. Returns `None`
+    (skip) when the file has no parseable front matter block."""
+    m = _FRONT_MATTER_RE.match(text)
+    if not m:
+        return None
+    try:
+        front_matter = _yaml_safe.load(m.group(1))
+    except Exception:
+        return None
+    if front_matter is None:
+        front_matter = {}
+    if not isinstance(front_matter, dict):
+        return None
+    raw_body = text[m.end():]
+    name = str(front_matter.get("name") or posixpath.splitext(filename)[0])
+    return IssueTemplate(
+        name=name,
+        filename=filename,
+        title_prefix=str(front_matter.get("title") or ""),
+        labels=_normalize_labels(front_matter.get("labels")),
+        kind="markdown",
+        fields=[],
+        raw_body=raw_body,
+    )
 
 
 def _list_workflows(

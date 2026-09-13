@@ -62,6 +62,8 @@ from lib_python_projects.providers.base import (
     FailingJob,
     FailureAnnotation,
     FieldSpec,
+    IssueTemplate,
+    IssueTemplateProvider,
     Label,
     LabelOperationUnsupported,
     now_utc,
@@ -90,6 +92,7 @@ from lib_python_projects.providers.base import (
     ReviewState,
     Status,
     StatusSpec,
+    TemplateField,
     Ticket,
     TicketFilters,
     TokenCapabilities,
@@ -480,6 +483,22 @@ def _project_scope(project: ProjectConfig) -> str:
             f"path {project.path!r}",
         )
     return f"/{quote(org, safe='')}/{quote(proj, safe='')}"
+
+
+def _team_scope(project: ProjectConfig) -> str:
+    """Return the `/{org}/{project}/{team}` URL prefix used by team-bound
+    work-item endpoints (e.g. `.../{team}/_apis/wit/templates`).
+
+    `project.default_team` wins when set; otherwise falls back to the
+    project name itself, matching Azure DevOps's own convention that a
+    project's default team is named the same as the project when no team
+    was explicitly created/configured. `_project_scope` already validates
+    organization/project are present, so by the time `team` is read here
+    `project.ado_project` (the fallback) is guaranteed non-empty.
+    """
+    scope = _project_scope(project)
+    team = project.default_team or project.ado_project
+    return f"{scope}/{quote(team, safe='')}"
 
 
 def _is_ado_project_not_found_message(message: str) -> bool:
@@ -2103,6 +2122,7 @@ class AzureDevOpsProvider(
     ViewerIdentityProvider,
     CIConfigurationProvider,
     PRDiffProvider,
+    IssueTemplateProvider,
 ):
     """Azure DevOps provider.
 
@@ -5450,6 +5470,71 @@ class AzureDevOpsProvider(
         `bool(self.list_workflows(project, token))` in spirit.
         """
         return bool(self.list_workflows(project, token))
+
+    # ---------- issue-template discovery (ticket #259, IssueTemplateProvider) -
+
+    def list_issue_templates(
+        self, project: ProjectConfig, token: str | None
+    ) -> list[IssueTemplate]:
+        """List the work-item templates for the project's default
+        work-item type.
+
+        The work-item type is resolved via `_default_work_item_type`
+        (never hardcoded) so this reflects whichever type
+        `create_ticket` would actually use.
+
+        The real Azure DevOps work-item-templates API is **team-scoped**,
+        not project-scoped: `GET .../{team}/_apis/wit/templates` (see
+        `_team_scope`). Its list response is also shallow — each entry
+        carries only `id`/`name`/`workItemTypeName`/`url`, no `fields`
+        mapping (confirmed against Microsoft's REST API docs, "Work Item
+        Templates - List", `azure-devops-rest-7.1`) — so a second, per-
+        template call, `GET .../{team}/_apis/wit/templates/{templateId}`
+        ("Work Item Templates - Get"), is needed to fetch each template's
+        full body including its `fields` mapping.
+
+        404 on the list call folds to `[]`; 401/403/5xx propagate as
+        `AzureDevOpsError`, from either call. Fields carry no
+        `required=True` teeth yet (see `templates.validate_ticket_body`'s
+        `kind="workitem"` short-circuit) -- Azure work-item templates
+        don't expose per-field required-ness the way GitHub forms do.
+        """
+        wi_type = self._default_work_item_type(project, token)
+        team_path = f"{_team_scope(project)}/_apis/wit/templates"
+        with _client(project, token) as c:
+            resp = c.get(team_path, params=_api_version_params({"workitemtypename": wi_type}))
+            if resp.status_code == 404:
+                return []
+            _check(resp)
+            entries = (resp.json() or {}).get("value") or []
+            templates: list[IssueTemplate] = []
+            for entry in entries:
+                template_id = entry.get("id")
+                detail_resp = c.get(
+                    f"{team_path}/{quote(str(template_id), safe='')}",
+                    params=_api_version_params(),
+                )
+                _check(detail_resp)
+                detail = detail_resp.json() or {}
+                fields = detail.get("fields") or {}
+                template_fields = [
+                    TemplateField(
+                        label=ref, field_id=ref, type="textarea", required=False,
+                        description=None,
+                    )
+                    for ref in fields.keys()
+                ]
+                templates.append(
+                    IssueTemplate(
+                        name=detail.get("name") or entry.get("name") or "",
+                        filename="",
+                        title_prefix="",
+                        labels=[],
+                        kind="workitem",
+                        fields=template_fields,
+                    )
+                )
+        return templates
 
     # ---------- pipelines -------------------------------------------------
 

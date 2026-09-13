@@ -2558,6 +2558,30 @@ def test_all_providers_expose_ci_configuration_methods():
             )
 
 
+def test_all_providers_expose_issue_template_methods():
+    """All three providers must expose `list_issue_templates` as a callable
+    with the shared `(project, token)` signature -- the `IssueTemplateProvider`
+    marker contract from `providers/base.py` (ticket #259), mirroring
+    `test_all_providers_expose_ci_configuration_methods` above."""
+    import inspect
+
+    from lib_python_projects.providers.base import IssueTemplateProvider
+
+    for provider_cls in _provider_classes():
+        assert issubclass(provider_cls, IssueTemplateProvider), (
+            f"{provider_cls.__name__} must implement IssueTemplateProvider"
+        )
+        assert callable(getattr(provider_cls, "list_issue_templates", None)), (
+            f"{provider_cls.__name__}.list_issue_templates must be callable"
+        )
+        sig = inspect.signature(getattr(provider_cls, "list_issue_templates"))
+        params = list(sig.parameters)
+        assert params[:3] == ["self", "project", "token"], (
+            f"{provider_cls.__name__}.list_issue_templates must be "
+            f"(self, project, token), got {params}"
+        )
+
+
 @pytest.mark.parametrize("provider_name,make_provider,make_project,install_mock", [
     (
         "github",

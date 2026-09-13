@@ -1,0 +1,28 @@
+name: Bug Report
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the problem context (optional background).
+      placeholder: What's the background?
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: What must be true for this to be considered fixed?
+      placeholder: Describe the acceptance criteria
+    validations:
+      required: true
+  - type: textarea
+    id: prior-attempts
+    attributes:
+      label: Prior attempts
+      description: What has already been tried?
+      placeholder: Describe prior attempts
+    validations:
+      required: true

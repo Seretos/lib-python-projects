@@ -475,6 +475,14 @@ class ProjectConfig(BaseModel):
     # default once per project (Issue → Bug → User Story → Product
     # Backlog Item → Requirement). Ignored by github/gitlab.
     default_work_item_type: str | None = None
+    # Azure DevOps only (ticket #259 round 3). The team used to scope
+    # team-bound work-item endpoints (currently just
+    # `list_issue_templates`'s `.../{team}/_apis/wit/templates`). When
+    # unset, the provider falls back to the project name itself — Azure
+    # DevOps's own convention: a project's default team is named the same
+    # as the project when no team was explicitly created/configured.
+    # Ignored by github/gitlab.
+    default_team: str | None = None
     # Azure DevOps only (ticket #172). Scopes work-item read/write paths
     # (list_tickets, list_labels, create_ticket) to a `System.AreaPath`
     # sub-tree, so two wrapper `ProjectConfig`s that share the same

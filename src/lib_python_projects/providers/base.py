@@ -5,6 +5,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
 
+# Re-exported so provider modules (and their callers) can import the
+# issue-template shapes from `providers.base` alongside every other
+# provider-facing dataclass, without `templates.py` importing anything
+# from `providers/` in return (one-way dependency, ticket #259).
+from lib_python_projects.templates import IssueTemplate, TemplateField, TemplateViolation
+
 
 _TIMESTAMP_FRACTION_RE = re.compile(
     r"(?P<base>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.\d+"
@@ -1849,4 +1855,32 @@ class TokenProjectDiscoveryProvider:
     def discover_projects(
         self, token: str, *, limit: int
     ) -> ProjectDiscoveryResult:
+        raise NotImplementedError
+
+
+# ---------- issue-template discovery (ticket #259) --------------------------
+
+
+class IssueTemplateProvider:
+    """Mixin/interface: providers that can read a project's web-UI issue
+    templates implement this method.
+
+    `list_issue_templates` returns `[]` when the project has no issue
+    templates configured (or the template store 404s) — never raises for
+    that case. Authentication failures (401/403) and server errors (5xx)
+    propagate as the provider's native error type
+    (`GitHubError`/`GitLabError`/`AzureDevOpsError`), mirroring
+    `CIConfigurationProvider`'s error contract above.
+
+    `IssueTemplate`/`TemplateField`/`TemplateViolation` (and
+    `validate_ticket_body`/`render_skeleton`) live in the provider-free
+    `lib_python_projects.templates` module and are re-exported here so
+    callers can import everything issue-template-related from
+    `providers.base` — `templates.py` itself never imports from
+    `providers/`.
+    """
+
+    def list_issue_templates(
+        self, project, token: str | None
+    ) -> list[IssueTemplate]:
         raise NotImplementedError
