@@ -81,6 +81,31 @@ class IssueTemplate:
     fields: list[TemplateField] = field(default_factory=list)
     raw_body: str = ""
 
+    @property
+    def required_sections(self) -> list[str]:
+        """The section labels this template actually requires, in document/
+        field order -- structurally the same set `validate_ticket_body`
+        enforces (see module docstring), derived independently from
+        `raw_body`/`fields` rather than by calling the validator itself:
+
+        - `kind="markdown"`: the headings in `raw_body`, via the same
+          `_markdown_headings` helper `_validate_markdown` uses for its
+          template side, so a repeated heading is listed once, in document
+          order.
+        - `kind="form"`: the labels of fields that are `required=True` and
+          not `type="markdown"`, in field order -- `_validate_form` never
+          checks a markdown-type field, so including one here would break
+          parity with the validator.
+        - `kind="workitem"`: always `[]` -- `validate_ticket_body`
+          short-circuits to `[]` for this kind (no validation teeth exist
+          yet for Azure DevOps work-item templates).
+        """
+        if self.kind == "markdown":
+            return _markdown_headings(self.raw_body)
+        if self.kind == "workitem":
+            return []
+        return [f.label for f in self.fields if f.required and f.type != "markdown"]
+
 
 @dataclass
 class TemplateViolation:
@@ -316,6 +341,26 @@ def _validate_form(body: str, template: IssueTemplate) -> list[TemplateViolation
     return violations
 
 
+def _markdown_headings(text: str) -> list[str]:
+    """Return the `##`/`###` heading labels present in `text`, in document
+    order, de-duplicated (first occurrence wins). Shared by
+    `_validate_markdown` (the template side; the body side wraps this in
+    `set()`) and by `IssueTemplate.required_sections`, so both stay
+    structurally in sync -- a repeated heading yields one violation and one
+    listed section, never one per occurrence. Matched against a
+    fenced-code-block-masked copy (see `_mask_fenced_code_blocks`) so a
+    heading-shaped line inside a code fence is never mistaken for a real
+    heading."""
+    seen: set[str] = set()
+    headings: list[str] = []
+    for m in _MARKDOWN_HEADING_RE.finditer(_mask_fenced_code_blocks(text)):
+        label = m.group(1).strip()
+        if label not in seen:
+            seen.add(label)
+            headings.append(label)
+    return headings
+
+
 def _validate_markdown(body: str, template: IssueTemplate) -> list[TemplateViolation]:
     """`kind="markdown"` validation: every `##`/`###` heading present in
     the template's `raw_body` must also appear as a line-anchored heading
@@ -323,14 +368,11 @@ def _validate_markdown(body: str, template: IssueTemplate) -> list[TemplateViola
     count. Both sides are matched against a fenced-code-block-masked copy
     (see `_mask_fenced_code_blocks`) so a heading-shaped line inside a code
     fence in either the template or the submitted body is never mistaken
-    for a real heading."""
-    template_headings = [
-        m.group(1).strip()
-        for m in _MARKDOWN_HEADING_RE.finditer(_mask_fenced_code_blocks(template.raw_body))
-    ]
-    body_headings = {
-        m.group(1).strip() for m in _MARKDOWN_HEADING_RE.finditer(_mask_fenced_code_blocks(body))
-    }
+    for a real heading. Template-side headings are de-duplicated (see
+    `_markdown_headings`), so a heading repeated in the template yields one
+    violation, not one per occurrence."""
+    template_headings = _markdown_headings(template.raw_body)
+    body_headings = set(_markdown_headings(body))
     violations: list[TemplateViolation] = []
     for label in template_headings:
         if label not in body_headings:
