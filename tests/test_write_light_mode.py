@@ -449,6 +449,44 @@ def test_merge_pr_light_request_budget_gitlab(monkeypatch: pytest.MonkeyPatch) -
     assert not any("/approvals" in r.url.path or "/notes" in r.url.path for r in seen)
 
 
+def test_merge_pr_light_gitlab_merge_response_not_yet_merged_gives_merged_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """test-critic MINOR F5: the budget test above is the only GitLab
+    merge case in the suite, and its fixture is always an already-merged
+    MR -- an implementation that hand-builds the ref with a hardcoded
+    `merged=True` on any 2xx PUT /merge response would pass it silently.
+    GitLab's merge endpoint genuinely can return 200 without the MR
+    having merged yet (e.g. `merge_when_pipeline_succeeds=true`: the
+    request is accepted but `state` stays `opened` and `merged_at` is
+    unset until the pipeline completes). Feeding exactly that response
+    shape forces `merged` to be read from `_map_mr`'s real
+    `state == "merged" or merged_at` logic rather than hardcoded."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "PUT" and path.endswith("/merge"):
+            return _json(_gl_mr_payload(
+                5, state="opened", merged_at=None,
+            ))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    seen = _install_gitlab_mock(monkeypatch, handler)
+    pr = GitLabProvider().merge_pr(_gl_project(), "t", "5", light=True)
+
+    assert len(seen) == 1
+    assert isinstance(pr, PullRequestRef)
+    assert pr.merged is False, (
+        "merged must come from _map_mr's real state == 'merged' check, "
+        "not a hardcoded True on any 2xx merge-PUT response"
+    )
+    assert pr.state == "open", (
+        "state must come from _map_mr's own state normalisation "
+        "(_normalise_gl_state('opened') == 'open'), not the raw 'opened' "
+        "value nor a value derived from `merged`"
+    )
+
+
 def test_merge_pr_light_request_budget_azuredevops(monkeypatch: pytest.MonkeyPatch) -> None:
     """ADO light: handshake GET (needed to build the completion PATCH's
     `lastMergeSourceCommit`) + completion PATCH + one status GET when the
@@ -464,9 +502,19 @@ def test_merge_pr_light_request_budget_azuredevops(monkeypatch: pytest.MonkeyPat
             poll["n"] += 1
             if poll["n"] == 1:
                 return _json(_ado_pr_payload(7, status="active", mergeStatus="notSet"))
-            return _json(_ado_pr_payload(7, status="completed", mergeStatus="succeeded"))
+            # Distinguishing commitId (test-critic MAJOR F1): differs from
+            # the still-unsettled PATCH response's below, so `head_sha`
+            # can only match if the ref is sourced from THIS settled
+            # status read, not the unsettled PATCH response.
+            return _json(_ado_pr_payload(
+                7, status="completed", mergeStatus="succeeded",
+                lastMergeSourceCommit={"commitId": "status-commit"},
+            ))
         if req.method == "PATCH" and path.endswith("/pullrequests/7"):
-            return _json(_ado_pr_payload(7, status="active", mergeStatus="queued"))
+            return _json(_ado_pr_payload(
+                7, status="active", mergeStatus="queued",
+                lastMergeSourceCommit={"commitId": "patch-commit"},
+            ))
         raise AssertionError(f"unexpected {req.method} {path}")
 
     seen = _install_ado_mock(monkeypatch, handler)
@@ -488,6 +536,22 @@ def test_merge_pr_light_request_budget_azuredevops(monkeypatch: pytest.MonkeyPat
     # exercise genuinely different response shapes.
     assert pr.merged is True
     assert pr.state == "merged"
+    # test-critic MAJOR F1: R1 names all six ADO light-merge ref fields
+    # explicitly (id/number/url/state/head_sha set, mergeable_state
+    # None) -- only merged/state were asserted before this round, so a
+    # ref built as `PullRequestRef(state="merged", merged=True)` with
+    # every other field left at its dataclass default would have passed
+    # silently. Assert the rest against the real payload.
+    assert pr.id == "7"
+    assert pr.number == 7
+    assert pr.url == azure_mod._build_pr_url(_ado_project(), "7")
+    assert pr.head_sha == "status-commit", (
+        "head_sha must be sourced from the settled status GET's own "
+        "response, not the still-unsettled PATCH response ('patch-commit')"
+    )
+    assert pr.mergeable_state is None, (
+        "ADO never populates mergeable_state on the light merge ref"
+    )
     assert not any(
         any(s in r.url.path for s in ("/threads", "/labels")) for r in seen
     )
@@ -724,11 +788,18 @@ def test_merge_pr_light_github_merged_key_absent_gives_none(
 # =============================================================================
 
 
-def test_update_ticket_light_column_move_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_update_ticket_light_column_move_with_label_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A `custom_fields` column-move write on a not-yet-ai-labelled ticket
     still gets the `ai-modified` label added (and PATCHed) under light --
     only the post-write REST poll (`_reget_issue`) and the Projects-v2
-    `projectItems` read-back are skipped."""
+    `projectItems` read-back are skipped. (Renamed from
+    `..._column_move_budget` to match the plan's own R2 driving-test
+    name -- this is the labels-CHANGED outcome (a); the labels-UNCHANGED
+    headline case (b) is a separate test below, since forcing a label
+    change here means this test alone can never exercise the no-PATCH
+    board-only path -- test-critic MAJOR F2.)"""
     board = _gh_board(owner="acme-org", project_number=7, status_field="Status")
     project = _gh_project(board)
     get_count = {"n": 0}
@@ -822,6 +893,193 @@ def test_update_ticket_light_column_move_budget(monkeypatch: pytest.MonkeyPatch)
     assert ref.url == "https://github.com/acme/backend/issues/42?patched=1", (
         "url must be populated from the PATCH response on the "
         "labels-changed path, not left None (test-critic MAJOR)"
+    )
+
+
+def test_update_ticket_light_column_move_no_label_change_board_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2's headline case (test-critic MAJOR F2): a `custom_fields`-only
+    column move where labels are UNCHANGED (the issue already carries
+    `ai-modified`, so the label-sync adds nothing) issues NO PATCH at
+    all. `url`/`status`/`labels`/`updated_at` must come from the *board
+    mutation's own* widened response -- not `None`, not the pre-write
+    GET -- proving the widened selection set (`_ISSUE_CONTENT_FIELDS`)
+    is actually threaded through `_write_custom_fields_to_board`/
+    `_update_project_v2_item_field_value` and mapped via
+    `_map_graphql_issue_content`, not just plumbed for the
+    labels-changed/PATCH path exercised above."""
+    board = _gh_board(owner="acme-org", project_number=7, status_field="Status")
+    project = _gh_project(board)
+    get_count = {"n": 0}
+
+    def _boom(_seconds: float) -> None:
+        raise AssertionError("light update_ticket must not poll via _reget_sleep")
+
+    monkeypatch.setattr(github_mod, "_reget_sleep", _boom)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            get_count["n"] += 1
+            # Already carries ai-modified -> label sync writes nothing,
+            # so (with only custom_fields passed) no PATCH is issued.
+            # Distinguishing values that must NOT leak into the ref --
+            # that's the pre-write-read leak this design forbids.
+            return _json(_gh_issue_payload(
+                42, labels=[{"name": "ai-modified"}],
+                html_url="https://github.com/acme/backend/issues/42?prewrite=1",
+                updated_at="2020-01-01T00:00:00Z",
+            ))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            raise AssertionError(
+                "no PATCH must be issued -- labels are unchanged and only "
+                "custom_fields was written"
+            )
+        if path == "/graphql":
+            body = json.loads(req.content.decode("utf-8"))
+            query = body["query"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-9"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                # The widened selection set: the mutation's OWN response
+                # carries the issue's content -- url/status/labels/
+                # updated_at must be sourced from THIS, not re-read.
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {
+                            "projectV2Item": {
+                                "id": "item-9",
+                                "content": {
+                                    "__typename": "Issue",
+                                    "number": 42,
+                                    "title": "Test issue",
+                                    "body": "issue body",
+                                    "state": "OPEN",
+                                    "stateReason": None,
+                                    "url": "https://github.com/acme/backend/issues/42?mutated=1",
+                                    "updatedAt": "2026-06-07T08:09:10Z",
+                                    "labels": {"nodes": [{"name": "ai-modified"}]},
+                                },
+                            },
+                        },
+                    },
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _gh_owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _gh_owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    seen = _install_github_mock(monkeypatch, handler)
+    ref = GitHubProvider().update_ticket(
+        project, "t", "42", custom_fields={"Status": "Done"}, light=True,
+    )
+
+    assert get_count["n"] == 1, "exactly one pre-write issue GET, no re-GET"
+    graphql_queries = [
+        json.loads(r.content.decode("utf-8"))["query"]
+        for r in seen if r.url.path == "/graphql"
+    ]
+    assert any(
+        "updateProjectV2ItemFieldValue" in q for q in graphql_queries
+    ), "the board mutation must actually be issued"
+    assert isinstance(ref, TicketRef)
+    assert ref.id == "42"
+    assert ref.url == "https://github.com/acme/backend/issues/42?mutated=1", (
+        "url must come from the board mutation's OWN response, not None "
+        "and not the pre-write GET's ?prewrite=1"
+    )
+    assert ref.status == "open", (
+        "status must be mapped from the mutation response's own "
+        "state/stateReason via _map_graphql_issue_content, not left None"
+    )
+    assert ref.labels == ["ai-modified"], (
+        "labels must come from the mutation response's own content, not "
+        "the pre-write GET"
+    )
+    assert ref.updated_at == "2026-06-07T08:09:10Z", (
+        "updated_at must come from the mutation response, not the "
+        "pre-write GET's 2020-01-01 value"
+    )
+    assert ref.custom_fields == {"Status": "Done"}
+
+
+def test_update_ticket_light_column_move_mutation_without_content_gives_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 outcome (b'): the SAME custom_fields-only, no-label-change call
+    as above, except the board mutation's response carries no `content`
+    field at all -- today's actual fixture shape
+    (`tests/test_github_board.py:1155` etc., `{"projectV2Item": {"id": ...}}`).
+    `url`/`status`/`labels`/`updated_at` must fall back to `None` (AC4),
+    with no extra request issued to make up for the missing data
+    (test-critic MAJOR F2)."""
+    board = _gh_board(owner="acme-org", project_number=7, status_field="Status")
+    project = _gh_project(board)
+    get_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            get_count["n"] += 1
+            return _json(_gh_issue_payload(42, labels=[{"name": "ai-modified"}]))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            raise AssertionError(
+                "no PATCH must be issued -- labels are unchanged and only "
+                "custom_fields was written"
+            )
+        if path == "/graphql":
+            body = json.loads(req.content.decode("utf-8"))
+            query = body["query"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-9"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                # Today's actual fixture shape -- no `content` key at all.
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "item-9"}},
+                    },
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _gh_owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _gh_owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    seen = _install_github_mock(monkeypatch, handler)
+    ref = GitHubProvider().update_ticket(
+        project, "t", "42", custom_fields={"Status": "Done"}, light=True,
+    )
+
+    assert get_count["n"] == 1, "no extra request to compensate for the missing content"
+    assert isinstance(ref, TicketRef)
+    assert ref.id == "42"
+    assert ref.url is None
+    assert ref.status is None
+    assert ref.labels is None
+    assert ref.updated_at is None
+    assert ref.custom_fields == {"Status": "Done"}, (
+        "custom_fields reports what THIS call wrote even when the "
+        "content-less fallback applies to the other four fields"
     )
 
 
@@ -982,6 +1240,95 @@ def test_update_ticket_light_azuredevops_same_request_count_as_full(
     assert ref.updated_at == "2026-03-04T05:06:07Z", (
         "ref must be built from the PATCH response, not an empty shell"
     )
+
+
+def test_update_ticket_light_gitlab_custom_fields_only_what_was_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """test-critic MAJOR F3: `update_ticket`'s custom_fields report was
+    entirely untested for GitLab/ADO -- the plan's own named test was
+    absent. GitLab's `update_ticket` has no `custom_fields` dict
+    parameter at all (only `milestone=`/`labels_add`/`labels_remove`,
+    unlike `create_ticket`) -- so a light ref must never fabricate a
+    `custom_fields` mapping out of a labels/milestone change made
+    through this call's own dedicated params. "Only what was actually
+    applied [as custom_fields]" is satisfied here by staying `None`,
+    never by echoing `labels_add` or `milestone` as if they were a
+    `custom_fields` write."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_gl_issue_payload(42, labels=["ai-generated"]))
+        if req.method == "PUT" and path.endswith("/issues/42"):
+            body = json.loads(req.content.decode("utf-8"))
+            assert body.get("add_labels") == "bug"
+            return _json(_gl_issue_payload(42, labels=["ai-generated", "bug"]))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    seen = _install_gitlab_mock(monkeypatch, handler)
+    ref = GitLabProvider().update_ticket(
+        _gl_project(), "t", "42", labels_add=["bug"], light=True,
+    )
+
+    assert len(seen) == 2
+    assert isinstance(ref, TicketRef)
+    assert ref.labels == ["ai-generated", "bug"], (
+        "labels themselves are still populated normally from the PUT response"
+    )
+    assert ref.custom_fields is None, (
+        "GitLab's update_ticket has no custom_fields dict parameter -- a "
+        "light ref must not fabricate custom_fields from a labels_add/"
+        "milestone= write (test-critic MAJOR F3)"
+    )
+
+
+def test_update_ticket_light_azuredevops_custom_fields_only_what_was_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """test-critic MAJOR F3: unlike GitLab, ADO's `update_ticket` DOES
+    accept `custom_fields` and unconditionally PATCHes every field ref
+    it's given (`azuredevops.py:3463-3464` -- no alias/canonical
+    rewriting on the UPDATE path, unlike `create_ticket`'s
+    `WorkItemType` handling). The light ref's `custom_fields` must echo
+    exactly what was PATCHed, and stay `None` on a call that wrote no
+    custom_fields at all -- both cases were entirely untested before
+    this round."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/50"):
+            return _json(_ado_work_item_payload(50))
+        if req.method == "PATCH" and path.endswith("/workitems/50"):
+            body = json.loads(req.content.decode("utf-8"))
+            assert any(
+                op.get("path") == "/fields/Custom.Priority" and op.get("value") == "High"
+                for op in body
+            ), "the custom field ref must actually be PATCHed"
+            return _json(_ado_work_item_payload(50, **{"Custom.Priority": "High"}))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    seen = _install_ado_mock(monkeypatch, handler)
+    ref = AzureDevOpsProvider().update_ticket(
+        _ado_project(), "t", "50", custom_fields={"Custom.Priority": "High"}, light=True,
+    )
+    assert len(seen) == 2
+    assert isinstance(ref, TicketRef)
+    assert ref.custom_fields == {"Custom.Priority": "High"}
+
+    def handler_no_fields(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/51"):
+            return _json(_ado_work_item_payload(51))
+        if req.method == "PATCH" and path.endswith("/workitems/51"):
+            return _json(_ado_work_item_payload(51, **{"System.Title": "renamed"}))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    _install_ado_mock(monkeypatch, handler_no_fields)
+    ref_without_fields = AzureDevOpsProvider().update_ticket(
+        _ado_project(), "t", "51", title="renamed", light=True,
+    )
+    assert ref_without_fields.custom_fields is None
 
 
 # =============================================================================
@@ -1653,6 +2000,48 @@ def test_create_ticket_light_custom_fields_written_vs_none_azuredevops(
         _ado_project(), "t", title="hi2", body="b", labels=[], assignees=[], light=True,
     )
     assert ref_without_fields.custom_fields is None
+
+
+def test_create_ticket_light_azuredevops_custom_fields_alias_not_echoed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """test-critic MAJOR F3: the written-vs-none test above only ever
+    passes fully-canonical keys, so `ref.custom_fields = dict(custom_fields)`
+    (a verbatim echo of the raw argument) would pass it trivially. ADO's
+    `create_ticket` also consumes the `WorkItemType` alias
+    (`azuredevops.py:3234-3307`) to pick the work-item type -- it is
+    popped from `custom_fields` BEFORE the field-PATCH loop and never
+    becomes a field op. A light ref that echoes the raw argument would
+    incorrectly report `WorkItemType` as an applied custom field; the
+    real ref must report only the keys actually PATCHed."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/workitems/$Bug"):
+            body = json.loads(req.content.decode("utf-8"))
+            assert not any(op.get("path") == "/fields/WorkItemType" for op in body), (
+                "the WorkItemType alias must never be PATCHed as a field"
+            )
+            assert any(
+                op.get("path") == "/fields/Custom.Priority" and op.get("value") == "High"
+                for op in body
+            )
+            return _json(
+                _ado_work_item_payload(32, **{"Custom.Priority": "High"}), status_code=201,
+            )
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    seen = _install_ado_mock(monkeypatch, handler)
+    ref = AzureDevOpsProvider().create_ticket(
+        _ado_project(), "t", title="hi", body="b", labels=[], assignees=[],
+        custom_fields={"WorkItemType": "Bug", "Custom.Priority": "High"}, light=True,
+    )
+    assert len(seen) == 1
+    assert ref.custom_fields == {"Custom.Priority": "High"}, (
+        "the WorkItemType alias was consumed to select the work-item type, "
+        "not PATCHed as a field -- it must not appear in ref.custom_fields, "
+        "which a raw-argument echo would fail to exclude"
+    )
 
 
 # ---------- R4 idempotency sub-cases (GitHub, representative surface) -------

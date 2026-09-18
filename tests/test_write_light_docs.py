@@ -16,6 +16,75 @@ containing the two required literal tokens, and (create methods only) a
 None of the 18 docstrings carry this block today (no docstring mentions
 `light` at all), so every assertion here is expected RED until
 phase=implement documents each method in this exact format.
+
+WHAT THIS FILE CAN AND CANNOT PROVE (test-critic CRITICAL F4, round 5+1
+-- read before trusting any single assertion below as behavioural
+evidence):
+
+  - `test_light_block_parses_and_matches_ref_dataclass`'s class-name-vs-
+    `inspect.signature(...).return_annotation` check and its Returns:/
+    None: == `dataclasses.fields(ref_type)` coverage check ARE tied to
+    real code -- they fail for a docstring naming a class the signature
+    doesn't return, or omitting/duplicating a real ref field. Likewise
+    `test_light_block_field_partition_matches_the_plan` pins the EXACT
+    per-(provider, method) Returns:/None: split against the plan's own
+    field lists, so a docstring that mis-classifies a field (e.g. GitHub
+    merge_pr's `state` claimed as populated) fails.
+  - The `Source:` "no reload"/"pre-cascade" substring checks, the
+    `Labels:` "still applied"/"none applied by this call" phrase checks,
+    and the `Replay:` "no"/"reload"/"mixed" phrase checks are, by
+    themselves, bare presence-of-words checks on prose -- pasting the
+    required tokens into a docstring satisfies them regardless of
+    whether the light path genuinely reloads, sleeps, polls, or
+    fabricates a custom_fields mapping. They do NOT re-prove the
+    underlying behaviour; that would overclaim what a prose-content
+    check can demonstrate. The genuine behavioural proof for each of
+    these claims lives in `tests/test_write_light_mode.py`'s R1-R4
+    driving tests instead, and this file's job is only to confirm the
+    DOCUMENTATION says the same thing the tests already prove true, so
+    the two can't silently drift apart:
+      * "no reload" (zero requests after the last write, on every one of
+        the 18 methods) -- proven by the R1-R4 request-budget / exact-
+        method-sequence assertions (`len(seen) == N`, `[r.method for r
+        in seen] == [...]`), each paired with a handler that raises
+        `AssertionError` on any unexpected request, so an unaccounted-
+        for reload fails the *behavioural* test, not this one.
+      * "labels still applied" on `update_ticket`'s light column-move
+        outcome (Q1 -> (a)) -- proven by
+        `test_update_ticket_light_column_move_with_label_change`'s
+        assertion that `"ai-modified"` is present in the actual PATCH
+        request BODY sent (not just echoed by the mocked response).
+      * "none applied by this call" on `add_comment`/`merge_pr` -- these
+        two methods never accept or write labels at all, light or not;
+        this is a pre-existing, pre-#265 invariant already covered by
+        the existing (non-light) suite, not new behaviour this ticket
+        introduces, so there is no NEW R1-R4 assertion to pair it with.
+      * the `Replay:` "mixed" mixed-light rule -- proven by
+        `test_create_ticket_light_false_retry_of_light_true_reloads_full_model`
+        (the `light=False` retry of a `light=True`-created key reloads
+        once and returns a full `Ticket`) and the two
+        `idempotent_replay` tests alongside it.
+      * the `pre-cascade` caveat (a board-write's returned `status` may
+        predate a board->issue-state automation cascade) is a narrative
+        disclosure about eventual consistency with no observable effect
+        against a mocked transport -- there is no behavioural test to
+        pair it with, and none is possible; it is intentionally a
+        documentation-only claim.
+    Per-provider/method `Labels:` content beyond the two phrases above
+    (i.e. `create_ticket`/`create_pr`/`update_pr`'s own label-touching
+    outcomes) is checked here only for non-emptiness, not for specific
+    wording -- their "labels are still written" claim is exercised
+    behaviourally by R4's create/update-pr tests (e.g.
+    `test_create_and_update_light_refs_github`'s `ai-generated`/`bug`
+    label writes), so no additional wording constraint was added here
+    to avoid re-manufacturing the same tautology this note is warning
+    against.
+  - `_assert_has_light_bool_parameter` (keyword-only, default `False`)
+    and the `Returns:`/`None:` field-coverage checks above are the parts
+    of this file doing real work; the prose-content checks exist only to
+    keep the docstrings honest about a truth proven elsewhere, and
+    should be read as such -- not as additional independent proof of
+    behaviour.
 """
 from __future__ import annotations
 
@@ -306,6 +375,15 @@ def test_light_block_parses_and_matches_ref_dataclass(
         "None: -- each field belongs in exactly one"
     )
 
+    # NOTE (test-critic CRITICAL F4, see module docstring): the two
+    # checks below are DOCUMENTATION-PRESENCE checks, not behavioural
+    # proof -- pasting the two tokens into a docstring satisfies them
+    # regardless of whether the light path actually avoids a reload.
+    # The genuine "no reload" behaviour is proven by
+    # tests/test_write_light_mode.py's R1-R4 request-budget/exact-
+    # sequence assertions; "pre-cascade" is an eventual-consistency
+    # narrative caveat with no observable counterpart against a mocked
+    # transport, so it has no behavioural test to pair with by design.
     source_lower = parsed["Source"].lower()
     assert "no reload" in source_lower, (
         f"{provider_cls.__name__}.{method_name}'s Source: line must "
@@ -316,6 +394,12 @@ def test_light_block_parses_and_matches_ref_dataclass(
         "contain the literal substring 'pre-cascade'"
     )
 
+    # Non-emptiness only here (documentation-presence, not behaviour) --
+    # the two methods with a fixed required phrase get their own
+    # dedicated tests below; the three label-writing create/update
+    # methods' "labels are still written" claim is proven behaviourally
+    # by R4's create_ticket/create_pr/update_pr tests in
+    # test_write_light_mode.py, not re-asserted here by wording.
     assert parsed["Labels"], (
         f"{provider_cls.__name__}.{method_name}'s Labels: line must not be empty"
     )
@@ -365,6 +449,11 @@ def test_light_block_field_partition_matches_the_plan(
 
 @pytest.mark.parametrize("provider_cls", PROVIDERS, ids=lambda c: c.__name__)
 def test_update_ticket_labels_line_documents_still_applied(provider_cls: type) -> None:
+    """Documentation-presence check only (test-critic CRITICAL F4, see
+    module docstring) -- the underlying TRUTH that labels are still
+    applied/PATCHed on a light column move is proven behaviourally by
+    `test_update_ticket_light_column_move_with_label_change`'s assertion
+    on the real PATCH request body, not by this wording check."""
     doc = _doc(provider_cls, "update_ticket")
     block = _light_block(doc, provider_cls, "update_ticket")
     labels_line = _parse_block(block)["Labels"].lower()
@@ -391,6 +480,12 @@ def test_update_ticket_labels_line_documents_still_applied(provider_cls: type) -
 def test_no_label_methods_use_the_literal_none_applied_phrase(
     provider_cls: type, method_name: str,
 ) -> None:
+    """Documentation-presence check only (test-critic CRITICAL F4, see
+    module docstring) -- `add_comment`/`merge_pr` never touching labels
+    is a pre-#265 invariant of the existing (non-light) suite, not new
+    behaviour this ticket introduces, so there is no new R1-R4 test to
+    pair this wording check with; it exists to keep the docstring
+    honest, not to prove the invariant itself."""
     doc = _doc(provider_cls, method_name)
     block = _light_block(doc, provider_cls, method_name)
     labels_line = _parse_block(block)["Labels"].lower()
@@ -416,7 +511,14 @@ def test_create_methods_replay_line_documents_both_directions(
     request; a `light=False` retry of that SAME key reloads once and
     returns the full model. Checked against the dedicated `Replay:` line
     -- no proximity scanning needed now that the block format gives the
-    rule its own labelled line."""
+    rule its own labelled line.
+
+    Documentation-presence check only (test-critic CRITICAL F4, see
+    module docstring) -- the underlying mixed-light replay RULE is
+    proven behaviourally by
+    `test_create_ticket_light_false_retry_of_light_true_reloads_full_model`
+    and the two `idempotent_replay` tests beside it, not by this
+    wording check."""
     doc = _doc(provider_cls, method_name)
     block = _light_block(doc, provider_cls, method_name)
     replay_line = _parse_block(block)
@@ -472,7 +574,15 @@ def test_azuredevops_merge_pr_documents_unsettled_outcome_and_handshake_get() ->
     earlier draft of the behavioural test) asserted the docstring must
     name "the 202 'merge in progress' outcome", which described the
     FULL-object path's behaviour, not light's; corrected here to match
-    the plan's own stated design (see change report)."""
+    the plan's own stated design (see change report).
+
+    Documentation-presence check only (test-critic CRITICAL F4, see
+    module docstring) -- the underlying still-unsettled-gives-None
+    behaviour is proven by
+    `test_merge_pr_light_azuredevops_still_unsettled_gives_merged_none`,
+    and the handshake GET's role is proven by the request-sequence
+    assertions in the ADO merge budget tests (`[GET, PATCH, ...]`), not
+    by this wording check."""
     doc = _doc(AzureDevOpsProvider, "merge_pr")
     block = _light_block(doc, AzureDevOpsProvider, "merge_pr")
     parsed = _parse_block(block)
