@@ -590,6 +590,15 @@ def test_merge_pr_light_azuredevops_two_requests_when_patch_settles(
 
     assert [r.method for r in seen] == ["GET", "PATCH"]
     assert pr.merged is True
+    # test-critic round-4 tautology::F7 (MAJOR): only `pr.state` in the
+    # settled 3-request budget test above was ever asserted, so a ref
+    # whose `state` is the hardcoded literal "merged" on every light
+    # merge -- including the still-unsettled case below, where it must
+    # NOT be "merged" -- passed silently. Pin it here too: the PATCH
+    # response settles as status="completed"/mergeStatus="succeeded", so
+    # `_map_pr` must map it to "merged" from the real payload, not a
+    # constant.
+    assert pr.state == "merged"
 
 
 def test_merge_pr_light_azuredevops_still_unsettled_gives_merged_none(
@@ -632,6 +641,20 @@ def test_merge_pr_light_azuredevops_still_unsettled_gives_merged_none(
         "merged=None (AC4), never _map_pr's misleading merged=False and "
         "never a raised AzureDevOpsError(202) -- that's the full-object "
         "poll's behaviour, not light's"
+    )
+    # test-critic round-4 tautology::F7 (MAJOR): R1 names `state` among
+    # the ADO light-merge ref fields that must be set, but no test in
+    # this file asserted it on the unsettled outcome -- so a ref whose
+    # `state` is hardcoded to the literal "merged" on every light merge
+    # (an incoherent `state="merged", merged=None` combination) passed
+    # the whole batch silently. Both status/PATCH payloads here carry
+    # status="active" (still unsettled), which `_map_pr` maps to "open"
+    # -- assert that real mapped value, not a constant.
+    assert pr.state == "open", (
+        "state must come from _map_pr's real status mapping "
+        "(status='active' -> 'open') on the still-unsettled payload, "
+        "not a hardcoded 'merged' that ignores whether the merge "
+        "actually settled"
     )
     assert [r.method for r in seen] == ["GET", "PATCH", "GET"]
 
@@ -1712,7 +1735,21 @@ def test_update_pr_light_github_all_stages_no_trailing_gets(
     `node_id`: `r0` and the PATCH response are given deliberately
     different `node_id`s, so the GraphQL draft-toggle mutation's `id`
     variable can only match the PATCH response's if `current` (not `r0`)
-    was actually threaded through."""
+    was actually threaded through.
+
+    test-critic round-4 tautology::F8 (MAJOR): `requested_reviewers`
+    used to be `[]` on BOTH `r0` and the PATCH response, so the reviewer
+    stage's input was indistinguishable -- a light path that kept
+    reading `r0["requested_reviewers"]` (stale) instead of
+    `current`'s (fresh) would compute the identical add-set and the
+    reviewers POST body was never inspected, so nothing in the batch
+    would have noticed. Fixed the same way as `node_id` above: give
+    `r0` and the PATCH response deliberately DIFFERENT non-empty
+    `requested_reviewers` (stale 'dave' vs. fresh 'erin'), request BOTH
+    'erin' (already-requested per the fresh/correct source) and 'carol'
+    (genuinely new), and assert the actual POST body -- a stale-read
+    implementation would see 'erin' as not-yet-requested (since only
+    'dave' is in the stale set) and incorrectly re-request it."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
@@ -1720,16 +1757,28 @@ def test_update_pr_light_github_all_stages_no_trailing_gets(
             return _json(_gh_pr_payload(
                 11, labels=[{"name": "ai-generated"}], draft=False,
                 node_id="pr-node-11-STALE",
+                requested_reviewers=[{"login": "dave"}],
             ))
         if req.method == "PATCH" and path.endswith("/pulls/11"):
             return _json(_gh_pr_payload(
                 11, title="new title", labels=[{"name": "ai-generated"}],
                 draft=False, node_id="pr-node-11-fresh",
+                requested_reviewers=[{"login": "erin"}],
             ))
         if req.method == "POST" and path.endswith("/issues/11/assignees"):
             return _json({"assignees": [{"login": "bob"}]})
         if req.method == "POST" and path.endswith("/pulls/11/requested_reviewers"):
-            return _json({"requested_reviewers": [{"login": "carol"}]})
+            body = json.loads(req.content.decode("utf-8"))
+            assert body["reviewers"] == ["carol"], (
+                "reviewer add-set must be computed off `current` (the "
+                "PATCH response's requested_reviewers=['erin']), which "
+                "already includes 'erin' -- not the stale pre-write "
+                "GET's requested_reviewers=['dave'], which would "
+                f"incorrectly re-request 'erin' too; got {body['reviewers']!r}"
+            )
+            return _json({"requested_reviewers": [
+                {"login": "carol"}, {"login": "erin"},
+            ]})
         if path == "/graphql":
             body = json.loads(req.content.decode("utf-8"))
             assert body["variables"]["id"] == "pr-node-11-fresh", (
@@ -1742,7 +1791,8 @@ def test_update_pr_light_github_all_stages_no_trailing_gets(
     seen = _install_github_mock(monkeypatch, handler)
     ref = GitHubProvider().update_pr(
         _gh_project(), "t", "11", title="new title",
-        assignees_add=["bob"], reviewers_add=["carol"], draft=True, light=True,
+        assignees_add=["bob"], reviewers_add=["carol", "erin"], draft=True,
+        light=True,
     )
 
     assert [r.method for r in seen] == ["GET", "PATCH", "POST", "POST", "POST"]
