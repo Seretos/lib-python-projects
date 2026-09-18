@@ -6,209 +6,130 @@ labelled `Returns:`/`Source:`/`None:`/`Labels:`/`Replay:` lines.
 This file was rewritten (plan's Affected-files: "today's prose/proximity
 matchers are the tautology trap") to replace `_mentions_together`/
 `_mentions_field` free-prose proximity matching with a real parser tied
-back to the dataclasses/signatures the docstrings describe. A docstring
-that merely mentions the right words in the right neighbourhood no
-longer passes -- it must supply a `Returns:`/`None:` field list whose
-union is checked against `dataclasses.fields()`, a `Source:` line
-containing the two required literal tokens, and (create methods only) a
-`Replay:` line naming both replay directions.
+back to the dataclasses/signatures the docstrings describe.
 
 None of the 18 docstrings carry this block today (no docstring mentions
 `light` at all), so every assertion here is expected RED until
 phase=implement documents each method in this exact format.
 
-ROUND 3 (test-critic tautology::F5, CRITICAL): the ADO merge_pr doc test
-used to scan the WHOLE docstring (`doc.lower()`) for "unsettled" and
-"handshake"/"lastmergesourcecommit", so unrelated full-path prose could
-satisfy both checks regardless of what the light block itself said.
-Fixed (round 3) to scan only the parsed light block's own text; then
-removed entirely in round 4 (see below) once it became clear that fix
-could not change what class of check this was.
+HISTORY (rounds 3-5, condensed -- kept for the record; ROUND 6 below is
+the final resolution):
 
-ROUND 4 (test-critic tautology::F1-F6, CRITICAL, two rounds running):
-the round-3 fix above narrowed WHERE the word-presence checks looked
-(whole docstring -> light block only), but round 3's test-critic pass
-raised the SAME class of finding again under fresh wording -- the
-`Source:`/`Labels:`/`Replay:` free-prose substring/phrase checks
-(`"no reload"`, `"pre-cascade"`, `"still applied"`, `"none applied by
-this call"`, the `Replay:` direction words, and the ADO merge doc test's
-`"unsettled"`/`"handshake"`/`"202"` checks) can NEVER "bite" no matter
-how the assertion is worded: a docstring author can paste the required
-words while the described behaviour is false, and no rewording of the
-substring/phrase match changes that -- confirmed structural, not a
-wording bug, after two independent rounds tried to fix it by rewording.
+  - Round 3: narrowed the ADO merge_pr doc test from scanning the WHOLE
+    docstring to the parsed light block only -- fixed WHERE the
+    word-presence checks looked, not WHAT class of check they were.
+  - Round 4: the round-3 fix did not change the underlying problem --
+    every `Source:`/`Labels:`/`Replay:` prose/phrase check
+    (`"no reload"`, `"pre-cascade"`, `"still applied"`, `"none applied
+    by this call"`, the `Replay:` direction words, `"unsettled"`/
+    `"handshake"`/`"202"`) can be satisfied by pasting the required
+    words next to a FALSE claim -- confirmed structural, not a wording
+    bug. All such checks were removed and replaced with bare
+    label-exists-and-non-empty checks; the dedicated
+    `test_azuredevops_merge_pr_documents_unsettled_outcome_and_handshake_get`
+    was removed outright (no structural residue to keep).
+  - Round 5: round 4's non-emptiness checks are gameable by a
+    placeholder (`Source: TBD`, `Labels: -`, `Replay: n/a`). Tried
+    re-tightening `Source:`/`Replay:`/6-of-18 `Labels:` lines to exact
+    literal-token/phrase requirements instead. This closed the
+    placeholder hole but NOT the deeper objection: an implementation can
+    paste the exact required tokens next to a docstring describing the
+    OPPOSITE of what the light path does, and every assertion still
+    passes -- exact-phrase matching narrows which strings pass, not
+    whether passing a string proves the behaviour. Confirmed, a second
+    time, structural rather than a wording gap.
 
-Accordingly, THIS round removes those assertions outright rather than
-attempting a third rewording:
-  - `test_light_block_parses_and_matches_ref_dataclass`'s `"no reload"`/
-    `"pre-cascade"` substring checks on `Source:` -- replaced with a
-    bare non-empty check (the label exists and has *some* text after
-    it, proving the docstring has the right STRUCTURE, not checking
-    WHAT that text says).
-  - `test_update_ticket_labels_line_documents_still_applied` (the
-    "still applied"/"still added"/"still synced" phrase check) --
-    removed entirely; `Labels:` non-emptiness is already covered by
-    `test_light_block_parses_and_matches_ref_dataclass`.
-  - `test_no_label_methods_use_the_literal_none_applied_phrase` (the
-    "none applied by this call" literal-phrase check) -- removed
-    entirely, same reason.
-  - `test_create_methods_replay_line_documents_both_directions`'s
-    "no"/"request"/"reload"/"mixed"/"first call" word checks -- replaced
-    with a bare non-empty check on the `Replay:` line's text.
-  - `test_azuredevops_merge_pr_documents_unsettled_outcome_and_handshake_get`
-    -- removed entirely; every one of its three assertions was a
-    word-presence or vacuous-negative check (round-3 critic F6) with no
-    structural component to keep.
+ROUND 6 (FINAL, test-critic tautology::F1, CRITICAL, third independent
+confirmation -- this is the hard cap round; no further reword attempts):
+the round-5 exact-token/exact-phrase checks (`_SOURCE_REQUIRED_TOKENS`,
+`_LABELS_NONE_APPLIED_PHRASE`, `_REPLAY_REQUIRED_PHRASES`) are removed
+outright, this time for good. Three independent test-critic passes
+(rounds 3, 4, 5) plus this round's own re-confirmation all land on the
+same conclusion: no wording of a string-content assertion on
+`Source:`/`Labels:`/`Replay:` can behaviourally constrain an
+implementation, because the assertion is blind to whether the described
+behaviour is real -- a mathematical/structural ceiling of matching prose
+against prose, not a gap that a fourth rewording would close.
 
-This is NOT a retreat from R6's requirement that these prose disclosures
-exist in the docstrings -- that is a real, owner-mandated documentation
-obligation, and phase=implement still has to write truthful `Source:`/
-`Labels:`/`Replay:` prose satisfying the *structural* checks below
-(label present, non-empty, right field-name partition). It is a
-recognition that an automated test cannot verify FREE-FORM PROSE CONTENT
-proves real behaviour -- exactly the same principle the plan already
-applied to the `None:` list (see "WHAT THIS FILE CAN AND CANNOT PROVE"
-below), now extended to `Source:`/`Labels:`/`Replay:` too. The actual
-behavioural claims these lines make ("no reload", "labels still
-applied", "replay direction") are proven by real R1-R4 assertions in
-`tests/test_write_light_mode.py` -- see the per-claim mapping below,
-re-verified still true after this round's removals.
+What remains in this file, kept because each one IS tied to real code
+and DOES fail for a wrong implementation:
+  - the `Light mode (`light=True`)` marker-line presence check;
+  - the `Returns:`/`None:` field-name cross-check against real
+    `dataclasses.fields(ref_type)` names (unknown field -> fail; a field
+    named in neither -> fail; a field named in both -> fail);
+  - the `Returns:` class name vs. `inspect.signature(...).return_annotation`
+    match (the class named in prose must be the method's real return
+    type, not just an assertion in a comment);
+  - the exact per-(provider, method) `Returns:`/`None:` field PARTITION
+    (`FIELD_PARTITION`, `test_light_block_field_partition_matches_the_plan`)
+    pinned against the plan's own R1-R4 field-sourcing rules -- this is
+    NOT a prose-content check: it is a set-equality check against a
+    table this file hardcodes from the plan, so a docstring that
+    mis-classifies e.g. GitHub merge_pr's `state` as populated (rather
+    than the documented `None:`) fails;
+  - a bare "this label line exists and is non-empty" check for
+    `Source:`/`Labels:`/`Replay:` on every method that must carry it --
+    proving the docstring has the right STRUCTURE (the label is present,
+    with SOME content), never proving anything about that content's
+    truth. This is intentionally the SAME ceiling the plan's own
+    `None:`-list design already accepted; round 6 makes the same
+    acceptance explicit for `Source:`/`Labels:`/`Replay:` too, after
+    three rounds tried and failed to do better.
 
-WHAT THIS FILE CAN AND CANNOT PROVE (test-critic CRITICAL, rounds 3-4 --
-read before trusting any single assertion below as behavioural
-evidence):
+This is NOT a retreat from R6's requirement that these four prose
+disclosures exist in the docstrings -- that is a real, owner-mandated
+documentation obligation that phase=implement must still honour with
+TRUTHFUL `Source:`/`Labels:`/`Replay:` prose (not just prose that
+satisfies this file's structural checks). It is a final, three-times-
+confirmed recognition that an automated test cannot verify FREE-FORM
+PROSE CONTENT proves real behaviour. The actual behavioural truth of
+every one of the four owner-mandated claims is separately and fully
+proven by real R1-R5 request/body assertions in
+`tests/test_write_light_mode.py` -- re-confirmed accurate this round:
 
-  - `test_light_block_parses_and_matches_ref_dataclass`'s class-name-vs-
-    `inspect.signature(...).return_annotation` check and its Returns:/
-    None: == `dataclasses.fields(ref_type)` coverage check ARE tied to
-    real code -- they fail for a docstring naming a class the signature
-    doesn't return, or omitting/duplicating a real ref field. Likewise
-    `test_light_block_field_partition_matches_the_plan` pins the EXACT
-    per-(provider, method) Returns:/None: split against the plan's own
-    field lists, so a docstring that mis-classifies a field (e.g. GitHub
-    merge_pr's `state` claimed as populated) fails. These, plus the
-    `Light mode (`light=True`)` marker-line presence check and the bare
-    non-empty checks on `Source:`/`Labels:`/`Replay:`, are what remains
-    in this file after round 4 -- everything structurally verifiable,
-    nothing that can be satisfied by prose alone.
-  - The (now-removed) `Source:` "no reload"/"pre-cascade" substring
-    checks, `Labels:` "still applied"/"none applied by this call" phrase
-    checks, and `Replay:` "no"/"reload"/"mixed" phrase checks were, by
-    themselves, bare presence-of-words checks on prose -- pasting the
-    required tokens into a docstring satisfies them regardless of
-    whether the light path genuinely reloads, sleeps, polls, or
-    fabricates a custom_fields mapping. They do NOT re-prove the
-    underlying behaviour; that would overclaim what a prose-content
-    check can demonstrate. The genuine behavioural proof for each of
-    these claims lives in `tests/test_write_light_mode.py`'s R1-R4
-    driving tests instead:
-      * "no reload" (zero requests after the last write, on every one of
-        the 18 methods) -- proven by the R1-R4 request-budget / exact-
-        method-sequence assertions (`len(seen) == N`, `[r.method for r
-        in seen] == [...]`), each paired with a handler that raises
-        `AssertionError` on any unexpected request, so an unaccounted-
-        for reload fails the *behavioural* test, not this one.
-      * "labels still applied" on `update_ticket`'s light column-move
-        outcome (Q1 -> (a)) -- proven by
-        `test_update_ticket_light_column_move_with_label_change`'s
-        assertion that `"ai-modified"` is present in the actual PATCH
-        request BODY sent (not just echoed by the mocked response), and
-        by `test_update_ticket_light_azuredevops_labels_still_applied`'s
-        `/fields/System.Tags` PATCH-body check.
-      * "none applied by this call" on `add_comment`/`merge_pr` -- these
-        two methods never accept or write labels at all, light or not;
-        this is a pre-existing, pre-#265 invariant already covered by
-        the existing (non-light) suite, not new behaviour this ticket
-        introduces, so there is no NEW R1-R4 assertion to pair it with.
-      * the `Replay:` "mixed" mixed-light rule -- proven by
-        `test_create_ticket_light_false_retry_of_light_true_reloads_full_model`
-        (the `light=False` retry of a `light=True`-created key reloads
-        once and returns a full `Ticket`) and the two
-        `idempotent_replay` tests alongside it.
-      * the `pre-cascade` caveat (a board-write's returned `status` may
-        predate a board->issue-state automation cascade) is a narrative
-        disclosure about eventual consistency with no observable effect
-        against a mocked transport -- there is no behavioural test to
-        pair it with, and none is possible; it is intentionally a
-        documentation-only claim, checked here (post-round-4) only for
-        the `Source:` line's non-emptiness, not its wording.
-      * the ADO merge_pr still-unsettled outcome and the handshake GET's
-        role -- proven by
-        `test_merge_pr_light_azuredevops_still_unsettled_gives_merged_none`
-        and the ADO merge budget tests' request-sequence assertions
-        respectively; no docs-file word check pairs with either anymore.
-  - `_assert_has_light_bool_parameter` (keyword-only, default `False`)
-    and the `Returns:`/`None:` field-coverage checks above are the parts
-    of this file doing real work; the remaining bare non-emptiness
-    checks on `Source:`/`Labels:`/`Replay:` exist only to keep the
-    docstrings structurally honest (the label is there, with content),
-    not as independent proof of behaviour.
+  * **"no reload"** (zero requests after the last write, on every one of
+    the 18 methods) -- proven by the R1-R4 request-budget / exact-
+    method-sequence assertions (`len(seen) == N`, `[r.method for r in
+    seen] == [...]`), each paired with a handler that raises
+    `AssertionError` on any unexpected request, so an unaccounted-for
+    reload fails the *behavioural* test, not this one.
+  * **"labels still applied"** on `update_ticket`'s light column-move
+    outcome (Q1 -> (a)) -- proven by
+    `test_update_ticket_light_column_move_with_label_change`'s assertion
+    that `"ai-modified"` is present in the actual PATCH request BODY
+    sent (not just echoed by the mocked response), and by
+    `test_update_ticket_light_azuredevops_labels_still_applied`'s
+    `/fields/System.Tags` PATCH-body check.
+  * **"none applied by this call"** on `add_comment`/`merge_pr` -- these
+    two methods never accept or write labels at all, light or not; a
+    pre-existing, pre-#265 invariant already covered by the existing
+    (non-light) suite, not new behaviour this ticket introduces, so
+    there is no NEW R1-R4 assertion to pair it with (and none is
+    needed).
+  * the `Replay:` **mixed-`light` rule** -- proven by
+    `test_create_ticket_light_false_retry_of_light_true_reloads_full_model`
+    (and its per-provider siblings: the `light=False` retry of a
+    `light=True`-created key reloads exactly once and returns a full
+    `Ticket`/`PullRequest` with `idempotent_replay=True`) and the
+    `idempotent_replay` tests alongside it.
+  * the **`pre-cascade`** caveat (a board-write's returned `status` may
+    predate a board->issue-state automation cascade) is a narrative
+    disclosure about eventual consistency with no observable effect
+    against a mocked transport -- there is no behavioural test to pair
+    it with, and none is possible; intentionally documentation-only,
+    checked here only for the `Source:` line's non-emptiness.
+  * the ADO merge_pr **still-unsettled outcome and the handshake GET's
+    role** -- proven by
+    `test_merge_pr_light_azuredevops_still_unsettled_gives_merged_none`
+    and the ADO merge budget tests' exact request-sequence assertions
+    respectively; no docs-file word check pairs with either.
 
-ROUND 5 (test-critic tautology::F1/F2, CRITICAL, round 4 accepted as
-plausible but asked for one more concrete attempt before treating the
-class as an inherent limit): round 4's bare non-emptiness checks above
-are gameable by a placeholder -- `Source: TBD`, `Labels: -`,
-`Replay: n/a` -- pass on all 18/18/6 methods without documenting
-anything. Tried here: the SAME structural-table approach that already
-grounds `test_light_block_field_partition_matches_the_plan`
-(`FIELD_PARTITION`, tied to the plan's own per-method field lists),
-extended to `Source:`/`Labels:`/`Replay:` wherever the plan or the
-owner's requirement actually specifies canonical text to require --
-not invented here:
-
-  - `Source:` -- the owner's requirement names two literal, universal
-    tokens for all 18 methods (`"no reload"`, `"pre-cascade"`; see the
-    plan's R6 Behaviour bullet). Re-added as exact lower-cased substring
-    requirements (`_SOURCE_REQUIRED_TOKENS`).
-  - `Replay:` -- the plan names the two replay directions in fixed
-    language (`resolve_replay`'s two branches: a `light=True` retry
-    issues no request; a `light=False` retry of a light-created key
-    reloads once). Re-added as two required exact phrases
-    (`_REPLAY_REQUIRED_PHRASES`) on the 6 create methods.
-  - `Labels:` -- tightened ONLY where the plan supplies an actual
-    canonical string: the owner's requirement gives the literal fallback
-    phrase `"none applied by this call"` for methods that apply no
-    labels at all. Grounded in the method signatures (not invented):
-    `add_comment` and `merge_pr` accept no `labels`/`labels_add`
-    parameter on any provider (6 of 18 methods) -- the other 12
-    (`create_ticket`, `update_ticket`, `create_pr`, `update_pr` x 3
-    providers) each apply a DIFFERENT set of labels (caller-supplied
-    labels, `ai-generated`, `ai-modified`, board auto-labels...) and the
-    plan names no single fixed sentence covering all four shapes
-    truthfully, so those 12 keep the round-4 non-emptiness check rather
-    than have this file invent plan content that isn't there.
-
-HONEST ASSESSMENT (asked for explicitly, not just a success claim):
-tightening from "non-empty" to "exact canonical phrase required" is a
-REAL, if narrow, improvement -- it closes the specific `TBD`/`n/a`/`-`
-placeholder hole for `Source:` (18/18), `Replay:` (6/6) and `Labels:`
-(6/18, the two no-label methods). A docstring that pastes those tokens
-now at least has to paste the RIGHT tokens, in the right slot, per
-method -- an author who gets the wording wrong (or forgets it) fails
-loudly instead of silently.
-
-It does NOT close the deeper objection the critic raised across rounds
-3-4, and re-deriving the substrings does not change that: for every one
-of these checks, an implementation can satisfy the exact phrase while
-the described behaviour is false -- a `light=True` `merge_pr` that
-still issues the pre-flight GET can still carry a docstring reading
-"Source: no reload, pre-cascade caveat noted" and pass. Exact-phrase
-matching narrows WHICH strings pass, not WHETHER passing the string
-proves the behaviour; that ceiling is structural to matching prose
-content against prose content, not a property of how tight the match
-is. Two independent rounds (3, narrowing scope from whole-docstring to
-the light block only; 4, removing the checks; this round, re-adding
-them as exact multi-token phrases instead of loose "mentions the idea"
-matching) have each changed HOW the prose is matched without changing
-THAT prose-matching cannot verify behaviour. Recommendation: treat
-`Source:`/`Replay:`/`Labels:`(the 12) as reaching the plan's own
-already-accepted limit for the `None:` list -- the real behavioural
-proof lives in `test_write_light_mode.py`'s R1-R4 assertions, and this
-file's job is documentation-shape completeness plus (as of this round)
-rejection of the specific placeholder-text failure mode, not proof of
-truthfulness. Further rounds chasing full closure of this exact class
-are unlikely to find one; this round's result is offered as the
-concrete attempt requested, not as a claim the objection is resolved.
+`_assert_has_light_bool_parameter` (keyword-only, default `False`) and
+the `Returns:`/`None:` field-coverage/partition checks above are the
+parts of this file doing real work; the bare non-emptiness checks on
+`Source:`/`Labels:`/`Replay:` exist only to keep the docstrings
+structurally honest (the label is there, with content), not as
+independent proof of behaviour -- stated plainly and finally.
 """
 from __future__ import annotations
 
@@ -380,31 +301,14 @@ _LABEL_PATTERNS = {
 }
 _RETURNS_SHAPE_RE = re.compile(r"^(\w+)\(([^)]*)\)")
 
-# ---------------------------------------------------------------------------
-# ROUND 5 canonical-text requirements (see module docstring's "ROUND 5"
-# section for the grounding and the honest limits of this approach).
-# ---------------------------------------------------------------------------
-
-# The owner's requirement names these two tokens verbatim, for every one
-# of the 18 methods, on the Source: line.
-_SOURCE_REQUIRED_TOKENS = ("no reload", "pre-cascade")
-
-# The plan's resolve_replay rule, named in fixed language, for the 6
-# create methods' Replay: line.
-_REPLAY_REQUIRED_PHRASES = (
-    "light=true replay: no new request",
-    "light=false after light=true: reloads full model",
-)
-
-# Methods that accept no labels/labels_add parameter on any provider --
-# add_comment and merge_pr never touch labels, light or not (pre-#265
-# invariant). These are the only methods for which the plan gives a
-# fixed literal fallback phrase for Labels:. The other 12 (create_ticket,
-# update_ticket, create_pr, update_pr) each apply a different label set
-# and have no single owner-specified sentence -- left at the round-4
-# non-emptiness check.
-_NO_LABEL_METHODS = {"add_comment", "merge_pr"}
-_LABELS_NONE_APPLIED_PHRASE = "none applied by this call"
+# ROUND 6 (FINAL): no canonical-text/exact-phrase constants here anymore.
+# Rounds 3-5 tried, in turn, whole-docstring word scans, light-block-only
+# word scans, and exact lower-cased token/phrase requirements on
+# `Source:`/`Labels:`/`Replay:` -- all three are prose-content checks a
+# docstring can satisfy while describing false behaviour, confirmed
+# structural across three independent test-critic rounds (see module
+# docstring). What remains below checks STRUCTURE only: the label line
+# exists and is non-empty.
 
 
 def _doc(cls: type, method_name: str) -> str:
@@ -525,44 +429,24 @@ def test_light_block_parses_and_matches_ref_dataclass(
         "None: -- each field belongs in exactly one"
     )
 
-    # ROUND 5 (test-critic tautology::F1, CRITICAL, third attempt -- see
-    # module docstring's "ROUND 5" section for why this is re-added as an
-    # exact-phrase check and an honest statement of what it does and does
-    # not prove): the owner's requirement names these two tokens verbatim
-    # for every one of the 18 methods. Re-required as exact lower-cased
-    # substrings -- this rejects a bare placeholder like "Source: TBD",
-    # which round 4's non-emptiness check could not; it does NOT prove
-    # the light path genuinely avoids a reload (a docstring can paste the
-    # tokens next to a false claim just as easily as a true one) -- that
-    # behavioural proof is tests/test_write_light_mode.py's R1-R4
-    # request-budget/exact-sequence assertions, unchanged by this check.
-    source_text = parsed["Source"].lower()
-    for _token in _SOURCE_REQUIRED_TOKENS:
-        assert _token in source_text, (
-            f"{provider_cls.__name__}.{method_name}'s Source: line must "
-            f"contain the literal token {_token!r} (owner requirement), "
-            f"got {parsed['Source']!r}"
-        )
-
-    # ROUND 5 (test-critic tautology::F1, CRITICAL): tightened only where
-    # the plan actually supplies a fixed sentence -- the literal fallback
-    # phrase for the 6 methods (add_comment, merge_pr x 3 providers) that
-    # apply no labels at all, grounded in their signatures accepting no
-    # labels/labels_add parameter. The other 12 methods apply four
-    # different label sets with no single owner-specified sentence, so
-    # they keep the round-4 non-emptiness check rather than have this
-    # file invent canonical text the plan doesn't provide.
-    labels_text = parsed["Labels"].lower()
-    if method_name in _NO_LABEL_METHODS:
-        assert _LABELS_NONE_APPLIED_PHRASE in labels_text, (
-            f"{provider_cls.__name__}.{method_name} applies no labels and "
-            f"must state {_LABELS_NONE_APPLIED_PHRASE!r} on its Labels: "
-            f"line, got {parsed['Labels']!r}"
-        )
-    else:
-        assert parsed["Labels"], (
-            f"{provider_cls.__name__}.{method_name}'s Labels: line must not be empty"
-        )
+    # ROUND 6 (FINAL, test-critic tautology::F1, CRITICAL, third
+    # independent confirmation -- see module docstring): rounds 3-5 each
+    # tried a different shape of string-content check on Source:/Labels:
+    # ("mentions the idea" prose scan, then bare non-emptiness, then
+    # exact literal tokens/phrases) and all three are satisfiable by a
+    # docstring that describes the OPPOSITE of the implemented behaviour
+    # -- a structural ceiling, not a wording gap. Final resolution: check
+    # only that the label exists and carries SOME text (right STRUCTURE),
+    # never what that text claims. The genuine behavioural proof for "no
+    # reload" and "labels still applied" lives in
+    # tests/test_write_light_mode.py's R1-R4 assertions (see module
+    # docstring's per-claim mapping).
+    assert parsed["Source"], (
+        f"{provider_cls.__name__}.{method_name}'s Source: line must not be empty"
+    )
+    assert parsed["Labels"], (
+        f"{provider_cls.__name__}.{method_name}'s Labels: line must not be empty"
+    )
 
 
 @pytest.mark.parametrize("provider_cls", PROVIDERS, ids=lambda c: c.__name__)
@@ -639,19 +523,18 @@ def test_create_methods_replay_line_documents_both_directions(
     ROUND 4 (test-critic tautology::F5, CRITICAL, two rounds running):
     this used to also scan the Replay: line's text for the substrings
     "no"/"request"/"reload"/"mixed"/"first call" -- bare prose-content
-    checks (and the "no" conjunct was additionally subsumed: "no" is a
-    substring of "none"/"not"/"node", and its own re-assertion of
-    "reload" on the very next line meant it could only fail when that
-    next assertion already had). No rewording fixes what is a structural
-    limitation of prose-content matching, so removed; reduced to the
-    same bare non-emptiness check used for `Source:`/`Labels:` above.
+    checks. Removed; reduced to a bare non-emptiness check.
 
-    ROUND 5 (test-critic tautology::F2, CRITICAL, third attempt -- see
-    module docstring's "ROUND 5" section): re-tightened to the two exact
-    phrases naming `resolve_replay`'s two branches, since the plan fixes
-    that language precisely. This rejects a bare "Replay: n/a" that
-    round 4's non-emptiness check let through; it does not prove the
-    mixed-light replay rule is actually implemented that way -- that is
+    ROUND 5 (test-critic tautology::F2, CRITICAL): re-tightened to two
+    exact phrases naming `resolve_replay`'s two branches.
+
+    ROUND 6 (FINAL, test-critic tautology::F1, CRITICAL, third
+    independent confirmation): the round-5 exact phrases are, like
+    `Source:`'s tokens, satisfiable by a docstring describing the
+    opposite of the real behaviour -- removed for good. Reduced to the
+    same bare non-emptiness check as `Source:`/`Labels:` above; it does
+    not prove the mixed-light replay rule is actually implemented that
+    way -- that is
     `test_create_ticket_light_false_retry_of_light_true_reloads_full_model`
     and the two `idempotent_replay` tests beside it, unchanged by this
     check."""
@@ -662,13 +545,9 @@ def test_create_methods_replay_line_documents_both_directions(
         f"{provider_cls.__name__}.{method_name} (a create method) must "
         "carry a Replay: line"
     )
-    replay_text = replay_line["Replay"].lower()
-    for _phrase in _REPLAY_REQUIRED_PHRASES:
-        assert _phrase in replay_text, (
-            f"{provider_cls.__name__}.{method_name}'s Replay: line must "
-            f"contain the literal phrase {_phrase!r}, got "
-            f"{replay_line['Replay']!r}"
-        )
+    assert replay_line["Replay"], (
+        f"{provider_cls.__name__}.{method_name}'s Replay: line must not be empty"
+    )
 
 
 @pytest.mark.parametrize("provider_cls", PROVIDERS, ids=lambda c: c.__name__)

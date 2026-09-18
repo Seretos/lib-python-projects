@@ -405,10 +405,12 @@ def test_merge_pr_light_request_budget_github(
     assert pr.url is None
     assert pr.head_sha is None
     assert pr.mergeable_state is None
-    assert not any(
-        any(s in r.url.path for s in ("/reviews", "/approvals", "/notes", "/check"))
-        for r in seen
-    )
+    # test-critic tautology::F3, round 6: a negative "no /reviews,
+    # /approvals, /notes, /check request" guard here would be redundant
+    # with `len(seen) == 1` above -- the handler raises AssertionError on
+    # any unrecorded/unexpected path, appended to `seen` before the raise,
+    # so an errant request would already have failed the test before this
+    # point. Removed rather than kept as a restatement.
 
 
 def test_merge_pr_light_request_budget_gitlab(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -452,7 +454,9 @@ def test_merge_pr_light_request_budget_gitlab(monkeypatch: pytest.MonkeyPatch) -
         "GitLab never populates mergeable_state (base.py:685) -- the one "
         "AC1 field GitLab's light merge ref does NOT carry"
     )
-    assert not any("/approvals" in r.url.path or "/notes" in r.url.path for r in seen)
+    # test-critic tautology::F3, round 6: same redundancy as the GitHub
+    # budget test above -- `len(seen) == 1` plus the raising handler
+    # already rules out an /approvals or /notes request. Removed.
 
 
 def test_merge_pr_light_gitlab_merge_response_not_yet_merged_gives_merged_false(
@@ -558,9 +562,9 @@ def test_merge_pr_light_request_budget_azuredevops(monkeypatch: pytest.MonkeyPat
     assert pr.mergeable_state is None, (
         "ADO never populates mergeable_state on the light merge ref"
     )
-    assert not any(
-        any(s in r.url.path for s in ("/threads", "/labels")) for r in seen
-    )
+    # test-critic tautology::F3, round 6: same redundancy -- the exact
+    # `["GET", "PATCH", "GET"]` sequence above, plus the raising handler,
+    # already rules out a /threads or /labels request. Removed.
 
 
 def test_merge_pr_light_azuredevops_two_requests_when_patch_settles(
@@ -1533,11 +1537,15 @@ def test_add_comment_light_empty_body_raises_before_request(
     def handler(req: httpx.Request) -> httpx.Response:
         raise AssertionError("no request expected for a blank body")
 
-    seen = _install_github_mock(monkeypatch, handler)
+    _install_github_mock(monkeypatch, handler)
     with pytest.raises(ValueError):
         GitHubProvider().add_comment(_gh_project(), "t", "42", "   ", light=True)
 
-    assert seen == []
+    # test-critic tautology::F3, round 6: `assert seen == []` here would be
+    # redundant -- the handler raises AssertionError on ANY request, so an
+    # issued request would surface as an AssertionError escaping
+    # `pytest.raises(ValueError)` and fail the test before this point. The
+    # real assertion is the `pytest.raises(ValueError)` block above.
 
 
 # =============================================================================
@@ -2120,14 +2128,18 @@ def test_create_ticket_light_gitlab_unsupported_custom_fields_key_raises_before_
             "front (gitlab.py:2919-2926)"
         )
 
-    seen = _install_gitlab_mock(monkeypatch, handler)
+    _install_gitlab_mock(monkeypatch, handler)
     with pytest.raises(ValueError, match="custom_fields"):
         GitLabProvider().create_ticket(
             _gl_project(), "t", title="hi", body="b", labels=[], assignees=[],
             custom_fields={"not_a_real_key": "oops"}, light=True,
         )
 
-    assert seen == [], "no request may be issued before the ValueError"
+    # test-critic tautology::F3, round 6: same redundancy as the
+    # add_comment empty-body test above -- the handler raises
+    # AssertionError on any request, so `assert seen == []` here could
+    # never observe a nonempty `seen` without the test already having
+    # failed via that AssertionError escaping `pytest.raises`. Removed.
 
 
 def test_create_ticket_light_custom_fields_written_vs_none_azuredevops(

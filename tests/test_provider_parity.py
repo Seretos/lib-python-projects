@@ -2706,10 +2706,13 @@ def test_all_write_methods_declare_light_keyword_only_default_false():
     )
     for provider_cls in _provider_classes():
         for method_name in write_methods:
+            # test-critic tautology::F2, round 6: a preceding
+            # `assert callable(method)` would only guard pre-existing code
+            # (these 18 methods already exist, independently of #265) --
+            # removed. `getattr(..., None)` plus `inspect.signature` below
+            # still raises naturally (TypeError on `None`) if a method were
+            # ever missing, so nothing is lost.
             method = getattr(provider_cls, method_name, None)
-            assert callable(method), (
-                f"{provider_cls.__name__} is missing callable {method_name!r}"
-            )
             sig = inspect.signature(method)
             assert "light" in sig.parameters, (
                 f"{provider_cls.__name__}.{method_name} must declare a "
