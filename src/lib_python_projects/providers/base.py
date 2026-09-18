@@ -119,6 +119,54 @@ class BulkTicketResult:
 
 
 @dataclass
+class TicketRef:
+    """Slim `light=True` result for `create_ticket` / `update_ticket`
+    (ticket #265).
+
+    Every field is sourced from the body of the write request (POST/
+    PATCH) this call actually issued, or echoed from the call's own
+    arguments (`id`) — **never** from a read issued before the write, and
+    never string-synthesised. A field this call's write response didn't
+    carry stays `None` rather than being guessed at; each provider's
+    `light=True` docstring names exactly which fields it leaves `None`
+    and why (typically because the corresponding write wasn't part of
+    *this* call, e.g. a `custom_fields`-only write leaves `labels` as
+    `None`).
+
+    `idempotent_replay` mirrors `Ticket.idempotent_replay`: `True` when
+    this result came from `_idempotency`'s replay of a previous
+    successful create rather than a fresh write.
+    """
+
+    id: str
+    url: str | None = None
+    status: Status | None = None
+    labels: list[str] | None = None
+    updated_at: str | None = None
+    custom_fields: dict[str, Any] | None = None
+    idempotent_replay: bool = False
+
+    @classmethod
+    def from_ticket(cls, ticket: "Ticket") -> "TicketRef":
+        """Project a full `Ticket` down to its `TicketRef` shape.
+
+        Used on the idempotency-replay path: the stored `Ticket` (or
+        `TicketRef`, via `dataclasses.replace`) from the original create
+        is projected down for a `light=True` retry — no new request is
+        issued to build this projection.
+        """
+        return cls(
+            id=ticket.id,
+            url=ticket.url,
+            status=ticket.status,
+            labels=list(ticket.labels) if ticket.labels is not None else None,
+            updated_at=ticket.updated_at,
+            custom_fields=ticket.custom_fields,
+            idempotent_replay=ticket.idempotent_replay,
+        )
+
+
+@dataclass
 class Comment:
     id: str
     author: str
@@ -126,6 +174,24 @@ class Comment:
     url: str
     created_at: str
     updated_at: str = ""
+
+
+@dataclass
+class CommentRef:
+    """Slim `light=True` result for `add_comment` (ticket #265).
+
+    `add_comment` never reloads on either `light` value — every field
+    here comes straight from the create response, so this type exists
+    purely to shrink the return shape, not to skip any request.
+    """
+
+    id: str
+    url: str | None = None
+    created_at: str | None = None
+
+    @classmethod
+    def from_comment(cls, comment: "Comment") -> "CommentRef":
+        return cls(id=comment.id, url=comment.url, created_at=comment.created_at)
 
 
 RelationKind = Literal[
@@ -664,6 +730,56 @@ class PullRequest:
     # rather than freshly created (ticket #150). Always False on the
     # no-op (omitted/None/"" key) path.
     idempotent_replay: bool = False
+
+
+@dataclass
+class PullRequestRef:
+    """Slim `light=True` result for `create_pr` / `update_pr` / `merge_pr`
+    (ticket #265).
+
+    Same no-reload sourcing rule as `TicketRef`: every field comes from
+    the body of the write request this call actually issued (POST/PATCH/
+    PUT), or — for `merge_pr` only — the single conditional post-write
+    status read AC 2 permits, or is echoed from the call's own arguments
+    (`number` ← `pr_id`). `state` mirrors `PullRequest.status`; `head_sha`
+    mirrors `PullRequest.head["sha"]`. A field not sourced by this call's
+    write stays `None`; each provider's `light=True` docstring names
+    which fields it leaves `None` and why.
+
+    `warnings` mirrors `PullRequest.warnings` — populated when a
+    best-effort side-step of the write (e.g. a label/reviewer attachment
+    during `create_pr`) failed, same as the full-object path already
+    reports. `idempotent_replay` mirrors `PullRequest.idempotent_replay`.
+    """
+
+    id: str | None = None
+    number: int | None = None
+    url: str | None = None
+    state: PRStatus | None = None
+    merged: bool | None = None
+    head_sha: str | None = None
+    mergeable_state: str | None = None
+    warnings: list[str] = field(default_factory=list)
+    idempotent_replay: bool = False
+
+    @classmethod
+    def from_pull_request(cls, pr: "PullRequest") -> "PullRequestRef":
+        """Project a full `PullRequest` down to its `PullRequestRef` shape.
+
+        Used on the idempotency-replay path — no new request is issued
+        to build this projection.
+        """
+        return cls(
+            id=pr.id,
+            number=pr.number,
+            url=pr.url,
+            state=pr.status,
+            merged=pr.merged,
+            head_sha=(pr.head or {}).get("sha"),
+            mergeable_state=pr.mergeable_state,
+            warnings=list(pr.warnings),
+            idempotent_replay=pr.idempotent_replay,
+        )
 
 
 @dataclass

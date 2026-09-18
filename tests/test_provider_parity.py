@@ -2685,3 +2685,42 @@ def test_pr_file_diff_dataclasses_importable_from_base():
     assert minimal.line_ranges is None
     assert minimal.additions is None
     assert minimal.deletions is None
+
+
+# ---------- ticket #265: light: bool = False parity across all 18 write methods --
+
+
+def test_all_write_methods_declare_light_keyword_only_default_false():
+    """AC1/AC4: every one of the 6 write methods (`create_ticket`,
+    `update_ticket`, `add_comment`, `create_pr`, `update_pr`, `merge_pr`)
+    on all 3 providers declares `light` as a keyword-only parameter
+    defaulting to `False` (opt-in) -- one structural parity assertion
+    across the whole 18-method surface, per the plan's R6 test strategy
+    (kept separate from `test_write_light_docs.py`'s per-method version
+    of the same check, matching the plan's own affected-files list)."""
+    import inspect
+
+    write_methods = (
+        "create_ticket", "update_ticket", "add_comment",
+        "create_pr", "update_pr", "merge_pr",
+    )
+    for provider_cls in _provider_classes():
+        for method_name in write_methods:
+            method = getattr(provider_cls, method_name, None)
+            assert callable(method), (
+                f"{provider_cls.__name__} is missing callable {method_name!r}"
+            )
+            sig = inspect.signature(method)
+            assert "light" in sig.parameters, (
+                f"{provider_cls.__name__}.{method_name} must declare a "
+                "`light` parameter"
+            )
+            param = sig.parameters["light"]
+            assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
+                f"{provider_cls.__name__}.{method_name}'s `light` parameter "
+                "must be keyword-only"
+            )
+            assert param.default is False, (
+                f"{provider_cls.__name__}.{method_name}'s `light` parameter "
+                f"must default to False (opt-in), got {param.default!r}"
+            )
