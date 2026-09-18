@@ -1024,27 +1024,46 @@ def test_update_ticket_light_column_move_no_label_change_board_only(
                     {"data": {"addProjectV2ItemById": {"item": {"id": "item-9"}}}}
                 )
             if "updateProjectV2ItemFieldValue" in query:
-                # The widened selection set: the mutation's OWN response
-                # carries the issue's content -- url/status/labels/
-                # updated_at must be sourced from THIS, not re-read.
-                return _json({
-                    "data": {
-                        "updateProjectV2ItemFieldValue": {
-                            "projectV2Item": {
-                                "id": "item-9",
-                                "content": {
-                                    "__typename": "Issue",
-                                    "number": 42,
-                                    "title": "Test issue",
-                                    "body": "issue body",
-                                    "state": "OPEN",
-                                    "stateReason": None,
-                                    "url": "https://github.com/acme/backend/issues/42?mutated=1",
-                                    "updatedAt": "2026-06-07T08:09:10Z",
-                                    "labels": {"nodes": [{"name": "ai-modified"}]},
+                # test-critic g2 round 2 (tautology::LIGHT-QUERY-UNPINNED,
+                # MAJOR): previously this branch handed back `content`
+                # regardless of what query text was actually sent, so an
+                # implementation that never threads `with_content=True`
+                # through (still sending the narrow, unwidened mutation)
+                # passed every assertion below anyway -- the mirror image
+                # of the gap the `light=False` byte-identity test closes
+                # below. Only return the widened response if the SENT
+                # query document itself asked for the `content{...on
+                # Issue{...}}` fragment; otherwise fall back to today's
+                # actual content-less fixture shape (the same shape
+                # `test_update_ticket_light_column_move_mutation_without_content_gives_none`
+                # exercises), so an unwidened implementation gets back no
+                # `content` key and the ref assertions below correctly
+                # fail instead of passing on a response the mock handed
+                # out unconditionally.
+                if "content{" in query and "...on Issue{" in query:
+                    return _json({
+                        "data": {
+                            "updateProjectV2ItemFieldValue": {
+                                "projectV2Item": {
+                                    "id": "item-9",
+                                    "content": {
+                                        "__typename": "Issue",
+                                        "number": 42,
+                                        "title": "Test issue",
+                                        "body": "issue body",
+                                        "state": "OPEN",
+                                        "stateReason": None,
+                                        "url": "https://github.com/acme/backend/issues/42?mutated=1",
+                                        "updatedAt": "2026-06-07T08:09:10Z",
+                                        "labels": {"nodes": [{"name": "ai-modified"}]},
+                                    },
                                 },
                             },
                         },
+                    })
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "item-9"}},
                     },
                 })
             if "ProjectV2FieldCommon" in query:
