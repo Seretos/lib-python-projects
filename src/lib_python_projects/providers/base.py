@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Any, ClassVar, Literal
+from dataclasses import dataclass, field, replace as _dc_replace
+from typing import Any, Callable, ClassVar, Literal
 
 # Re-exported so provider modules (and their callers) can import the
 # issue-template shapes from `providers.base` alongside every other
@@ -780,6 +780,56 @@ class PullRequestRef:
             warnings=list(pr.warnings),
             idempotent_replay=pr.idempotent_replay,
         )
+
+
+def _identity_ref(ref_type: type, **identity: Any) -> Any:
+    """Build a `light=True` result for a write call that ended up issuing
+    no write at all beyond identity information already known from the
+    call's own arguments (ticket #265's `_identity_ref` rule).
+
+    Every field not passed in `identity` stays at the ref dataclass's own
+    default (`None` for everything but `warnings`/`idempotent_replay`,
+    which default to `[]`/`False`) — matching AC4: nothing here is ever
+    guessed at from a read.
+    """
+    return ref_type(**identity)
+
+
+def resolve_replay(
+    result: "Ticket | TicketRef | PullRequest | PullRequestRef",
+    light: bool,
+    reload: Callable[[], "Ticket | PullRequest"],
+) -> "Ticket | TicketRef | PullRequest | PullRequestRef":
+    """Adapt an idempotency-replay `result` (already `idempotent_replay=True`,
+    via `_idempotency.lookup`) to the shape `light` actually asked for
+    (ticket #265).
+
+    Four cases, all but one issuing zero new requests:
+      - stored full model (`Ticket`/`PullRequest`), `light=False` wanted
+        -> returned as-is.
+      - stored full model, `light=True` wanted -> projected down via
+        `TicketRef.from_ticket` / `PullRequestRef.from_pull_request` (no
+        request).
+      - stored ref (`TicketRef`/`PullRequestRef`), `light=True` wanted ->
+        returned as-is (no request).
+      - stored ref, `light=False` wanted -> `reload()` is called (the
+        provider's own `get_ticket`/`get_pr`) and the full model it
+        returns is handed back with `idempotent_replay` forced `True` —
+        the one reload AC3's promise ("`light=False` always returns a
+        `Ticket`/`PullRequest`") costs on this specific mixed-`light`
+        replay path; every other replay direction costs nothing.
+    """
+    if isinstance(result, (TicketRef, PullRequestRef)):
+        if light:
+            return result
+        full = reload()
+        return _dc_replace(full, idempotent_replay=True)
+    if light:
+        if isinstance(result, Ticket):
+            return TicketRef.from_ticket(result)
+        if isinstance(result, PullRequest):
+            return PullRequestRef.from_pull_request(result)
+    return result
 
 
 @dataclass

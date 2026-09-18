@@ -2593,6 +2593,12 @@ def test_create_ticket_light_idempotent_replay_gitlab(
         # no-op for all three.
         if req.method == "GET":
             return _json([])
+        # get_ticket's best-effort Work Items GraphQL hierarchy-parent
+        # lookup (gitlab.py's GraphQL exception, ticket #151) -- same
+        # permissive no-op as get_ticket's other relation-walk
+        # sub-requests above.
+        if path == "/api/graphql":
+            return _json({"data": {}})
         raise AssertionError(f"unexpected {req.method} {path}")
 
     seen = _install_gitlab_mock(monkeypatch, handler)
@@ -2701,6 +2707,13 @@ def test_create_pr_light_idempotent_replay_github(
         if req.method == "POST" and path.endswith("/pulls"):
             post_count["n"] += 1
             return _json(_gh_pr_payload(21, labels=[]), status_code=201)
+        if req.method == "POST" and path.endswith("/issues/21/labels"):
+            # The ai-generated label attach step (create_pr always
+            # applies it) -- present in every other create_pr fixture in
+            # this file; omitted here originally, which made even a
+            # correct implementation fail on the initial light=True
+            # create before idempotency ever came into play.
+            return _json([{"name": "ai-generated"}], status_code=200)
         if req.method == "GET" and path.endswith("/pulls/21"):
             get_count["n"] += 1
             # Distinguishing value -- proves the replay's PullRequest is
@@ -2804,7 +2817,12 @@ def test_create_pr_light_idempotent_replay_gitlab(
         "stored PullRequestRef"
     )
     assert replay_full.idempotent_replay is True
-    assert replay_full.head_sha == "reloadedsha80", (
+    # `PullRequest` (unlike `PullRequestRef`) has no `head_sha` field of
+    # its own -- the sha lives under `head["sha"]` (test bug fixed during
+    # implementation: this assertion previously referenced a
+    # PullRequestRef-only attribute on a PullRequest instance, an
+    # AttributeError no correct implementation could ever satisfy).
+    assert replay_full.head["sha"] == "reloadedsha80", (
         "must be built from the reload's own response"
     )
     assert post_count["n"] == 1, "no new create POST -- only the reload GET"
@@ -2875,7 +2893,10 @@ def test_create_pr_light_idempotent_replay_azuredevops(
         "stored PullRequestRef"
     )
     assert replay_full.idempotent_replay is True
-    assert replay_full.head_sha == "reloadedsha70", (
+    # `PullRequest` (unlike `PullRequestRef`) has no `head_sha` field of
+    # its own -- the sha lives under `head["sha"]` (same test bug fixed
+    # as the GitLab sibling test above).
+    assert replay_full.head["sha"] == "reloadedsha70", (
         "must be built from the reload's own response"
     )
     assert post_count["n"] == 1, "no new create POST -- only the reload GET"

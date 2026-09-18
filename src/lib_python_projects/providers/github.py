@@ -31,6 +31,7 @@ from lib_python_projects.providers.base import (
     BulkTicketResult,
     CIConfigurationProvider,
     Comment,
+    CommentRef,
     DiffHunkRange,
     DiscoveredProject,
     FailingJob,
@@ -50,6 +51,7 @@ from lib_python_projects.providers.base import (
     ProjectDiscoveryResult,
     ProviderError,
     PullRequest,
+    PullRequestRef,
     RateLimitError,
     Ref,
     Relation,
@@ -59,6 +61,7 @@ from lib_python_projects.providers.base import (
     Release,
     resolve_event_alias,
     resolve_fetch_page_size,
+    resolve_replay,
     run_matches_ref,
     Review,
     review_decision_from_states,
@@ -69,6 +72,7 @@ from lib_python_projects.providers.base import (
     TemplateField,
     Ticket,
     TicketFilters,
+    TicketRef,
     TokenCapabilities,
     TokenProjectDiscoveryProvider,
     ViewerIdentity,
@@ -77,6 +81,7 @@ from lib_python_projects.providers.base import (
     NO_CI_SENTINEL,
     _assert_not_self_relation,
     _extract_parent_id,
+    _identity_ref,
     _not_found_message,
     _validate_label_lists,
     _validate_limit,
@@ -1825,6 +1830,24 @@ _BOARD_COLUMNS_ORG_QUERY = _board_columns_query("organization")
 _BOARD_COLUMNS_USER_QUERY = _board_columns_query("user")
 
 
+# `content{...}` fragment shared by the Projects-v2 items query below and
+# (ticket #265) the light-only widened `updateProjectV2ItemFieldValue`
+# mutation (`_UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION_WITH_CONTENT`) —
+# extracted once so the two call sites can never drift apart. Text is
+# byte-for-byte what `_board_items_query` sent before the extraction.
+_ISSUE_CONTENT_FIELDS = (
+    "__typename"
+    "...on Issue{"
+    "number title body state stateReason url "
+    "repository{nameWithOwner} "
+    "createdAt updatedAt "
+    "author{login}"
+    "assignees(first:50){nodes{login}}"
+    "labels(first:50){nodes{name}}"
+    "}"
+)
+
+
 def _board_items_query(owner_field: str) -> str:
     return (
         "query($owner:String!,$number:Int!,$fieldName:String!,$after:String){"
@@ -1835,17 +1858,7 @@ def _board_items_query(owner_field: str) -> str:
         "fieldValueByName(name:$fieldName){"
         "...on ProjectV2ItemFieldSingleSelectValue{name optionId}"
         "}"
-        "content{"
-        "__typename"
-        "...on Issue{"
-        "number title body state stateReason url "
-        "repository{nameWithOwner} "
-        "createdAt updatedAt "
-        "author{login}"
-        "assignees(first:50){nodes{login}}"
-        "labels(first:50){nodes{name}}"
-        "}"
-        "}"
+        "content{" + _ISSUE_CONTENT_FIELDS + "}"
         "}"
         "}"
         "}}}"
@@ -2170,6 +2183,21 @@ _UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION = (
     "updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,"
     "fieldId:$fieldId,value:$value}){projectV2Item{id}}}"
 )
+# ticket #265, light=True only: same mutation, widened to also select the
+# item's `content` (the shared `_ISSUE_CONTENT_FIELDS` fragment) so a
+# `light=True` board-only column move can source its four ref fields
+# (`url`/`status`/`labels`/`updated_at`) from THIS write's own response
+# instead of a post-write reload. Reached only via `with_content=True`
+# (light-only) — `light=False` keeps sending the literal
+# `_UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION` above, byte for byte
+# (AC3), so this second constant exists precisely so the two documents
+# never have to be collapsed into one.
+_UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION_WITH_CONTENT = (
+    "mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){"
+    "updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,"
+    "fieldId:$fieldId,value:$value}){projectV2Item{id content{"
+    + _ISSUE_CONTENT_FIELDS + "}}}}"
+)
 _UPDATE_PROJECT_V2_FIELD_OPTIONS_MUTATION = (
     "mutation($fieldId:ID!,$options:[ProjectV2SingleSelectFieldOptionInput!]!){"
     "updateProjectV2Field(input:{fieldId:$fieldId,singleSelectOptions:$options})"
@@ -2390,11 +2418,29 @@ def _update_project_v2_item_field_value(
     item_id: str,
     field_id: str,
     value: dict,
-) -> None:
+    *,
+    with_content: bool = False,
+) -> dict | None:
+    """Send `updateProjectV2ItemFieldValue`.
+
+    `with_content=True` (ticket #265, `light=True`-only) selects the
+    widened mutation document so the response's `projectV2Item.content`
+    can be read back — see `_UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION_WITH_CONTENT`.
+    `with_content=False` (the default — every existing caller) keeps
+    sending the original, byte-identical mutation (AC3). Returns the
+    `projectV2Item` payload (which carries `content` only under
+    `with_content=True`, and even then only when GitHub's response
+    includes one), or `None` if the response carried no `projectV2Item`.
+    """
+    query = (
+        _UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION_WITH_CONTENT
+        if with_content
+        else _UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION
+    )
     r = client.post(
         "/graphql",
         json={
-            "query": _UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION,
+            "query": query,
             "variables": {
                 "projectId": project_id,
                 "itemId": item_id,
@@ -2409,13 +2455,28 @@ def _update_project_v2_item_field_value(
         raise GitHubError(
             400, f"GraphQL error updating project field value: {body['errors']}"
         )
+    return ((body.get("data") or {}).get("updateProjectV2ItemFieldValue") or {}).get(
+        "projectV2Item"
+    )
 
 
 def _write_custom_fields_to_board(
-    client: httpx.Client, binding: Any, content_id: str, custom_fields: dict[str, Any],
-) -> None:
+    client: httpx.Client,
+    binding: Any,
+    content_id: str,
+    custom_fields: dict[str, Any],
+    *,
+    with_content: bool = False,
+) -> dict | None:
     """Add the created issue to the bound Projects v2 board and write
-    each `custom_fields` entry onto it (ticket #123 write path)."""
+    each `custom_fields` entry onto it (ticket #123 write path).
+
+    `with_content` (ticket #265) is threaded through to
+    `_update_project_v2_item_field_value` for every field write; returns
+    the LAST field write's `projectV2Item` payload (or `None` if
+    `custom_fields` was empty), so a `light=True` caller can read the
+    final mutation's own `content` back without a reload.
+    """
     project_v2 = _fetch_projects_v2_via_graphql(
         client,
         owner=binding.owner,
@@ -2432,12 +2493,15 @@ def _write_custom_fields_to_board(
             f"owner {binding.owner!r} did not return an 'id'",
         )
     item_id = _add_project_v2_item(client, project_id, content_id)
+    last_item: dict | None = None
     for field_name, value in custom_fields.items():
         field = _resolve_project_field_for_write(client, binding, field_name)
         value_input = _project_v2_field_value_input(field, field_name, value)
-        _update_project_v2_item_field_value(
+        last_item = _update_project_v2_item_field_value(
             client, project_id, item_id, field["id"], value_input,
+            with_content=with_content,
         )
+    return last_item
 
 
 _CLEAR_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION = (
@@ -3717,7 +3781,8 @@ class GitHubProvider(
         custom_fields: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         milestone: Any = _UNSET,
-    ) -> Ticket:
+        light: bool = False,
+    ) -> Ticket | TicketRef:
         """Create an issue with the project's AI-generated attribution marker.
 
         Marker policy (ticket Seretos/agent-marketplace#15):
@@ -3766,6 +3831,23 @@ class GitHubProvider(
         sentinel default so "not provided" issues no milestone write at
         all. A board-write failure after the issue is created raises
         `PartialTicketCreateError`, same as `custom_fields`.
+
+        Light mode (`light=True`):
+            Returns: TicketRef(id, url, status, labels, updated_at, idempotent_replay)
+            Source: the create response (plus the follow-up status PATCH,
+                when a non-open `status` was requested) — no reload.
+            None: custom_fields
+                (populated with exactly what THIS call wrote to the
+                board when `custom_fields` was passed, else None — a
+                mapper never populates it on its own.)
+            Labels: still applied (the ai-generated marker + any board
+                on_create labels), same as light=False.
+            Replay: a light=True retry of the same idempotency_key
+                returns the stored TicketRef with idempotent_replay=True
+                and issues no new request; a light=False retry of a key
+                whose original create used light=True reloads once
+                (get_ticket) and returns the full Ticket, also with
+                idempotent_replay=True.
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
@@ -3776,7 +3858,10 @@ class GitHubProvider(
                 {"title": title, "body": body},
             )
             if replay is not None:
-                return replay
+                return resolve_replay(
+                    replay, light,
+                    lambda: self.get_ticket(project, token, str(replay.id))[0],
+                )
         binding = None
         if custom_fields:
             board = project.board
@@ -3918,14 +4003,21 @@ class GitHubProvider(
                         issue_node_id=content_id,
                     ) from exc
             ticket = _map_issue(raw)
+            if light:
+                ref = TicketRef.from_ticket(ticket)
+                result: Ticket | TicketRef = dataclasses.replace(
+                    ref, custom_fields=dict(custom_fields) if custom_fields else None,
+                )
+            else:
+                result = ticket
             if idempotency_key:
                 _idempotency.record(
                     (project.provider, project.id),
                     idempotency_key,
                     {"title": title, "body": body},
-                    ticket,
+                    result,
                 )
-            return ticket
+            return result
 
     def update_ticket(
         self,
@@ -3942,7 +4034,8 @@ class GitHubProvider(
         assignees_remove: list[str] | None = None,
         custom_fields: dict[str, Any] | None = None,
         milestone: Any = _UNSET,
-    ) -> Ticket:
+        light: bool = False,
+    ) -> Ticket | TicketRef:
         """Update an issue, optionally also writing `custom_fields` to its
         bound Projects v2 board (ticket #145) — the update-side
         counterpart to `create_ticket`'s `custom_fields` support.
@@ -4030,6 +4123,34 @@ class GitHubProvider(
         `Ticket.custom_fields` reflects the reset first-column value
         (and `Ticket.milestone` is populated too), even when the caller
         passed no `custom_fields` of their own.
+
+        Light mode (`light=True`):
+            Returns: TicketRef(id, idempotent_replay)
+            Source: when this call issues a REST PATCH (title/body/
+                status/labels/assignees changed), the ref is built from
+                that PATCH's own response — no `_reget_issue` poll, no
+                Projects-v2 read-back. When this call writes only
+                `custom_fields` (a board-only column move, no PATCH),
+                the four fields below come from that SAME board
+                mutation's own widened response (`with_content=True`,
+                light-only — see `_UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION_WITH_CONTENT`),
+                never a post-write reload; the mutation's own
+                resolve-then-mutate prelude (project-id query,
+                addProjectV2ItemById, field resolve) is unchanged from
+                light=False and counts as part of performing that write,
+                not a reload. `status`/`custom_fields` may therefore be
+                pre-cascade (see the #178 paragraph above) — a board
+                automation that flips REST state asynchronously may not
+                have landed yet.
+            None: url, status, labels, updated_at, custom_fields
+                (always None on a call that writes nothing at all
+                (identity-only); on a `custom_fields`-only board move,
+                the first four are None only when the mutation's
+                response carries no `content` (the pre-#265 fixture
+                shape); `custom_fields` specifically is None whenever
+                this call wrote none, independently of the other four.)
+            Labels: still applied (the ai-modified label + board
+                on_update/on_move_to auto-labels), same as light=False.
         """
         _validate_label_lists(labels_add, labels_remove)
         binding = None
@@ -4267,6 +4388,7 @@ class GitHubProvider(
             if not payload:
                 # Nothing to do via REST — still honor a pending board
                 # write, then return the current state.
+                mutation_item: dict | None = None
                 if custom_fields:
                     content_id = current.get("node_id")
                     if not content_id:
@@ -4275,8 +4397,9 @@ class GitHubProvider(
                             f"ticket '{project.id}#{ticket_id}' payload "
                             f"missing 'node_id'; cannot write custom_fields",
                         )
-                    _write_custom_fields_to_board(
+                    mutation_item = _write_custom_fields_to_board(
                         client, binding, content_id, custom_fields,
+                        with_content=light,
                     )
                 if milestone is not _UNSET:
                     content_id = current.get("node_id")
@@ -4287,6 +4410,17 @@ class GitHubProvider(
                             f"missing 'node_id'; cannot write milestone",
                         )
                     _write_milestone_to_board(client, binding, content_id, milestone)
+                if light:
+                    if custom_fields:
+                        content = (mutation_item or {}).get("content")
+                        if content:
+                            board_ticket = _map_graphql_issue_content(content)
+                            ref = TicketRef.from_ticket(board_ticket)
+                            return dataclasses.replace(
+                                ref, id=ticket_id, custom_fields=dict(custom_fields),
+                            )
+                        return TicketRef(id=ticket_id, custom_fields=dict(custom_fields))
+                    return _identity_ref(TicketRef, id=ticket_id)
                 if custom_fields:
                     return _reget_issue(current.get("state"), binding or reopen_binding)
                 return _map_issue(current)
@@ -4328,6 +4462,12 @@ class GitHubProvider(
                     reopen_binding,
                     content_id,
                     {reopen_binding.status_field: reset_value},
+                )
+            if light:
+                ticket = _map_issue(raw)
+                ref = TicketRef.from_ticket(ticket)
+                return dataclasses.replace(
+                    ref, custom_fields=dict(custom_fields) if custom_fields else None,
                 )
             if custom_fields or should_reset_board_column:
                 # Use the PRE-write state (`current`, captured before the
@@ -4557,7 +4697,9 @@ class GitHubProvider(
         token: str | None,
         ticket_id: str,
         body: str,
-    ) -> Comment:
+        *,
+        light: bool = False,
+    ) -> Comment | CommentRef:
         """Post a comment on an issue (POSTs to
         `/repos/{owner}/{repo}/issues/{ticket_id}/comments`).
 
@@ -4568,6 +4710,14 @@ class GitHubProvider(
         disjoint ticket/PR id-spaces, where the equivalent mistake 404s or
         targets an unrelated item instead. Use `add_pr_comment` when you
         mean a PR.
+
+        Light mode (`light=True`):
+            Returns: CommentRef(id, url, created_at)
+            Source: the create response itself — `add_comment` never
+                reloads on either `light` value, so this only shrinks the
+                return shape; the request cost is identical either way.
+            None: none
+            Labels: none applied by this call.
         """
         if not body or not body.strip():
             raise ValueError("body must not be empty")
@@ -4585,7 +4735,10 @@ class GitHubProvider(
                         404, f"ticket '{project.id}#{ticket_id}' not found"
                     ) from exc
                 raise
-            return _map_comment(r.json())
+            comment = _map_comment(r.json())
+            if light:
+                return CommentRef.from_comment(comment)
+            return comment
 
     def list_comments(
         self,
@@ -4958,7 +5111,8 @@ class GitHubProvider(
         requested_reviewers: list[str] | None = None,
         *,
         idempotency_key: str | None = None,
-    ) -> PullRequest:
+        light: bool = False,
+    ) -> PullRequest | PullRequestRef:
         """Create a pull request, applying the AI-generated marker.
 
         Marker policy mirrors `create_ticket` (see ticket
@@ -4982,6 +5136,22 @@ class GitHubProvider(
         for conflict detection. A retry with the same key but a different
         `title`/`head`/`base` raises `IdempotencyConflict`. `None`/`""`
         (the default) disables idempotency entirely.
+
+        Light mode (`light=True`):
+            Returns: PullRequestRef(id, number, url, state, merged, head_sha, mergeable_state, warnings, idempotent_replay)
+            Source: the create response — GitHub's `POST /pulls` response
+                is a full PR object, so every AC1 field is genuinely
+                populated from it, no reload.
+            None: none
+            Labels: still applied (the ai-generated marker), same as
+                light=False; a labels-attachment failure still surfaces
+                via `warnings`, same as light=False.
+            Replay: a light=True retry of the same idempotency_key
+                returns the stored PullRequestRef with
+                idempotent_replay=True and issues no new request; a
+                light=False retry of a key whose original create used
+                light=True reloads once (get_pr) and returns the full
+                PullRequest, also with idempotent_replay=True.
         """
         if idempotency_key:
             replay = _idempotency.lookup(
@@ -4990,7 +5160,10 @@ class GitHubProvider(
                 {"title": title, "head": head, "base": base},
             )
             if replay is not None:
-                return replay
+                return resolve_replay(
+                    replay, light,
+                    lambda: self.get_pr(project, token, str(replay.number))[0],
+                )
         ai_generated_label = project.auto_labels.ai_generated
         merged_labels = list(dict.fromkeys([*(labels or []), ai_generated_label]))
         prefixed_body = ensure_body_prefix(body, markers=_marker_set(project))
@@ -5084,14 +5257,17 @@ class GitHubProvider(
             pr = _map_pr(pr_raw)
             if warnings:
                 pr = dataclasses.replace(pr, warnings=warnings)
+            result: PullRequest | PullRequestRef = (
+                PullRequestRef.from_pull_request(pr) if light else pr
+            )
             if idempotency_key:
                 _idempotency.record(
                     (project.provider, project.id),
                     idempotency_key,
                     {"title": title, "head": head, "base": base},
-                    pr,
+                    result,
                 )
-            return pr
+            return result
 
     def update_pr(
         self,
@@ -5110,7 +5286,8 @@ class GitHubProvider(
         reviewers_add: list[str] | None = None,
         reviewers_remove: list[str] | None = None,
         draft: bool | None = None,
-    ) -> PullRequest:
+        light: bool = False,
+    ) -> PullRequest | PullRequestRef:
         """Update a PR's title/body/state/base, plus label/assignee/reviewer deltas.
 
         **Not atomic.** `labels_add` is validated up front via
@@ -5134,6 +5311,24 @@ class GitHubProvider(
 
         Applies the project's configured `ai_modified` label (mirroring
         `update_ticket`) when the PR wasn't originally created by us.
+
+        Light mode (`light=True`):
+            Returns: PullRequestRef(number, warnings, idempotent_replay)
+            Source: the title/body/base/status PATCH's own response, when
+                one was issued (drops all three trailing re-GETs after
+                the assignees/reviewers/draft stages — their inputs are
+                already on that PATCH response). When this call issues
+                no such PATCH at all (e.g. a labels-only or
+                reviewers-only update), the ref is identity-only: only
+                `number` (echoed from the call's own `pr_id`) is
+                populated even though the labels/assignees/reviewers/
+                draft side-writes still really execute.
+            None: id, url, state, merged, head_sha, mergeable_state
+                (this is the no-PATCH, identity-only outcome's
+                guaranteed set — a PATCH response, when issued, does
+                populate these beyond that floor.)
+            Labels: still applied (the ai-modified label plus any
+                labels_add/labels_remove), same as light=False.
         """
         _validate_label_lists(labels_add, labels_remove)
         with _client(token) as client:
@@ -5228,10 +5423,11 @@ class GitHubProvider(
                         json={"assignees": sorted(to_remove)},
                     )
                     _check(a_resp)
-                # Re-fetch so the returned PR reflects the final state.
-                r_final = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
-                _check(r_final)
-                current = r_final.json()
+                if not light:
+                    # Re-fetch so the returned PR reflects the final state.
+                    r_final = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
+                    _check(r_final)
+                    current = r_final.json()
 
             if reviewers_add or reviewers_remove:
                 # Reviewer add/remove live on `/pulls/{n}/requested_reviewers`,
@@ -5260,9 +5456,10 @@ class GitHubProvider(
                         json={"reviewers": sorted(to_remove)},
                     )
                     _check(rv_resp)
-                r_final = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
-                _check(r_final)
-                current = r_final.json()
+                if not light:
+                    r_final = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
+                    _check(r_final)
+                    current = r_final.json()
 
             if draft is not None and bool(current.get("draft", False)) != draft:
                 node_id = current.get("node_id")
@@ -5273,10 +5470,15 @@ class GitHubProvider(
                         "cannot toggle draft state via GraphQL",
                     )
                 _set_pr_draft_via_graphql(client, node_id, draft)
-                r_final = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
-                _check(r_final)
-                current = r_final.json()
+                if not light:
+                    r_final = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
+                    _check(r_final)
+                    current = r_final.json()
 
+            if light:
+                if payload:
+                    return PullRequestRef.from_pull_request(_map_pr(current))
+                return _identity_ref(PullRequestRef, number=int(pr_id))
             return _map_pr(current)
 
     def add_pr_comment(
@@ -5733,7 +5935,9 @@ class GitHubProvider(
         merge_method: str = "merge",
         commit_title: str | None = None,
         commit_message: str | None = None,
-    ) -> PullRequest:
+        *,
+        light: bool = False,
+    ) -> PullRequest | PullRequestRef:
         """Merge a PR. `merge_method` is one of "merge", "squash", "rebase".
 
         Translates the GitHub merge-not-allowed 405 into a `GitHubError`
@@ -5746,6 +5950,19 @@ class GitHubProvider(
         trip. This enrichment is best-effort: a failure degrades to empty
         `reviews`/`reviewers`/`review_decision` (logged as a warning)
         rather than failing an already-successful merge.
+
+        Light mode (`light=True`):
+            Returns: PullRequestRef(number, merged, warnings, idempotent_replay)
+            Source: the merge PUT's own `{sha, merged, message}` response
+                only — no pre-flight GET, no re-fetch, no reviews fetch
+                (AC2's "merge request plus at most one status read"
+                budget; on light, the happy path is exactly the one PUT).
+                The 405 probe below is an error-path exception that
+                raises and returns no ref, not part of that budget.
+            None: id, url, state, head_sha, mergeable_state
+                (the merge PUT's body carries none of these — its `sha`
+                is the merge commit, not the PR head.)
+            Labels: none applied by this call.
         """
         if merge_method not in ("merge", "squash", "rebase"):
             raise GitHubError(400, f"invalid merge_method '{merge_method}'")
@@ -5757,26 +5974,36 @@ class GitHubProvider(
         with _client(token) as client:
             # Pre-flight: if the PR is already merged, raise before PUT so
             # callers get a clear "already merged" error rather than a silent
-            # HTTP 200 that looks like a fresh merge.
-            preflight = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
-            try:
-                _check(preflight)
-            except GitHubError as exc:
-                if exc.status == 404:
+            # HTTP 200 that looks like a fresh merge. Skipped under light
+            # (AC2's budget): the merge PUT's own 404/405 responses cover
+            # the same cases (see the except-block below).
+            if not light:
+                preflight = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
+                try:
+                    _check(preflight)
+                except GitHubError as exc:
+                    if exc.status == 404:
+                        raise GitHubError(
+                            404, _not_found_message("PR", f"{project.id}#{pr_id}")
+                        ) from exc
+                    raise
+                if preflight.json().get("merged") is True:
                     raise GitHubError(
-                        404, _not_found_message("PR", f"{project.id}#{pr_id}")
-                    ) from exc
-                raise
-            if preflight.json().get("merged") is True:
-                raise GitHubError(
-                    405, f"PR '{project.id}#{pr_id}' is already merged"
-                )
+                        405, f"PR '{project.id}#{pr_id}' is already merged"
+                    )
             r = client.put(
                 f"{_repo_path(project)}/pulls/{pr_id}/merge", json=payload
             )
             try:
                 _check(r)
             except GitHubError as exc:
+                if exc.status == 404:
+                    # Only reachable under light (the pre-flight GET
+                    # above already turned this into the same message
+                    # under light=False).
+                    raise GitHubError(
+                        404, _not_found_message("PR", f"{project.id}#{pr_id}")
+                    ) from exc
                 if exc.status == 405:
                     # GitHub returns 405 for both "already merged" and
                     # "merge conflict / not mergeable".  Probe the PR to
@@ -5796,6 +6023,12 @@ class GitHubProvider(
                         f" — rebase or resolve conflicts and retry",
                     ) from exc
                 raise
+            if light:
+                merge_raw = r.json()
+                return PullRequestRef(
+                    number=int(pr_id),
+                    merged=merge_raw.get("merged"),
+                )
             # Re-fetch so the response carries the merged state/timestamp.
             r2 = client.get(f"{_repo_path(project)}/pulls/{pr_id}")
             _check(r2)

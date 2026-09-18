@@ -48,6 +48,8 @@ from lib_python_projects.providers.gitlab import GitLabProvider, GitLabError
 from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
 from lib_python_projects.providers.base import (
     Ticket, Comment, PullRequest, ReviewComment, Review,
+    # Slim `light=True` write results (ticket #265):
+    TicketRef, CommentRef, PullRequestRef,
     TicketFilters, PRFilters, RelationKind, Relation,
     StatusSpec, BoardColumnSpec, PipelineRun, FailingJob, PipelineFailure,
     TokenCapabilities, TokenCapabilityProvider,
@@ -67,6 +69,48 @@ from lib_python_projects.providers.base import (
 # Provider-free issue-template validation/rendering (ticket #259):
 from lib_python_projects.templates import validate_ticket_body, render_skeleton
 ```
+
+### Opting out of the post-write reload: `light=True` (ticket #265)
+
+Each of the six write methods — `create_ticket`, `update_ticket`,
+`add_comment`, `create_pr`, `update_pr`, `merge_pr` — takes an opt-in
+keyword-only `light: bool = False`. Passing `light=True` skips every
+request whose sole purpose is enriching the return value (a post-write
+poll/re-GET, a re-fetch of reviews/approvals/votes, ...) and returns a
+slim `TicketRef` / `CommentRef` / `PullRequestRef` built only from the
+write call's own response instead of the full `Ticket` / `Comment` /
+`PullRequest`. `light=False` (the default) is unchanged, byte-for-byte,
+down to the requests it sends on the wire — every existing caller keeps
+working exactly as before.
+
+```python
+# Full object (default): may cost a post-write reload/reread.
+ticket = provider.create_ticket(project, token, title="...", body="...")
+
+# Light: only the requests needed to perform the write.
+ref = provider.create_ticket(project, token, title="...", body="...", light=True)
+# ref.id, ref.url, ref.status, ref.labels, ref.updated_at,
+# ref.custom_fields (only when this call wrote some), ref.idempotent_replay
+```
+
+Every ref field comes from the body of the write request this call
+actually issued (or, for `merge_pr` only, the single conditional
+post-write status read the write budget permits), or is echoed from the
+call's own arguments where the write response can't carry it (e.g.
+`PullRequestRef.number` on GitHub's `merge_pr`, whose merge response
+never repeats the PR number back). A field this call's write genuinely
+can't supply stays `None` rather than being backfilled with an extra
+request — each provider method's docstring names exactly which fields
+that is and why, under a `Light mode (`light=True`)` block.
+
+Idempotency replay (`idempotency_key=`, ticket #150) composes with
+`light`: a `light=True` retry of a previously-used key returns the
+stored ref with `idempotent_replay=True` and issues no new request; a
+`light=False` retry of a key whose original create used `light=True`
+reloads once (`get_ticket`/`get_pr`) and returns the full model, also
+with `idempotent_replay=True` — the one request cost AC3's promise
+("`light=False` always returns a `Ticket`/`PullRequest`") requires on
+that specific mixed-`light` replay path.
 
 ## Board support
 
@@ -510,6 +554,15 @@ result = load_projects(
 
 ## What's new in 0.1.0
 
+- Ticket #265: opt-in `light: bool = False` on the six write methods
+  (`create_ticket`, `update_ticket`, `add_comment`, `create_pr`,
+  `update_pr`, `merge_pr`) on all three providers. `light=True` returns a
+  slim `TicketRef`/`CommentRef`/`PullRequestRef` sourced only from the
+  write's own response, skipping every post-write reload/reread the
+  full-object path otherwise performs (up to 4-6 extra HTTP round trips
+  and ~0.35s of built-in sleeps on a PR merge or board-column move
+  today). `light=False` is unchanged, byte-for-byte. See "Opting out of
+  the post-write reload" above.
 - `ProjectConfig.local_path: str | None = None` — the local checkout path
   for the project, when known. Auto-populated for `source="git-remote"`
   projects from the discovered git-repo root; readable from YAML for
