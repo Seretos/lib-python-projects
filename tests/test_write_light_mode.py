@@ -1082,7 +1082,10 @@ def test_update_ticket_light_column_move_no_label_change_board_only(
         ("POST", "/graphql"),  # field resolve (ProjectV2FieldCommon)
         ("POST", "/graphql"),  # updateProjectV2ItemFieldValue -- the mutation itself
     ]
-    assert len(seen) == 5
+    # (test-critic g2 round 2, tautology::LEN-SEEN-DEAD, minor: a separate
+    # `len(seen) == 5` here is entailed by the list-equality assertion
+    # above and can never be false at this point -- removed as dead
+    # weight, not as a coverage gap.)
     mutation_query = json.loads(seen[-1].content.decode("utf-8"))["query"]
     assert "updateProjectV2ItemFieldValue" in mutation_query, (
         "the board mutation must be the LAST request issued -- zero "
@@ -1177,7 +1180,22 @@ def test_update_ticket_light_false_board_mutation_query_unchanged(
     )
 
     assert len(mutation_queries) == 1, "the mutation must be issued exactly once"
-    assert mutation_queries[0] == github_mod._UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION, (
+    # test-critic g2 round 2 (tautology::CONST-SELF-REF, MAJOR): comparing
+    # against `github_mod._UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION`
+    # itself is a self-reference -- if a future/buggy implementation
+    # widened that very constant in place (instead of adding the separate
+    # `..._WITH_CONTENT` constant the plan calls for), both sides of the
+    # comparison would move together and this would still pass. Pin an
+    # independent, hardcoded literal copied from the current production
+    # source (github.py:2168-2172) instead, so the test constrains the
+    # actual byte content, not "equals whatever the module currently
+    # holds".
+    expected_light_false_mutation = (
+        "mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){"
+        "updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,"
+        "fieldId:$fieldId,value:$value}){projectV2Item{id}}}"
+    )
+    assert mutation_queries[0] == expected_light_false_mutation, (
         "light=False (the default, omitted here) must send the literal, "
         "byte-identical mutation document it sends today -- no "
         "`content{...on Issue{...}}` fragment leaking in from the "
