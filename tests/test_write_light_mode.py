@@ -955,8 +955,20 @@ def test_update_ticket_light_column_move_no_label_change_board_only(
             # so (with only custom_fields passed) no PATCH is issued.
             # Distinguishing values that must NOT leak into the ref --
             # that's the pre-write-read leak this design forbids.
+            #
+            # test-critic round 4 (tautology::F4, MAJOR): this used to
+            # give state="open"/labels=[ai-modified] -- the SAME values
+            # the mutation response below also carries -- so a light
+            # path that sourced ref.status/ref.labels from THIS pre-write
+            # GET instead of the mutation's own content passed anyway.
+            # Now distinctly wrong on both fields (closed:completed vs
+            # the mutation's open; a 2-label set vs the mutation's single
+            # ai-modified) while still keeping ai-modified present so the
+            # label-sync comparison below still finds nothing changed and
+            # still issues no PATCH.
             return _json(_gh_issue_payload(
-                42, labels=[{"name": "ai-modified"}],
+                42, state="closed", state_reason="completed",
+                labels=[{"name": "ai-modified"}, {"name": "triage"}],
                 html_url="https://github.com/acme/backend/issues/42?prewrite=1",
                 updated_at="2020-01-01T00:00:00Z",
             ))
@@ -1030,11 +1042,13 @@ def test_update_ticket_light_column_move_no_label_change_board_only(
     )
     assert ref.status == "open", (
         "status must be mapped from the mutation response's own "
-        "state/stateReason via _map_graphql_issue_content, not left None"
+        "state/stateReason via _map_graphql_issue_content, not left None "
+        "and not leaked from the pre-write GET's closed:completed"
     )
     assert ref.labels == ["ai-modified"], (
-        "labels must come from the mutation response's own content, not "
-        "the pre-write GET"
+        "labels must come from the mutation response's own content "
+        "(a single ai-modified label), not the pre-write GET's "
+        "[ai-modified, triage]"
     )
     assert ref.updated_at == "2026-06-07T08:09:10Z", (
         "updated_at must come from the mutation response, not the "
