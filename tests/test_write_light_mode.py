@@ -2,8 +2,11 @@
 provider write methods (`create_ticket`, `update_ticket`, `add_comment`,
 `create_pr`, `update_pr`, `merge_pr`) across GitHub/GitLab/Azure DevOps.
 
-Organised by the plan's R1-R4 driving-test requirements (see
-`.adev/265-1/plan.md`):
+Organised by the plan's R1-R4 driving-test requirements (generation 2,
+see `.adev/265-3/plan.md` -- generation 1's `.adev/265-1/plan.md` hit
+test-critic's hard cap on R6's untestable free-form-prose evidence and
+was replanned; R1-R4 and their request-budget numbers are unchanged
+across the replan):
   R1 - merge_pr(light=True): request budget + error-path parity
   R2 - update_ticket(light=True): skips the post-write reload/poll
   R3 - add_comment(light=True): a single request on every provider
@@ -15,6 +18,38 @@ Organised by the plan's R1-R4 driving-test requirements (see
 below is expected to fail RED with
 `TypeError: <method>() got an unexpected keyword argument 'light'` until
 phase=implement adds the parameter to each of the 18 methods.
+
+Generation-2 plan-critic round-3 (soft cap; 1 major + 3 minor `misread`
+findings, forwarded to implementation as documented interpretations, not
+resolved on the ticket itself -- see `.adev/265-3/plan-critic-g2-3/
+critique-merged.json`):
+  - misread::F1 (major) -- ADO `merge_pr(light=True)`'s pre-write
+    handshake GET is NOT counted against AC2's "merge request plus at
+    most one status read" budget: the plan (and the budget tests below,
+    `test_merge_pr_light_request_budget_azuredevops` et al.) treat AC2 as
+    bounding *post-write* reads only, placing the handshake GET in the
+    same load-bearing-pre-write-work category the owner blessed in Q1 for
+    `update_ticket`'s pre-write label-diff GET. This is the plan's own
+    reading, not an amendment recorded on the ticket -- noted here rather
+    than silently assumed.
+  - misread::F2 (minor) -- the light column-move's resolve-then-mutate
+    GraphQL prelude (project-id query, `addProjectV2ItemById`, field
+    resolve) is counted as part of *performing* the board write, not as
+    a reload, and is pinned literally in
+    `test_update_ticket_light_column_move_no_label_change_board_only`'s
+    exact request-sequence assertion -- likewise the plan's own reading
+    of the amended budget, not a literal restatement of it.
+  - misread::F3 (minor) -- `PullRequestRef.number` (GitHub `merge_pr`)
+    and `TicketRef.custom_fields`/board-applied fields are sourced from
+    the CALL's own arguments (`pr_id`, the board argument/consumed
+    keys/PATCHed field refs) rather than exclusively from the write
+    response body, per the `base.py:740-747` identity-echo rule the plan
+    cites. `test_merge_pr_light_request_budget_github` is parametrized
+    over `pr_id` specifically to prove `ref.number` is read from the
+    call's own argument, not hardcoded.
+  - misread::F4 (minor) -- see `tests/test_write_light_docs.py`'s module
+    docstring for this one; it concerns the R6a docstring-partition
+    test's design, not this file.
 """
 from __future__ import annotations
 
@@ -1031,13 +1066,28 @@ def test_update_ticket_light_column_move_no_label_change_board_only(
     )
 
     assert get_count["n"] == 1, "exactly one pre-write issue GET, no re-GET"
-    graphql_queries = [
-        json.loads(r.content.decode("utf-8"))["query"]
-        for r in seen if r.url.path == "/graphql"
+    # Generation-2 plan, "three things changed" item 4: pin the FULL
+    # request sequence and count literally, not just "was the mutation
+    # issued somewhere" -- an added or re-added request (e.g. a
+    # reintroduced post-write reload) now fails this test even if every
+    # other assertion below would still pass. The board mutation's own
+    # resolve-then-mutate prelude (project-id query, addProjectV2ItemById,
+    # field resolve) is unchanged from light=False and is part of
+    # performing this write (plan's Approach section, R2(b)) -- it is not
+    # a reload and is included in the fixed count.
+    assert [(r.method, r.url.path) for r in seen] == [
+        ("GET", "/repos/acme/backend/issues/42"),
+        ("POST", "/graphql"),  # project-id resolve (resolve-then-mutate prelude)
+        ("POST", "/graphql"),  # addProjectV2ItemById (idempotent re-add)
+        ("POST", "/graphql"),  # field resolve (ProjectV2FieldCommon)
+        ("POST", "/graphql"),  # updateProjectV2ItemFieldValue -- the mutation itself
     ]
-    assert any(
-        "updateProjectV2ItemFieldValue" in q for q in graphql_queries
-    ), "the board mutation must actually be issued"
+    assert len(seen) == 5
+    mutation_query = json.loads(seen[-1].content.decode("utf-8"))["query"]
+    assert "updateProjectV2ItemFieldValue" in mutation_query, (
+        "the board mutation must be the LAST request issued -- zero "
+        "post-write reload/reread after it"
+    )
     assert isinstance(ref, TicketRef)
     assert ref.id == "42"
     assert ref.url == "https://github.com/acme/backend/issues/42?mutated=1", (
@@ -1059,6 +1109,80 @@ def test_update_ticket_light_column_move_no_label_change_board_only(
         "pre-write GET's 2020-01-01 value"
     )
     assert ref.custom_fields == {"Status": "Done"}
+
+
+def test_update_ticket_light_false_board_mutation_query_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generation-2 plan, "three things changed" item 3(b): the widened
+    `content{...on Issue{...}}` selection set on
+    `updateProjectV2ItemFieldValue` is reachable ONLY through
+    `with_content=True`, gated on `light=True` -- `light=False` (the
+    default; this call passes no `light` kwarg at all, matching every
+    existing caller) must keep sending the EXACT SAME mutation document
+    it sends today. The pre-existing R5 suite (`test_github_board.py`)
+    only ever asserts a query SUBSTRING
+    (`"updateProjectV2ItemFieldValue" in query`), which would still pass
+    even if a `content{...}` fragment were silently appended for every
+    caller -- this test closes that gap by comparing the sent query
+    byte-for-byte against the production constant itself, so a widened
+    selection leaking onto the light=False path fails here even though
+    it would slip past every existing `in`-based check."""
+    board = _gh_board(owner="acme-org", project_number=7, status_field="Status")
+    project = _gh_project(board)
+    mutation_queries: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_gh_issue_payload(42, labels=[{"name": "ai-modified"}]))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            raise AssertionError(
+                "no PATCH must be issued -- labels are unchanged and only "
+                "custom_fields was written"
+            )
+        if path == "/graphql":
+            body = json.loads(req.content.decode("utf-8"))
+            query = body["query"]
+            if "addProjectV2ItemById" in query:
+                return _json(
+                    {"data": {"addProjectV2ItemById": {"item": {"id": "item-9"}}}}
+                )
+            if "updateProjectV2ItemFieldValue" in query:
+                mutation_queries.append(query)
+                return _json({
+                    "data": {
+                        "updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "item-9"}},
+                    },
+                })
+            if "ProjectV2FieldCommon" in query:
+                owner_field = _gh_owner_field(query)
+                return _json({"data": {owner_field: {"projectV2": {"field": {
+                    "id": "field-status", "name": "Status",
+                    "options": [{"id": "opt-done", "name": "Done"}],
+                }}}}})
+            if "projectV2(number:$number){id}" in query:
+                owner_field = _gh_owner_field(query)
+                return _json(
+                    {"data": {owner_field: {"projectV2": {"id": "proj-node-id"}}}}
+                )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    _install_github_mock(monkeypatch, handler)
+    # No `light=` kwarg at all -- this is the ordinary, pre-existing
+    # calling shape every current caller uses, and it must keep working
+    # unchanged (AC3).
+    GitHubProvider().update_ticket(
+        project, "t", "42", custom_fields={"Status": "Done"},
+    )
+
+    assert len(mutation_queries) == 1, "the mutation must be issued exactly once"
+    assert mutation_queries[0] == github_mod._UPDATE_PROJECT_V2_ITEM_FIELD_VALUE_MUTATION, (
+        "light=False (the default, omitted here) must send the literal, "
+        "byte-identical mutation document it sends today -- no "
+        "`content{...on Issue{...}}` fragment leaking in from the "
+        "light=True-only `with_content` variant (AC3)"
+    )
 
 
 def test_update_ticket_light_column_move_mutation_without_content_gives_none(

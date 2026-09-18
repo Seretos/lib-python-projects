@@ -130,6 +130,43 @@ parts of this file doing real work; the bare non-emptiness checks on
 `Source:`/`Labels:`/`Replay:` exist only to keep the docstrings
 structurally honest (the label is there, with content), not as
 independent proof of behaviour -- stated plainly and finally.
+
+GENERATION 2 (`.adev/265-3/plan.md`) replanned R6: R6a below (structural
+`Returns:`/`None:` checks against real `dataclasses.fields()`) is
+`driving-test` evidence; the free-form `Source:`/`Labels:`/`Replay:`
+prose content is split out as R6b, `none`-evidence, per round 6's own
+conclusion above that no string-content assertion can behaviourally
+constrain free prose. The R1-R4 budget/field numbers this file's
+`FIELD_PARTITION` table encodes are unchanged by the replan.
+
+Plan-critic round-3 (soft cap) forwarded finding misread::F4 (minor,
+`.adev/265-3/plan-critic-g2-3/critique-merged.json`) against this file's
+design: the plan's prose for R6a's second test describes driving each
+method through its R1-R4 scenario live and asserting the docstring's
+`None:` list against whatever fields are `None` on THAT run's produced
+ref, rather than against a hand-written table -- and warns that doing so
+naively would conflate a field that is *conditionally* empty (e.g.
+`custom_fields`, `None` only when this call wrote none -- AC1) with a
+field AC4 calls structurally unsourceable, since whichever single run
+drives the check forces the conditionally-empty field into `None:`
+either way.
+
+`FIELD_PARTITION` below sidesteps that exact trap rather than falling
+into it: each entry already encodes ONE specific, plan-named canonical
+scenario per (provider, method) -- chosen to match R1-R4's own stated
+"Behaviour" bullets (e.g. GitHub `update_ticket`'s board-only outcome,
+ADO `merge_pr`'s still-unsettled outcome) -- and documents run-dependent
+fields (`custom_fields`, ADO merge's `merged`) under `None:` WITH the
+producing condition named in the surrounding comment, exactly as the
+plan itself prescribes ("document that field under `None:` with the
+condition in prose"). It is deliberately not rewritten into a blind
+"run whatever scenario and diff against it" live harness -- that
+rewrite is not required by this round's dispatch (only the ADO-budget /
+GraphQL-prelude / identity-field misreads, F1-F3, carry required
+test-code changes; F4 is noted here per the dispatch's own scoping, not
+converted into a new test). The behavioural truth of "run-dependent =
+condition documented in prose" is what R1-R4 already assert on the
+specific runs each `merged`/`custom_fields` case exercises.
 """
 from __future__ import annotations
 
