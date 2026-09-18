@@ -9,10 +9,10 @@ name: tests
 # ubuntu-latest) matches the WSL2 / plugin-binary glibc target, so a
 # regression here would be visible to the same downstream consumers.
 #
-# Note: `pip install -e .[test]` pulls `lib-python-config` from its
-# `release/0.x` floating branch on GitHub (declared in pyproject.toml).
-# CI needs that branch to exist on the lib-python-config remote — if a
-# config-side fix needs to ship first, release it before retrying.
+# Note: `pip install -e .[test]` pulls `lib-python-config` at the exact
+# tag declared in pyproject.toml. If a config-side fix needs to ship
+# first, that requires a tagged lib-python-config release plus a pin
+# bump here — not just a retry.
 on:
   pull_request:
 

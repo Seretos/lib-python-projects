@@ -8,6 +8,16 @@ are never hand-labelled with a version string or tag.
 
 ## Unreleased
 
+### Changed
+
+- Tickets #266/#268: pinned `lib-python-config` in `pyproject.toml` to the
+  exact tag `v0.1.2`, replacing the floating `release/0.x` branch pin.
+  `lib-python-config`'s own release workflow force-pushes `release/0.x` on
+  every release, so a clean install could previously resolve to a
+  different, never-reviewed config commit with no diff/PR in this repo. A
+  config release now reaches this lib only via an explicit, reviewed pin
+  bump.
+
 ### Added
 
 - Ticket #265: an opt-in `light: bool = False` keyword-only parameter on

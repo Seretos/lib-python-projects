@@ -27,10 +27,10 @@ name: release
 # a force-push because the commit they point to is preserved by git as
 # long as the tag exists.
 #
-# Cross-lib note: this lib pins lib-python-config via @release/0.x
-# (see pyproject.toml). A release here ships with whichever config
-# commit sits on that branch at install time — bump config first if
-# this release needs a specific config-side fix.
+# Cross-lib note: this lib pins lib-python-config at an exact tag (see
+# pyproject.toml), so a release here ships a fixed, reviewed config
+# version — bump the pin first if this release needs a specific
+# config-side fix.
 on:
   workflow_dispatch:
     inputs:

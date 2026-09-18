@@ -10,14 +10,15 @@ requires-python = ">=3.11"
 authors = [{ name = "Arne von Appen" }]
 dependencies = [
   # Foundation lib: YAML loading, path discovery, and the generic
-  # `LoadResult` we subclass as `ProjectsLoadResult`. Pinned to the
-  # floating `release/0.x` branch so minor/patch foundation releases
-  # flow into this lib's builds without a downstream bump. Bump to
-  # `release/Nx` once lib-python-config reaches a Nx.0.0 breaking
-  # release. For local development, run `pip install -e ../lib-python-config`
+  # `LoadResult` we subclass as `ProjectsLoadResult`. Pinned to an exact
+  # tag so a clean install always resolves to the same reviewed commit.
+  # A lib-python-config release only reaches this lib via an explicit,
+  # reviewed bump of this pin (the incoming downstream
+  # dependency-update-ticket mechanism) -- never an automatic branch
+  # move. For local development, run `pip install -e ../lib-python-config`
   # BEFORE `pip install -e .` to override the git-resolved copy with
   # an editable sibling checkout.
-  "lib-python-config @ git+https://github.com/Seretos/lib-python-config@release/0.x",
+  "lib-python-config @ git+https://github.com/Seretos/lib-python-config@v0.1.2",
   "pydantic>=2.0",
   "ruamel.yaml>=0.18",
   "httpx>=0.27",
