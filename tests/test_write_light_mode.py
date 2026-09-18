@@ -35,7 +35,13 @@ from lib_python_projects.providers.azuredevops import (
     _basic_auth_header,
     _cache_clear_all,
 )
-from lib_python_projects.providers.base import CommentRef, PullRequestRef, Ticket, TicketRef
+from lib_python_projects.providers.base import (
+    CommentRef,
+    PullRequest,
+    PullRequestRef,
+    Ticket,
+    TicketRef,
+)
 from lib_python_projects.providers.github import GitHubError, GitHubProvider
 from lib_python_projects.providers.gitlab import GitLabProvider
 
@@ -1331,6 +1337,57 @@ def test_update_ticket_light_azuredevops_custom_fields_only_what_was_written(
     assert ref_without_fields.custom_fields is None
 
 
+def test_update_ticket_light_azuredevops_labels_still_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closes a test-critic round-3 F1-F4 audit gap: the docs test's
+    "Labels: still applied" claim (Q1 -> (a): labels are still
+    applied/synced on a light column move) is asserted on ALL 3
+    providers' `update_ticket` docstrings
+    (`test_update_ticket_labels_line_documents_still_applied`,
+    parametrized over `PROVIDERS`), but before this round its ONLY
+    behavioural backing was GitHub's
+    `test_update_ticket_light_column_move_with_label_change` asserting
+    `"ai-modified"` in the actual PATCH body. The two ADO tests above
+    (`..._same_request_count_as_full`, `..._custom_fields_only_what_was_written`)
+    never pass `labels_add`/`labels_remove` at all, so nothing
+    behaviourally proved the claim for ADO. Mirrors
+    `test_update_ticket_light_gitlab_custom_fields_only_what_was_written`'s
+    body-level assertion: the label change must be present in the actual
+    PATCH request BODY sent (`/fields/System.Tags`), not merely echoed
+    back by the mocked response."""
+    patch_bodies: list[list[dict]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/workitems/61"):
+            return _json(_ado_work_item_payload(61))
+        if req.method == "PATCH" and path.endswith("/workitems/61"):
+            patch_bodies.append(json.loads(req.content.decode("utf-8")))
+            return _json(_ado_work_item_payload(61, **{"System.Tags": "bug"}))
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    seen = _install_ado_mock(monkeypatch, handler)
+    ref = AzureDevOpsProvider().update_ticket(
+        _ado_project(), "t", "61", labels_add=["bug"], light=True,
+    )
+
+    assert len(seen) == 2, "exactly one pre-write GET + one PATCH, no reload"
+    assert len(patch_bodies) == 1
+    assert any(
+        op.get("path") == "/fields/System.Tags" and "bug" in op.get("value", "")
+        for op in patch_bodies[0]
+    ), (
+        "the label change must actually be present in the PATCH request "
+        "BODY that was SENT, not merely echoed back by the mocked response"
+    )
+    assert isinstance(ref, TicketRef)
+    assert ref.labels == ["bug"], (
+        "labels must be populated from the PATCH response, proving the "
+        "light path still applies/syncs labels on update_ticket"
+    )
+
+
 # =============================================================================
 # R3 -- add_comment(light=True): a single request on every provider
 # =============================================================================
@@ -1965,6 +2022,50 @@ def test_create_ticket_light_custom_fields_written_vs_none_gitlab(
     assert ref_without_fields.custom_fields is None
 
 
+def test_create_ticket_light_gitlab_unsupported_custom_fields_key_raises_before_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """test-critic round-3 tautology::F6 (major): the plan's own R2
+    edge-case note names GitLab's "only the supported keys it consumed"
+    rule's discriminating case as passing an UNSUPPORTED extra
+    `custom_fields` key -- but no GitLab test in the batch ever did that;
+    the test above only ever passes `{"labels": [...]}`, which is fully
+    supported, so a verbatim-echo implementation
+    (`ref.custom_fields = dict(custom_fields)`) would pass it undetected.
+
+    Unlike ADO (which silently drops an unrecognised custom_fields key --
+    see `test_create_ticket_light_azuredevops_custom_fields_alias_not_echoed`'s
+    WorkItemType-alias case for the ONE key ADO *does* special-case), the
+    real GitLab discriminating behaviour is NOT "silently drop the
+    unsupported key and report only what was consumed" -- GitLab's own
+    `create_ticket` raises `ValueError` for any `custom_fields` key
+    outside `{"labels", "milestone"}` *before* issuing any request at all
+    (`gitlab.py:2919-2926`). The plan's prose ("only the supported keys
+    it consumed") describes the OUTCOME a caller experiences (an
+    unsupported key never becomes part of what was written), but for
+    GitLab that outcome is reached by rejecting the call outright, not by
+    filtering a written mapping down to the recognised subset -- so this
+    test exercises the real discriminating behaviour (the raise, with
+    zero requests) rather than the "silently drop it" framing that
+    doesn't literally apply here."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError(
+            "an unsupported custom_fields key must raise before any request "
+            "is issued -- GitLab's create_ticket validates the keys up "
+            "front (gitlab.py:2919-2926)"
+        )
+
+    seen = _install_gitlab_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="custom_fields"):
+        GitLabProvider().create_ticket(
+            _gl_project(), "t", title="hi", body="b", labels=[], assignees=[],
+            custom_fields={"not_a_real_key": "oops"}, light=True,
+        )
+
+    assert seen == [], "no request may be issued before the ValueError"
+
+
 def test_create_ticket_light_custom_fields_written_vs_none_azuredevops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2203,3 +2304,342 @@ def test_create_ticket_light_false_retry_of_light_true_reloads_full_model(
     )
     assert post_count["n"] == 1, "no new create POST -- only the reload GET"
     assert get_count["n"] == 1, "exactly one reload (get_ticket call)"
+
+
+# =============================================================================
+# R4 idempotency sub-cases, remaining (provider, method) combinations --
+# closes a test-critic round-3 F1-F4 audit gap.
+#
+# test_write_light_docs.py's `test_create_methods_replay_line_documents_
+# both_directions` asserts the `Replay:` docstring claim on ALL SIX create
+# methods (create_ticket/create_pr x GitHub/GitLab/AzureDevOps), but until
+# this round the only behavioural backing for that claim was the three
+# GitHub-create_ticket tests directly above ("GitHub, representative
+# surface"). `resolve_replay` is one shared `base.py` helper called
+# identically at all 6 sites, but each site still wires its OWN `reload`
+# callable (`self.get_ticket`/`self.get_pr`) and its OWN pre-#265
+# `_idempotency.lookup`/`record` call pair -- a provider that forgot to
+# thread `light` through `resolve_replay`, or wired the wrong reload, would
+# not have been caught by testing GitHub alone. These five tests close
+# that gap for the five previously-untested combinations: GitLab
+# create_ticket, GitLab create_pr, Azure DevOps create_ticket, Azure DevOps
+# create_pr, and GitHub create_pr. Each proves both replay directions in
+# one test (light->light: zero new requests; light=False after light=True:
+# exactly one reload, returning the full model with idempotent_replay=True)
+# rather than the three separate GitHub-style functions, to keep the added
+# scope proportionate to the gap being closed.
+# =============================================================================
+
+
+def test_create_ticket_light_idempotent_replay_gitlab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    post_count = {"n": 0}
+    get_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/issues"):
+            post_count["n"] += 1
+            return _json(_gl_issue_payload(60), status_code=201)
+        if req.method == "GET" and path.endswith("/issues/60"):
+            get_count["n"] += 1
+            # Distinguishing value -- proves the replay's Ticket is built
+            # from a genuine reload response, not up-converted from the
+            # stored TicketRef's own (narrower) field set.
+            return _json(_gl_issue_payload(
+                60, web_url="https://gitlab.com/acme/backend/-/issues/60?reloaded=1",
+            ))
+        # Permissive catch-all for get_ticket's own notes/links/closed_by
+        # sub-requests -- their exact shape is get_ticket's pre-existing,
+        # already-tested concern, not this ticket's; an empty list is a
+        # no-op for all three.
+        if req.method == "GET":
+            return _json([])
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    seen = _install_gitlab_mock(monkeypatch, handler)
+    first = GitLabProvider().create_ticket(
+        _gl_project(), "t", title="hi", body="b", labels=[], assignees=[],
+        idempotency_key="gl-k1", light=True,
+    )
+    assert isinstance(first, TicketRef)
+    count_after_first = len(seen)
+
+    replay_light = GitLabProvider().create_ticket(
+        _gl_project(), "t", title="hi", body="b", labels=[], assignees=[],
+        idempotency_key="gl-k1", light=True,
+    )
+    assert len(seen) == count_after_first, "light->light replay must issue no new request"
+    assert isinstance(replay_light, TicketRef)
+    assert replay_light.idempotent_replay is True
+
+    replay_full = GitLabProvider().create_ticket(
+        _gl_project(), "t", title="hi", body="b", labels=[], assignees=[],
+        idempotency_key="gl-k1", light=False,
+    )
+    assert len(seen) > count_after_first, (
+        "a light=False replay of a light-created key must reload, not "
+        "return the stored ref untouched"
+    )
+    assert isinstance(replay_full, Ticket), (
+        "must return the full Ticket model (via reload), not the stored TicketRef"
+    )
+    assert replay_full.idempotent_replay is True
+    assert replay_full.url == "https://gitlab.com/acme/backend/-/issues/60?reloaded=1", (
+        "must be built from the reload's own response"
+    )
+    assert post_count["n"] == 1, "no new create POST -- only the reload GET"
+    assert get_count["n"] == 1, "exactly one reload (get_ticket call)"
+
+
+def test_create_ticket_light_idempotent_replay_azuredevops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    post_count = {"n": 0}
+    get_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/workitems/$Issue"):
+            post_count["n"] += 1
+            return _json(_ado_work_item_payload(65), status_code=201)
+        if req.method == "GET" and path.endswith("/workitems/65"):
+            get_count["n"] += 1
+            # Distinguishing value -- proves the replay's Ticket is built
+            # from a genuine reload response, not up-converted from the
+            # stored TicketRef's own (narrower) field set.
+            return _json(_ado_work_item_payload(
+                65, **{"System.ChangedDate": "2026-09-18T09:08:07Z"},
+            ))
+        if req.method == "GET" and path.endswith("/comments"):
+            return _json({"comments": []})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    seen = _install_ado_mock(monkeypatch, handler)
+    first = AzureDevOpsProvider().create_ticket(
+        _ado_project(), "t", title="hi", body="b", labels=[], assignees=[],
+        idempotency_key="ado-k1", light=True,
+    )
+    assert isinstance(first, TicketRef)
+    count_after_first = len(seen)
+
+    replay_light = AzureDevOpsProvider().create_ticket(
+        _ado_project(), "t", title="hi", body="b", labels=[], assignees=[],
+        idempotency_key="ado-k1", light=True,
+    )
+    assert len(seen) == count_after_first, "light->light replay must issue no new request"
+    assert isinstance(replay_light, TicketRef)
+    assert replay_light.idempotent_replay is True
+
+    replay_full = AzureDevOpsProvider().create_ticket(
+        _ado_project(), "t", title="hi", body="b", labels=[], assignees=[],
+        idempotency_key="ado-k1", light=False,
+    )
+    assert len(seen) > count_after_first, (
+        "a light=False replay of a light-created key must reload, not "
+        "return the stored ref untouched"
+    )
+    assert isinstance(replay_full, Ticket), (
+        "must return the full Ticket model (via reload), not the stored TicketRef"
+    )
+    assert replay_full.idempotent_replay is True
+    assert replay_full.updated_at == "2026-09-18T09:08:07Z", (
+        "must be built from the reload's own response"
+    )
+    assert post_count["n"] == 1, "no new create POST -- only the reload GET"
+    assert get_count["n"] == 1, "exactly one reload (get_ticket call)"
+
+
+def test_create_pr_light_idempotent_replay_github(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    post_count = {"n": 0}
+    get_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/labels") and "/issues/" not in path:
+            return _json({"name": "ai-generated"}, status_code=201)
+        if req.method == "POST" and path.endswith("/pulls"):
+            post_count["n"] += 1
+            return _json(_gh_pr_payload(21, labels=[]), status_code=201)
+        if req.method == "GET" and path.endswith("/pulls/21"):
+            get_count["n"] += 1
+            # Distinguishing value -- proves the replay's PullRequest is
+            # built from a genuine get_pr response, not up-converted from
+            # the stored PullRequestRef's own (narrower) field set.
+            return _json(_gh_pr_payload(
+                21, html_url="https://github.com/acme/backend/pull/21?reloaded=1",
+            ))
+        if req.method == "GET" and path.endswith("/issues/21/comments"):
+            return _json([])
+        if req.method == "GET" and path.endswith("/pulls/21/reviews"):
+            return _json([])
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    seen = _install_github_mock(monkeypatch, handler)
+    first = GitHubProvider().create_pr(
+        _gh_project(), "t", title="hi", body="b", head="feature", base="main",
+        idempotency_key="pr-k1", light=True,
+    )
+    assert isinstance(first, PullRequestRef)
+    count_after_first = len(seen)
+
+    replay_light = GitHubProvider().create_pr(
+        _gh_project(), "t", title="hi", body="b", head="feature", base="main",
+        idempotency_key="pr-k1", light=True,
+    )
+    assert len(seen) == count_after_first, "light->light replay must issue no new request"
+    assert isinstance(replay_light, PullRequestRef)
+    assert replay_light.idempotent_replay is True
+
+    replay_full = GitHubProvider().create_pr(
+        _gh_project(), "t", title="hi", body="b", head="feature", base="main",
+        idempotency_key="pr-k1", light=False,
+    )
+    assert len(seen) > count_after_first, (
+        "a light=False replay of a light-created key must reload, not "
+        "return the stored ref untouched"
+    )
+    assert isinstance(replay_full, PullRequest), (
+        "must return the full PullRequest model (via reload), not the "
+        "stored PullRequestRef"
+    )
+    assert replay_full.idempotent_replay is True
+    assert replay_full.url == "https://github.com/acme/backend/pull/21?reloaded=1", (
+        "must be built from the reload's own response"
+    )
+    assert post_count["n"] == 1, "no new create POST -- only the reload GET"
+    assert get_count["n"] == 1, "exactly one reload (get_pr call)"
+
+
+def test_create_pr_light_idempotent_replay_gitlab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    post_count = {"n": 0}
+    get_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/merge_requests"):
+            post_count["n"] += 1
+            return _json(_gl_mr_payload(80, sha="createprsha80"), status_code=201)
+        if req.method == "GET" and path.endswith("/merge_requests/80"):
+            get_count["n"] += 1
+            # Distinguishing value -- proves the replay's PullRequest is
+            # built from a genuine get_pr response, not up-converted from
+            # the stored PullRequestRef's own (narrower) field set.
+            return _json(_gl_mr_payload(80, sha="reloadedsha80"))
+        if req.method == "GET" and path.endswith("/approvals"):
+            # `_fetch_mr_approvals` degrades gracefully on 403/404.
+            return httpx.Response(status_code=404, content=b"{}")
+        if req.method == "GET" and path.endswith("/notes"):
+            return _json([])
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    seen = _install_gitlab_mock(monkeypatch, handler)
+    first = GitLabProvider().create_pr(
+        _gl_project(), "t", title="hi", body="b", head="feat", base="main",
+        idempotency_key="gl-pr-k1", light=True,
+    )
+    assert isinstance(first, PullRequestRef)
+    count_after_first = len(seen)
+
+    replay_light = GitLabProvider().create_pr(
+        _gl_project(), "t", title="hi", body="b", head="feat", base="main",
+        idempotency_key="gl-pr-k1", light=True,
+    )
+    assert len(seen) == count_after_first, "light->light replay must issue no new request"
+    assert isinstance(replay_light, PullRequestRef)
+    assert replay_light.idempotent_replay is True
+
+    replay_full = GitLabProvider().create_pr(
+        _gl_project(), "t", title="hi", body="b", head="feat", base="main",
+        idempotency_key="gl-pr-k1", light=False,
+    )
+    assert len(seen) > count_after_first, (
+        "a light=False replay of a light-created key must reload, not "
+        "return the stored ref untouched"
+    )
+    assert isinstance(replay_full, PullRequest), (
+        "must return the full PullRequest model (via reload), not the "
+        "stored PullRequestRef"
+    )
+    assert replay_full.idempotent_replay is True
+    assert replay_full.head_sha == "reloadedsha80", (
+        "must be built from the reload's own response"
+    )
+    assert post_count["n"] == 1, "no new create POST -- only the reload GET"
+    assert get_count["n"] == 1, "exactly one reload (get_pr call)"
+
+
+def test_create_pr_light_idempotent_replay_azuredevops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    post_count = {"n": 0}
+    get_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        cached = _repos_handler(req)
+        if cached is not None:
+            return cached
+        path = req.url.path
+        if req.method == "POST" and path.endswith("/pullrequests"):
+            post_count["n"] += 1
+            return _json(
+                _ado_pr_payload(70, lastMergeSourceCommit={"commitId": "createprsha70"}),
+                status_code=201,
+            )
+        if req.method == "POST" and path.endswith("/pullrequests/70/labels"):
+            return _json({"name": "ai-generated"}, status_code=201)
+        if req.method == "GET" and path.endswith("/pullrequests/70"):
+            get_count["n"] += 1
+            # Distinguishing value -- proves the replay's PullRequest is
+            # built from a genuine get_pr response, not up-converted from
+            # the stored PullRequestRef's own (narrower) field set.
+            return _json(_ado_pr_payload(
+                70, lastMergeSourceCommit={"commitId": "reloadedsha70"},
+            ))
+        if req.method == "GET" and path.endswith("/pullrequests/70/labels"):
+            # `_fetch_pr_labels` degrades gracefully on 403/404.
+            return _json({}, status_code=404)
+        if req.method == "GET" and path.endswith("/threads"):
+            return _json({"value": []})
+        raise AssertionError(f"unexpected {req.method} {path}")
+
+    seen = _install_ado_mock(monkeypatch, handler)
+    _prime_ado_repo_cache(seen)
+    first = AzureDevOpsProvider().create_pr(
+        _ado_project(), "t", title="hi", body="b", head="feat", base="main",
+        idempotency_key="ado-pr-k1", light=True,
+    )
+    assert isinstance(first, PullRequestRef)
+    count_after_first = len(seen)
+
+    replay_light = AzureDevOpsProvider().create_pr(
+        _ado_project(), "t", title="hi", body="b", head="feat", base="main",
+        idempotency_key="ado-pr-k1", light=True,
+    )
+    assert len(seen) == count_after_first, "light->light replay must issue no new request"
+    assert isinstance(replay_light, PullRequestRef)
+    assert replay_light.idempotent_replay is True
+
+    replay_full = AzureDevOpsProvider().create_pr(
+        _ado_project(), "t", title="hi", body="b", head="feat", base="main",
+        idempotency_key="ado-pr-k1", light=False,
+    )
+    assert len(seen) > count_after_first, (
+        "a light=False replay of a light-created key must reload, not "
+        "return the stored ref untouched"
+    )
+    assert isinstance(replay_full, PullRequest), (
+        "must return the full PullRequest model (via reload), not the "
+        "stored PullRequestRef"
+    )
+    assert replay_full.idempotent_replay is True
+    assert replay_full.head_sha == "reloadedsha70", (
+        "must be built from the reload's own response"
+    )
+    assert post_count["n"] == 1, "no new create POST -- only the reload GET"
+    assert get_count["n"] == 1, "exactly one reload (get_pr call)"

@@ -17,6 +17,14 @@ None of the 18 docstrings carry this block today (no docstring mentions
 `light` at all), so every assertion here is expected RED until
 phase=implement documents each method in this exact format.
 
+ROUND 3 (test-critic tautology::F5, CRITICAL): the ADO merge_pr doc test
+below (`test_azuredevops_merge_pr_documents_unsettled_outcome_and_handshake_get`)
+used to scan the WHOLE docstring (`doc.lower()`) for "unsettled" and
+"handshake"/"lastmergesourcecommit", so unrelated full-path prose could
+satisfy both checks regardless of what the light block itself said.
+Fixed to scan only the parsed light block's own text (`block.lower()`)
+-- see that test's docstring for detail.
+
 WHAT THIS FILE CAN AND CANNOT PROVE (test-critic CRITICAL F4, round 5+1
 -- read before trusting any single assertion below as behavioural
 evidence):
@@ -582,18 +590,29 @@ def test_azuredevops_merge_pr_documents_unsettled_outcome_and_handshake_get() ->
     `test_merge_pr_light_azuredevops_still_unsettled_gives_merged_none`,
     and the handshake GET's role is proven by the request-sequence
     assertions in the ADO merge budget tests (`[GET, PATCH, ...]`), not
-    by this wording check."""
+    by this wording check.
+
+    test-critic round-3 tautology::F5 (CRITICAL): the "unsettled" and
+    "handshake"/"lastMergeSourceCommit" checks used to scan `doc_lower`
+    -- the ENTIRE docstring, not just the light block -- so unrelated
+    full-path prose describing the pre-#265 poll (which already mentions
+    both words) could satisfy them regardless of what the light block
+    itself said. Fixed to scan only `block` (the text from the
+    ``Light mode (`light=True`)`` marker onward), matching every other
+    check in this file, which already operates on `block`/`parsed`."""
     doc = _doc(AzureDevOpsProvider, "merge_pr")
     block = _light_block(doc, AzureDevOpsProvider, "merge_pr")
     parsed = _parse_block(block)
-    doc_lower = doc.lower()
-    assert "still unsettled" in parsed["None"].lower() or "unsettled" in doc_lower, (
-        "must document the still-unsettled outcome"
+    block_lower = block.lower()
+    assert "still unsettled" in parsed["None"].lower() or "unsettled" in block_lower, (
+        "must document the still-unsettled outcome in the light block"
     )
     assert "202" not in parsed.get("Source", "") + parsed.get("None", ""), (
         "must not describe light's still-unsettled outcome as a 202 error "
         "-- that's the full-object poll's behaviour, not light's"
     )
-    assert "handshake" in doc_lower or "lastmergesourcecommit" in doc_lower, (
-        "must name the handshake GET that the completion PATCH depends on"
+    assert "handshake" in block_lower or "lastmergesourcecommit" in block_lower, (
+        "must name the handshake GET that the completion PATCH depends on, "
+        "in the light block itself -- not merely somewhere in the full "
+        "docstring's pre-existing full-path prose"
     )
