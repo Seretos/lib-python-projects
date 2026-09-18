@@ -58,6 +58,7 @@ from lib_python_projects.providers.base import (
     BulkTicketResult,
     CIConfigurationProvider,
     Comment,
+    CommentRef,
     DiscoveredProject,
     FailingJob,
     FailureAnnotation,
@@ -76,6 +77,7 @@ from lib_python_projects.providers.base import (
     ProjectDiscoveryResult,
     ProviderError,
     PullRequest,
+    PullRequestRef,
     RateLimitError,
     Ref,
     Relation,
@@ -85,6 +87,7 @@ from lib_python_projects.providers.base import (
     Release,
     resolve_event_alias,
     resolve_fetch_page_size,
+    resolve_replay,
     run_matches_ref,
     Review,
     review_decision_from_states,
@@ -95,6 +98,7 @@ from lib_python_projects.providers.base import (
     TemplateField,
     Ticket,
     TicketFilters,
+    TicketRef,
     TokenCapabilities,
     TokenCapabilityProvider,
     TokenProjectDiscoveryProvider,
@@ -1583,6 +1587,24 @@ def _parse_thread_id_from_alias(value: str | None) -> str | None:
 # proceed. Shared with `_wait_for_merge_status`, whose terminal
 # failure set must stay identical.
 _MERGE_FAILURE_STATUSES = frozenset({"conflicts", "rejectedByPolicy", "failure"})
+
+
+def _is_merge_settled(payload: dict) -> bool:
+    """True iff a PR payload's `mergeStatus`/`status` are settled —
+    extracted (ticket #265) from `_wait_for_merge_settle`'s inline
+    condition so `merge_pr(light=True)` can reuse the exact same
+    predicate for its single conditional post-write status read.
+
+    Settled means EITHER:
+      - `mergeStatus` in `_MERGE_FAILURE_STATUSES` (a terminal failure
+        mode: `conflicts`/`rejectedByPolicy`/`failure`), OR
+      - `mergeStatus == "succeeded"` AND `status == "completed"` (ADO
+        has actually finalized the merge).
+    """
+    merge_status = payload.get("mergeStatus")
+    if merge_status in _MERGE_FAILURE_STATUSES:
+        return True
+    return merge_status == "succeeded" and payload.get("status") == "completed"
 
 
 def _map_merge_status(merge_status: str | None) -> bool | None:
@@ -3172,7 +3194,8 @@ class AzureDevOpsProvider(
         *,
         idempotency_key: str | None = None,
         milestone: Any = _UNSET,
-    ) -> Ticket:
+        light: bool = False,
+    ) -> Ticket | TicketRef:
         """Create an ADO work item.
 
         When ``status`` is given, this runs a two-step flow: the work item
@@ -3219,6 +3242,26 @@ class AzureDevOpsProvider(
         unchanged). Uses the ``_UNSET`` sentinel default so "not
         provided" issues no patch op at all; ``milestone=None`` is also a
         no-op on create (there's nothing to clear on a fresh work item).
+
+        Light mode (`light=True`):
+            Returns: TicketRef(id, url, status, labels, updated_at, idempotent_replay)
+            Source: the create response (plus the follow-up status-
+                transition update_ticket call, when a status differing
+                from the initial state was requested) — no reload.
+            None: custom_fields
+                (populated with exactly the field refs this call
+                actually PATCHed — excluding the WorkItemType/
+                System.WorkItemType alias, which is consumed to pick the
+                work-item type and never becomes a field op — when
+                `custom_fields` was passed, else None.)
+            Labels: still applied (the ai-generated marker + any board
+                on_create labels), same as light=False.
+            Replay: a light=True retry of the same idempotency_key
+                returns the stored TicketRef with idempotent_replay=True
+                and issues no new request; a light=False retry of a key
+                whose original create used light=True reloads once
+                (get_ticket) and returns the full Ticket, also with
+                idempotent_replay=True.
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
@@ -3229,7 +3272,10 @@ class AzureDevOpsProvider(
                 {"title": title, "body": body},
             )
             if replay is not None:
-                return replay
+                return resolve_replay(
+                    replay, light,
+                    lambda: self.get_ticket(project, token, str(replay.id))[0],
+                )
 
         remaining_custom_fields = dict(custom_fields or {})
         canonical_type_override = remaining_custom_fields.pop("System.WorkItemType", None)
@@ -3335,14 +3381,22 @@ class AzureDevOpsProvider(
                     f"work item #{created.id} created but state "
                     f"transition to '{status}' failed: {exc}",
                 ) from exc
+        if light:
+            ref = TicketRef.from_ticket(created)
+            ref.custom_fields = (
+                dict(remaining_custom_fields) if remaining_custom_fields else None
+            )
+            result: Ticket | TicketRef = ref
+        else:
+            result = created
         if idempotency_key:
             _idempotency.record(
                 (project.provider, project.id),
                 idempotency_key,
                 {"title": title, "body": body},
-                created,
+                result,
             )
-        return created
+        return result
 
     def update_ticket(
         self,
@@ -3359,7 +3413,8 @@ class AzureDevOpsProvider(
         assignees_remove: list[str] | None = None,
         custom_fields: dict[str, Any] | None = None,
         milestone: Any = _UNSET,
-    ) -> Ticket:
+        light: bool = False,
+    ) -> Ticket | TicketRef:
         """Update a work item.
 
         Optional ``milestone`` (ticket #151, keyword-only): maps to a
@@ -3371,6 +3426,19 @@ class AzureDevOpsProvider(
         for ``System.IterationPath``, every work item belongs to some
         iteration). ``milestone=`` omitted (``_UNSET``) issues no patch
         op at all.
+
+        Light mode (`light=True`):
+            Returns: TicketRef(id, url, status, labels, updated_at, idempotent_replay)
+            Source: `update_ticket` is already reload-free on Azure
+                DevOps — light changes only the return shape, never the
+                request count or the data source (the pre-write GET when
+                this call writes nothing, else the PATCH response).
+            None: custom_fields
+                (populated with exactly the field refs this call
+                actually PATCHed when `custom_fields` was passed, else
+                None.)
+            Labels: still applied (the ai-modified label + board
+                on_update auto-labels), same as light=False.
         """
         _validate_label_lists(labels_add, labels_remove)
         _validate_int32_id(ticket_id, "ticket")
@@ -3478,7 +3546,14 @@ class AzureDevOpsProvider(
                 })
 
         if not patch:
-            return _map_work_item(current, project)
+            ticket = _map_work_item(current, project)
+            if light:
+                ref = TicketRef.from_ticket(ticket)
+                ref.custom_fields = (
+                    dict(custom_fields) if custom_fields else None
+                )
+                return ref
+            return ticket
 
         with _client(project, token) as c:
             resp = c.patch(
@@ -3520,7 +3595,12 @@ class AzureDevOpsProvider(
                     f"{accepted_clause}"
                 ) from exc
             raise
-        return _map_work_item(resp.json(), project)
+        ticket = _map_work_item(resp.json(), project)
+        if light:
+            ref = TicketRef.from_ticket(ticket)
+            ref.custom_fields = dict(custom_fields) if custom_fields else None
+            return ref
+        return ticket
 
     def bulk_update_tickets(
         self,
@@ -3581,13 +3661,24 @@ class AzureDevOpsProvider(
         token: str | None,
         ticket_id: str,
         body: str,
-    ) -> Comment:
+        *,
+        light: bool = False,
+    ) -> Comment | CommentRef:
         """Post a comment on a work item.
 
         Azure DevOps's work-item and pull-request id-spaces are
         **disjoint** — a PR id passed here as `ticket_id` targets an
         unrelated work item if one happens to exist with that same id,
         otherwise it **404**s. Use `add_pr_comment` for pull requests.
+
+        Light mode (`light=True`):
+            Returns: CommentRef(id, url, created_at)
+            Source: the create response itself — this ticket-level
+                `add_comment` never resolves a repo id (unlike the
+                PR-scoped write methods) and never reloads on either
+                `light` value, so this only shrinks the return shape.
+            None: none
+            Labels: none applied by this call.
         """
         if not body or not body.strip():
             raise ValueError("body must not be empty")
@@ -3610,7 +3701,10 @@ class AzureDevOpsProvider(
                     404, f"ticket '{project.id}#{ticket_id}' not found"
                 ) from exc
             raise
-        return _map_work_item_comment(resp.json(), project, str(ticket_id))
+        comment = _map_work_item_comment(resp.json(), project, str(ticket_id))
+        if light:
+            return CommentRef.from_comment(comment)
+        return comment
 
     def list_comments(
         self,
@@ -4295,7 +4389,8 @@ class AzureDevOpsProvider(
         requested_reviewers: list[str] | None = None,
         *,
         idempotency_key: str | None = None,
-    ) -> PullRequest:
+        light: bool = False,
+    ) -> PullRequest | PullRequestRef:
         """Create a pull request, applying the AI-generated marker + label.
 
         Mirrors `github.py:create_pr`: the body always gets the project's
@@ -4333,6 +4428,22 @@ class AzureDevOpsProvider(
         absence. We never pattern-match on ADO's message text to decide
         which branch is at fault — the existence probe is the only
         discriminator.
+
+        Light mode (`light=True`):
+            Returns: PullRequestRef(id, number, url, state, merged, head_sha, warnings, idempotent_replay)
+            Source: the create response — drops the terminal
+                `self.get_pr(...)` reload this method otherwise always
+                performs after applying labels.
+            None: mergeable_state
+                (Azure DevOps never populates this GitHub-only field.)
+            Labels: still applied (the ai-generated marker plus any
+                caller labels, best-effort), same as light=False.
+            Replay: a light=True retry of the same idempotency_key
+                returns the stored PullRequestRef with
+                idempotent_replay=True and issues no new request; a
+                light=False retry of a key whose original create used
+                light=True reloads once (get_pr) and returns the full
+                PullRequest, also with idempotent_replay=True.
         """
         if idempotency_key:
             replay = _idempotency.lookup(
@@ -4341,7 +4452,10 @@ class AzureDevOpsProvider(
                 {"title": title, "head": head, "base": base},
             )
             if replay is not None:
-                return replay
+                return resolve_replay(
+                    replay, light,
+                    lambda: self.get_pr(project, token, str(replay.number))[0],
+                )
         repo_id = self._resolve_repository_id(project, token)
         body_with_marker = ensure_body_prefix(body or "", markers=_marker_set(project))
         payload: dict[str, Any] = {
@@ -4381,15 +4495,19 @@ class AzureDevOpsProvider(
         if merged_labels:
             for lbl in merged_labels:
                 self._add_pr_label_best_effort(project, token, repo_id, pr.id, lbl)
-            pr, _ = self.get_pr(project, token, pr.id)
+            if not light:
+                pr, _ = self.get_pr(project, token, pr.id)
+        result: PullRequest | PullRequestRef = (
+            PullRequestRef.from_pull_request(pr) if light else pr
+        )
         if idempotency_key:
             _idempotency.record(
                 (project.provider, project.id),
                 idempotency_key,
                 {"title": title, "head": head, "base": base},
-                pr,
+                result,
             )
-        return pr
+        return result
 
     def _add_pr_label_best_effort(
         self,
@@ -4471,7 +4589,8 @@ class AzureDevOpsProvider(
         reviewers_add: list[str] | None = None,
         reviewers_remove: list[str] | None = None,
         draft: bool | None = None,
-    ) -> PullRequest:
+        light: bool = False,
+    ) -> PullRequest | PullRequestRef:
         """Update a PR's title/body/state/base, plus label/reviewer deltas.
 
         Mirrors `github.py:update_pr` for the marker + label policy:
@@ -4487,6 +4606,21 @@ class AzureDevOpsProvider(
         synthesize one (current UTC) whenever this call performs any
         write — the returned `pr.updated_at` therefore reflects "this
         call mutated the PR" rather than ADO's persisted state.
+
+        Light mode (`light=True`):
+            Returns: PullRequestRef(id, number, url, state, merged, head_sha, warnings, idempotent_replay)
+            Source: drops the terminal `self.get_pr(...)` reload this
+                method otherwise always performs. When this call issues
+                the title/body/base/draft/status PATCH, the ref is built
+                from that PATCH's own response; otherwise (a labels- or
+                reviewers-only update) from the initial read-once GET
+                (`update_pr` needs it regardless of `light` to compute
+                label/marker/assignee deltas — it is this call's own
+                required input, not a discretionary reload).
+            None: mergeable_state
+                (Azure DevOps never populates this GitHub-only field.)
+            Labels: still applied (the ai-modified label plus any
+                labels_add/labels_remove), same as light=False.
         """
         _validate_label_lists(labels_add, labels_remove)
         repo_id = self._resolve_repository_id(project, token)
@@ -4589,6 +4723,12 @@ class AzureDevOpsProvider(
                     _check(resp)
                 wrote = True
 
+        if light:
+            source = resp.json() if payload else cur
+            pr = _map_pr(source, project)
+            if wrote:
+                pr.updated_at = _utc_iso_now()
+            return PullRequestRef.from_pull_request(pr)
         pr, _ = self.get_pr(project, token, pr_id)
         if wrote:
             pr.updated_at = _utc_iso_now()
@@ -4602,7 +4742,9 @@ class AzureDevOpsProvider(
         merge_method: str = "merge",
         commit_title: str | None = None,
         commit_message: str | None = None,
-    ) -> PullRequest:
+        *,
+        light: bool = False,
+    ) -> PullRequest | PullRequestRef:
         """Complete a PR. ADO's `status=completed` PATCH triggers an async
         merge — the response carries the pre-merge snapshot, so we
         poll until `mergeStatus` settles before mapping the PR. The
@@ -4623,6 +4765,26 @@ class AzureDevOpsProvider(
         This enrichment is best-effort: a failure degrades to empty
         `reviews`/`review_decision` (logged as a warning) rather than
         failing an already-successful merge.
+
+        Light mode (`light=True`):
+            Returns: PullRequestRef(id, number, url, state, head_sha, warnings, idempotent_replay)
+            Source: the handshake GET (needed regardless of `light` to
+                build the completion PATCH's `lastMergeSourceCommit`
+                concurrency token — this is load-bearing pre-write work,
+                not a discretionary read, so it is not counted against
+                AC2's post-write budget) plus the completion PATCH's own
+                response, plus — only when that PATCH response is not
+                yet settled per `_is_merge_settled` — AC2's one
+                permitted post-write status GET. No labels fetch, no
+                votes/threads fetch, no sleep/poll loop.
+            None: mergeable_state, merged
+                (`mergeable_state` is never populated on Azure DevOps.
+                `merged` is None whenever the merge is still unsettled
+                after that one permitted status read — never a raised
+                202, and never `_map_pr`'s misleading `merged=False`,
+                which would claim the merge definitely did not happen
+                rather than "not yet observed to have happened".)
+            Labels: none applied by this call.
         """
         repo_id = self._resolve_repository_id(project, token)
         path = (
@@ -4665,6 +4827,45 @@ class AzureDevOpsProvider(
         with _client(project, token) as c:
             resp = c.patch(path, params=_api_version_params(), json=body)
         _check(resp)
+
+        if light:
+            patch_payload = resp.json() or {}
+            if _is_merge_settled(patch_payload):
+                light_settled = patch_payload
+            else:
+                with _client(project, token) as c:
+                    status_resp = c.get(path, params=_api_version_params())
+                _check(status_resp)
+                light_settled = status_resp.json() or {}
+            light_merge_status = light_settled.get("mergeStatus")
+            if light_merge_status == "conflicts":
+                raise AzureDevOpsError(
+                    409,
+                    f"PR {pr_id}: merge has conflicts — resolve before retrying",
+                )
+            if light_merge_status == "rejectedByPolicy":
+                raise AzureDevOpsError(
+                    409, f"PR {pr_id}: merge rejected by branch policy",
+                )
+            if light_merge_status == "failure":
+                raise AzureDevOpsError(
+                    500, f"PR {pr_id}: merge failed (Azure DevOps server-side error)",
+                )
+            merged = (
+                True
+                if light_merge_status == "succeeded"
+                and light_settled.get("status") == "completed"
+                else None
+            )
+            pr_partial = _map_pr(light_settled, project)
+            return PullRequestRef(
+                id=pr_partial.id,
+                number=pr_partial.number,
+                url=pr_partial.url,
+                state=pr_partial.status,
+                merged=merged,
+                head_sha=(pr_partial.head or {}).get("sha"),
+            )
 
         # Settle-loop: ADO returns the PATCH response before the async
         # merge finishes. Poll until mergeStatus is a terminal state.
@@ -4753,7 +4954,6 @@ class AzureDevOpsProvider(
         `merged=false` even though the merge is done. Cumulative cap
         is ~10s to absorb slow-environment lag.
         """
-        merge_failure = _MERGE_FAILURE_STATUSES
         last: dict = {}
         for delay_ms in self._MERGE_SETTLE_DELAYS_MS:
             time.sleep(delay_ms / 1000.0)
@@ -4761,11 +4961,7 @@ class AzureDevOpsProvider(
                 resp = c.get(path, params=_api_version_params())
             _check(resp)
             last = resp.json() or {}
-            ms = last.get("mergeStatus")
-            st = last.get("status")
-            if ms in merge_failure:
-                return last
-            if ms == "succeeded" and st == "completed":
+            if _is_merge_settled(last):
                 return last
         return last
 

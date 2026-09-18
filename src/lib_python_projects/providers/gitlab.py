@@ -50,6 +50,7 @@ from lib_python_projects.providers.base import (
     BulkTicketResult,
     CIConfigurationProvider,
     Comment,
+    CommentRef,
     DiffHunkRange,
     DiscoveredProject,
     FailingJob,
@@ -69,6 +70,7 @@ from lib_python_projects.providers.base import (
     ProjectDiscoveryResult,
     ProviderError,
     PullRequest,
+    PullRequestRef,
     RateLimitError,
     Ref,
     Relation,
@@ -78,6 +80,7 @@ from lib_python_projects.providers.base import (
     Release,
     resolve_event_alias,
     resolve_fetch_page_size,
+    resolve_replay,
     run_matches_ref,
     Review,
     ReviewComment,
@@ -85,6 +88,7 @@ from lib_python_projects.providers.base import (
     StatusSpec,
     Ticket,
     TicketFilters,
+    TicketRef,
     TokenCapabilities,
     TokenCapabilityProvider,
     TokenProjectDiscoveryProvider,
@@ -2853,7 +2857,8 @@ class GitLabProvider(
         custom_fields: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         milestone: Any = _UNSET,
-    ) -> Ticket:
+        light: bool = False,
+    ) -> Ticket | TicketRef:
         """Create a GitLab issue with the AI-generated marker.
 
         Marker policy mirrors `GitHubProvider.create_ticket`:
@@ -2905,6 +2910,23 @@ class GitLabProvider(
         same key but a different `title`/`body` raises
         `IdempotencyConflict`. `None`/`""` (the default) disables
         idempotency entirely.
+
+        Light mode (`light=True`):
+            Returns: TicketRef(id, url, status, labels, updated_at, idempotent_replay)
+            Source: the create response (plus the follow-up status PUT,
+                when a non-open `status` was requested) — no reload.
+            None: custom_fields
+                (populated with exactly this call's own `custom_fields`
+                argument (already validated to `labels`/`milestone` keys
+                only) when one was passed, else None.)
+            Labels: still applied (the ai-generated marker + any board
+                on_create labels), same as light=False.
+            Replay: a light=True retry of the same idempotency_key
+                returns the stored TicketRef with idempotent_replay=True
+                and issues no new request; a light=False retry of a key
+                whose original create used light=True reloads once
+                (get_ticket) and returns the full Ticket, also with
+                idempotent_replay=True.
         """
         if not title or not title.strip():
             raise ValueError("title must not be blank")
@@ -2915,7 +2937,10 @@ class GitLabProvider(
                 {"title": title, "body": body},
             )
             if replay is not None:
-                return replay
+                return resolve_replay(
+                    replay, light,
+                    lambda: self.get_ticket(project, token, str(replay.id))[0],
+                )
         allowed_custom_field_keys = {"labels", "milestone"}
         unknown_keys = set(custom_fields or {}) - allowed_custom_field_keys
         if unknown_keys:
@@ -2986,14 +3011,20 @@ class GitLabProvider(
                 _check(pu)
                 raw = pu.json()
             ticket = _map_issue(raw, project)
+            if light:
+                ref = TicketRef.from_ticket(ticket)
+                ref.custom_fields = dict(custom_fields) if custom_fields else None
+                result: Ticket | TicketRef = ref
+            else:
+                result = ticket
             if idempotency_key:
                 _idempotency.record(
                     (project.provider, project.id),
                     idempotency_key,
                     {"title": title, "body": body},
-                    ticket,
+                    result,
                 )
-            return ticket
+            return result
 
     def update_ticket(
         self,
@@ -3009,7 +3040,8 @@ class GitLabProvider(
         assignees_add: list[str] | None = None,
         assignees_remove: list[str] | None = None,
         milestone: Any = _UNSET,
-    ) -> Ticket:
+        light: bool = False,
+    ) -> Ticket | TicketRef:
         """Update an issue.
 
         Optional `milestone` (ticket #151, keyword-only): `update_ticket`
@@ -3039,6 +3071,19 @@ class GitLabProvider(
         issue wasn't tagged with the configured `ai_generated` label
         originally — same heuristic as the GitHub provider but
         implemented with the GitLab params.
+
+        Light mode (`light=True`):
+            Returns: TicketRef(id, url, status, labels, updated_at, idempotent_replay)
+            Source: `update_ticket` is already reload-free on GitLab —
+                light changes only the return shape, never the request
+                count or the data source (the pre-write GET when this
+                call writes nothing, else the PUT response).
+            None: custom_fields
+                (GitLab's update_ticket has no `custom_fields` dict
+                parameter at all, so this is always None — never
+                fabricated from a `labels_add`/`milestone=` write.)
+            Labels: still applied (the ai-modified label + board
+                on_update auto-labels), same as light=False.
         """
         _validate_label_lists(labels_add, labels_remove)
         markers = _marker_set(project)
@@ -3111,12 +3156,16 @@ class GitLabProvider(
                 )
 
             if not payload:
-                return _map_issue(current, project)
-            r = client.put(
-                f"/projects/{path}/issues/{ticket_id}", json=payload,
-            )
-            _check(r)
-            return _map_issue(r.json(), project)
+                ticket = _map_issue(current, project)
+            else:
+                r = client.put(
+                    f"/projects/{path}/issues/{ticket_id}", json=payload,
+                )
+                _check(r)
+                ticket = _map_issue(r.json(), project)
+            if light:
+                return TicketRef.from_ticket(ticket)
+            return ticket
 
     def bulk_update_tickets(
         self,
@@ -3223,13 +3272,23 @@ class GitLabProvider(
         token: str | None,
         ticket_id: str,
         body: str,
-    ) -> Comment:
+        *,
+        light: bool = False,
+    ) -> Comment | CommentRef:
         """Post a note on an issue. The AI-comment prefix is applied.
 
         GitLab's issue and merge-request id-spaces (iids) are
         **disjoint** — an MR iid passed here as `ticket_id` targets an
         unrelated issue if one happens to exist with that same iid,
         otherwise it **404**s. Use `add_pr_comment` for merge requests.
+
+        Light mode (`light=True`):
+            Returns: CommentRef(id, url, created_at)
+            Source: the create response itself — `add_comment` never
+                reloads on either `light` value, so this only shrinks
+                the return shape.
+            None: none
+            Labels: none applied by this call.
         """
         if not body or not body.strip():
             raise ValueError("body must not be empty")
@@ -3248,7 +3307,10 @@ class GitLabProvider(
                         404, f"ticket '{project.id}#{ticket_id}' not found"
                     ) from exc
                 raise
-            return _map_note(r.json(), project)
+            comment = _map_note(r.json(), project)
+            if light:
+                return CommentRef.from_comment(comment)
+            return comment
 
     def list_comments(
         self,
@@ -3682,7 +3744,8 @@ class GitLabProvider(
         requested_reviewers: list[str] | None = None,
         *,
         idempotency_key: str | None = None,
-    ) -> PullRequest:
+        light: bool = False,
+    ) -> PullRequest | PullRequestRef:
         """Create a merge request with the AI-generated marker.
 
         Body prefix + the project's configured `ai_generated` label
@@ -3710,6 +3773,21 @@ class GitLabProvider(
         405 naming the blocking reason. `create_pr` itself does not
         detect, reject, or raise on this case — give the source branch a
         real commit before expecting the MR to merge.
+
+        Light mode (`light=True`):
+            Returns: PullRequestRef(id, number, url, state, merged, head_sha, warnings, idempotent_replay)
+            Source: the create response — GitLab's `POST
+                /merge_requests` response is a full MR object.
+            None: mergeable_state
+                (GitLab never populates this GitHub-only field.)
+            Labels: still applied (the ai-generated marker), same as
+                light=False.
+            Replay: a light=True retry of the same idempotency_key
+                returns the stored PullRequestRef with
+                idempotent_replay=True and issues no new request; a
+                light=False retry of a key whose original create used
+                light=True reloads once (get_pr) and returns the full
+                PullRequest, also with idempotent_replay=True.
         """
         if idempotency_key:
             replay = _idempotency.lookup(
@@ -3718,7 +3796,10 @@ class GitLabProvider(
                 {"title": title, "head": head, "base": base},
             )
             if replay is not None:
-                return replay
+                return resolve_replay(
+                    replay, light,
+                    lambda: self.get_pr(project, token, str(replay.number))[0],
+                )
         merged_labels = list(
             dict.fromkeys([*(labels or []), project.auto_labels.ai_generated])
         )
@@ -3759,14 +3840,17 @@ class GitLabProvider(
                     ) from exc
                 raise
             pr = _map_mr(r.json(), project)
+            result: PullRequest | PullRequestRef = (
+                PullRequestRef.from_pull_request(pr) if light else pr
+            )
             if idempotency_key:
                 _idempotency.record(
                     (project.provider, project.id),
                     idempotency_key,
                     {"title": title, "head": head, "base": base},
-                    pr,
+                    result,
                 )
-            return pr
+            return result
 
     def update_pr(
         self,
@@ -3785,7 +3869,8 @@ class GitLabProvider(
         reviewers_add: list[str] | None = None,
         reviewers_remove: list[str] | None = None,
         draft: bool | None = None,
-    ) -> PullRequest:
+        light: bool = False,
+    ) -> PullRequest | PullRequestRef:
         """Update an MR's metadata, status, base branch, labels, assignees, reviewers.
 
         `status` accepts only `"open"` / `"closed"`. Use `merge_pr` to
@@ -3800,6 +3885,17 @@ class GitLabProvider(
         The project's configured `ai_modified` label is added when the
         MR wasn't tagged with the configured `ai_generated` label —
         mirrors `update_ticket`.
+
+        Light mode (`light=True`):
+            Returns: PullRequestRef(id, number, url, state, merged, head_sha, warnings, idempotent_replay)
+            Source: `update_pr` is already reload-free on GitLab — light
+                changes only the return shape, never the request count or
+                the data source (the pre-write GET when this call writes
+                nothing, else the PUT response).
+            None: mergeable_state
+                (GitLab never populates this GitHub-only field.)
+            Labels: still applied (the ai-modified label plus any
+                labels_add/labels_remove), same as light=False.
         """
         path = _project_path(project)
         if status not in (None, "open", "closed"):
@@ -3883,12 +3979,16 @@ class GitLabProvider(
                 )
 
             if not payload:
-                return _map_mr(current, project)
-            r = client.put(
-                f"/projects/{path}/merge_requests/{pr_id}", json=payload,
-            )
-            _check(r)
-            return _map_mr(r.json(), project)
+                pr = _map_mr(current, project)
+            else:
+                r = client.put(
+                    f"/projects/{path}/merge_requests/{pr_id}", json=payload,
+                )
+                _check(r)
+                pr = _map_mr(r.json(), project)
+            if light:
+                return PullRequestRef.from_pull_request(pr)
+            return pr
 
     def add_pr_comment(
         self,
@@ -4468,7 +4568,9 @@ class GitLabProvider(
         merge_method: str = "merge",
         commit_title: str | None = None,
         commit_message: str | None = None,
-    ) -> PullRequest:
+        *,
+        light: bool = False,
+    ) -> PullRequest | PullRequestRef:
         """Merge a merge request.
 
         `merge_method` mapping (unified with GitHub — see #52 F1):
@@ -4520,6 +4622,15 @@ class GitLabProvider(
         failure degrades to `approvals=None` (empty `reviews`,
         `review_decision=None`, logged as a warning) rather than failing
         an already-successful merge.
+
+        Light mode (`light=True`):
+            Returns: PullRequestRef(id, number, url, state, merged, head_sha, warnings, idempotent_replay)
+            Source: the merge PUT's own response only — GitLab's merge
+                endpoint already returns the full MR, so no re-fetch, no
+                approvals fetch, no notes fetch.
+            None: mergeable_state
+                (GitLab never populates this GitHub-only field.)
+            Labels: none applied by this call.
         """
         if merge_method == "rebase":
             raise ValueError(
@@ -4631,6 +4742,8 @@ class GitLabProvider(
                         f" — {guidance}",
                     ) from exc
                 raise
+            if light:
+                return PullRequestRef.from_pull_request(_map_mr(r.json(), project))
             # Re-fetch so the response captures the post-merge state
             # (merged_at, merge_commit_sha, state=merged). The merge
             # endpoint returns the MR, but mirror GitHub's pattern of
