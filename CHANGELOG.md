@@ -8,6 +8,16 @@ are never hand-labelled with a version string or tag.
 
 ## Unreleased
 
+### Fixed
+
+- Ticket #272: the ETag cache no longer replays stale pagination headers
+  (`Link`, `X-Total-Pages`, `X-Next-Page`) on a 304. GETs carrying `page` or
+  `per_page` now bypass the conditional cache entirely, so
+  `list_comments(order="desc")` and `has_more` reflect the current server
+  state. GitLab's descending `has_more` now also accounts for older notes
+  trimmed by the `limit` slice, and the conditional rebuild preserves
+  `request.extensions` (so cached GETs keep the client's timeout).
+
 ### Changed
 
 - Ticket #271: `GitHubProvider.merge_pr`'s 405 error no longer tells the
