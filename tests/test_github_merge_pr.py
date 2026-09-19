@@ -267,6 +267,7 @@ def test_merge_pr_405_draft_names_draft_and_fix(
     assert "cannot be merged" in message
     assert "draft" in message
     assert "update_pr(draft=false)" in message
+    assert "mark it ready for review" in message
     assert "rebase" not in message
     assert "resolve conflicts" not in message
 
@@ -282,6 +283,7 @@ def test_merge_pr_405_draft_via_mergeable_state_only(
     message = exc.value.message
     assert exc.value.status == 405
     assert "update_pr(draft=false)" in message
+    assert "mark it ready for review" in message
     assert "rebase" not in message
     assert "resolve conflicts" not in message
 
@@ -298,6 +300,7 @@ def test_merge_pr_405_draft_light_mode_same_message(
     assert exc.value.status == 405
     assert "draft" in message
     assert "update_pr(draft=false)" in message
+    assert "mark it ready for review" in message
     assert "rebase" not in message
     assert "resolve conflicts" not in message
     assert len(seen) == 2, "expected exactly PUT + probe GET in light mode"
@@ -315,6 +318,7 @@ def test_merge_pr_405_non_dirty_state_omits_conflict_advice(
     assert exc.value.status == 405
     assert "cannot be merged" in message
     assert "blocked" in message
+    assert "see mergeable_state for the blocking condition" in message
     assert "rebase" not in message
     assert "resolve conflicts" not in message
 
@@ -331,6 +335,7 @@ def test_merge_pr_405_missing_state_omits_conflict_advice(
     assert exc.value.status == 405
     assert "cannot be merged" in message
     assert "unknown" in message
+    assert "see mergeable_state for the blocking condition" in message
     assert "rebase" not in message
     assert "resolve conflicts" not in message
 

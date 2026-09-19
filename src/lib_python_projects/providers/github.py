@@ -6016,11 +6016,25 @@ class GitHubProvider(
                             405, f"PR '{project.id}#{pr_id}' is already merged"
                         ) from exc
                     mergeable_state = raw.get("mergeable_state") or "unknown"
+                    if raw.get("draft") is True or mergeable_state == "draft":
+                        # A draft PR can report any mergeable_state
+                        # (often 'clean'), so name the draft explicitly.
+                        raise GitHubError(
+                            405,
+                            f"PR '{project.id}#{pr_id}' cannot be merged:"
+                            f" it is a draft (mergeable_state="
+                            f"'{mergeable_state}') — mark it ready for"
+                            f" review with update_pr(draft=false) and retry",
+                        ) from exc
+                    if mergeable_state == "dirty":
+                        advice = "rebase or resolve conflicts and retry"
+                    else:
+                        advice = "see mergeable_state for the blocking condition"
                     raise GitHubError(
                         405,
                         f"PR '{project.id}#{pr_id}' cannot be merged:"
                         f" mergeable_state='{mergeable_state}'"
-                        f" — rebase or resolve conflicts and retry",
+                        f" — {advice}",
                     ) from exc
                 raise
             if light:
