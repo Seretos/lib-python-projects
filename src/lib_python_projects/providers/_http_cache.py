@@ -64,6 +64,14 @@ def _cache_key(request: httpx.Request) -> str:
     return normalised
 
 
+_PAGINATION_PARAMS: frozenset[str] = frozenset({"page", "per_page"})
+
+
+def _is_pagination_scoped(request: httpx.Request) -> bool:
+    """True when the request's query carries a pagination parameter."""
+    return any(k in _PAGINATION_PARAMS for k, _ in parse_qsl(request.url.query.decode()))
+
+
 def clear_etag_cache() -> None:
     """Test hook: drain the in-memory ETag store."""
     with _etag_lock:
@@ -96,6 +104,14 @@ class ETagTransport(httpx.BaseTransport):
             response.read()
             return response
 
+        if _is_pagination_scoped(request):
+            # Pagination headers (Link, X-Total-Pages, ...) are not a function
+            # of the page body, so a body-based validator cannot certify them:
+            # never cache, never send a conditional header (ticket #272).
+            response = self._wrapped.handle_request(request)
+            response.read()
+            return response
+
         key = _cache_key(request)
 
         # Inject conditional headers if we have a cached entry.
@@ -115,6 +131,7 @@ class ETagTransport(httpx.BaseTransport):
                 url=request.url,
                 headers=headers,
                 content=b"",
+                extensions=request.extensions,
             )
 
         response = self._wrapped.handle_request(request)

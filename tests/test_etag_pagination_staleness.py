@@ -343,3 +343,14 @@ def test_gitlab_desc_has_more_false_when_exactly_limit_notes(
     thread = _GitLabThread(3)
     _install_gitlab(monkeypatch, thread.handler)
     assert _gl_list(3) == ([3, 2, 1], False)
+
+
+def test_gitlab_desc_has_more_true_when_earlier_pages_remain_unfetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pins the ``cur >= 1`` term: 9 notes, per_page=3, limit=3 -- the walk
+    stops after page 3 with exactly ``limit`` notes collected, pages 2 and 1
+    unfetched, so ``len(collected) > limit`` alone would say False."""
+    thread = _GitLabThread(9)
+    _install_gitlab(monkeypatch, thread.handler)
+    assert _gl_list(3) == ([9, 8, 7], True)

@@ -397,11 +397,13 @@ def test_conditional_rebuild_preserves_request_extensions() -> None:
             return httpx.Response(304)
         return httpx.Response(200, content=b"body", headers={"ETag": '"v1"'})
 
-    with httpx.Client(timeout=5.0, transport=_make_transport(handler)) as client:
-        client.get("https://api.example.com/items")
-        client.get("https://api.example.com/items")
+    with httpx.Client(timeout=7.5, transport=_make_transport(handler)) as client:
+        client.get("https://api.example.com/items", extensions={"x-marker": "m"})
+        client.get("https://api.example.com/items", extensions={"x-marker": "m"})
 
     assert len(seen) == 2
+    assert seen[1]["x-marker"] == "m"
+    assert seen[1]["timeout"] == httpx.Timeout(7.5).as_dict()
     assert "timeout" in seen[0]
     assert "timeout" in seen[1]  # conditional (rebuilt) request
     assert seen[1]["timeout"] == seen[0]["timeout"]
