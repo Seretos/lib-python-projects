@@ -381,3 +381,81 @@ def test_patch_gzip_response_decoded_without_error() -> None:
         "PATCH response body must be gzip-decoded exactly once; "
         f"got {response.content!r}"
     )
+
+
+# ---------- ticket #272: pagination-scoped GETs and request extensions --------
+
+
+def test_conditional_rebuild_preserves_request_extensions() -> None:
+    """DRIVING (R6): the rebuilt conditional request must carry the client's
+    ``timeout`` extension; the rebuild used to drop every extension."""
+    seen: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(dict(req.extensions))
+        if req.headers.get("If-None-Match") == '"v1"':
+            return httpx.Response(304)
+        return httpx.Response(200, content=b"body", headers={"ETag": '"v1"'})
+
+    with httpx.Client(timeout=5.0, transport=_make_transport(handler)) as client:
+        client.get("https://api.example.com/items")
+        client.get("https://api.example.com/items")
+
+    assert len(seen) == 2
+    assert "timeout" in seen[0]
+    assert "timeout" in seen[1]  # conditional (rebuilt) request
+    assert seen[1]["timeout"] == seen[0]["timeout"]
+
+
+def _conditional_headers_seen(url: str, calls: int = 2) -> list[dict[str, bool]]:
+    seen: list[dict[str, bool]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append({
+            "inm": "if-none-match" in req.headers,
+            "ims": "if-modified-since" in req.headers,
+        })
+        if "if-none-match" in req.headers:
+            return httpx.Response(304)
+        return httpx.Response(
+            200, content=b"body",
+            headers={"ETag": '"v1"', "Last-Modified": "Wed, 01 Jan 2025 00:00:00 GMT"},
+        )
+
+    transport = _make_transport(handler)
+    for _ in range(calls):
+        _get(transport, url)
+    return seen
+
+
+def test_pagination_scoped_get_never_sends_conditional_headers() -> None:
+    """DRIVING (R7): a GET carrying ``page``/``per_page`` is never cached."""
+    seen = _conditional_headers_seen(
+        "https://api.example.com/repos/a/b/issues/1/comments?per_page=3&page=1"
+    )
+    assert seen == [{"inm": False, "ims": False}] * 2
+
+
+def test_per_page_alone_is_pagination_scoped() -> None:
+    seen = _conditional_headers_seen(
+        "https://api.example.com/repos/a/b/issues/1/comments?per_page=3"
+    )
+    assert seen == [{"inm": False, "ims": False}] * 2
+
+
+def test_page_alone_is_pagination_scoped() -> None:
+    seen = _conditional_headers_seen(
+        "https://api.example.com/repos/a/b/issues/1/comments?page=2"
+    )
+    assert seen == [{"inm": False, "ims": False}] * 2
+
+
+def test_non_paginated_get_is_still_cached() -> None:
+    """The bypass is keyed on the query, not the path (already passes)."""
+    seen = _conditional_headers_seen(
+        "https://api.example.com/repos/a/b/issues/1/comments?state=open"
+    )
+    assert seen == [
+        {"inm": False, "ims": False},
+        {"inm": True, "ims": True},
+    ]
