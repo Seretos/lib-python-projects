@@ -223,6 +223,121 @@ def test_merge_pr_405_conflict_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     assert exc.value.status == 405
     assert "cannot be merged" in exc.value.message
     assert "dirty" in exc.value.message
+    assert "rebase or resolve conflicts" in exc.value.message
+
+
+# ---------- ticket #271: 405 message must name the real blocker ---------------
+
+
+def _install_405_probe(
+    monkeypatch: pytest.MonkeyPatch, **overrides
+) -> list[httpx.Request]:
+    """PUT merge -> 405; GET /pulls/7 -> unmerged payload with ``overrides`` applied.
+
+    A value of ``None`` in ``overrides`` removes that key from the payload.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/pulls/7"):
+            raw = _pr_payload(7, merged=False)
+            for key, value in overrides.items():
+                if value is None:
+                    raw.pop(key, None)
+                else:
+                    raw[key] = value
+            return _json(raw)
+        if req.method == "PUT" and path.endswith("/pulls/7/merge"):
+            return _json({"message": "Pull Request is not mergeable"}, status_code=405)
+        return _json({})
+
+    return _install_mock(monkeypatch, handler)
+
+
+def test_merge_pr_405_draft_names_draft_and_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Draft PR (mergeable_state='clean') -> message names the draft + update_pr fix."""
+    _install_405_probe(monkeypatch, draft=True, mergeable_state="clean")
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+
+    message = exc.value.message
+    assert exc.value.status == 405
+    assert "cannot be merged" in message
+    assert "draft" in message
+    assert "update_pr(draft=false)" in message
+    assert "mark it ready for review" in message
+    assert "rebase" not in message
+    assert "resolve conflicts" not in message
+
+
+def test_merge_pr_405_draft_via_mergeable_state_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``draft`` key, mergeable_state='draft' -> same draft message."""
+    _install_405_probe(monkeypatch, draft=None, mergeable_state="draft")
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+
+    message = exc.value.message
+    assert exc.value.status == 405
+    assert "update_pr(draft=false)" in message
+    assert "mark it ready for review" in message
+    assert "rebase" not in message
+    assert "resolve conflicts" not in message
+
+
+def test_merge_pr_405_draft_light_mode_same_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """light=True skips only the pre-flight GET: PUT + probe, same draft message."""
+    seen = _install_405_probe(monkeypatch, draft=True, mergeable_state="clean")
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().merge_pr(_project(), token="t", pr_id="7", light=True)
+
+    message = exc.value.message
+    assert exc.value.status == 405
+    assert "draft" in message
+    assert "update_pr(draft=false)" in message
+    assert "mark it ready for review" in message
+    assert "rebase" not in message
+    assert "resolve conflicts" not in message
+    assert len(seen) == 2, "expected exactly PUT + probe GET in light mode"
+
+
+def test_merge_pr_405_non_dirty_state_omits_conflict_advice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-draft, non-dirty state ('blocked') -> no rebase/conflict advice."""
+    _install_405_probe(monkeypatch, draft=False, mergeable_state="blocked")
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+
+    message = exc.value.message
+    assert exc.value.status == 405
+    assert "cannot be merged" in message
+    assert "blocked" in message
+    assert "see mergeable_state for the blocking condition" in message
+    assert "rebase" not in message
+    assert "resolve conflicts" not in message
+
+
+def test_merge_pr_405_missing_state_omits_conflict_advice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No mergeable_state at all -> 'unknown', no rebase/conflict advice."""
+    _install_405_probe(monkeypatch, draft=False, mergeable_state=None)
+    with pytest.raises(GitHubError) as exc:
+        GitHubProvider().merge_pr(_project(), token="t", pr_id="7")
+
+    message = exc.value.message
+    assert exc.value.status == 405
+    assert "cannot be merged" in message
+    assert "unknown" in message
+    assert "see mergeable_state for the blocking condition" in message
+    assert "rebase" not in message
+    assert "resolve conflicts" not in message
 
 
 # ---------- 405 race: pre-flight not-merged but probe shows merged ------------

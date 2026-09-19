@@ -10,6 +10,11 @@ are never hand-labelled with a version string or tag.
 
 ### Changed
 
+- Ticket #271: `GitHubProvider.merge_pr`'s 405 error no longer tells the
+  caller to "rebase or resolve conflicts" unconditionally. A draft PR now
+  gets a message naming the draft and suggesting `update_pr(draft=false)`;
+  only `mergeable_state='dirty'` keeps the conflict advice; any other
+  state points at `mergeable_state` as the blocking condition.
 - Tickets #266/#268: pinned `lib-python-config` in `pyproject.toml` to the
   exact tag `v0.1.2`, replacing the floating `release/0.x` branch pin.
   `lib-python-config`'s own release workflow force-pushes `release/0.x` on
