@@ -35,6 +35,13 @@ are never hand-labelled with a version string or tag.
 
 ### Added
 
+- Ticket #275: `wait_for_pipeline(project, token, sha, *, timeout_s,
+  poll_interval_s)` on the GitHub, GitLab and Azure DevOps providers (shared
+  `PipelineWaitProvider` mixin). Blocks until the commit's CI reaches a
+  verdict and returns `PipelineWaitResult(state, runs, waited_s)` with state
+  `success` / `failure` / `pending` / `no_verdict` (cancelled or skipped, never
+  `failure`) / `no_runs`.
+
 - Ticket #265: an opt-in `light: bool = False` keyword-only parameter on
   the six provider write methods — `create_ticket`, `update_ticket`,
   `add_comment`, `create_pr`, `update_pr`, `merge_pr` — across all three

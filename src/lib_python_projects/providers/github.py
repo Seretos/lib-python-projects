@@ -30,6 +30,7 @@ from lib_python_projects.providers.base import (
     BoardColumnSpec,
     BulkTicketResult,
     CIConfigurationProvider,
+    PipelineWaitProvider,
     Comment,
     CommentRef,
     DiffHunkRange,
@@ -3339,6 +3340,7 @@ class GitHubProvider(
     TokenProjectDiscoveryProvider,
     ViewerIdentityProvider,
     CIConfigurationProvider,
+    PipelineWaitProvider,
     PRDiffProvider,
     IssueTemplateProvider,
 ):
