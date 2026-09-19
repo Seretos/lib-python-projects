@@ -58,6 +58,7 @@ from lib_python_projects.providers.base import (
     BulkTicketResult,
     CIConfigurationProvider,
     Comment,
+    PipelineWaitProvider,
     CommentRef,
     DiscoveredProject,
     FailingJob,
@@ -2143,6 +2144,7 @@ class AzureDevOpsProvider(
     TokenProjectDiscoveryProvider,
     ViewerIdentityProvider,
     CIConfigurationProvider,
+    PipelineWaitProvider,
     PRDiffProvider,
     IssueTemplateProvider,
 ):

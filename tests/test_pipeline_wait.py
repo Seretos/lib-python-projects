@@ -165,18 +165,16 @@ def test_in_progress_past_timeout_returns_pending_within_one_interval(monkeypatc
     clock = FakeClock()
     result = _wait_gh(clock, timeout_s=50.0, poll_interval_s=20.0)
     assert result.state == "pending"
-    assert result.waited_s <= 50.0
-    assert clock.sleeps  # it did wait
-    assert sum(clock.sleeps) <= 50.0
-    assert all(s <= 20.0 for s in clock.sleeps)
+    assert clock.sleeps == [20.0, 20.0, 10.0]  # final sleep truncated to the budget
+    assert sum(clock.sleeps) == 50.0
+    assert result.waited_s == 50.0
 
 
 def test_poll_interval_below_floor_is_clamped_to_five_seconds(monkeypatch):
     _install_github(monkeypatch, Script([[_gh_run(1, "in_progress", None)]]))
     clock = FakeClock()
     _wait_gh(clock, timeout_s=30.0, poll_interval_s=1.0)
-    assert clock.sleeps
-    assert min(clock.sleeps) >= 5.0
+    assert clock.sleeps == [5.0] * 6
 
 
 def test_interval_larger_than_timeout_still_returns_within_timeout(monkeypatch):
@@ -184,7 +182,8 @@ def test_interval_larger_than_timeout_still_returns_within_timeout(monkeypatch):
     clock = FakeClock()
     result = _wait_gh(clock, timeout_s=10.0, poll_interval_s=300.0)
     assert result.state == "pending"
-    assert result.waited_s <= 10.0
+    assert clock.sleeps == [10.0]
+    assert result.waited_s == 10.0
 
 
 def test_no_runs_only_after_full_timeout(monkeypatch):

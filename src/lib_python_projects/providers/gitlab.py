@@ -50,6 +50,7 @@ from lib_python_projects.providers.base import (
     BulkTicketResult,
     CIConfigurationProvider,
     Comment,
+    PipelineWaitProvider,
     CommentRef,
     DiffHunkRange,
     DiscoveredProject,
@@ -2514,6 +2515,7 @@ class GitLabProvider(
     TokenProjectDiscoveryProvider,
     ViewerIdentityProvider,
     CIConfigurationProvider,
+    PipelineWaitProvider,
     PRDiffProvider,
     IssueTemplateProvider,
 ):

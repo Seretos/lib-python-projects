@@ -272,6 +272,37 @@ just triggered. Both `trigger_pipeline` and `wait_for_run` return the
 raising for "not found yet". A non-2xx dispatch/queue response still
 raises the provider's error type.
 
+### Waiting for a commit's CI to finish (ticket #275)
+
+```python
+result = provider.wait_for_pipeline(
+    project, token, sha, timeout_s=600.0, poll_interval_s=20.0,
+)
+result.state      # "success" | "failure" | "pending" | "no_verdict" | "no_runs"
+result.runs       # the last polled run rows (same shape as list_runs_for_commit)
+result.waited_s   # elapsed seconds
+```
+
+One blocking call, shared by GitHub, GitLab and Azure DevOps (the
+`PipelineWaitProvider` mixin in `providers.base`), so a caller that may not
+run its own `sleep` loop can still gate on CI. It polls
+`list_runs_for_commit` until a verdict or `timeout_s`:
+
+- `failure` - any run red (`failure`, `failed`, `timed_out`,
+  `startup_failure`); returned at once, without waiting for other runs.
+- `success` - at least one run, all `completed` with conclusion `success`.
+- `no_verdict` - all runs finished, none red, but at least one was
+  cancelled/skipped/otherwise inconclusive. A cancelled run is never
+  reported as `failure`.
+- `pending` - runs were still in flight when `timeout_s` expired. No
+  exception is raised.
+- `no_runs` - no run appeared for the whole timeout (a push can precede run
+  creation, so an empty listing is retried), or the project has no CI at all.
+
+`poll_interval_s` defaults to 20 s and is clamped to a 5 s floor; the last
+sleep is truncated so the call returns within `timeout_s`. `now`/`sleep`
+are injectable keyword-only arguments for tests.
+
 ### Filtering run listings
 
 All five listing methods (`list_runs_for_branch`, `list_runs_for_commit`,
