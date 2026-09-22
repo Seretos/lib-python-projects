@@ -6754,9 +6754,9 @@ class GitHubProvider(
         """Fetch a single workflow run, optionally with failure context.
 
         When `include_failure_excerpt` is True AND the run concluded as
-        failed, populates `run.failure` with per-failing-job annotations
-        and a small log excerpt. In-progress runs (`conclusion=None`)
-        never trigger the failure-context fetch.
+        failed or cancelled, populates `run.failure` with per-failing-job
+        annotations and a small log excerpt. In-progress runs
+        (`conclusion=None`) never trigger the failure-context fetch.
 
         ``tail_lines``, when a positive int, overrides the smart excerpt
         logic and returns the last *tail_lines* lines of each failing
@@ -6785,7 +6785,7 @@ class GitHubProvider(
             run = _map_run(raw)
             if (
                 include_failure_excerpt
-                and run.conclusion == "failure"
+                and run.conclusion in _FAILURE_CONTEXT_CONCLUSIONS
                 and run.status == "completed"
             ):
                 run.failure = _get_failure_excerpt(
@@ -8060,6 +8060,27 @@ def _normalize_gh_annotations(
     return out
 
 
+# Run/job conclusions that trigger failure-context collection. Shared by
+# GitHubProvider.get_run's gate and _get_failure_excerpt's per-job filter so
+# the two enumerations cannot drift apart (ticket #280: a run/job killed by
+# `timeout-minutes` reports conclusion "cancelled", not "failure").
+_FAILURE_CONTEXT_CONCLUSIONS = frozenset({"failure", "cancelled"})
+
+
+def _pick_failed_step(steps: list[dict]) -> str:
+    """Priority pick for the step name to surface as `failed_step`: prefer a
+    step that itself failed, then one that was cancelled, then one that was
+    still running (`conclusion` null) when the job ended, else `""`."""
+    for wanted in ("failure", "cancelled"):
+        for step in steps:
+            if (step.get("conclusion") or "") == wanted:
+                return step.get("name") or ""
+    for step in steps:
+        if step.get("conclusion") is None:
+            return step.get("name") or ""
+    return ""
+
+
 def _get_failure_excerpt(
     client: httpx.Client,
     project: ProjectConfig,
@@ -8068,9 +8089,9 @@ def _get_failure_excerpt(
     *,
     tail_lines: int | None = None,
 ) -> PipelineFailure:
-    """Build a `PipelineFailure` for a failed run.
+    """Build a `PipelineFailure` for a failed or cancelled run.
 
-    Walks the run's jobs, picks the failed ones, then for each:
+    Walks the run's jobs, picks the failed/cancelled ones, then for each:
       - reads check-run annotations (when `check_run_url` is present)
       - reads the job log via the 302 redirect flow and extracts an excerpt
 
@@ -8087,14 +8108,9 @@ def _get_failure_excerpt(
     failing: list[FailingJob] = []
     logs_missing = False
     for job in jobs:
-        if (job.get("conclusion") or "") != "failure":
+        if (job.get("conclusion") or "") not in _FAILURE_CONTEXT_CONCLUSIONS:
             continue
-        # Pick the first failed step to surface as `failed_step`.
-        failed_step = ""
-        for step in job.get("steps") or []:
-            if (step.get("conclusion") or "") == "failure":
-                failed_step = step.get("name") or ""
-                break
+        failed_step = _pick_failed_step(job.get("steps") or [])
 
         # Annotations live on the check-run associated with the job.
         annotations: list[dict] = []
