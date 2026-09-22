@@ -153,62 +153,16 @@ jobs:
             "${NOTES_START_TAG_FLAG[@]}" \
             $PRE_FLAG
 
-      - name: Open dependency-update ticket in consumers
-        # continue-on-error: a missing/invalid PROJECTS_TICKET_TOKEN must
-        # never fail the release itself.
-        id: file_projects
+      - name: Open dependency-update tickets in consumers
+        # Central ecosystem action, deliberately unpinned (@main) so fixes
+        # propagate to every lib. continue-on-error: notification failure
+        # must never fail the release itself.
         continue-on-error: true
-        uses: ./.github/actions/file-consumer-ticket
+        uses: Seretos/agent-plugin-dev/.github/actions/notify-consumers@main
         with:
           version: ${{ inputs.version }}
           source_repo: ${{ github.repository }}
-          consumer_repo: Seretos/agent-project-issues
-          # PROJECTS_TICKET_TOKEN must be a classic PAT with the `repo` scope
-          # (Issues:write on the consumer repo) and the `project` scope, so
-          # the board-add step below can reuse this same token — fine-grained
-          # PATs have no Projects permission at all (no separate board secret).
-          gh_token: ${{ secrets.PROJECTS_TICKET_TOKEN }}
-
-      - name: Add agent-project-issues ticket to project board
-        # Reuses PROJECTS_TICKET_TOKEN: a classic PAT carrying both `repo`
-        # (Issues:write on the consumer repo) and `project` scopes, so the
-        # same per-consumer token adds the item to the user-owned Projects v2
-        # board — no separate board secret to maintain.
-        id: board_projects
-        if: steps.file_projects.outputs.issue_url != ''
-        continue-on-error: true
-        uses: ./.github/actions/add-to-board
-        with:
-          issue_url: ${{ steps.file_projects.outputs.issue_url }}
-          board_owner: Seretos
-          board_number: '2'
-          gh_token: ${{ secrets.PROJECTS_TICKET_TOKEN }}
-
-      - name: Open dependency-update ticket in workboard
-        # continue-on-error: a missing/invalid WORKBOARD_TICKET_TOKEN must
-        # never fail the release itself.
-        id: file_workboard
-        continue-on-error: true
-        uses: ./.github/actions/file-consumer-ticket
-        with:
-          version: ${{ inputs.version }}
-          source_repo: ${{ github.repository }}
-          consumer_repo: Seretos/workboard
-          # WORKBOARD_TICKET_TOKEN must be a classic PAT with the `repo` scope
-          # (Issues:write on the consumer repo) and the `project` scope, so
-          # the board-add step below can reuse this same token — fine-grained
-          # PATs have no Projects permission at all (no separate board secret).
-          gh_token: ${{ secrets.WORKBOARD_TICKET_TOKEN }}
-
-      - name: Add workboard ticket to project board
-        # Reuses WORKBOARD_TICKET_TOKEN: a classic PAT carrying both `repo`
-        # and `project` scopes, so no separate board secret is needed.
-        id: board_workboard
-        if: steps.file_workboard.outputs.issue_url != ''
-        continue-on-error: true
-        uses: ./.github/actions/add-to-board
-        with:
-          issue_url: ${{ steps.file_workboard.outputs.issue_url }}
-          board_owner: Seretos
-          board_number: '2'
-          gh_token: ${{ secrets.WORKBOARD_TICKET_TOKEN }}
+          consumers: |
+            Seretos/agent-project-issues
+            Seretos/workboard
+          gh_token: ${{ secrets.ECOSYSTEM_TOKEN }}

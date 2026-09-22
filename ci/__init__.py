@@ -1,10 +1,9 @@
 """``ci`` -- plain-source CI helper package for #243 generation 2.
 
 Not installed as part of the ``lib-python-projects`` distribution: it lives
-at the repo root, is imported by the two local composite actions
-(``.github/actions/file-consumer-ticket``, ``.github/actions/add-to-board``)
-via ``python3 -m ci.<module>``, and is exercised directly by the test suite
-(``pyproject.toml`` adds the repo root to ``pythonpath`` for that reason).
+at the repo root and is invoked by ``release.yml`` via ``python3 -m
+ci.prev_tag``, and is exercised directly by the test suite (``pyproject.toml``
+adds the repo root to ``pythonpath`` for that reason).
 
 Invariants enforced structurally across every module in this package (see
 ``tests/test_ci_gh_discipline.py``):
