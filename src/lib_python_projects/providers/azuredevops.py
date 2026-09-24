@@ -2718,9 +2718,10 @@ class AzureDevOpsProvider(
                 f"add one to projects.yml before calling list_board_columns"
             )
         binding = board.binding
-        if binding.kind != "azure-boards":
+        if binding is None or binding.kind != "azure-boards":
             raise ValueError(
-                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"project {project.id!r} board binding is "
+                f"{None if binding is None else binding.kind!r}, "
                 f"not 'azure-boards' — list_board_columns is "
                 f"Azure-Boards-only"
             )
@@ -2799,9 +2800,10 @@ class AzureDevOpsProvider(
                 f"add one to projects.yml before calling ensure_board_column"
             )
         binding = board.binding
-        if binding.kind != "azure-boards":
+        if binding is None or binding.kind != "azure-boards":
             raise ValueError(
-                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"project {project.id!r} board binding is "
+                f"{None if binding is None else binding.kind!r}, "
                 f"not 'azure-boards' — ensure_board_column is "
                 f"Azure-Boards-only"
             )
@@ -7034,9 +7036,10 @@ def _board_column_wiql_clauses(
             f"System.State as a fallback filter instead)"
         )
     binding = board.binding
-    if binding.kind != "azure-boards":
+    if binding is None or binding.kind != "azure-boards":
         raise ValueError(
-            f"project {project.id!r} board binding is {binding.kind!r}, "
+            f"project {project.id!r} board binding is "
+            f"{None if binding is None else binding.kind!r}, "
             f"not 'azure-boards' — board_column filtering on Azure DevOps "
             f"requires an azure-boards binding (use 'status'/'states' "
             f"matching System.State as a fallback filter instead)"

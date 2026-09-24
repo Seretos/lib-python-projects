@@ -398,6 +398,23 @@ def test_list_board_columns_wrong_binding_kind_raises(
         GitHubProvider().list_board_columns(_project(board), "t")
 
 
+def test_list_board_columns_no_binding_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 (#285): a label-mode board (columns, no binding) raises the
+    existing wrong-kind `ValueError`, not an `AttributeError` on
+    `None.kind` — this is a `Board.binding: ... | None` hand-built
+    model, the provider unit-test half of R3 (R1 covers the YAML path)."""
+    board = Board(columns=["Todo"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for a binding-less board")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="not 'github-projects-v2'"):
+        GitHubProvider().list_board_columns(_project(board), "t")
+
+
 def test_list_board_columns_missing_owner_or_number_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -674,6 +691,23 @@ def test_list_tickets_board_column_wrong_binding_kind_raises(
 
     def handler(req: httpx.Request) -> httpx.Response:
         raise AssertionError("no HTTP call expected for a non-GitHub binding")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="not 'github-projects-v2'"):
+        GitHubProvider().list_tickets(
+            _project(board), token="t", filters=TicketFilters(board_column="Review"),
+        )
+
+
+def test_list_tickets_board_column_no_binding_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 (#285): same as `test_list_board_columns_no_binding_raises`,
+    for the `list_tickets(filters.board_column=...)` path."""
+    board = Board(columns=["Review"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for a binding-less board")
 
     _install_mock(monkeypatch, handler)
     with pytest.raises(ValueError, match="not 'github-projects-v2'"):
@@ -1373,6 +1407,28 @@ def test_create_ticket_custom_fields_non_projects_v2_binding_raises(
 
     def handler(req: httpx.Request) -> httpx.Response:
         raise AssertionError("no HTTP call expected when binding isn't github-projects-v2")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="github-projects-v2"):
+        GitHubProvider().create_ticket(
+            _project(board), "t", title="hi", body="b", labels=[], assignees=[],
+            custom_fields={"Status": "Done"},
+        )
+
+
+def test_create_ticket_custom_fields_label_mode_board_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Additional edge-case coverage for R3 (#285): a label-mode board
+    (columns, no binding) + non-empty custom_fields raises the same
+    existing ValueError as the no-board and wrong-binding-kind cases —
+    this guard already tests `binding is None` (see
+    `test_create_ticket_custom_fields_no_board_raises`), so this is
+    expected to already pass once `Board.binding` accepts `None`."""
+    board = Board(columns=["Todo", "Done"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for a binding-less board")
 
     _install_mock(monkeypatch, handler)
     with pytest.raises(ValueError, match="github-projects-v2"):
@@ -2791,6 +2847,40 @@ def test_update_ticket_reopen_azure_boards_binding_rest_only(
     assert not any(r.url.path == "/graphql" for r in seen)
 
 
+def test_update_ticket_label_mode_board_no_reopen_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4 (#285): a label-mode board (columns, no binding) is a silent
+    no-op for the reopen-reset feature, same as `project.board is None`
+    or an `azure-boards` binding — must not raise `AttributeError` on
+    `project.board.binding.kind` when `binding` is `None`. The REST
+    update itself must still complete normally, not merely swallow the
+    call: exactly one PATCH is issued and the returned `Ticket` reflects
+    its response, same as the plain-REST-path tests above."""
+    board = Board(columns=["Todo", "Done"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if req.method == "GET" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, title="old title", state="closed"))
+        if req.method == "PATCH" and path.endswith("/issues/42"):
+            return _json(_ai_issue_payload(42, title="x", state="open"))
+        if path == "/graphql":
+            raise AssertionError(
+                "no GraphQL call expected for a binding-less board"
+            )
+        raise AssertionError(f"unexpected request {req.method} {path}")
+
+    seen = _install_mock(monkeypatch, handler)
+    ticket = GitHubProvider().update_ticket(
+        _project(board), "t", "42", title="x",
+    )
+    assert ticket.title == "x"
+    patch_requests = [r for r in seen if r.method == "PATCH"]
+    assert len(patch_requests) == 1
+    assert not any(r.url.path == "/graphql" for r in seen)
+
+
 def test_update_ticket_reopen_mapped_columns_resets_to_resolved_native_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2880,6 +2970,25 @@ def test_update_ticket_custom_fields_non_projects_v2_binding_raises(
 
     def handler(req: httpx.Request) -> httpx.Response:
         raise AssertionError("no HTTP call expected for a non-GitHub binding")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="github-projects-v2"):
+        GitHubProvider().update_ticket(
+            _project(board), "t", "42", custom_fields={"Status": "Done"},
+        )
+
+
+def test_update_ticket_custom_fields_label_mode_board_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Additional edge-case coverage for R3 (#285): same as
+    `test_create_ticket_custom_fields_label_mode_board_raises`, for
+    `update_ticket` — already tests `binding is None`, so expected to
+    already pass once `Board.binding` accepts `None`."""
+    board = Board(columns=["Todo", "Done"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for a binding-less board")
 
     _install_mock(monkeypatch, handler)
     with pytest.raises(ValueError, match="github-projects-v2"):
@@ -4140,6 +4249,21 @@ def test_ensure_board_column_wrong_binding_kind_raises(
 
     def handler(req: httpx.Request) -> httpx.Response:
         raise AssertionError("no HTTP call expected for a non-GitHub binding")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="not 'github-projects-v2'"):
+        GitHubProvider().ensure_board_column(_project(board), "t", "In Progress")
+
+
+def test_ensure_board_column_no_binding_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 (#285): same as `test_list_board_columns_no_binding_raises`,
+    for `ensure_board_column`."""
+    board = Board(columns=["Todo"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for a binding-less board")
 
     _install_mock(monkeypatch, handler)
     with pytest.raises(ValueError, match="not 'github-projects-v2'"):
