@@ -4176,6 +4176,30 @@ def test_create_ticket_custom_fields_return_carries_board_fields(
     assert len(read_back_calls) == 1, (
         "expected exactly one projectItems read-back query"
     )
+    # Test-critique finding tautology::F3: the mock above answers the
+    # read-back identically no matter when it arrives, so an
+    # implementation that reads back straight after POST /issues --
+    # before the custom_fields write mutations even happen -- would
+    # satisfy the assertions above by coincidence. Assert the recorded
+    # call order explicitly: the read-back query must come after every
+    # board-write mutation (addProjectV2ItemById / the custom_fields
+    # updateProjectV2ItemFieldValue write), matching the plan's "the
+    # read-back runs after both writes".
+    write_mutation_indices = [
+        i for i, c in enumerate(graphql_calls)
+        if "addProjectV2ItemById" in c["query"]
+        or "updateProjectV2ItemFieldValue" in c["query"]
+    ]
+    read_back_indices = [
+        i for i, c in enumerate(graphql_calls)
+        if "repository(owner:$owner,name:$repo)" in c["query"]
+    ]
+    assert write_mutation_indices, "expected board-write mutations to have run"
+    assert max(write_mutation_indices) < min(read_back_indices), (
+        "the projectItems read-back query must run after the "
+        "custom_fields/milestone write mutations, not before "
+        f"(graphql_calls order: {[c['query'][:40] for c in graphql_calls]})"
+    )
 
 
 def test_create_ticket_custom_fields_no_item_on_board_returns_empty_dict(

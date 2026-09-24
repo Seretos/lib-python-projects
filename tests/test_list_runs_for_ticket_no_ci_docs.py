@@ -17,11 +17,16 @@ Follows the pattern of `tests/test_add_comment_id_space_docs.py`.
 from __future__ import annotations
 
 import inspect
+import json
 import re
 
+import httpx
 import pytest
 
+from lib_python_projects import ProjectConfig
+from lib_python_projects.providers import github as github_provider
 from lib_python_projects.providers.azuredevops import AzureDevOpsProvider
+from lib_python_projects.providers.base import NO_CI_SENTINEL
 from lib_python_projects.providers.github import GitHubProvider
 from lib_python_projects.providers.gitlab import GitLabProvider
 
@@ -98,16 +103,123 @@ def test_list_runs_for_ticket_docstring_explains_no_ci_sentinel(
     assert _PLANNED_PARAGRAPH in collapsed, collapsed
 
 
+def test_github_list_runs_for_ticket_no_ci_sentinel_is_actually_last(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ties the docstring's claim to the real runtime behaviour (test-critique
+    finding tautology::F1): the sibling test above only pins the docstring
+    text -- it never calls `list_runs_for_ticket`, so pasting the planned
+    paragraph into a docstring while the runtime appends the sentinel
+    somewhere other than last (or appends it even when CI exists) would
+    still pass it. This test actually exercises
+    `GitHubProvider.list_runs_for_ticket` in a no-run-matched /
+    no-CI-configured scenario and confirms `NO_CI_SENTINEL` is genuinely
+    the LAST element of the returned `resolved_refs`.
+
+    Mirrors `test_ticket_is_pr_with_no_runs` in
+    tests/test_github_pipelines.py (PR-as-ticket_id resolves a head_sha,
+    no runs match), except `/actions/workflows` answers 404 here (not
+    configured) instead of 200 -- that is what turns the sentinel on, per
+    `GitHubProvider.list_runs_for_ticket`'s own `if not _has_workflows(...):
+    return [], [*shas, NO_CI_SENTINEL]` (github.py).
+    """
+
+    def _json(payload: object, status_code: int = 200) -> httpx.Response:
+        return httpx.Response(
+            status_code=status_code,
+            content=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+
+    head_sha = "abc123def456"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == "/repos/acme/backend/issues/42":
+            return _json({
+                "number": 42,
+                "title": "PR 42",
+                "body": "",
+                "state": "open",
+                "user": {"login": "alice"},
+                "assignees": [],
+                "labels": [],
+                "html_url": "https://github.com/acme/backend/pull/42",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-02T00:00:00Z",
+                "pull_request": {
+                    "url": "https://api.github.com/repos/acme/backend/pulls/42",
+                    "html_url": "https://github.com/acme/backend/pull/42",
+                    "merged_at": None,
+                },
+            })
+        if path == "/repos/acme/backend/pulls/42":
+            return _json({
+                "number": 42,
+                "title": "PR 42",
+                "state": "open",
+                "head": {
+                    "sha": head_sha,
+                    "ref": "feature-branch",
+                    "label": "acme:feature-branch",
+                },
+                "base": {"sha": "base000", "ref": "main"},
+                "html_url": "https://github.com/acme/backend/pull/42",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-02T00:00:00Z",
+            })
+        if path == "/repos/acme/backend/actions/runs":
+            return _json({"workflow_runs": []})
+        if path == "/repos/acme/backend/actions/workflows":
+            # No CI configured -- this is what turns NO_CI_SENTINEL on.
+            return _json({"message": "Not Found"}, status_code=404)
+        raise AssertionError(f"unexpected request: {req.url}")
+
+    transport = httpx.MockTransport(handler)
+
+    def fake_client(token: str | None) -> httpx.Client:
+        headers = {"Accept": "application/vnd.github+json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return httpx.Client(
+            base_url=github_provider.API_BASE,
+            headers=headers,
+            transport=transport,
+        )
+
+    monkeypatch.setattr(github_provider, "_client", fake_client)
+    project = ProjectConfig(
+        id="acme", provider="github", path="acme/backend",
+        token_env="GITHUB_TOKEN_ACME",
+    )
+    runs, resolved_refs = GitHubProvider().list_runs_for_ticket(
+        project, token="t", ticket_id="42",
+    )
+    assert runs == []
+    assert resolved_refs == [head_sha, NO_CI_SENTINEL]
+    assert resolved_refs[-1] == NO_CI_SENTINEL
+
+
 def test_github_list_runs_for_ticket_docstring_drops_stale_head_shas_wording() -> None:
     """The pre-#288 GitHub docstring described `resolved_refs` as "the
     de-duped list of head_shas we queried" -- true for the SHA-only case
     but no longer complete once the sentinel is documented. #288 replaces
-    it; this stale phrase must not survive.
+    it; this stale phrase must not survive, AND it must be replaced by the
+    real explanation, not merely deleted or reworded away (test-critique
+    finding tautology::F2: a bare absence check on the stale phrase would
+    also pass a rewording like "the head SHAs queried" -- still stale and
+    incomplete -- or an outright deletion with nothing put in its place).
 
-    Whitespace is collapsed before the check (same as the sibling test
+    Whitespace is collapsed before both checks (same as the sibling test
     above) so that source-level line-wrapping cannot accidentally satisfy
-    -- or accidentally fail to satisfy -- this assertion either way."""
+    -- or accidentally fail to satisfy -- either assertion either way."""
     doc = inspect.getdoc(GitHubProvider.list_runs_for_ticket)
     assert doc is not None
     collapsed_doc = re.sub(r"\s+", " ", doc.lower())
     assert "head_shas we queried" not in collapsed_doc
+    # The stale sentence must be replaced by the real explanation, not
+    # just removed: reuse the same verbatim planned paragraph the sibling
+    # test pins, so deleting/rewording the stale line without adding the
+    # correct paragraph still fails this test.
+    collapsed_doc_ws = _collapse_whitespace(doc)
+    assert _PLANNED_PARAGRAPH in collapsed_doc_ws, collapsed_doc_ws
