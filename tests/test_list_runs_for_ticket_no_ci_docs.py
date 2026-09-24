@@ -63,21 +63,39 @@ def test_list_runs_for_ticket_docstring_explains_no_ci_sentinel(
     in one place: it's the last element, it only appears when no CI is
     configured, and it is not a real ref. Every check below is scoped to
     that ONE paragraph (not the whole docstring), so a stray mention of
-    the constant elsewhere in the docstring cannot make this pass."""
+    the constant elsewhere in the docstring cannot make this pass.
+
+    Each assertion below requires the claim's key words to sit directly
+    adjacent to each other, in the affirmative phrasing the plan specifies
+    (e.g. "appended as the last element only when ... has no ci
+    configured", "marker, not a ref") -- not merely co-occurring anywhere
+    in the paragraph. A paragraph that states the opposite meaning (e.g.
+    "resolved_refs never contains NO_CI_SENTINEL; it is not a ref, is
+    never the last element, and appears even with no CI configured")
+    contains all the individual words but does not match any of these
+    tightly-scoped phrase patterns, so it cannot satisfy this test."""
     paragraph = _sentinel_paragraph(provider_cls)
-    collapsed = re.sub(r"\s+", " ", paragraph.lower())
-    assert "resolved_refs" in collapsed
+    collapsed = re.sub(r"\s+", " ", paragraph.replace("`", "").lower())
+    assert re.search(r"resolved_refs may end with no_ci_sentinel", collapsed), collapsed
     assert '"no-ci"' in collapsed
-    assert "last element" in collapsed
-    assert "no ci configured" in collapsed
-    assert "not a ref" in collapsed
+    assert re.search(
+        r"appended as the last element only when no run matched "
+        r"and the project has no ci configured",
+        collapsed,
+    ), collapsed
+    assert re.search(r"marker, not a ref", collapsed), collapsed
 
 
 def test_github_list_runs_for_ticket_docstring_drops_stale_head_shas_wording() -> None:
     """The pre-#288 GitHub docstring described `resolved_refs` as "the
     de-duped list of head_shas we queried" -- true for the SHA-only case
     but no longer complete once the sentinel is documented. #288 replaces
-    it; this stale phrase must not survive."""
+    it; this stale phrase must not survive.
+
+    Whitespace is collapsed before the check (same as the sibling test
+    above) so that source-level line-wrapping cannot accidentally satisfy
+    -- or accidentally fail to satisfy -- this assertion either way."""
     doc = inspect.getdoc(GitHubProvider.list_runs_for_ticket)
     assert doc is not None
-    assert "head_shas we queried" not in doc
+    collapsed_doc = re.sub(r"\s+", " ", doc.lower())
+    assert "head_shas we queried" not in collapsed_doc
