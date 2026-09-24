@@ -292,6 +292,23 @@ def test_list_board_columns_wrong_binding_kind_raises(
         AzureDevOpsProvider().list_board_columns(_project(board), "t")
 
 
+def test_list_board_columns_no_binding_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 (#285): a label-mode board (columns, no binding) raises the
+    existing wrong-kind `ValueError`, not an `AttributeError` on
+    `None.kind` — the provider unit-test half of R3 (R1 covers the YAML
+    path)."""
+    board = Board(columns=["Todo"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for a binding-less board")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="not 'azure-boards'"):
+        AzureDevOpsProvider().list_board_columns(_project(board), "t")
+
+
 def test_list_board_columns_missing_team_or_board_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -489,6 +506,22 @@ def test_wiql_mismatched_binding_kind_raises(monkeypatch: pytest.MonkeyPatch) ->
 
     def handler(req: httpx.Request) -> httpx.Response:
         raise AssertionError("no HTTP call expected for a mismatched binding")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="not 'azure-boards'"):
+        AzureDevOpsProvider().list_tickets(
+            _project(board), token="t",
+            filters=TicketFilters(board_column="Doing", status="any"),
+        )
+
+
+def test_wiql_no_binding_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R3 (#285): same as `test_list_board_columns_no_binding_raises`,
+    for the `list_tickets(filters.board_column=...)` / WIQL path."""
+    board = Board(columns=["Doing"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for a binding-less board")
 
     _install_mock(monkeypatch, handler)
     with pytest.raises(ValueError, match="not 'azure-boards'"):
@@ -787,6 +820,21 @@ def test_ensure_board_column_raises_wrong_binding_kind(
 
     def handler(req: httpx.Request) -> httpx.Response:
         raise AssertionError("no HTTP call expected for a non-Azure-Boards binding")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(ValueError, match="not 'azure-boards'"):
+        AzureDevOpsProvider().ensure_board_column(_project(board), "t", "Doing")
+
+
+def test_ensure_board_column_raises_no_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 (#285): same as `test_list_board_columns_no_binding_raises`,
+    for `ensure_board_column`."""
+    board = Board(columns=["Doing"])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no HTTP call expected for a binding-less board")
 
     _install_mock(monkeypatch, handler)
     with pytest.raises(ValueError, match="not 'azure-boards'"):

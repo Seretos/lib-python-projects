@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Any, Callable, ClassVar, Literal
 
@@ -1930,6 +1931,87 @@ class CIConfigurationProvider:
 
     def is_ci_configured(self, project, token: str | None) -> bool:
         raise NotImplementedError
+
+
+# ---------- waiting for a commit's CI to reach a verdict (ticket #275) ----------
+
+PipelineWaitState = Literal["success", "failure", "pending", "no_verdict", "no_runs"]
+
+#: Conclusions that are unambiguously red across the three providers' mapped
+#: vocabularies (GitHub ``failure``/``timed_out``/``startup_failure``, GitLab
+#: ``failed``). Anything terminal that is neither green nor in this set is
+#: ``no_verdict`` — a cancelled/skipped run must never read as a failure.
+_RED_CONCLUSIONS = frozenset({"failure", "failed", "timed_out", "startup_failure"})
+
+#: Rate-limit floor for ``poll_interval_s``.
+_MIN_POLL_INTERVAL_S = 5.0
+
+
+@dataclass
+class PipelineWaitResult:
+    """Outcome of ``PipelineWaitProvider.wait_for_pipeline``.
+
+    ``state`` is one of ``success`` / ``failure`` / ``pending`` (runs still in
+    flight at timeout) / ``no_verdict`` (all runs finished, none red, at least
+    one cancelled/skipped/otherwise inconclusive) / ``no_runs`` (no run seen
+    for the whole timeout). ``runs`` is the last polled run list and
+    ``waited_s`` the elapsed time on the injected clock.
+    """
+
+    state: PipelineWaitState
+    runs: list[PipelineRun]
+    waited_s: float
+
+
+def _classify_runs(runs: list[PipelineRun]) -> PipelineWaitState:
+    """Classify a non-empty run list. Returns ``pending`` while any run is
+    still in flight and no run is red; the ``no_verdict > success`` ordering
+    only applies once every run has completed."""
+    if any(r.conclusion in _RED_CONCLUSIONS for r in runs):
+        return "failure"
+    if any(r.status != "completed" for r in runs):
+        return "pending"
+    if all(r.conclusion == "success" for r in runs):
+        return "success"
+    return "no_verdict"
+
+
+class PipelineWaitProvider:
+    """Mixin: one blocking ``wait_for_pipeline`` shared by all providers,
+    built on the provider's own ``list_runs_for_commit``."""
+
+    def list_runs_for_commit(self, *args: Any, **kwargs: Any) -> tuple[list[PipelineRun], list[str]]:
+        raise NotImplementedError
+
+    def wait_for_pipeline(
+        self,
+        project,
+        token: str | None,
+        sha: str,
+        *,
+        timeout_s: float = 600.0,
+        poll_interval_s: float = 20.0,
+        now: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> PipelineWaitResult:
+        interval = max(poll_interval_s, _MIN_POLL_INTERVAL_S)
+        start = now()
+        deadline = start + timeout_s
+        runs: list[PipelineRun] = []
+        while True:
+            runs, refs = self.list_runs_for_commit(project, token, sha, limit=50)
+            if runs:
+                state = _classify_runs(runs)
+                if state != "pending":
+                    return PipelineWaitResult(state, runs, now() - start)
+            elif NO_CI_SENTINEL in refs:
+                return PipelineWaitResult("no_runs", [], now() - start)
+            remaining = deadline - now()
+            if remaining <= 0:
+                return PipelineWaitResult(
+                    "pending" if runs else "no_runs", runs, now() - start
+                )
+            sleep(min(interval, remaining))
 
 
 # ---------- token project discovery (ticket #80) ----------

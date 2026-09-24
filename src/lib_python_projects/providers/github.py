@@ -30,6 +30,7 @@ from lib_python_projects.providers.base import (
     BoardColumnSpec,
     BulkTicketResult,
     CIConfigurationProvider,
+    PipelineWaitProvider,
     Comment,
     CommentRef,
     DiffHunkRange,
@@ -3339,6 +3340,7 @@ class GitHubProvider(
     TokenProjectDiscoveryProvider,
     ViewerIdentityProvider,
     CIConfigurationProvider,
+    PipelineWaitProvider,
     PRDiffProvider,
     IssueTemplateProvider,
 ):
@@ -3566,9 +3568,10 @@ class GitHubProvider(
                 f"board_column requires one"
             )
         binding = board.binding
-        if binding.kind != "github-projects-v2":
+        if binding is None or binding.kind != "github-projects-v2":
             raise ValueError(
-                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"project {project.id!r} board binding is "
+                f"{None if binding is None else binding.kind!r}, "
                 f"not 'github-projects-v2' — board_column filtering is "
                 f"GitHub-only"
             )
@@ -4198,6 +4201,7 @@ class GitHubProvider(
         reopen_binding: Any = None
         if (
             project.board is not None
+            and project.board.binding is not None
             and project.board.binding.kind == "github-projects-v2"
         ):
             reopen_binding = project.board.binding
@@ -4600,9 +4604,10 @@ class GitHubProvider(
                 f"add one to projects.yml before calling list_board_columns"
             )
         binding = board.binding
-        if binding.kind != "github-projects-v2":
+        if binding is None or binding.kind != "github-projects-v2":
             raise ValueError(
-                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"project {project.id!r} board binding is "
+                f"{None if binding is None else binding.kind!r}, "
                 f"not 'github-projects-v2' — list_board_columns is GitHub-only"
             )
         if not binding.owner or not binding.project_number:
@@ -4675,9 +4680,10 @@ class GitHubProvider(
                 f"add one to projects.yml before calling ensure_board_column"
             )
         binding = board.binding
-        if binding.kind != "github-projects-v2":
+        if binding is None or binding.kind != "github-projects-v2":
             raise ValueError(
-                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"project {project.id!r} board binding is "
+                f"{None if binding is None else binding.kind!r}, "
                 f"not 'github-projects-v2' — ensure_board_column is GitHub-only"
             )
         if not binding.owner or not binding.project_number:
@@ -6016,11 +6022,25 @@ class GitHubProvider(
                             405, f"PR '{project.id}#{pr_id}' is already merged"
                         ) from exc
                     mergeable_state = raw.get("mergeable_state") or "unknown"
+                    if raw.get("draft") is True or mergeable_state == "draft":
+                        # A draft PR can report any mergeable_state
+                        # (often 'clean'), so name the draft explicitly.
+                        raise GitHubError(
+                            405,
+                            f"PR '{project.id}#{pr_id}' cannot be merged:"
+                            f" it is a draft (mergeable_state="
+                            f"'{mergeable_state}') — mark it ready for"
+                            f" review with update_pr(draft=false) and retry",
+                        ) from exc
+                    if mergeable_state == "dirty":
+                        advice = "rebase or resolve conflicts and retry"
+                    else:
+                        advice = "see mergeable_state for the blocking condition"
                     raise GitHubError(
                         405,
                         f"PR '{project.id}#{pr_id}' cannot be merged:"
                         f" mergeable_state='{mergeable_state}'"
-                        f" — rebase or resolve conflicts and retry",
+                        f" — {advice}",
                     ) from exc
                 raise
             if light:
@@ -6738,9 +6758,9 @@ class GitHubProvider(
         """Fetch a single workflow run, optionally with failure context.
 
         When `include_failure_excerpt` is True AND the run concluded as
-        failed, populates `run.failure` with per-failing-job annotations
-        and a small log excerpt. In-progress runs (`conclusion=None`)
-        never trigger the failure-context fetch.
+        failed or cancelled, populates `run.failure` with per-failing-job
+        annotations and a small log excerpt. In-progress runs
+        (`conclusion=None`) never trigger the failure-context fetch.
 
         ``tail_lines``, when a positive int, overrides the smart excerpt
         logic and returns the last *tail_lines* lines of each failing
@@ -6769,7 +6789,7 @@ class GitHubProvider(
             run = _map_run(raw)
             if (
                 include_failure_excerpt
-                and run.conclusion == "failure"
+                and run.conclusion in _FAILURE_CONTEXT_CONCLUSIONS
                 and run.status == "completed"
             ):
                 run.failure = _get_failure_excerpt(
@@ -8044,6 +8064,27 @@ def _normalize_gh_annotations(
     return out
 
 
+# Run/job conclusions that trigger failure-context collection. Shared by
+# GitHubProvider.get_run's gate and _get_failure_excerpt's per-job filter so
+# the two enumerations cannot drift apart (ticket #280: a run/job killed by
+# `timeout-minutes` reports conclusion "cancelled", not "failure").
+_FAILURE_CONTEXT_CONCLUSIONS = frozenset({"failure", "cancelled"})
+
+
+def _pick_failed_step(steps: list[dict]) -> str:
+    """Priority pick for the step name to surface as `failed_step`: prefer a
+    step that itself failed, then one that was cancelled, then one that was
+    still running (`conclusion` null) when the job ended, else `""`."""
+    for wanted in ("failure", "cancelled"):
+        for step in steps:
+            if (step.get("conclusion") or "") == wanted:
+                return step.get("name") or ""
+    for step in steps:
+        if step.get("conclusion") is None:
+            return step.get("name") or ""
+    return ""
+
+
 def _get_failure_excerpt(
     client: httpx.Client,
     project: ProjectConfig,
@@ -8052,9 +8093,9 @@ def _get_failure_excerpt(
     *,
     tail_lines: int | None = None,
 ) -> PipelineFailure:
-    """Build a `PipelineFailure` for a failed run.
+    """Build a `PipelineFailure` for a failed or cancelled run.
 
-    Walks the run's jobs, picks the failed ones, then for each:
+    Walks the run's jobs, picks the failed/cancelled ones, then for each:
       - reads check-run annotations (when `check_run_url` is present)
       - reads the job log via the 302 redirect flow and extracts an excerpt
 
@@ -8071,14 +8112,9 @@ def _get_failure_excerpt(
     failing: list[FailingJob] = []
     logs_missing = False
     for job in jobs:
-        if (job.get("conclusion") or "") != "failure":
+        if (job.get("conclusion") or "") not in _FAILURE_CONTEXT_CONCLUSIONS:
             continue
-        # Pick the first failed step to surface as `failed_step`.
-        failed_step = ""
-        for step in job.get("steps") or []:
-            if (step.get("conclusion") or "") == "failure":
-                failed_step = step.get("name") or ""
-                break
+        failed_step = _pick_failed_step(job.get("steps") or [])
 
         # Annotations live on the check-run associated with the job.
         annotations: list[dict] = []

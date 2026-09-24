@@ -806,6 +806,83 @@ def _jobs_payload(job_id: int, job_name: str = "test", failed_step_name: str = "
     }
 
 
+def _cancelled_run_payload(run_id: int, head_sha: str) -> dict:
+    """A completed *cancelled* workflow_run payload — e.g. a run where one
+    job hit ``timeout-minutes`` and GitHub cancelled the rest (ticket #280)."""
+    payload = _failed_run_payload(run_id, head_sha)
+    payload["conclusion"] = "cancelled"
+    return payload
+
+
+def _cancelled_jobs_payload(job_a_id: int, job_b_id: int, job_c_id: int) -> dict:
+    """A /jobs response for a fail-fast cancellation: job A was mid-step when
+    cancelled (its running step reports ``cancelled``), job B never got past
+    setup (its next step is still ``null``), and job C already finished
+    successfully before the cancellation propagated and must be excluded."""
+    return {
+        "jobs": [
+            {
+                "id": job_a_id,
+                "name": "job-a",
+                "conclusion": "cancelled",
+                "html_url": f"https://github.com/acme/backend/actions/runs/1/jobs/{job_a_id}",
+                "check_run_url": None,
+                "steps": [
+                    {"name": "Set up job", "conclusion": "success", "number": 1},
+                    {"name": "Run pytest", "conclusion": "cancelled", "number": 2},
+                    {"name": "Post checkout", "conclusion": None, "number": 3},
+                ],
+            },
+            {
+                "id": job_b_id,
+                "name": "job-b",
+                "conclusion": "cancelled",
+                "html_url": f"https://github.com/acme/backend/actions/runs/1/jobs/{job_b_id}",
+                "check_run_url": None,
+                "steps": [
+                    {"name": "Set up job", "conclusion": "success", "number": 1},
+                    {"name": "Run pytest", "conclusion": None, "number": 2},
+                    {"name": "Complete job", "conclusion": None, "number": 3},
+                ],
+            },
+            {
+                "id": job_c_id,
+                "name": "job-c",
+                "conclusion": "success",
+                "html_url": f"https://github.com/acme/backend/actions/runs/1/jobs/{job_c_id}",
+                "check_run_url": None,
+                "steps": [
+                    {"name": "Set up job", "conclusion": "success", "number": 1},
+                    {"name": "Run pytest", "conclusion": "success", "number": 2},
+                ],
+            },
+        ]
+    }
+
+
+def _cancelled_job_all_clean_steps_payload(job_id: int) -> dict:
+    """A /jobs response for a single cancelled job whose every step reports
+    ``success``/``skipped`` — no ``failure``, ``cancelled``, or ``null`` step
+    for `failed_step` selection to land on, so it must fall through to
+    ``""`` while the job itself still gets a `log_excerpt`."""
+    return {
+        "jobs": [
+            {
+                "id": job_id,
+                "name": "job-clean",
+                "conclusion": "cancelled",
+                "html_url": f"https://github.com/acme/backend/actions/runs/1/jobs/{job_id}",
+                "check_run_url": None,
+                "steps": [
+                    {"name": "Set up job", "conclusion": "success", "number": 1},
+                    {"name": "Checkout", "conclusion": "success", "number": 2},
+                    {"name": "Cleanup", "conclusion": "skipped", "number": 3},
+                ],
+            }
+        ]
+    }
+
+
 def test_get_run_tail_lines_overrides_excerpt(monkeypatch: pytest.MonkeyPatch) -> None:
     """get_run(..., tail_lines=5) on a failed run must set log_excerpt to the
     last 5 lines of the job log, ignoring the smart-excerpt heuristics."""
@@ -1245,6 +1322,213 @@ def test_get_run_to_get_step_log_round_trip(monkeypatch: pytest.MonkeyPatch) -> 
     )
     assert result == full_log_text
     assert requested_urls[-1] == f"/repos/acme/backend/actions/jobs/{job_id}/logs"
+
+
+# ---------- ticket #280: cancelled-run failure context -----------------------
+
+
+def test_get_run_cancelled_run_populates_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cancelled run (e.g. one job killed by timeout-minutes, taking the
+    rest of the run down with it) must populate run.failure with a
+    FailingJob per cancelled job, in API order, excluding any job that
+    already completed successfully."""
+    run_id = 90001
+    job_a_id = 701
+    job_b_id = 702
+    job_c_id = 703
+    head_sha = "cancel001"
+
+    log_text_a = "job A log\nsecond line A\n"
+    log_text_b = "job B log\nsecond line B\n"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == f"/repos/acme/backend/actions/runs/{run_id}":
+            return _json(_cancelled_run_payload(run_id, head_sha))
+        if path == f"/repos/acme/backend/actions/runs/{run_id}/jobs":
+            return _json(_cancelled_jobs_payload(job_a_id, job_b_id, job_c_id))
+        raise AssertionError(f"unexpected JSON request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+
+    def fake_fetch(token, url, *, max_bytes=256 * 1024):
+        if url.endswith(f"/jobs/{job_a_id}/logs"):
+            return log_text_a
+        if url.endswith(f"/jobs/{job_b_id}/logs"):
+            return log_text_b
+        raise AssertionError(f"unexpected job-log fetch: {url}")
+
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log", fake_fetch,
+    )
+
+    run = GitHubProvider().get_run(_project(), token="t", run_id=str(run_id))
+
+    assert run.failure is not None
+    jobs = run.failure.failing_jobs
+    # Job C (success) must be excluded; A and B stay in API order.
+    assert [j.job_id for j in jobs] == [str(job_a_id), str(job_b_id)]
+    assert jobs[0].log_excerpt is not None
+    assert jobs[0].log_excerpt == "job A log\nsecond line A"
+    assert jobs[1].log_excerpt is not None
+    assert jobs[1].log_excerpt == "job B log\nsecond line B"
+    # failed_step selection: prefer a "failure" step, then "cancelled",
+    # then a null (still-running-at-cancellation) step.
+    assert jobs[0].failed_step == "Run pytest"  # cancelled step
+    assert jobs[1].failed_step == "Run pytest"  # first null step (no failure/cancelled step present)
+
+
+def test_get_run_cancelled_job_all_clean_steps_gets_empty_failed_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled job whose steps are all success/skipped (no failure,
+    cancelled, or null step to anchor on) gets failed_step == "" but must
+    still carry a log_excerpt."""
+    run_id = 90002
+    job_id = 711
+    head_sha = "cancel002"
+    log_text = "clean job log\nnothing unusual here\n"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == f"/repos/acme/backend/actions/runs/{run_id}":
+            return _json(_cancelled_run_payload(run_id, head_sha))
+        if path == f"/repos/acme/backend/actions/runs/{run_id}/jobs":
+            return _json(_cancelled_job_all_clean_steps_payload(job_id))
+        raise AssertionError(f"unexpected JSON request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log",
+        lambda token, url, *, max_bytes=256 * 1024: log_text,
+    )
+
+    run = GitHubProvider().get_run(_project(), token="t", run_id=str(run_id))
+
+    assert run.failure is not None
+    assert len(run.failure.failing_jobs) == 1
+    job = run.failure.failing_jobs[0]
+    assert job.failed_step == ""
+    assert job.log_excerpt is not None
+
+
+def test_get_run_success_run_skips_failure_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Guard: a successful run must never trigger the failure-context fetch
+    at all — this keeps the widened (failure OR cancelled) gate from
+    accidentally swallowing `success` runs too."""
+    run_id = 90003
+    head_sha = "success001"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == f"/repos/acme/backend/actions/runs/{run_id}":
+            payload = _failed_run_payload(run_id, head_sha)
+            payload["conclusion"] = "success"
+            return _json(payload)
+        raise AssertionError(f"unexpected JSON request: {req.url} — success run must not fetch /jobs")
+
+    _install_mock(monkeypatch, handler)
+
+    run = GitHubProvider().get_run(_project(), token="t", run_id=str(run_id))
+
+    assert run.failure is None
+
+
+def test_get_run_cancelled_run_tail_lines(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_run(..., tail_lines=3) on a cancelled run must set each failing
+    job's log_excerpt to the true last 3 lines of that job's log, and must
+    bypass the 256 KB cap (max_bytes=None) exactly as it does for failed
+    runs."""
+    run_id = 90004
+    job_a_id = 721
+    job_b_id = 722
+    job_c_id = 723
+    head_sha = "cancel003"
+
+    log_text_a = "\n".join([f"a-line-{i}" for i in range(10)] + ["A-TAIL-1", "A-TAIL-2", "A-TAIL-3"])
+    log_text_b = "\n".join([f"b-line-{i}" for i in range(10)] + ["B-TAIL-1", "B-TAIL-2", "B-TAIL-3"])
+
+    called_max_bytes: dict[int, object] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == f"/repos/acme/backend/actions/runs/{run_id}":
+            return _json(_cancelled_run_payload(run_id, head_sha))
+        if path == f"/repos/acme/backend/actions/runs/{run_id}/jobs":
+            return _json(_cancelled_jobs_payload(job_a_id, job_b_id, job_c_id))
+        raise AssertionError(f"unexpected JSON request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+
+    def fake_fetch(token, url, *, max_bytes=256 * 1024):
+        if url.endswith(f"/jobs/{job_a_id}/logs"):
+            called_max_bytes[job_a_id] = max_bytes
+            return log_text_a
+        if url.endswith(f"/jobs/{job_b_id}/logs"):
+            called_max_bytes[job_b_id] = max_bytes
+            return log_text_b
+        raise AssertionError(f"unexpected job-log fetch: {url}")
+
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log", fake_fetch,
+    )
+
+    run = GitHubProvider().get_run(
+        _project(), token="t", run_id=str(run_id), tail_lines=3
+    )
+
+    assert run.failure is not None
+    jobs = run.failure.failing_jobs
+    assert [j.job_id for j in jobs] == [str(job_a_id), str(job_b_id)]
+    assert jobs[0].log_excerpt is not None
+    assert jobs[0].log_excerpt.splitlines() == ["A-TAIL-1", "A-TAIL-2", "A-TAIL-3"]
+    assert jobs[1].log_excerpt is not None
+    assert jobs[1].log_excerpt.splitlines() == ["B-TAIL-1", "B-TAIL-2", "B-TAIL-3"]
+    assert called_max_bytes == {job_a_id: None, job_b_id: None}
+
+
+def test_get_run_cancelled_to_get_step_log_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The FailingJob.job_id populated by get_run(include_failure_excerpt=True)
+    on a *cancelled* run must be usable, unmodified, as the job_id argument to
+    get_step_log — mirrors test_get_run_to_get_step_log_round_trip but for
+    the cancelled-run path."""
+    run_id = 90005
+    job_a_id = 731
+    job_b_id = 732
+    job_c_id = 733
+    head_sha = "cancel004"
+    full_log_text_a = "full raw job A log contents\nline 2\n"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path == f"/repos/acme/backend/actions/runs/{run_id}":
+            return _json(_cancelled_run_payload(run_id, head_sha))
+        if path == f"/repos/acme/backend/actions/runs/{run_id}/jobs":
+            return _json(_cancelled_jobs_payload(job_a_id, job_b_id, job_c_id))
+        raise AssertionError(f"unexpected JSON request: {req.url}")
+
+    _install_mock(monkeypatch, handler)
+
+    requested_urls: list[str] = []
+
+    def fake_fetch(token, url, *, max_bytes=256 * 1024):
+        requested_urls.append(url)
+        return full_log_text_a
+
+    monkeypatch.setattr(
+        "lib_python_projects.providers.github._fetch_job_log", fake_fetch,
+    )
+
+    run = GitHubProvider().get_run(_project(), token="t", run_id=str(run_id))
+    assert run.failure is not None
+    resolved_job_id = run.failure.failing_jobs[0].job_id
+    assert resolved_job_id == str(job_a_id)
+
+    result = GitHubProvider().get_step_log(
+        _project(), token="t", run_id=str(run_id), job_id=resolved_job_id
+    )
+    assert result == full_log_text_a
+    assert requested_urls[-1] == f"/repos/acme/backend/actions/jobs/{job_a_id}/logs"
 
 
 # ---------- ticket #200 -- run-listing filters (workflow/event/since) -------

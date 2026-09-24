@@ -50,6 +50,7 @@ from lib_python_projects.providers.base import (
     BulkTicketResult,
     CIConfigurationProvider,
     Comment,
+    PipelineWaitProvider,
     CommentRef,
     DiffHunkRange,
     DiscoveredProject,
@@ -2514,6 +2515,7 @@ class GitLabProvider(
     TokenProjectDiscoveryProvider,
     ViewerIdentityProvider,
     CIConfigurationProvider,
+    PipelineWaitProvider,
     PRDiffProvider,
     IssueTemplateProvider,
 ):
@@ -3430,7 +3432,7 @@ class GitLabProvider(
 
         tail = collected_oldest_first[-limit:]
         tail.reverse()
-        has_more = cur >= 1
+        has_more = cur >= 1 or len(collected_oldest_first) > limit
         return tail, has_more
 
     def get_comment(

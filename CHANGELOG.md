@@ -8,8 +8,26 @@ are never hand-labelled with a version string or tag.
 
 ## Unreleased
 
+### Fixed
+
+- Ticket #272: the ETag cache no longer replays stale pagination headers
+  (`Link`, `X-Total-Pages`, `X-Next-Page`) on a 304. GETs carrying `page` or
+  `per_page` now bypass the conditional cache entirely, so
+  `list_comments(order="desc")` and `has_more` reflect the current server
+  state. GitLab's descending `has_more` now also accounts for older notes
+  trimmed by the `limit` slice, and the conditional rebuild preserves
+  `request.extensions` (so cached GETs keep the client's timeout).
+
 ### Changed
 
+- Ticket #283: bumped the `lib-python-config` pin to the exact tag
+  `v0.1.3` (upstream change is CI/tooling-only,
+  Seretos/lib-python-config#17; no consumer-side API change).
+- Ticket #271: `GitHubProvider.merge_pr`'s 405 error no longer tells the
+  caller to "rebase or resolve conflicts" unconditionally. A draft PR now
+  gets a message naming the draft and suggesting `update_pr(draft=false)`;
+  only `mergeable_state='dirty'` keeps the conflict advice; any other
+  state points at `mergeable_state` as the blocking condition.
 - Tickets #266/#268: pinned `lib-python-config` in `pyproject.toml` to the
   exact tag `v0.1.2`, replacing the floating `release/0.x` branch pin.
   `lib-python-config`'s own release workflow force-pushes `release/0.x` on
@@ -19,6 +37,27 @@ are never hand-labelled with a version string or tag.
   bump.
 
 ### Added
+
+- Ticket #285: `Board.binding` is now optional (`None` by default), so a
+  `projects.yml` entry can configure `board.columns` — plus optional
+  `label_map` (logical column -> label name) and `closed_column` (the
+  logical column mapping to the ticket's native closed state) — without
+  a live provider board binding. This "label mode" lets a label-only
+  consumer (GitLab, or GitHub without a Projects v2 board) configure a
+  board at all, instead of the whole project entry being dropped into
+  `invalid_projects`. `label_map`/`closed_column` are validated against
+  `columns` the same way `binding.map` is; both are inert data stored on
+  `Board`, not resolved by this library (agent-project-issues#365).
+  Every provider path that requires a live board binding still raises
+  its existing `ValueError` for a label-mode project instead of an
+  `AttributeError`; a project with an existing `binding` is unaffected.
+
+- Ticket #275: `wait_for_pipeline(project, token, sha, *, timeout_s,
+  poll_interval_s)` on the GitHub, GitLab and Azure DevOps providers (shared
+  `PipelineWaitProvider` mixin). Blocks until the commit's CI reaches a
+  verdict and returns `PipelineWaitResult(state, runs, waited_s)` with state
+  `success` / `failure` / `pending` / `no_verdict` (cancelled or skipped, never
+  `failure`) / `no_runs`.
 
 - Ticket #265: an opt-in `light: bool = False` keyword-only parameter on
   the six provider write methods — `create_ticket`, `update_ticket`,
