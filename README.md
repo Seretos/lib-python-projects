@@ -190,6 +190,43 @@ falling back to an unfiltered result. When board context isn't configured,
 use `status` / `states` (matching `System.State` directly) as a manual
 fallback filter instead.
 
+### Label-mode boards: `columns` without a `binding` (ticket #285)
+
+`board.binding` is optional. A project that tracks its logical columns via
+issue labels instead of a live provider board — a GitLab project (GitLab
+has no board binding concept), or a GitHub project with no Projects v2
+board — can configure `columns` (plus optional `label_map` and
+`closed_column`) with no `binding` at all:
+
+```yaml
+projects:
+  - id: acme
+    provider: gitlab
+    path: acme-group/backend
+    board:
+      columns: [Todo, Doing, Done]
+      label_map:
+        Todo: status/todo
+        Doing: status/doing
+      closed_column: Done
+```
+
+`label_map` (logical column -> label name) and `closed_column` (the
+logical column that corresponds to the ticket's native closed state,
+*not* a label) are validated against `columns` the same way
+`binding.map` is — an unmatched key still lands the whole project in
+`invalid_projects`, and `closed_column` may not also appear as a
+`label_map` key. Both fields are inert data on `Board`: this library
+validates and stores them but does not itself resolve a ticket's labels
+to a column (that consumer-facing lookup is out of scope here — see
+agent-project-issues#365). `Board.resolve(column)` falls back to
+identity (the logical column name unchanged) when `binding` is unset, so
+label-mode boards behave the same as an unmapped bound column. Every
+provider call that requires a live board binding (`list_board_columns`,
+`ensure_board_column`, `board_column` filtering) still raises its usual
+`ValueError` for a label-mode board — it just names the binding as
+missing rather than crashing.
+
 ## Pipeline triggering, run filtering, refs & releases (ticket #200)
 
 All three providers expose a matching, provider-agnostic surface for

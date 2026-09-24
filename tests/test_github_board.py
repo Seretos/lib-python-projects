@@ -2853,15 +2853,18 @@ def test_update_ticket_label_mode_board_no_reopen_reset(
     """R4 (#285): a label-mode board (columns, no binding) is a silent
     no-op for the reopen-reset feature, same as `project.board is None`
     or an `azure-boards` binding — must not raise `AttributeError` on
-    `project.board.binding.kind` when `binding` is `None`."""
+    `project.board.binding.kind` when `binding` is `None`. The REST
+    update itself must still complete normally, not merely swallow the
+    call: exactly one PATCH is issued and the returned `Ticket` reflects
+    its response, same as the plain-REST-path tests above."""
     board = Board(columns=["Todo", "Done"])
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
         if req.method == "GET" and path.endswith("/issues/42"):
-            return _json(_ai_issue_payload(42, state="closed"))
+            return _json(_ai_issue_payload(42, title="old title", state="closed"))
         if req.method == "PATCH" and path.endswith("/issues/42"):
-            return _json(_ai_issue_payload(42, state="open"))
+            return _json(_ai_issue_payload(42, title="x", state="open"))
         if path == "/graphql":
             raise AssertionError(
                 "no GraphQL call expected for a binding-less board"
@@ -2872,6 +2875,9 @@ def test_update_ticket_label_mode_board_no_reopen_reset(
     ticket = GitHubProvider().update_ticket(
         _project(board), "t", "42", title="x",
     )
+    assert ticket.title == "x"
+    patch_requests = [r for r in seen if r.method == "PATCH"]
+    assert len(patch_requests) == 1
     assert not any(r.url.path == "/graphql" for r in seen)
 
 

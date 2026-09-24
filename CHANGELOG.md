@@ -38,6 +38,20 @@ are never hand-labelled with a version string or tag.
 
 ### Added
 
+- Ticket #285: `Board.binding` is now optional (`None` by default), so a
+  `projects.yml` entry can configure `board.columns` — plus optional
+  `label_map` (logical column -> label name) and `closed_column` (the
+  logical column mapping to the ticket's native closed state) — without
+  a live provider board binding. This "label mode" lets a label-only
+  consumer (GitLab, or GitHub without a Projects v2 board) configure a
+  board at all, instead of the whole project entry being dropped into
+  `invalid_projects`. `label_map`/`closed_column` are validated against
+  `columns` the same way `binding.map` is; both are inert data stored on
+  `Board`, not resolved by this library (agent-project-issues#365).
+  Every provider path that requires a live board binding still raises
+  its existing `ValueError` for a label-mode project instead of an
+  `AttributeError`; a project with an existing `binding` is unaffected.
+
 - Ticket #275: `wait_for_pipeline(project, token, sha, *, timeout_s,
   poll_interval_s)` on the GitHub, GitLab and Azure DevOps providers (shared
   `PipelineWaitProvider` mixin). Blocks until the commit's CI reaches a

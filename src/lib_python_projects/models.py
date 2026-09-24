@@ -333,7 +333,15 @@ class Board(BaseModel):
 
     `columns` is the ordered list of logical column names the agent
     reasons about; `binding` maps those logical names onto a specific
-    provider's native board primitives.
+    provider's native board primitives. `binding` is optional (#285):
+    a board with `columns` (plus optional `label_map`/`closed_column`)
+    and no `binding` is "label mode" — for a label-only consumer (e.g.
+    GitLab, or GitHub without a Projects-v2 binding) that tracks its
+    logical columns via issue labels instead of a live provider board.
+    `label_map`/`closed_column` are inert data on `Board`: this library
+    validates and stores them but does not itself resolve a ticket's
+    labels to a column (out of scope here; see
+    agent-project-issues#365).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -345,6 +353,13 @@ class Board(BaseModel):
         ]
         | None
     ) = None
+    # Label-mode data (#285): maps a logical column name to the label
+    # that represents it, and names the logical column that corresponds
+    # to the ticket's native "closed" state (not a label). Both are
+    # independent of `binding` — allowed (and inert) whether or not a
+    # binding is configured.
+    label_map: dict[str, str] | None = None
+    closed_column: str | None = None
     # Board-column-dependent auto-labels (ticket #154). Defaults to empty
     # lists/dict, so a board with no `auto_labels:` block behaves exactly
     # as before.
@@ -375,6 +390,36 @@ class Board(BaseModel):
                         f"board binding 'map' key {key!r} does not match any "
                         f"entry in 'columns' {self.columns!r}"
                     )
+        return self
+
+    @model_validator(mode="after")
+    def _check_label_mode_keys(self) -> "Board":
+        """Validate the label-mode fields (#285) against `columns`,
+        independently of whether `binding` is set — same case-insensitive
+        matching and message style as `_check_map_keys`."""
+        columns_lower = {col.lower() for col in self.columns}
+        if self.label_map:
+            for key in self.label_map:
+                if key.lower() not in columns_lower:
+                    raise ValueError(
+                        f"board 'label_map' key {key!r} does not match any "
+                        f"entry in 'columns' {self.columns!r}"
+                    )
+        if self.closed_column is not None:
+            if self.closed_column.lower() not in columns_lower:
+                raise ValueError(
+                    f"board 'closed_column' {self.closed_column!r} does not "
+                    f"match any entry in 'columns' {self.columns!r}"
+                )
+            if self.label_map and any(
+                key.lower() == self.closed_column.lower() for key in self.label_map
+            ):
+                raise ValueError(
+                    f"board 'closed_column' {self.closed_column!r} must not "
+                    f"also be a 'label_map' key — it names the logical "
+                    f"column that maps to the ticket's native closed "
+                    f"state, instead of a label"
+                )
         return self
 
     @model_validator(mode="after")

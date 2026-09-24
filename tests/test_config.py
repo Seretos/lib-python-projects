@@ -932,11 +932,18 @@ class TestBoardBlock:
         if expected_kind == "generic":
             assert "Extra inputs are not permitted" in error
         elif expected_kind == "not_in_columns":
+            # Ties the key to the specific rejection message itself (not
+            # just its presence anywhere in the error, which pydantic's
+            # `input_value=` echo would satisfy on its own regardless of
+            # what the validator's own message says).
             assert "Extra inputs are not permitted" not in error
-            assert "does not match any entry in 'columns'" in error
+            assert f"{offending_key!r} does not match any entry in 'columns'" in error
         else:  # "exclusivity": closed_column doubling as a label_map key
             assert "Extra inputs are not permitted" not in error
-            assert "label_map" in error and "closed_column" in error
+            assert (
+                f"'closed_column' {offending_key!r} must not also be a "
+                f"'label_map' key" in error
+            )
 
     def test_label_map_key_matches_column_case_insensitively(self, tmp_path: Path):
         """Additional edge-case coverage for R2: a `label_map` key

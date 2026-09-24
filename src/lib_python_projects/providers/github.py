@@ -3568,9 +3568,10 @@ class GitHubProvider(
                 f"board_column requires one"
             )
         binding = board.binding
-        if binding.kind != "github-projects-v2":
+        if binding is None or binding.kind != "github-projects-v2":
             raise ValueError(
-                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"project {project.id!r} board binding is "
+                f"{None if binding is None else binding.kind!r}, "
                 f"not 'github-projects-v2' — board_column filtering is "
                 f"GitHub-only"
             )
@@ -4200,6 +4201,7 @@ class GitHubProvider(
         reopen_binding: Any = None
         if (
             project.board is not None
+            and project.board.binding is not None
             and project.board.binding.kind == "github-projects-v2"
         ):
             reopen_binding = project.board.binding
@@ -4602,9 +4604,10 @@ class GitHubProvider(
                 f"add one to projects.yml before calling list_board_columns"
             )
         binding = board.binding
-        if binding.kind != "github-projects-v2":
+        if binding is None or binding.kind != "github-projects-v2":
             raise ValueError(
-                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"project {project.id!r} board binding is "
+                f"{None if binding is None else binding.kind!r}, "
                 f"not 'github-projects-v2' — list_board_columns is GitHub-only"
             )
         if not binding.owner or not binding.project_number:
@@ -4677,9 +4680,10 @@ class GitHubProvider(
                 f"add one to projects.yml before calling ensure_board_column"
             )
         binding = board.binding
-        if binding.kind != "github-projects-v2":
+        if binding is None or binding.kind != "github-projects-v2":
             raise ValueError(
-                f"project {project.id!r} board binding is {binding.kind!r}, "
+                f"project {project.id!r} board binding is "
+                f"{None if binding is None else binding.kind!r}, "
                 f"not 'github-projects-v2' — ensure_board_column is GitHub-only"
             )
         if not binding.owner or not binding.project_number:
