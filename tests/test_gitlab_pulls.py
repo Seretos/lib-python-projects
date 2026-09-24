@@ -2856,10 +2856,17 @@ def test_submit_pr_review_comment_url_synthesised(
 # ---------- list_comments created_after (ticket #4) --------------------------
 
 
-def test_list_comments_since_uses_created_after(
+def test_list_comments_since_does_not_send_created_after(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """since parameter must be forwarded as created_after (not updated_after)."""
+    """R1 (ticket #287): GitLab's `created_after` server hint only matches
+    a note's *creation* time, so a note edited after `since` but created
+    before it would be dropped server-side before the client-side
+    `updated_at` filter (see `test_gitlab_issues.py
+    ::test_list_comments_since_includes_comment_edited_after_since`) ever
+    sees it. The fix stops sending `created_after` — filtering happens
+    entirely client-side against `updated_at` (falling back to
+    `created_at`) — and `updated_after` was never sent either."""
     seen_params: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -2868,7 +2875,7 @@ def test_list_comments_since_uses_created_after(
 
     _install_mock(monkeypatch, handler)
     GitLabProvider().list_comments(_project(), "t", "5", since="2024-06-01T00:00:00Z")
-    assert seen_params.get("created_after") == "2024-06-01T00:00:00Z"
+    assert "created_after" not in seen_params
     assert "updated_after" not in seen_params
 
 
@@ -3212,12 +3219,15 @@ def test_list_pr_files_returns_paths_patch_and_line_ranges(
     `new_path` (preferred over `old_path`), a modified entry's
     `change_type`, the `diff` string verbatim as `patch`, and
     `line_ranges` via the shared `parse_diff_hunk_ranges` helper.
-    `additions`/`deletions` stay `None` — GitLab's changes payload
-    carries no such counts. `old_path` is deliberately different from
-    `new_path` here (this is not a rename — `renamed_file` stays
-    `False`) so that `path == new_path` can only pass if the mapper
-    prefers `new_path` over `old_path`, per the plan's `new_path or
-    old_path` -> `path` rule."""
+    `additions`/`deletions` are derived by counting `+`/`-` lines in the
+    diff's hunk body (ticket #287 R2) — GitLab's changes payload carries
+    no such counts natively. This diff has one hunk with exactly one
+    added line (`+new`) and zero removed lines, so additions=1,
+    deletions=0. `old_path` is deliberately different from `new_path`
+    here (this is not a rename — `renamed_file` stays `False`) so that
+    `path == new_path` can only pass if the mapper prefers `new_path`
+    over `old_path`, per the plan's `new_path or old_path` -> `path`
+    rule."""
     diff = "@@ -1,3 +1,4 @@ def foo():\n context\n+new\n"
     entry = _change_entry("src/app.py", old_path="src/app_before.py", diff=diff)
 
@@ -3240,8 +3250,60 @@ def test_list_pr_files_returns_paths_patch_and_line_ranges(
     assert f.change_type == "modified"
     assert f.patch == diff
     assert f.line_ranges == [DiffHunkRange("LEFT", 1, 3), DiffHunkRange("RIGHT", 1, 4)]
-    assert f.additions is None
-    assert f.deletions is None
+    assert f.additions == 1
+    assert f.deletions == 0
+
+
+def test_list_pr_files_counts_multi_hunk_additions_and_deletions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 additional coverage: counts sum across multiple hunks in the
+    same diff, a removed line whose content itself starts with `--`
+    (the raw diff line reads `---triple dash content`, and only the
+    FIRST `-` is the diff marker) is still counted as exactly one
+    removal, and a `\\ No newline at end of file` marker line is
+    ignored entirely (counted as neither an addition nor a removal)."""
+    diff = (
+        "@@ -1,3 +1,3 @@\n"
+        " context\n"
+        "-removed line\n"
+        "+added line\n"
+        "@@ -10,3 +10,4 @@\n"
+        " context\n"
+        "---triple dash content\n"
+        "+added line 2\n"
+        "+added line 3\n"
+        "\\ No newline at end of file\n"
+    )
+    entry = _change_entry("src/app.py", diff=diff)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result[0].additions == 3
+    assert result[0].deletions == 2
+
+
+def test_list_pr_files_empty_diff_counts_are_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 additional coverage: a file with no diff text at all (e.g. a
+    pure rename or a mode-only change, where GitLab's `changes` entry
+    carries an empty `diff` string with no hunk header) must report
+    `additions`/`deletions` as `None` — genuinely unknown — not a fake
+    `0`/`0`. This is distinct from a file whose diff exists but has zero
+    net additions or deletions, which would report real `0` counts."""
+    entry = _change_entry("src/app.py", diff="")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json(_changes_response([entry]))
+
+    _install_mock(monkeypatch, handler)
+    result = GitLabProvider().list_pr_files(_project(), "t", "7")
+    assert result[0].additions is None
+    assert result[0].deletions is None
 
 
 def test_list_pr_files_new_file_maps_added(monkeypatch: pytest.MonkeyPatch) -> None:
