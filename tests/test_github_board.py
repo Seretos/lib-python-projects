@@ -1190,6 +1190,14 @@ def test_create_ticket_custom_fields_writes_via_project_v2_mutations(
                         }
                     }
                 })
+            if "repository(owner:$owner,name:$repo)" in query:
+                # ticket #288: create_ticket now reads custom_fields/milestone
+                # back from the board after the write, the same as
+                # update_ticket (#185). Checked before the
+                # "ProjectV2FieldCommon" branch below because that fragment
+                # name also appears inside this read-back query's own
+                # selection set.
+                return _json(_project_items_read_response())
             if "ProjectV2FieldCommon" in query:
                 owner_field = _owner_field(query)
                 field_name = variables["fieldName"]
@@ -1258,6 +1266,14 @@ def test_create_ticket_custom_fields_single_select_case_insensitive_match(
                         }
                     }
                 })
+            if "repository(owner:$owner,name:$repo)" in query:
+                # ticket #288: create_ticket now reads custom_fields/milestone
+                # back from the board after the write, the same as
+                # update_ticket (#185). Checked before the
+                # "ProjectV2FieldCommon" branch below because that fragment
+                # name also appears inside this read-back query's own
+                # selection set.
+                return _json(_project_items_read_response())
             if "ProjectV2FieldCommon" in query:
                 owner_field = _owner_field(query)
                 return _json({"data": {owner_field: {"projectV2": {"field": {

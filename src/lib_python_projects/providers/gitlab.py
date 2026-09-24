@@ -5266,6 +5266,12 @@ class GitLabProvider(
         filter for this aggregation path; client-side filtering would
         be misleading here. See `list_runs_for_branch` for
         `workflow`/`event`/`since` semantics (ticket #200).
+
+        `resolved_refs` may end with `NO_CI_SENTINEL` (`"no-ci"`). It is
+        appended as the last element only when no run matched and the
+        project has no CI configured. It is a marker, not a ref: strip it
+        before treating entries as SHAs / `!iid` / `build/{id}`. See
+        `NO_CI_SENTINEL` in `base.py`.
         """
         _validate_limit(limit)
         path = _project_path(project)
