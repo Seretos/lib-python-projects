@@ -20,6 +20,9 @@ are never hand-labelled with a version string or tag.
 
 ### Changed
 
+- Ticket #283: bumped the `lib-python-config` pin to the exact tag
+  `v0.1.3` (upstream change is CI/tooling-only,
+  Seretos/lib-python-config#17; no consumer-side API change).
 - Ticket #271: `GitHubProvider.merge_pr`'s 405 error no longer tells the
   caller to "rebase or resolve conflicts" unconditionally. A draft PR now
   gets a message naming the draft and suggesting `update_pr(draft=false)`;
