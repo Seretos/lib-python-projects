@@ -339,9 +339,12 @@ class Board(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     columns: list[str]
-    binding: Annotated[
-        GithubProjectsV2Binding | AzureBoardsBinding, Field(discriminator="kind")
-    ]
+    binding: (
+        Annotated[
+            GithubProjectsV2Binding | AzureBoardsBinding, Field(discriminator="kind")
+        ]
+        | None
+    ) = None
     # Board-column-dependent auto-labels (ticket #154). Defaults to empty
     # lists/dict, so a board with no `auto_labels:` block behaves exactly
     # as before.
@@ -364,7 +367,7 @@ class Board(BaseModel):
 
     @model_validator(mode="after")
     def _check_map_keys(self) -> "Board":
-        if self.binding.map:
+        if self.binding is not None and self.binding.map:
             columns_lower = {col.lower() for col in self.columns}
             for key in self.binding.map:
                 if key.lower() not in columns_lower:
@@ -390,9 +393,10 @@ class Board(BaseModel):
         """Resolve a logical column name to its provider-native value.
 
         Looks up `column` in `binding.map` case-insensitively; falls back
-        to the column name itself (identity) when unmapped.
+        to the column name itself (identity) when unmapped (including
+        when `binding` itself is unset — label-mode boards, #285).
         """
-        if self.binding.map:
+        if self.binding is not None and self.binding.map:
             for key, value in self.binding.map.items():
                 if key.lower() == column.lower():
                     return value

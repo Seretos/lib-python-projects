@@ -776,6 +776,188 @@ class TestBoardBlock:
         assert board.binding.map is None
         assert board.resolve("Todo") == "Todo"
 
+    # ---- label mode (ticket #285): board.columns/label_map/closed_column
+    # without board.binding, for label-only tracking (GitLab, or GitHub
+    # without a Projects-v2 binding). ----
+
+    def test_label_mode_board_loads_without_binding(self, tmp_path: Path):
+        """R1: a real projects.yml entry with `board.columns` plus the
+        optional `label_map`/`closed_column`, and no `board.binding`,
+        loads instead of being dropped into `invalid_projects`."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: gitlab
+                path: acme-group/backend
+                board:
+                  columns: [Todo, Doing, Done]
+                  label_map:
+                    Todo: status/todo
+                    Doing: status/doing
+                  closed_column: Done
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        assert result.invalid_projects == []
+        board = result.projects[0].board
+        assert board is not None
+        assert board.binding is None
+        assert board.columns == ["Todo", "Doing", "Done"]
+        assert board.label_map == {"Todo": "status/todo", "Doing": "status/doing"}
+        assert board.closed_column == "Done"
+
+    def test_label_mode_board_columns_only_loads_and_resolves_identity(
+        self, tmp_path: Path
+    ):
+        """Additional edge-case coverage for R1: a columns-only
+        binding-less board (no `label_map`/`closed_column`) also loads,
+        and `resolve()` falls back to identity with no binding at all."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: gitlab
+                path: acme-group/backend
+                board:
+                  columns: [Todo, Doing, Done]
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        board = result.projects[0].board
+        assert board is not None
+        assert board.binding is None
+        assert board.resolve("Todo") == "Todo"
+
+    @pytest.mark.parametrize(
+        "yaml_text, offending_key, expected_kind",
+        [
+            pytest.param(
+                """
+                    version: 1
+                    projects:
+                      - id: acme
+                        provider: gitlab
+                        path: acme-group/backend
+                        board:
+                          columns: [Todo, Doing, Done]
+                          label_map:
+                            Bogus: status/bogus
+                """,
+                "Bogus",
+                "not_in_columns",
+                id="label_map_key_not_in_columns",
+            ),
+            pytest.param(
+                """
+                    version: 1
+                    projects:
+                      - id: acme
+                        provider: gitlab
+                        path: acme-group/backend
+                        board:
+                          columns: [Todo, Doing, Done]
+                          closed_column: Bogus
+                """,
+                "Bogus",
+                "not_in_columns",
+                id="closed_column_not_in_columns",
+            ),
+            pytest.param(
+                """
+                    version: 1
+                    projects:
+                      - id: acme
+                        provider: gitlab
+                        path: acme-group/backend
+                        board:
+                          columns: [Todo, Doing, Done]
+                          label_map:
+                            Done: status/done
+                          closed_column: Done
+                """,
+                "Done",
+                "exclusivity",
+                id="closed_column_is_also_a_label_map_key",
+            ),
+            pytest.param(
+                """
+                    version: 1
+                    projects:
+                      - id: acme
+                        provider: gitlab
+                        path: acme-group/backend
+                        board:
+                          columns: [Todo, Doing, Done]
+                          bogus_key: nope
+                """,
+                "bogus_key",
+                "generic",
+                id="unknown_key_on_binding_less_board",
+            ),
+        ],
+    )
+    def test_malformed_label_mode_board_rejected(
+        self,
+        tmp_path: Path,
+        yaml_text: str,
+        offending_key: str,
+        expected_kind: str,
+    ):
+        """R2: a malformed label-mode block — a `label_map` key or
+        `closed_column` not in `columns`, `closed_column` doubling as a
+        `label_map` key, or an unknown key — lands in `invalid_projects`
+        with the offending key named in the error.
+
+        Cases (a)-(c) must be rejected by the plan's new
+        `_check_label_mode_keys` validator specifically (its own message,
+        matching `_check_map_keys`'s style), not merely by pydantic's
+        generic `extra_forbidden` catch-all that currently rejects the
+        whole `label_map`/`closed_column` field outright because those
+        fields don't exist yet — so those three assert the *absence* of
+        the generic "Extra inputs are not permitted" wording, which would
+        otherwise let this test pass vacuously both before and after the
+        fix. Case (d) (a genuinely unknown key) is expected to keep using
+        that generic path unchanged, before and after."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, yaml_text)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "config_error"
+        assert result.projects == []
+        assert len(result.invalid_projects) == 1
+        error = result.invalid_projects[0].error
+        assert offending_key in error
+        if expected_kind == "generic":
+            assert "Extra inputs are not permitted" in error
+        elif expected_kind == "not_in_columns":
+            assert "Extra inputs are not permitted" not in error
+            assert "does not match any entry in 'columns'" in error
+        else:  # "exclusivity": closed_column doubling as a label_map key
+            assert "Extra inputs are not permitted" not in error
+            assert "label_map" in error and "closed_column" in error
+
+    def test_label_map_key_matches_column_case_insensitively(self, tmp_path: Path):
+        """Additional edge-case coverage for R2: a `label_map` key
+        matches `columns` case-insensitively, same as the existing
+        `binding.map` key check."""
+        cfg = tmp_path / ".seretos/project-issues.yml"
+        _write(cfg, """
+            version: 1
+            projects:
+              - id: acme
+                provider: gitlab
+                path: acme-group/backend
+                board:
+                  columns: [Todo, Doing, Done]
+                  label_map:
+                    todo: status/todo
+        """)
+        result = load_projects(cwd=tmp_path)
+        assert result.state == "ok"
+        assert result.invalid_projects == []
+
 
 # ---------- Optional `board.auto_labels` block (ticket #154) ----------------
 
