@@ -1,0 +1,27 @@
+# Temporary Windows startup override for agent-project-issues 0.3.3.
+# Remove after the plugin ships a working Windows MCP launch command.
+[mcp_servers.project-issues]
+env_vars = ["GITHUB_TOKEN"]
+command = 'C:/Users/arnev/.codex/plugins/cache/seretos-agent-marketplace/agent-project-issues/0.3.3/bin/project-issues.exe'
+startup_timeout_sec = 20
+
+[mcp_servers.project-issues.tools.search_projects]
+approval_mode = "approve"
+
+[mcp_servers.project-issues.tools.list_ticket_templates]
+approval_mode = "approve"
+
+[mcp_servers.project-issues.tools.list_tickets]
+approval_mode = "approve"
+
+[mcp_servers.project-issues.tools.create_ticket]
+approval_mode = "approve"
+
+[mcp_servers.project-issues.tools.get_ticket]
+approval_mode = "approve"
+
+[mcp_servers.project-issues.tools.update_ticket]
+approval_mode = "approve"
+
+[mcp_servers.project-issues.tools.add_comment]
+approval_mode = "approve"
