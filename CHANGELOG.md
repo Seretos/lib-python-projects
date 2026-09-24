@@ -10,6 +10,22 @@ are never hand-labelled with a version string or tag.
 
 ### Fixed
 
+- Ticket #287: `GitLabProvider.list_comments(since=...)` now matches a
+  note's last-update time (`updated_at`, falling back to `created_at`),
+  the same semantics as GitHub's `?since=`, instead of only its creation
+  time — an edited comment is no longer silently missed. The unreliable
+  `created_after` server hint is no longer sent at all; filtering is
+  entirely client-side.
+- Ticket #287: `GitLabProvider.list_pr_files` now derives real
+  `additions`/`deletions` by counting `+`/`-` lines in each file's diff
+  hunks, instead of always returning `null`/`null`. They stay `None`
+  only when GitLab sends no diff text at all (e.g. an oversized or
+  binary file).
+- Ticket #287: a rejected GitLab `parent`/`child` relation add (a
+  work-item type pair GitLab's hierarchy rules don't allow) now raises
+  `GitLabError(422, ...)` naming both items' work-item types and the
+  type-pair precondition, keeping GitLab's original error text, instead
+  of a bare, cryptic 422 message.
 - Ticket #272: the ETag cache no longer replays stale pagination headers
   (`Link`, `X-Total-Pages`, `X-Next-Page`) on a 304. GETs carrying `page` or
   `per_page` now bypass the conditional cache entirely, so

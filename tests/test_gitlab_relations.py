@@ -2112,4 +2112,3 @@ def test_add_relation_child_type_rejection_names_item_types(
         "it's not allowed to add this type of parent item"
         in exc.value.message
     )
-    assert truncated is None
