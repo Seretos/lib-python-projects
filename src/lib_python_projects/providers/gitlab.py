@@ -495,8 +495,9 @@ def _map_pr_file(raw: dict) -> PRFileDiff:
     old_path` rule) — needed so a rename that changed the path still
     reports the current one. `previous_path` is populated ONLY when
     `renamed_file` is true, never merely because `old_path != new_path`.
-    `additions`/`deletions` stay `None` — the `changes` payload carries
-    no such counts.
+    `additions`/`deletions` are derived by counting `+`/`-` lines in the
+    `diff` text's hunk bodies via `_count_diff_changes` (ticket #287
+    R2) — the `changes` payload carries no such counts natively.
     """
     new_path = raw.get("new_path")
     old_path = raw.get("old_path")
@@ -510,15 +511,64 @@ def _map_pr_file(raw: dict) -> PRFileDiff:
     else:
         change_type = "modified"
     diff = raw.get("diff")
+    additions, deletions = _count_diff_changes(diff)
     return PRFileDiff(
         path=new_path or old_path or "",
         change_type=change_type,
         previous_path=old_path if renamed else None,
         patch=diff,
         line_ranges=parse_diff_hunk_ranges(diff),
-        additions=None,
-        deletions=None,
+        additions=additions,
+        deletions=deletions,
     )
+
+
+def _count_diff_changes(diff: str | None) -> tuple[int | None, int | None]:
+    """Count `+`/`-` lines in a unified diff's hunk bodies.
+
+    Reuses `base._HUNK_HEADER_RE` to recognize `@@ -a,b +c,d @@` hunk
+    headers; everything before the first recognized header is ignored,
+    as are `'\\ No newline at end of file'` marker lines. Only the
+    FIRST character of a body line is the diff marker, so a removed
+    line whose own content happens to start with `-` (e.g. a raw diff
+    line reading `---triple dash content`) is still counted as exactly
+    one removal — never mistaken for another hunk header, since a real
+    header must match `_HUNK_HEADER_RE` in full, not merely start with
+    `@@`. A line starting with `@@` that does NOT match the header
+    pattern (malformed) suspends counting until the next valid header,
+    mirroring `_resolve_left_position_lines`'s treatment of a malformed
+    header.
+
+    Returns `(None, None)` — genuinely unknown, never a fake `(0, 0)`
+    — when `diff` is empty, `None`, or has no recognizable hunk header
+    at all (e.g. a pure rename or mode-only change with no diff text,
+    or an oversized/binary file GitLab sends with no diff at all).
+    """
+    if not diff:
+        return None, None
+    additions = 0
+    deletions = 0
+    seen_header = False
+    counting = False
+    for line in diff.splitlines():
+        if line.startswith("@@"):
+            if _HUNK_HEADER_RE.match(line):
+                seen_header = True
+                counting = True
+            else:
+                counting = False
+            continue
+        if not counting:
+            continue
+        if line.startswith("\\"):
+            continue
+        if line.startswith("+"):
+            additions += 1
+        elif line.startswith("-"):
+            deletions += 1
+    if not seen_header:
+        return None, None
+    return additions, deletions
 
 
 def _resolve_left_position_lines(
@@ -1841,6 +1891,7 @@ _WORK_ITEM_HIERARCHY_QUERY = (
     "workItems(iid: $iid) {"
     "nodes {"
     "id iid title webUrl state "
+    "workItemType { name } "
     "widgets {"
     "... on WorkItemWidgetHierarchy {"
     "parent { id iid title webUrl state }"
@@ -2011,7 +2062,21 @@ def _gitlab_add_hierarchy_relation(
     if existing_parent and str(existing_parent.get("iid")) == str(new_parent_iid):
         raise RelationAlreadyExists(kind=kind, ticket_id=ticket_id, target=f"#{target_iid}")
 
-    _gitlab_set_work_item_parent(client, project, subject_wi["id"], parent_wi["id"])
+    try:
+        _gitlab_set_work_item_parent(client, project, subject_wi["id"], parent_wi["id"])
+    except GitLabError as exc:
+        if exc.status != 422:
+            raise
+        subject_type = (subject_wi.get("workItemType") or {}).get("name") or "?"
+        parent_type = (parent_wi.get("workItemType") or {}).get("name") or "?"
+        raise GitLabError(
+            422,
+            f"GitLab rejected making #{new_parent_iid} ({parent_type}) the "
+            f"parent of #{subject_iid} ({subject_type}): GitLab's work-item "
+            "hierarchy only allows specific type pairs (e.g. Epic→Issue, "
+            "Issue→Task) as parent/child — this pair isn't one of them. "
+            f"GitLab said: {exc.message}",
+        ) from exc
 
     # The Relation returned always describes the *target* ticket (the
     # caller's `target` argument) — same convention as every other
@@ -3330,8 +3395,10 @@ class GitLabProvider(
         System notes (state changes, label edits, milestone moves) are
         filtered out — they aren't user-facing comments.
 
-        Returns `(rows, has_more)`. `since` maps to GitLab's
-        `created_after` query parameter (ISO-8601). `page` is 1-based.
+        Returns `(rows, has_more)`. `since` matches a note's last-update
+        time (`updated_at`, falling back to `created_at` when GitLab
+        omits it), filtered client-side — the same semantics as
+        GitHub's `?since=`. `page` is 1-based.
 
         Tail-fetch (ticket #47 follow-up): when `order="desc"`,
         `page=1`, and no `since`, the implementation probes the
@@ -3361,8 +3428,6 @@ class GitLabProvider(
                 "sort": "asc",
                 "order_by": "created_at",
             }
-            if since:
-                params["created_after"] = since
             r = client.get(
                 f"/projects/{path}/issues/{ticket_id}/notes",
                 params=params,
@@ -3372,10 +3437,17 @@ class GitLabProvider(
                 _map_note(it, project) for it in r.json()
                 if not it.get("system", False)
             ]
-            # GitLab's `created_after` server hint is not reliably
-            # honoured for notes — apply the filter client-side.
+            # GitLab's `created_after` server hint only matches a note's
+            # *creation* time, so an edited-after-`since` note created
+            # before it would be dropped before ever reaching this
+            # filter — don't send it at all. Filter entirely client-side
+            # against `updated_at` (falling back to `created_at` when a
+            # note has none), matching GitHub's `?since=` semantics.
             if since:
-                rows = [c for c in rows if c.created_at and c.created_at >= since]
+                rows = [
+                    c for c in rows
+                    if (c.updated_at or c.created_at) >= since
+                ]
             next_page = (r.headers.get("X-Next-Page") or "").strip()
             has_more = bool(next_page)
             return rows, has_more
@@ -4821,6 +4893,11 @@ class GitLabProvider(
           - `parent` / `child` → Work Items GraphQL `hierarchyWidget`
             (ticket #151), same-project only (cross-project hierarchy is
             not yet supported, same restriction as every other kind here).
+            GitLab only allows specific work-item type pairs as
+            parent/child (e.g. Epic→Issue, Issue→Task); a pair it
+            rejects raises `GitLabError(422, ...)` naming both items'
+            work-item types and this precondition, keeping GitLab's
+            original error text (ticket #287).
 
         `target` is parsed via `_parse_gitlab_relation_target`;
         currently same-project only.

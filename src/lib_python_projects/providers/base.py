@@ -996,6 +996,11 @@ class PRFileDiff:
     upstream payload happens to carry a former-path field (e.g. a
     stray `previous_filename`/`sourceServerItem` on a non-rename entry
     is deliberately ignored).
+
+    `additions`/`deletions` are `None` only when the provider cannot
+    determine them at all. On GitLab that means a `changes` entry
+    whose `diff` carries no hunk text (e.g. an oversized or binary
+    file) — otherwise they're counted from the diff's `+`/`-` lines.
     """
 
     path: str

@@ -1291,6 +1291,42 @@ def test_list_comments_since_filters_old_comments(
     assert has_more is False
 
 
+def test_list_comments_since_includes_comment_edited_after_since(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1 (ticket #287): `since` must match a note's last-UPDATE time, not
+    just its creation time — the docstring's own stated use case ("what
+    changed since X") must not silently drop a comment that was edited
+    (not created) after `since`. Note 1 was created before `since` but
+    edited after it and must be included; note 2 was both created and
+    updated before `since` and must stay excluded."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _json([
+            {
+                "id": 1, "body": "edited comment", "system": False,
+                "author": {"username": "alice"},
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-03-01T00:00:00Z",
+            },
+            {
+                "id": 2, "body": "untouched comment", "system": False,
+                "author": {"username": "bob"},
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            },
+        ])
+
+    _install_mock(monkeypatch, handler)
+    comments, has_more = GitLabProvider().list_comments(
+        _project(), "t", "5", since="2024-02-01T00:00:00Z"
+    )
+    assert len(comments) == 1
+    assert comments[0].id == "1"
+    assert comments[0].body == "edited comment"
+    assert has_more is False
+
+
 def test_get_comment_composite_key(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(req: httpx.Request) -> httpx.Response:
         assert "acme%2Fbackend/issues/5/notes/99" in str(req.url)

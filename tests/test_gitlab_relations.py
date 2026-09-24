@@ -1993,4 +1993,122 @@ def test_get_ticket_include_relations_false_leaves_parent_id_none(
     )
     assert ticket.parent_id is None
     assert relations == []
-    assert truncated is None
+
+
+# ---------- ticket #287 R3: 422 type-pair rejection gets a clear message -----
+#
+# GitLab's work-item hierarchy mutation rejects a parent/child add whose two
+# items' work-item types aren't an allowed hierarchy pair (e.g. two ordinary
+# Issues) with a bare `"#7 cannot be added: it's not allowed to add this type
+# of parent item"` — no item types, no hint at the type-pair rule. The fix
+# re-raises that 422 with a message naming both items' types, keeping
+# GitLab's original text, and the status stays 422 (see plan L16-20).
+
+
+def test_add_relation_parent_type_rejection_names_item_types(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 driving test: `add_relation(kind="parent")` against a pair GitLab
+    rejects for type reasons must raise `GitLabError(422, ...)` whose
+    message names both items' work-item types and the type-pair
+    precondition, keeping GitLab's original text. Today's message is the
+    bare `GitLab work item hierarchy update failed: #7 cannot be added:
+    it's not allowed to add this type of parent item`, with no `(Issue)`
+    and no `Epic` hint — this is the expected RED reason. The lookup
+    query must also request `workItemType` so the enriched message can
+    name the types without a second request."""
+    captured_lookup_query: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            if "workItemUpdate" in body["query"]:
+                return _graphql_response({
+                    "workItemUpdate": {
+                        "workItem": None,
+                        "errors": [
+                            "#7 cannot be added: it's not allowed to "
+                            "add this type of parent item"
+                        ],
+                    }
+                })
+            captured_lookup_query["query"] = body["query"]
+            iid = int(variables["iid"])
+            if iid == 5:
+                wi = _work_item(5, parent=None)
+                wi["workItemType"] = {"name": "Issue"}
+                return _graphql_response(
+                    {"project": {"workItems": {"nodes": [wi]}}}
+                )
+            if iid == 7:
+                wi = _work_item(7, title="Issue 7")
+                wi["workItemType"] = {"name": "Issue"}
+                return _graphql_response(
+                    {"project": {"workItems": {"nodes": [wi]}}}
+                )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "parent", "#7")
+    assert exc.value.status == 422
+    assert "(Issue)" in exc.value.message
+    assert "Epic" in exc.value.message
+    assert (
+        "it's not allowed to add this type of parent item"
+        in exc.value.message
+    )
+    assert "workItemType" in captured_lookup_query["query"]
+
+
+def test_add_relation_child_type_rejection_names_item_types(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 additional coverage: same rejection, `kind="child"` — the
+    mutation is issued against the *target*'s (7's) work item with
+    ticket_id (5) as the new parent, so the direction wording swaps, but
+    the message must still name both items' types and keep GitLab's
+    original text."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url.endswith("/api/graphql"):
+            body = _graphql_body(req)
+            variables = body["variables"]
+            if "workItemUpdate" in body["query"]:
+                return _graphql_response({
+                    "workItemUpdate": {
+                        "workItem": None,
+                        "errors": [
+                            "#5 cannot be added: it's not allowed to "
+                            "add this type of parent item"
+                        ],
+                    }
+                })
+            iid = int(variables["iid"])
+            if iid == 5:
+                wi = _work_item(5, title="Issue 5")
+                wi["workItemType"] = {"name": "Issue"}
+                return _graphql_response(
+                    {"project": {"workItems": {"nodes": [wi]}}}
+                )
+            if iid == 7:
+                wi = _work_item(7, parent=None)
+                wi["workItemType"] = {"name": "Issue"}
+                return _graphql_response(
+                    {"project": {"workItems": {"nodes": [wi]}}}
+                )
+        raise AssertionError(f"unexpected {req.method} {req.url}")
+
+    _install_mock(monkeypatch, handler)
+    with pytest.raises(GitLabError) as exc:
+        GitLabProvider().add_relation(_project(), "t", "5", "child", "#7")
+    assert exc.value.status == 422
+    assert "(Issue)" in exc.value.message
+    assert "Epic" in exc.value.message
+    assert (
+        "it's not allowed to add this type of parent item"
+        in exc.value.message
+    )
