@@ -7,10 +7,10 @@ reviewed commit at any time. These tests parse `pyproject.toml` (same
 `tomllib` idiom as `tests/test_pytest_timeout_config.py`) and assert every
 `git+` runtime dependency is pinned to an exact `vX.Y.Z` tag.
 
-The specific fact that `lib-python-config` is pinned to exactly `v0.1.2` is
-not asserted here as a standalone literal-string check -- a bare equality
-against the current pyproject.toml value has no discriminating power beyond
-"the config file currently says v0.1.2" and cannot prove the tag actually
+The specific exact tag `lib-python-config` is pinned to is not asserted
+here as a standalone literal-string check -- a bare equality against the
+current pyproject.toml value has no discriminating power beyond "the
+config file currently says this tag" and cannot prove the tag actually
 exists/resolves upstream. That value is instead verified by the PR
 reviewer reading the pyproject.toml diff, and by a real clean-venv install
 (declared `ci-evidence` in the plan).
