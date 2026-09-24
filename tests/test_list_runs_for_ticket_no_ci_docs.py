@@ -27,6 +27,27 @@ from lib_python_projects.providers.gitlab import GitLabProvider
 
 _PROVIDERS = [GitHubProvider, GitLabProvider, AzureDevOpsProvider]
 
+# The exact paragraph the plan (#288, round 2) specifies for every
+# provider's `list_runs_for_ticket` docstring (plan.md, "Item 1 (docs
+# only)"). Pinned verbatim (case-sensitive) rather than approximated by
+# keyword/phrase regexes: round-2 test-critique showed that phrase-adjacency
+# regexes are structurally beatable by a docstring that arranges the same
+# words/phrases into a negated, false statement (e.g. "NO_CI_SENTINEL is
+# never the last element of resolved_refs; it is not a ref unless there is
+# no CI configured"). Such a negated paraphrase does not match this exact
+# sentence, so it cannot satisfy this test.
+_PLANNED_PARAGRAPH = (
+    '`resolved_refs` may end with `NO_CI_SENTINEL` (`"no-ci"`). It is '
+    "appended as the last element only when no run matched and the "
+    "project has no CI configured. It is a marker, not a ref: strip it "
+    "before treating entries as SHAs / `!iid` / `build/{id}`. See "
+    "`NO_CI_SENTINEL` in `base.py`."
+)
+
+
+def _collapse_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
 
 def _sentinel_paragraph(provider_cls: type) -> str:
     """Return the paragraph of `provider_cls`'s OWN (non-inherited)
@@ -58,32 +79,23 @@ def _sentinel_paragraph(provider_cls: type) -> str:
 def test_list_runs_for_ticket_docstring_explains_no_ci_sentinel(
     provider_cls: type,
 ) -> None:
-    """Each provider's own `list_runs_for_ticket` docstring must have a
-    paragraph tying `NO_CI_SENTINEL` to `resolved_refs` and explaining,
-    in one place: it's the last element, it only appears when no CI is
-    configured, and it is not a real ref. Every check below is scoped to
-    that ONE paragraph (not the whole docstring), so a stray mention of
-    the constant elsewhere in the docstring cannot make this pass.
+    """Each provider's own `list_runs_for_ticket` docstring must contain
+    the plan's exact paragraph (verbatim, whitespace-normalized) tying
+    `NO_CI_SENTINEL` to `resolved_refs`: last element, only when no CI is
+    configured, and not a real ref.
 
-    Each assertion below requires the claim's key words to sit directly
-    adjacent to each other, in the affirmative phrasing the plan specifies
-    (e.g. "appended as the last element only when ... has no ci
-    configured", "marker, not a ref") -- not merely co-occurring anywhere
-    in the paragraph. A paragraph that states the opposite meaning (e.g.
-    "resolved_refs never contains NO_CI_SENTINEL; it is not a ref, is
-    never the last element, and appears even with no CI configured")
-    contains all the individual words but does not match any of these
-    tightly-scoped phrase patterns, so it cannot satisfy this test."""
+    This is a text pin, not a keyword/phrase heuristic: round-2
+    test-critique showed that phrase-adjacency regexes are beatable by a
+    docstring paragraph that arranges the same required words/phrases into
+    a negated, false statement (e.g. "NO_CI_SENTINEL is never the last
+    element of resolved_refs; it is not a ref unless there is no CI
+    configured" -- every phrase present, meaning reversed). That negated
+    paraphrase is not equal, even after whitespace normalization, to the
+    plan's exact sentence, so it cannot satisfy a verbatim substring check
+    the way it could satisfy separate adjacency regexes."""
     paragraph = _sentinel_paragraph(provider_cls)
-    collapsed = re.sub(r"\s+", " ", paragraph.replace("`", "").lower())
-    assert re.search(r"resolved_refs may end with no_ci_sentinel", collapsed), collapsed
-    assert '"no-ci"' in collapsed
-    assert re.search(
-        r"appended as the last element only when no run matched "
-        r"and the project has no ci configured",
-        collapsed,
-    ), collapsed
-    assert re.search(r"marker, not a ref", collapsed), collapsed
+    collapsed = _collapse_whitespace(paragraph)
+    assert _PLANNED_PARAGRAPH in collapsed, collapsed
 
 
 def test_github_list_runs_for_ticket_docstring_drops_stale_head_shas_wording() -> None:
