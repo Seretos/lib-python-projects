@@ -5943,6 +5943,12 @@ class AzureDevOpsProvider(
         never truncate the candidate `build_ids` list up front, or a
         matching run could be skipped simply because it wasn't among the
         first `limit` relations walked.
+
+        `resolved_refs` may end with `NO_CI_SENTINEL` (`"no-ci"`). It is
+        appended as the last element only when no run matched and the
+        project has no CI configured. It is a marker, not a ref: strip it
+        before treating entries as SHAs / `!iid` / `build/{id}`. See
+        `NO_CI_SENTINEL` in `base.py`.
         """
         _validate_limit(limit)
         # Walk the work item's relations for ArtifactLink entries pointing

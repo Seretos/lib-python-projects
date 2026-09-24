@@ -3814,6 +3814,16 @@ class GitHubProvider(
         naming the missing config. `None`/`{}` is a silent no-op so
         existing callers are unaffected.
 
+        With `light=False` and a non-empty `custom_fields`, the returned
+        `Ticket.custom_fields`/`.milestone` are read back from the board
+        (ticket #288, parity with `update_ticket` #185 /
+        `get_ticket(include_custom_fields=True)`) via the same
+        `_populate_board_fields` helper, at the cost of one extra GraphQL
+        request. Otherwise (`light=True`, no `custom_fields`, or a
+        milestone-only create) both stay `None`. A read-back failure
+        raises `PartialTicketCreateError` — the issue and its board
+        fields are already written by that point.
+
         Optional `idempotency_key` (ticket #150): a retried call with the
         same key (scoped to this project) returns the ticket created by
         the first successful call instead of creating a duplicate, with
@@ -4006,6 +4016,30 @@ class GitHubProvider(
                         issue_node_id=content_id,
                     ) from exc
             ticket = _map_issue(raw)
+            if custom_fields and not light:
+                try:
+                    _populate_board_fields(
+                        client,
+                        ticket,
+                        repo_owner=project.owner,
+                        repo=project.repo,
+                        issue_number=int(raw["number"]),
+                        binding=binding,
+                        include_custom_fields=True,
+                    )
+                except GitHubError as exc:
+                    number = raw.get("number")
+                    url = raw.get("html_url")
+                    node_id = raw.get("node_id")
+                    raise PartialTicketCreateError(
+                        exc.status,
+                        f"issue #{number} ({url}) was created and board "
+                        f"fields written, but reading them back failed: "
+                        f"{exc.message}",
+                        issue_number=number,
+                        issue_url=url,
+                        issue_node_id=node_id,
+                    ) from exc
             if light:
                 ref = TicketRef.from_ticket(ticket)
                 result: Ticket | TicketRef = dataclasses.replace(
@@ -6640,11 +6674,16 @@ class GitHubProvider(
     ) -> tuple[list[PipelineRun], list[str]]:
         """Resolve a ticket -> linked PR head_shas -> runs.
 
-        Returns `(runs, resolved_refs)`. `resolved_refs` is the de-duped
-        list of head_shas we queried. When the ticket has no linked PR
+        Returns `(runs, resolved_refs)`. When the ticket has no linked PR
         or branch reference, both lists are empty (the tool layer turns
         this into a `hint`). See `list_runs_for_branch` for
         `workflow`/`event`/`since` semantics.
+
+        `resolved_refs` may end with `NO_CI_SENTINEL` (`"no-ci"`). It is
+        appended as the last element only when no run matched and the
+        project has no CI configured. It is a marker, not a ref: strip it
+        before treating entries as SHAs / `!iid` / `build/{id}`. See
+        `NO_CI_SENTINEL` in `base.py`.
         """
         with _client(token) as client:
             shas = _resolved_refs_for_ticket(client, project, ticket_id)
