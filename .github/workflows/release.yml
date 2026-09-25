@@ -155,14 +155,13 @@ jobs:
 
       - name: Open dependency-update tickets in consumers
         # Central ecosystem action, deliberately unpinned (@main) so fixes
-        # propagate to every lib. continue-on-error: notification failure
-        # must never fail the release itself.
-        continue-on-error: true
-        uses: Seretos/agent-plugin-dev/.github/actions/notify-consumers@main
+        # propagate to every lib. A failure here fails the release run
+        # itself -- silently missing bump tickets is worse than a red run.
+        uses: seretos-agents/modular-software-factory-dev/.github/actions/notify-consumers@main
         with:
           version: ${{ inputs.version }}
           source_repo: ${{ github.repository }}
           consumers: |
-            Seretos/agent-project-issues
+            seretos-agents/agent-project-issues
             Seretos/workboard
           gh_token: ${{ secrets.ECOSYSTEM_TOKEN }}

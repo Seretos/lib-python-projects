@@ -40,12 +40,12 @@ class TestNonsenseQueryReturnsEmpty:
             _make_project(
                 id="agent-project-issues",
                 description="Issue tracking",
-                path="Seretos/agent-project-issues",
+                path="seretos-agents/agent-project-issues",
             ),
             _make_project(
                 id="lib-python-config",
                 description="Python config library",
-                path="Seretos/lib-python-config",
+                path="seretos-agents/lib-python-config",
             ),
         ]
         result = find_projects(projects, query="nonexistent-project-xyz-99", fields="full")
@@ -71,8 +71,8 @@ class TestExactIdMatch:
     """An exact id query should produce a score of 1.0 and rank first."""
 
     def test_exact_id_match_scores_one_and_ranks_first(self) -> None:
-        p1 = _make_project(id="agent-project-issues", path="Seretos/agent-project-issues")
-        p2 = _make_project(id="lib-python-config", path="Seretos/lib-python-config")
+        p1 = _make_project(id="agent-project-issues", path="seretos-agents/agent-project-issues")
+        p2 = _make_project(id="lib-python-config", path="seretos-agents/lib-python-config")
         result = find_projects([p1, p2], query="agent-project-issues", fields="id")
         assert len(result.matches) >= 1
         top = result.matches[0]
@@ -84,7 +84,7 @@ class TestPartialIdMatch:
     """A partial query ('agent') should still match 'agent-project-issues'."""
 
     def test_partial_id_match_is_above_floor(self) -> None:
-        p = _make_project(id="agent-project-issues", path="Seretos/agent-project-issues")
+        p = _make_project(id="agent-project-issues", path="seretos-agents/agent-project-issues")
         result = find_projects([p], query="agent", fields="id")
         assert len(result.matches) == 1
         assert result.matches[0].project.id == "agent-project-issues"
@@ -221,7 +221,7 @@ class TestDominantMatchNoiseSuppression:
         whose incidental token overlaps score ~0.3–0.45.
         """
         # "agent-project-issues" matches id exactly → F1 = 1.0
-        p_exact = _make_project(id="agent-project-issues", path="Seretos/agent-project-issues")
+        p_exact = _make_project(id="agent-project-issues", path="seretos-agents/agent-project-issues")
         # "some-issues-tracker" shares "issues" token with query but is far
         # from a full match.  Expected F1 ~ 0.35 (well below 1.0 * 0.5).
         p_noise1 = _make_project(id="some-issues-tracker", path="acme/tracker")
@@ -276,7 +276,7 @@ class TestDominantMatchNoiseSuppression:
         and pass after (cutoff = max(min_score, top*RELATIVE_SCORE_CUTOFF)).
         """
         # Exact match (score 1.0) + noise (score well below 0.5)
-        p_exact = _make_project(id="agent-project-issues", path="Seretos/agent-project-issues")
+        p_exact = _make_project(id="agent-project-issues", path="seretos-agents/agent-project-issues")
         p_noise = _make_project(id="some-issues-tracker", path="acme/tracker")
 
         result = find_projects(

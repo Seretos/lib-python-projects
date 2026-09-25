@@ -63,7 +63,7 @@ from tests.fake_gh import FakeGitHub
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FAKE_GH_EXECUTABLE = REPO_ROOT / "tests" / "fake_gh" / "executable.py"
 
-SOURCE_REPO = "Seretos/lib-python-projects"
+SOURCE_REPO = "seretos-agents/lib-python-projects"
 
 
 @pytest.fixture

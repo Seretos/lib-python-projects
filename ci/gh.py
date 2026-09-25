@@ -91,7 +91,7 @@ def gh_paginate_rest(path: str, *, per_page: int = 100, max_pages: int = 200) ->
     ``max_pages=200`` (at ``per_page=100``, 20,000 items) rather than the
     original 50 (5,000 items): this function's one known caller today
     (``ci.bump_ticket``'s open-issue duplicate probe) only ever targets
-    ``Seretos/agent-project-issues`` and ``Seretos/workboard``, two repos
+    ``seretos-agents/agent-project-issues`` and ``Seretos/workboard``, two repos
     extremely unlikely to ever carry 5,000+ open issues, let alone 20,000 --
     but since exhaustion here has a real cost (the caller's duplicate-avoidance
     check becomes unreliable, see :class:`GhPaginationExhausted`), a cheap 4x

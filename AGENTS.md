@@ -56,14 +56,16 @@ do those phases by hand on the main thread — let the skill drive them.
 ## Downstream dependency notifications
 
 After every release, `release.yml` calls the central
-`Seretos/agent-plugin-dev/.github/actions/notify-consumers@main` action
+`seretos-agents/modular-software-factory-dev/.github/actions/notify-consumers@main` action
 (deliberately unpinned to `@main` so fixes propagate to every lib) in one
-`continue-on-error: true` step, fed only facts — `version`, `source_repo`,
-the newline-separated `consumers` list (`Seretos/agent-project-issues`,
+step, fed only facts — `version`, `source_repo`,
+the newline-separated `consumers` list (`seretos-agents/agent-project-issues`,
 `Seretos/workboard`), and `gh_token: ${{ secrets.ECOSYSTEM_TOKEN }}`. The
 central action owns labels, changelog embedding and board placement for
 both consumers; this lib keeps no per-consumer ticket or board logic of its
-own.
+own. A failure in that step fails the release run itself (no
+`continue-on-error`) — silently missing bump tickets is worse than a red
+run.
 
 **Human prerequisite — `ECOSYSTEM_TOKEN`:**
 This must be a repository secret (Settings → Secrets → Actions) containing a

@@ -34,7 +34,7 @@ from lib_python_projects.providers.azuredevops import (
 )
 
 
-def _github_project(path: str = "Seretos/agent-project-issues") -> ProjectConfig:
+def _github_project(path: str = "seretos-agents/agent-project-issues") -> ProjectConfig:
     return ProjectConfig(id="github-tests", provider="github", path=path)
 
 
@@ -1945,15 +1945,15 @@ def test_relation_ticket_id_is_hash_prefixed_on_read_across_providers(monkeypatc
     # the 404 fallback) -- exercises all three `_ref_to_relation` branches. ----
     def gh_handler(req):
         path = req.url.path
-        if path == "/repos/Seretos/agent-project-issues/issues/42":
+        if path == "/repos/seretos-agents/agent-project-issues/issues/42":
             return _resp({
                 "number": 42, "title": "T", "state": "open",
                 "user": {"login": "a"}, "assignees": [], "labels": [],
-                "html_url": "https://github.com/Seretos/agent-project-issues/issues/42",
+                "html_url": "https://github.com/seretos-agents/agent-project-issues/issues/42",
                 "created_at": "2024-01-01T00:00:00Z",
                 "updated_at": "2024-01-01T00:00:00Z",
                 "body": (
-                    "Fixes Seretos/agent-project-issues#77\n"
+                    "Fixes seretos-agents/agent-project-issues#77\n"
                     "see #88\n"
                     "Duplicate of otherowner/other-repo#99\n"
                 ),
@@ -1963,16 +1963,16 @@ def test_relation_ticket_id_is_hash_prefixed_on_read_across_providers(monkeypatc
                     "repository": {"full_name": "otherowner/other-repo"},
                 },
             })
-        if path == "/repos/Seretos/agent-project-issues/issues/42/comments":
+        if path == "/repos/seretos-agents/agent-project-issues/issues/42/comments":
             return _resp([])
-        if path == "/repos/Seretos/agent-project-issues/issues/42/sub_issues":
+        if path == "/repos/seretos-agents/agent-project-issues/issues/42/sub_issues":
             return _resp([{
                 "number": 15, "title": "Child", "state": "open",
-                "html_url": "https://github.com/Seretos/agent-project-issues/issues/15",
+                "html_url": "https://github.com/seretos-agents/agent-project-issues/issues/15",
                 "user": {"login": "a"}, "assignees": [], "labels": [],
-                "repository": {"full_name": "Seretos/agent-project-issues"},
+                "repository": {"full_name": "seretos-agents/agent-project-issues"},
             }])
-        if path == "/repos/Seretos/agent-project-issues/issues/42/timeline":
+        if path == "/repos/seretos-agents/agent-project-issues/issues/42/timeline":
             return _resp([])
         if "/dependencies/" in path:
             return _resp([])
@@ -2131,25 +2131,25 @@ def test_all_providers_populate_annotations_as_failure_annotation_list(monkeypat
 
     def gh_handler(req):
         path = req.url.path
-        if path == f"/repos/Seretos/agent-project-issues/actions/runs/{gh_run_id}":
+        if path == f"/repos/seretos-agents/agent-project-issues/actions/runs/{gh_run_id}":
             return _resp({
                 "id": gh_run_id, "name": "CI", "head_sha": "sha1",
                 "head_branch": "main", "event": "push", "status": "completed",
                 "conclusion": "failure",
-                "html_url": f"https://github.com/Seretos/agent-project-issues/actions/runs/{gh_run_id}",
+                "html_url": f"https://github.com/seretos-agents/agent-project-issues/actions/runs/{gh_run_id}",
                 "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:01:00Z",
                 "run_attempt": 1,
             })
-        if path == f"/repos/Seretos/agent-project-issues/actions/runs/{gh_run_id}/jobs":
+        if path == f"/repos/seretos-agents/agent-project-issues/actions/runs/{gh_run_id}/jobs":
             return _resp({
                 "jobs": [{
                     "id": gh_job_id, "name": "build", "conclusion": "failure",
                     "html_url": "https://github.com/x/jobs/6001",
-                    "check_run_url": "https://api.github.com/repos/Seretos/agent-project-issues/check-runs/9",
+                    "check_run_url": "https://api.github.com/repos/seretos-agents/agent-project-issues/check-runs/9",
                     "steps": [{"name": "Run make", "conclusion": "failure", "number": 1}],
                 }]
             })
-        if path == "/repos/Seretos/agent-project-issues/check-runs/9/annotations":
+        if path == "/repos/seretos-agents/agent-project-issues/check-runs/9/annotations":
             return _resp([{
                 "path": "x.py", "start_line": 1, "annotation_level": "failure",
                 "message": "boom",
@@ -2258,7 +2258,7 @@ def _custom_auto_labels() -> "AutoLabels":
 
 def test_github_create_ticket_honors_custom_auto_labels(monkeypatch):
     project = ProjectConfig(
-        id="github-tests", provider="github", path="Seretos/agent-project-issues",
+        id="github-tests", provider="github", path="seretos-agents/agent-project-issues",
         auto_labels=_custom_auto_labels(),
     )
     captured: dict = {}

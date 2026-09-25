@@ -163,7 +163,7 @@ def _run_step(
 def test_notes_start_tag_flag_added_when_previous_tag_exists(tmp_path):
     result, calls = _run_step(
         tmp_path,
-        {"VERSION": "0.3.14", "REPO": "Seretos/lib-python-projects", "PREV_TAG": "v0.3.13"},
+        {"VERSION": "0.3.14", "REPO": "seretos-agents/lib-python-projects", "PREV_TAG": "v0.3.13"},
     )
 
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -204,7 +204,7 @@ def test_no_notes_start_tag_flag_when_previous_tag_empty(tmp_path):
     not even as a dangling empty-string argument."""
     result, calls = _run_step(
         tmp_path,
-        {"VERSION": "0.1.0", "REPO": "Seretos/lib-python-projects", "PREV_TAG": ""},
+        {"VERSION": "0.1.0", "REPO": "seretos-agents/lib-python-projects", "PREV_TAG": ""},
     )
 
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -229,7 +229,7 @@ def test_prerelease_flag_still_present_for_prerelease_version(tmp_path):
     still threaded through correctly alongside it."""
     result, calls = _run_step(
         tmp_path,
-        {"VERSION": "0.4.0-rc.1", "REPO": "Seretos/lib-python-projects", "PREV_TAG": "v0.3.14"},
+        {"VERSION": "0.4.0-rc.1", "REPO": "seretos-agents/lib-python-projects", "PREV_TAG": "v0.3.14"},
     )
 
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -251,7 +251,7 @@ def test_prerelease_flag_absent_for_stable_version(tmp_path):
     also pass."""
     result, calls = _run_step(
         tmp_path,
-        {"VERSION": "0.3.14", "REPO": "Seretos/lib-python-projects", "PREV_TAG": "v0.3.13"},
+        {"VERSION": "0.3.14", "REPO": "seretos-agents/lib-python-projects", "PREV_TAG": "v0.3.13"},
     )
 
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
