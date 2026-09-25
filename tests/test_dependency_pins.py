@@ -84,7 +84,7 @@ def test_non_git_dependency_is_skipped_by_shape_check() -> None:
     deps = [
         "pydantic>=2.0",
         "requests==2.31.0",
-        "lib-python-config @ git+https://github.com/Seretos/lib-python-config@v1.0.0",
+        "lib-python-config @ git+https://github.com/seretos-agents/lib-python-config@v1.0.0",
     ]
 
     refs = _git_dependency_refs_from(deps)

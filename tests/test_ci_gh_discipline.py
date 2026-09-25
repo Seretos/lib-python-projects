@@ -49,7 +49,7 @@ def test_unknown_flag_is_rejected_by_the_simulator():
     way real `gh` would -- the exact class of bug (round 3: `--jq --arg`)
     that generation 1's blanket-responding fake could never have caught."""
     fake = FakeGitHub()
-    fake.add_release("Seretos/lib-python-projects", "v1.0.0", "some notes")
+    fake.add_release("seretos-agents/lib-python-projects", "v1.0.0", "some notes")
 
     with pytest.raises(GhCallError):
         fake.run_gh(
@@ -58,7 +58,7 @@ def test_unknown_flag_is_rejected_by_the_simulator():
                 "view",
                 "v1.0.0",
                 "--repo",
-                "Seretos/lib-python-projects",
+                "seretos-agents/lib-python-projects",
                 "--json",
                 "body",
                 "--bogus-flag",

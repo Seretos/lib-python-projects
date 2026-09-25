@@ -476,7 +476,7 @@ class ProjectConfig(BaseModel):
     """A single project entry.
 
     `path` is the provider-native repo identifier:
-      - GitHub: `"owner/repo"` (e.g. `"Seretos/agent-project-issues"`)
+      - GitHub: `"owner/repo"` (e.g. `"seretos-agents/agent-project-issues"`)
       - GitLab: full namespace path (e.g. `"group/sub/project"`)
       - Azure DevOps: `"organization/project/repository"` — work items
         scope to `organization/project`, PRs to the full three-part path.
