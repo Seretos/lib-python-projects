@@ -36,6 +36,9 @@ are never hand-labelled with a version string or tag.
 
 ### Changed
 
+- Ticket #292: bumped the `lib-python-config` pin to the exact tag
+  `v0.1.4` (upstream change is README-only,
+  seretos-agents/lib-python-config#19; no consumer-side API change).
 - Ticket #283: bumped the `lib-python-config` pin to the exact tag
   `v0.1.3` (upstream change is CI/tooling-only,
   Seretos/lib-python-config#17; no consumer-side API change).
