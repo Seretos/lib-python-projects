@@ -60,10 +60,11 @@ After every release, `release.yml` calls the central
 (deliberately unpinned to `@main` so fixes propagate to every lib) in one
 step, fed only facts — `version`, `source_repo`,
 the newline-separated `consumers` list (`seretos-agents/agent-project-issues`,
-`Seretos/workboard`), and `gh_token: ${{ secrets.ECOSYSTEM_TOKEN }}`. The
-central action owns labels, changelog embedding and board placement for
-both consumers; this lib keeps no per-consumer ticket or board logic of its
-own. A failure in that step fails the release run itself (no
+`Seretos/workboard`, `seretos-agents/ecosystem-statistics`), and
+`gh_token: ${{ secrets.ECOSYSTEM_TOKEN }}`. The central action owns labels,
+changelog embedding and board placement for all consumers; this lib keeps
+no per-consumer ticket or board logic of its own. A failure in that step
+fails the release run itself (no
 `continue-on-error`) — silently missing bump tickets is worse than a red
 run.
 
