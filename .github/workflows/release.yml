@@ -164,4 +164,5 @@ jobs:
           consumers: |
             seretos-agents/agent-project-issues
             Seretos/workboard
+            seretos-agents/ecosystem-statistics
           gh_token: ${{ secrets.ECOSYSTEM_TOKEN }}
